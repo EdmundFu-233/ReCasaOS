@@ -299,7 +299,7 @@ func GetSystemNetInfo(ctx echo.Context) error {
 }
 
 func GetSystemProxy(ctx echo.Context) error {
-	resp, err := netsecurity.GetPublicHTTPS(ctx.Request().Context(), ctx.QueryParam("url"), 30*time.Second)
+	resp, err := netsecurity.GetPublicHTTPS(ctx.Request().Context(), netsecurity.StaticAssetCapability, ctx.QueryParam("url"), 30*time.Second)
 	if err != nil {
 		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.INVALID_PARAMS, Message: "outbound URL rejected"})
 	}

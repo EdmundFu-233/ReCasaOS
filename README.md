@@ -35,7 +35,8 @@ The first hardening milestone includes:
   server-owned root, and a separate header-only bearer token;
 - bounded root file/SSH WebSockets, verified local SSH host keys, one-use SSH
   login tickets, and removal of an SSH infinite retry path;
-- public-HTTPS-only SSRF controls with DNS/redirect/IP revalidation;
+- capability-bound outbound fetches with exact host allowlists and
+  DNS/redirect/IP revalidation;
 - fail-closed cloud OAuth recovery until one-time state and PKCE are available;
 - maintained archive/OpenAPI implementations and upgraded vulnerable
   dependencies;

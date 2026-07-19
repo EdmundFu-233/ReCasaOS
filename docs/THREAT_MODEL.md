@@ -78,7 +78,7 @@ this repository, but recovery plans must account for them.
 | Destructive management operation | System stop, SSH-over-WebSocket, Samba, storage, batch, and integration routes have high impact. Legacy `curl | bash` automatic update execution is disabled until signed ReCasaOS manifests and rollback exist. | Keep management routes on VPN; require reauthentication for dangerous actions where supported; audit actions; never expose debug/API docs publicly. |
 | WebSocket hijacking or exhaustion | Root file/SSH sockets validate Origin, cap messages/connections, use bounded queues and deadlines, and overwrite client sender identity. SSH passwords are accepted only from a verified POST-issued one-use ticket or the first socket frame, and the local SSH host key must match protected system key material. The legacy UI still emits ignored credentials and JWTs in its WebSocket URL, so browser/Gateway logging remains a release blocker until that UI is patched. External-component sockets remain separate risks. | Keep all WebSockets off the public file hostname; patch and pin the UI so credentials and long-lived JWTs never enter URLs; use short-lived one-use socket tickets; test host-key mismatch, expiry/replay/revocation, normal session exit, slow output, and saturation across the locked stack. |
 | Upload/download denial of service | Root multipart handlers cap chunks at 256 MiB, files at 64 GiB/256 chunks, and active v2 sessions at 16 with expiry cleanup; indexes are checked before allocation and assembly streams. Client-selected bases, aggregate disk quota, symlink TOCTOU in management uploads, and archive traversal races remain concerns. | Keep privileged upload APIs on VPN; add per-user/disk quotas and reserved system space; monitor isolated temporary uploads; test 413/429, interruption, concurrency, archive budgets, and disk exhaustion. |
-| SSRF and third-party credential theft | Root generic proxy/search fetches now require public HTTPS on port 443, re-check DNS and redirects, disable ambient proxies, and cap response bodies. Cloud, OAuth, DDNS, ZeroTier, update checks, and external components still cross trust boundaries. | Keep egress policy and integration-specific destination allowlists; use scoped credentials and encrypted secret storage; regression-test IPv4/IPv6 private ranges, DNS rebinding, redirects, and credential logging. |
+| SSRF and third-party credential theft | Root proxy/search fetches are bound to separate capabilities and exact service-host allowlists. They require canonical HTTPS on port 443, re-check DNS and redirects under the same capability, disable ambient proxies, and cap response headers and bodies. Cloud, OAuth, DDNS, ZeroTier, update checks, and external components still cross trust boundaries. | Keep the capability allowlists narrow and pair them with an egress policy; use scoped credentials and encrypted secret storage; regression-test lookalike hosts, userinfo, IPv4/IPv6 private ranges, DNS rebinding, cross-capability redirects, and credential logging. |
 | Local component compromise | Shared runtime files, public keys, message bus, Gateway management, and privileged OS operations create lateral movement paths. | Separate Unix users and writable paths; authenticate local IPC; minimize capabilities/sudo; protect runtime files; audit service-unit hardening. |
 | Supply-chain drift | The Message Bus OpenAPI input, generator, Go toolchain, and Actions are pinned, and dangerous inherited workflows plus remote-shell updates are disabled. UI/installer/runtime components are not yet locked as one release. | Follow `RECASAOS_COMPONENTS.md`; pin every release component/action to reviewed immutable revisions; generate before test; scan dependencies; verify checksums, SBOM, signatures, and provenance. |
 | Backup compromise or failed recovery | Backups contain files, tokens, databases, and configuration; an untested copy may be inconsistent. | Encrypt with separate keys, restrict/monitor access, use snapshots or quiesce databases, keep an offline/off-account copy, and regularly restore into an isolated host. |
@@ -94,13 +94,13 @@ this foundation, are tracked by issue #7 for descriptor-relative and allowed-roo
 redesign, and reinforce the private/VPN-only management boundary.
 
 The public portal does not use those pathname helpers. It resolves only beneath
-its pinned share descriptor with Linux `openat2`. The generic outbound HTTPS
-client is likewise a custom sanitizer: it accepts only HTTPS on port 443, disables
-ambient proxies, resolves and dials only checked public addresses, repeats URL
-validation on redirects, and caps response bodies. Static-analysis results for
-either boundary must be reviewed against the complete data path; false-positive
-or accepted-risk classifications must retain a written justification and a
-tracking issue where hardening remains.
+its pinned share descriptor with Linux `openat2`. Outbound fetches are likewise
+capability-bound: each caller receives only the exact service hosts it needs,
+canonical HTTPS on port 443, a direct transport that resolves and dials only
+checked public addresses, same-capability redirect validation, and response
+header/body limits. Static-analysis results for either boundary must be reviewed
+against the complete data path; false-positive or accepted-risk classifications
+must retain a written justification and a tracking issue where hardening remains.
 
 ## Public-readiness blockers
 

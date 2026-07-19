@@ -10,13 +10,21 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
 
 var (
-	ErrUnsafeURL            = errors.New("outbound URL is not allowed")
-	ErrResponseTooLarge     = errors.New("outbound response is too large")
+	ErrUnsafeURL        = errors.New("outbound URL is not allowed")
+	ErrResponseTooLarge = errors.New("outbound response is too large")
+	// canonicalPublicHTTPSURL rejects ambiguous URL spellings before the
+	// structured and DNS-aware checks below. In particular, the authority is
+	// ASCII-only and paths/queries must use RFC 3986 characters or percent
+	// encoding; raw Unicode, fragments, backslashes, and trailing-dot hosts are
+	// not accepted.
+	canonicalPublicHTTPSURL = regexp.MustCompile(`^https://[a-z0-9](?:[a-z0-9._-]{0,251}[a-z0-9])?(?::443)?(?:[/?](?:[A-Za-z0-9._~!$&'()*+,;=:@/?-]|%[0-9A-Fa-f]{2})*)?$`)
+
 	blockedOutboundPrefixes = []netip.Prefix{
 		netip.MustParsePrefix("100.64.0.0/10"), // shared carrier-grade NAT
 		netip.MustParsePrefix("192.0.0.0/24"),  // IETF protocol assignments
@@ -33,11 +41,23 @@ var (
 	}
 )
 
-// ValidatePublicHTTPSURL permits only HTTPS on the default port and rejects
-// URL forms that are unsafe for a server-side fetch. The transport repeats IP
-// checks after DNS resolution, so hostnames cannot resolve to private services.
-func ValidatePublicHTTPSURL(rawURL string) (*url.URL, error) {
+type FetchCapability uint8
+
+const (
+	SearchSuggestionsCapability FetchCapability = iota + 1
+	StaticAssetCapability
+
+	maximumResponseHeaderBytes = 64 << 10
+)
+
+// ValidatePublicHTTPSURL permits only the exact hosts assigned to capability,
+// over canonical HTTPS on the default port. The transport repeats IP checks
+// after DNS resolution, so authorized names cannot resolve to private services.
+func ValidatePublicHTTPSURL(rawURL string, capability FetchCapability) (*url.URL, error) {
 	if strings.TrimSpace(rawURL) != rawURL || len(rawURL) == 0 || len(rawURL) > 4096 || strings.IndexByte(rawURL, 0) >= 0 {
+		return nil, ErrUnsafeURL
+	}
+	if !canonicalPublicHTTPSURL.MatchString(rawURL) {
 		return nil, ErrUnsafeURL
 	}
 	parsed, err := url.ParseRequestURI(rawURL)
@@ -45,6 +65,22 @@ func ValidatePublicHTTPSURL(rawURL string) (*url.URL, error) {
 		return nil, ErrUnsafeURL
 	}
 	if port := parsed.Port(); port != "" && port != "443" {
+		return nil, ErrUnsafeURL
+	}
+	switch capability {
+	case SearchSuggestionsCapability:
+		switch parsed.Hostname() {
+		case "www.bing.com", "www.google.com", "www.baidu.com", "duckduckgo.com", "www.startpage.com":
+		default:
+			return nil, ErrUnsafeURL
+		}
+	case StaticAssetCapability:
+		switch parsed.Hostname() {
+		case "files.codelife.cc", "www.startpage.com":
+		default:
+			return nil, ErrUnsafeURL
+		}
+	default:
 		return nil, ErrUnsafeURL
 	}
 
@@ -58,21 +94,23 @@ func ValidatePublicHTTPSURL(rawURL string) (*url.URL, error) {
 	return parsed, nil
 }
 
-// NewPublicHTTPSClient creates a direct client that does not honor ambient
-// proxy variables. Every connection resolves the hostname and rejects the
-// entire result set if any address is non-public, which also covers redirects.
-func NewPublicHTTPSClient(timeout time.Duration) *http.Client {
+// NewPublicHTTPSClient creates a capability-bound direct client that does not
+// honor ambient proxy variables. Every connection resolves the hostname and
+// rejects the entire result set if any address is non-public. Redirects are
+// revalidated against the same capability.
+func NewPublicHTTPSClient(capability FetchCapability, timeout time.Duration) *http.Client {
 	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
 	transport := &http.Transport{
-		Proxy:                 nil,
-		ForceAttemptHTTP2:     true,
-		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
-		TLSHandshakeTimeout:   5 * time.Second,
-		ResponseHeaderTimeout: 10 * time.Second,
-		IdleConnTimeout:       30 * time.Second,
-		MaxIdleConns:          20,
-		MaxIdleConnsPerHost:   2,
-		MaxConnsPerHost:       4,
+		Proxy:                  nil,
+		ForceAttemptHTTP2:      true,
+		TLSClientConfig:        &tls.Config{MinVersion: tls.VersionTLS12},
+		TLSHandshakeTimeout:    5 * time.Second,
+		ResponseHeaderTimeout:  10 * time.Second,
+		MaxResponseHeaderBytes: maximumResponseHeaderBytes,
+		IdleConnTimeout:        30 * time.Second,
+		MaxIdleConns:           20,
+		MaxIdleConnsPerHost:    2,
+		MaxConnsPerHost:        4,
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(address)
 			if err != nil || port != "443" {
@@ -100,14 +138,14 @@ func NewPublicHTTPSClient(timeout time.Duration) *http.Client {
 			if len(via) >= 5 {
 				return errors.New("too many redirects")
 			}
-			_, err := ValidatePublicHTTPSURL(request.URL.String())
+			_, err := ValidatePublicHTTPSURL(request.URL.String(), capability)
 			return err
 		},
 	}
 }
 
-func GetPublicHTTPS(ctx context.Context, rawURL string, timeout time.Duration) (*http.Response, error) {
-	parsed, err := ValidatePublicHTTPSURL(rawURL)
+func GetPublicHTTPS(ctx context.Context, capability FetchCapability, rawURL string, timeout time.Duration) (*http.Response, error) {
+	parsed, err := ValidatePublicHTTPSURL(rawURL, capability)
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +154,7 @@ func GetPublicHTTPS(ctx context.Context, rawURL string, timeout time.Duration) (
 		return nil, ErrUnsafeURL
 	}
 	request.Header.Set("Accept", "application/json, text/plain, image/*;q=0.8, */*;q=0.1")
-	return NewPublicHTTPSClient(timeout).Do(request)
+	return NewPublicHTTPSClient(capability, timeout).Do(request)
 }
 
 func ReadBodyLimited(body io.Reader, maximum int64) ([]byte, error) {

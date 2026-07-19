@@ -103,7 +103,7 @@ func (s *otherService) Search(key string) ([]model.SearchEngine, error) {
 }
 
 func (s *otherService) AgentSearch(url string) ([]byte, error) {
-	resp, err := netsecurity.GetPublicHTTPS(context.Background(), url, 3*time.Second)
+	resp, err := netsecurity.GetPublicHTTPS(context.Background(), netsecurity.SearchSuggestionsCapability, url, 3*time.Second)
 	if err != nil {
 		logger.Error("search proxy request rejected", zap.Error(err))
 		return nil, err
