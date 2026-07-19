@@ -57,7 +57,6 @@ func TestGetSambaSharesList(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-
 	executeWithContext := func() *httptest.ResponseRecorder {
 		response := httptest.NewRecorder()
 		// con, ginEngine := gin.CreateTestContext(response)
