@@ -47,6 +47,19 @@ func TestValidatePublicHTTPSURLRejectsUnauthorizedAndAmbiguousTargets(t *testing
 		{StaticAssetCapability, "https://files.codelife.cc.evil.example/itab/search/bing.svg"},
 		{StaticAssetCapability, "https://www.startpage.com.attacker.example/sp/cdn/icon.png"},
 		{StaticAssetCapability, "https://www.google.com/complete/search?q=test"},
+		{StaticAssetCapability, "https://files.codelife.cc/"},
+		{StaticAssetCapability, "https://files.codelife.cc/itab/search/bing.svg?"},
+		{StaticAssetCapability, "https://files.codelife.cc/itab/search/bing.svg?download=1"},
+		{StaticAssetCapability, "https://www.startpage.com/sp/cdn/favicons/other.png"},
+		{SearchSuggestionsCapability, "https://www.bing.com/search?q=test"},
+		{SearchSuggestionsCapability, "https://www.bing.com/osjson.aspx?other=test"},
+		{SearchSuggestionsCapability, "https://www.bing.com/osjson.aspx?query="},
+		{SearchSuggestionsCapability, "https://www.bing.com/osjson.aspx?query=one&query=two"},
+		{SearchSuggestionsCapability, "https://www.google.com/complete/search?client=gws-wiz&q=test"},
+		{SearchSuggestionsCapability, "https://www.baidu.com/sugrec?json=1&wd=test"},
+		{SearchSuggestionsCapability, "https://www.startpage.com/suggestions?segment=startpage.udog&lui=english&q=test%0aheader"},
+		{SearchSuggestionsCapability, "https://www.bing.com/%6fsjson.aspx?query=test"},
+		{SearchSuggestionsCapability, "https://www.bing.com/osjson.aspx?%71uery=test"},
 		{FetchCapability(255), "https://files.codelife.cc/itab/search/bing.svg"},
 		{SearchSuggestionsCapability, "http://www.bing.com/"},
 		{SearchSuggestionsCapability, "https://user:secret@www.bing.com/"},
@@ -81,7 +94,7 @@ func TestRedirectRevalidatesCapabilityHost(t *testing.T) {
 		redirect   string
 		wantError  bool
 	}{
-		{name: "search stays on suggestion host", capability: SearchSuggestionsCapability, redirect: "https://www.google.com/complete/search?q=test"},
+		{name: "search stays on suggestion host", capability: SearchSuggestionsCapability, redirect: "https://www.google.com/complete/search?client=gws-wiz&xssi=t&hl=en-US&authuser=0&dpr=1&q=test"},
 		{name: "asset stays on codelife", capability: StaticAssetCapability, redirect: "https://files.codelife.cc/itab/search/google.svg"},
 		{name: "search cannot redirect to asset host", capability: SearchSuggestionsCapability, redirect: "https://files.codelife.cc/itab/search/google.svg", wantError: true},
 		{name: "asset cannot redirect to search host", capability: StaticAssetCapability, redirect: "https://www.google.com/complete/search?q=test", wantError: true},
@@ -108,9 +121,13 @@ func TestRedirectRevalidatesCapabilityHost(t *testing.T) {
 
 func TestPublicHTTPSClientIsDirectAndBounded(t *testing.T) {
 	client := NewPublicHTTPSClient(StaticAssetCapability, time.Second)
-	transport, ok := client.Transport.(*http.Transport)
+	boundTransport, ok := client.Transport.(capabilityTransport)
 	if !ok {
 		t.Fatalf("transport type = %T", client.Transport)
+	}
+	transport, ok := boundTransport.base.(*http.Transport)
+	if !ok {
+		t.Fatalf("base transport type = %T", boundTransport.base)
 	}
 	if transport.Proxy != nil {
 		t.Fatal("public HTTPS client must not honor ambient proxy configuration")
@@ -121,13 +138,37 @@ func TestPublicHTTPSClientIsDirectAndBounded(t *testing.T) {
 	if transport.TLSClientConfig == nil || transport.TLSClientConfig.MinVersion != tls.VersionTLS12 {
 		t.Fatal("public HTTPS client must require TLS 1.2 or newer")
 	}
+	second := NewPublicHTTPSClient(SearchSuggestionsCapability, 2*time.Second)
+	secondBoundTransport, ok := second.Transport.(capabilityTransport)
+	if !ok || secondBoundTransport.base != boundTransport.base {
+		t.Fatal("capability clients must share one bounded connection pool")
+	}
+}
+
+func TestPublicHTTPSClientValidatesInitialRequest(t *testing.T) {
+	client := NewPublicHTTPSClient(StaticAssetCapability, time.Second)
+	request, err := http.NewRequest(http.MethodGet, "https://files.codelife.cc/unauthorized", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Do(request); !errors.Is(err, ErrUnsafeURL) {
+		t.Fatalf("initial request error = %v, want ErrUnsafeURL", err)
+	}
+
+	request, err = http.NewRequest(http.MethodPost, "https://files.codelife.cc/itab/search/bing.svg", strings.NewReader("body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Do(request); !errors.Is(err, ErrUnsafeURL) {
+		t.Fatalf("non-GET request error = %v, want ErrUnsafeURL", err)
+	}
 }
 
 func TestPublicAddressPolicy(t *testing.T) {
 	for _, candidate := range []string{
-		"127.0.0.1", "10.0.0.1", "169.254.169.254", "100.64.0.1",
-		"192.0.2.1", "198.18.0.1", "203.0.113.1", "::1", "fe80::1",
-		"64:ff9b::a00:1", "64:ff9b:1::a00:1", "2001::a00:1", "2001:db8::1", "2002:0a00:0001::",
+		"0.0.0.1", "127.0.0.1", "10.0.0.1", "169.254.169.254", "100.64.0.1",
+		"192.0.2.1", "192.88.99.1", "198.18.0.1", "203.0.113.1", "::1", "100::1", "fec0::1", "fe80::1",
+		"64:ff9b::a00:1", "64:ff9b:1::a00:1", "2001::a00:1", "2001:2::1", "2001:10::1", "2001:20::1", "2001:db8::1", "2002:0a00:0001::", "3fff::1", "4000::1",
 	} {
 		if isPublicAddress(netip.MustParseAddr(candidate)) {
 			t.Errorf("%s unexpectedly accepted", candidate)
