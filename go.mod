@@ -9,7 +9,6 @@ require (
 	github.com/IceWhaleTech/CasaOS-Common v0.4.11-alpha4
 	github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf
 	github.com/deckarep/golang-set/v2 v2.3.0
-	github.com/disintegration/imaging v1.6.2
 	github.com/dsoprea/go-exif/v3 v3.0.1
 	github.com/getkin/kin-openapi v0.142.0
 	github.com/glebarez/sqlite v1.8.0
@@ -42,6 +41,7 @@ require (
 	go.uber.org/goleak v1.2.1
 	go.uber.org/zap v1.24.0
 	golang.org/x/crypto v0.54.0
+	golang.org/x/image v0.43.0
 	golang.org/x/mod v0.38.0
 	golang.org/x/net v0.57.0
 	golang.org/x/sync v0.22.0
@@ -102,7 +102,6 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/exp v0.0.0-20240404231335-c0f41cb1a7a0 // indirect
-	golang.org/x/image v0.43.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 	golang.org/x/tools v0.48.0 // indirect
