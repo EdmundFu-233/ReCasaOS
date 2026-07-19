@@ -1065,7 +1065,7 @@ func validateManagedTransferTransaction(parentFD int, parentMountID uint64, name
 	}
 	var nameStat unix.Stat_t
 	if err := unix.Fstatat(parentFD, name, &nameStat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return err
+		return fmt.Errorf("%w: managed transfer transaction name is unavailable: %w", ErrUnsafePath, err)
 	}
 	if !sameManagedTransferStat(&descriptorStat, &nameStat) {
 		return fmt.Errorf("%w: managed transfer transaction name changed", ErrUnsafePath)

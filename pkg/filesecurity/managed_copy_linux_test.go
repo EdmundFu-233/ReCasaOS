@@ -1097,7 +1097,7 @@ func TestManagedReplacePreservesOldTargetWhenTransactionNameMoves(t *testing.T) 
 	}
 
 	result, err := roots.CopyInto(source, destination, ManagedConflictReplace)
-	if !result.Changed || result.Destination != target || !errors.Is(err, ErrUnsafePath) || !ManagedMutationChanged(err) {
+	if !result.Changed || result.Destination != target || !errors.Is(err, ErrUnsafePath) || !errors.Is(err, unix.ENOENT) || !ManagedMutationChanged(err) {
 		t.Fatalf("transaction name move result = %+v, %v", result, err)
 	}
 	assertManagedTestContent(t, target, "published")
