@@ -14,75 +14,64 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/dsoprea/go-exif/v3"
-	exifcommon "github.com/dsoprea/go-exif/v3/common"
 	"golang.org/x/image/bmp"
 	golangdraw "golang.org/x/image/draw"
 	"golang.org/x/image/tiff"
 )
 
 const (
-	maxThumbnailSourceBytes  int64 = 128 << 20
-	maxThumbnailSourcePixels int64 = 64_000_000
-	maxThumbnailOutputPixels int64 = 16_000_000
-	maxThumbnailDimension          = 8192
+	maxThumbnailSourceBytes  int64 = 64 << 20
+	maxThumbnailSourcePixels int64 = 16_000_000
+	maxThumbnailOutputPixels int64 = 4_000_000
+	maxThumbnailDimension          = 4096
+)
+
+var (
+	ErrThumbnailBusy     = errors.New("thumbnail decoder is busy")
+	thumbnailDecodeSlots = make(chan struct{}, 2)
 )
 
 func GetImage(path string, width, height int) ([]byte, error) {
-	if thumbnail, err := GetThumbnailByOwnerPhotos(path); err == nil {
-		return thumbnail, nil
-	} else {
-		return GetThumbnailByWebPhoto(path, width, height)
+	source, err := os.Open(path)
+	if err != nil {
+		return nil, err
 	}
+	defer source.Close()
+	return GetImageFromFile(source, path, width, height)
 }
+
+// GetImageFromFile decodes a thumbnail from an already authorized and opened
+// descriptor. displayName is used only to select the output image format.
+func GetImageFromFile(source *os.File, displayName string, width, height int) ([]byte, error) {
+	if source == nil {
+		return nil, errors.New("thumbnail source is nil")
+	}
+	// Embedded EXIF thumbnails are attacker-controlled compressed images too.
+	// Decode and re-encode every response through the same size, pixel, and
+	// concurrency policy instead of returning unbounded embedded bytes.
+	return getThumbnailByWebPhoto(source, displayName, width, height)
+}
+
 func GetThumbnailByOwnerPhotos(path string) ([]byte, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	buff := &bytes.Buffer{}
-
-	defer file.Close()
-	offset := 0
-	offsets := []int{12, 30}
-
-	head := make([]byte, 0xffff)
-
-	r := io.TeeReader(file, buff)
-	_, err = r.Read(head)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, offset = range offsets {
-		if _, err = exif.ParseExifHeader(head[offset:]); err == nil {
-			break
-		}
-	}
-	if err != nil {
-		return nil, err
-	}
-	im, err := exifcommon.NewIfdMappingWithStandard()
-	if err != nil {
-		return nil, err
-	}
-
-	_, index, err := exif.Collect(im, exif.NewTagIndex(), head[offset:])
-	if err != nil {
-		return nil, err
-	}
-
-	ifd := index.RootIfd.NextIfd()
-	if ifd == nil {
-		return nil, exif.ErrNoThumbnail
-	}
-	thumbnail, err := ifd.Thumbnail()
-	if err != nil {
-		return nil, err
-	}
-	return thumbnail, nil
+	_ = path
+	return nil, errors.New("direct embedded EXIF thumbnails are disabled")
 }
 func GetThumbnailByWebPhoto(path string, width, height int) (thumbnail []byte, err error) {
+	source, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer source.Close()
+	return getThumbnailByWebPhoto(source, path, width, height)
+}
+
+func getThumbnailByWebPhoto(source *os.File, displayName string, width, height int) (thumbnail []byte, err error) {
+	select {
+	case thumbnailDecodeSlots <- struct{}{}:
+		defer func() { <-thumbnailDecodeSlots }()
+	default:
+		return nil, ErrThumbnailBusy
+	}
 	defer func() {
 		if recover() != nil {
 			thumbnail = nil
@@ -97,7 +86,7 @@ func GetThumbnailByWebPhoto(path string, width, height int) (thumbnail []byte, e
 		return nil, errors.New("thumbnail width and height cannot both be zero")
 	}
 
-	src, err := decodeThumbnailSource(path)
+	src, err := decodeThumbnailSource(source)
 	if err != nil {
 		return nil, err
 	}
@@ -114,19 +103,16 @@ func GetThumbnailByWebPhoto(path string, width, height int) (thumbnail []byte, e
 	golangdraw.CatmullRom.Scale(resized, resized.Bounds(), src, src.Bounds(), golangdraw.Src, nil)
 
 	var buf bytes.Buffer
-	if err := encodeThumbnail(&buf, resized, filepath.Ext(path)); err != nil {
+	if err := encodeThumbnail(&buf, resized, filepath.Ext(displayName)); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
 }
 
-func decodeThumbnailSource(path string) (image.Image, error) {
-	source, err := os.Open(path)
-	if err != nil {
-		return nil, err
+func decodeThumbnailSource(source *os.File) (image.Image, error) {
+	if source == nil {
+		return nil, errors.New("thumbnail source is nil")
 	}
-	defer source.Close()
-
 	info, err := source.Stat()
 	if err != nil {
 		return nil, err
@@ -137,19 +123,19 @@ func decodeThumbnailSource(path string) (image.Image, error) {
 	if info.Size() > maxThumbnailSourceBytes {
 		return nil, errors.New("thumbnail source exceeds the size limit")
 	}
-
-	config, _, err := image.DecodeConfig(source)
+	boundedSource := io.NewSectionReader(source, 0, info.Size())
+	config, _, err := image.DecodeConfig(boundedSource)
 	if err != nil {
 		return nil, err
 	}
 	if !thumbnailPixelCountWithinLimit(config.Width, config.Height, maxThumbnailSourcePixels) {
 		return nil, errors.New("thumbnail source dimensions exceed the pixel limit")
 	}
-	if _, err := source.Seek(0, io.SeekStart); err != nil {
+	if _, err := boundedSource.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
 
-	decoded, _, err := image.Decode(source)
+	decoded, _, err := image.Decode(boundedSource)
 	if err != nil {
 		return nil, err
 	}

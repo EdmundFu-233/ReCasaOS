@@ -2,6 +2,7 @@ package file
 
 import (
 	"bytes"
+	"errors"
 	"image"
 	"image/color"
 	"image/png"
@@ -112,6 +113,34 @@ func TestThumbnailDimensionsPreservesAspectRatio(t *testing.T) {
 	}
 	if width != 67 || height != 100 {
 		t.Fatalf("dimensions = (%d,%d), want (67,100)", width, height)
+	}
+}
+
+func TestThumbnailDecodeCapacityFailsFast(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "source.png")
+	writeThumbnailTestPNG(t, path, 4, 2)
+	source, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+
+	for index := 0; index < cap(thumbnailDecodeSlots); index++ {
+		thumbnailDecodeSlots <- struct{}{}
+	}
+	defer func() {
+		for index := 0; index < cap(thumbnailDecodeSlots); index++ {
+			<-thumbnailDecodeSlots
+		}
+	}()
+	if _, err := GetImageFromFile(source, path, 2, 0); !errors.Is(err, ErrThumbnailBusy) {
+		t.Fatalf("saturated decoder error = %v", err)
+	}
+}
+
+func TestDirectEXIFThumbnailPathIsDisabled(t *testing.T) {
+	if _, err := GetThumbnailByOwnerPhotos("ignored"); err == nil {
+		t.Fatal("direct EXIF thumbnail unexpectedly enabled")
 	}
 }
 
