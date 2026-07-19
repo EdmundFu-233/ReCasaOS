@@ -209,14 +209,18 @@ func (r *secureRoot) openRegular(relative string) (*os.File, fileInfo, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 {
+		unix.Close(fd)
+		return nil, nil, unix.EPERM
+	}
 	file := os.NewFile(uintptr(fd), "public-file")
 	info, err := file.Stat()
 	if err != nil {
 		file.Close()
 		return nil, nil, err
 	}
-	stat, ok := info.Sys().(*unix.Stat_t)
-	if !ok || !info.Mode().IsRegular() || stat.Nlink != 1 {
+	if !info.Mode().IsRegular() {
 		file.Close()
 		return nil, nil, unix.EPERM
 	}
