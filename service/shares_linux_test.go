@@ -399,9 +399,7 @@ func TestLegacyMigrationRejectsModifiedOrUnbackedTransitionalConfigWithoutMutati
 					t.Fatal(err)
 				}
 				legacyMain = managedMain
-				if err := os.WriteFile(mainPath, managedMain, 0o600); err != nil {
-					t.Fatal(err)
-				}
+				overwriteSambaTestFile(t, mainPath, managedMain, 0o600)
 			}
 			shareService := &sharesStruct{
 				db:                    database,
@@ -625,12 +623,8 @@ func TestLegacyMigrationResumesManagedCandidateBeforeDatabaseCommit(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(mainPath, managedMain, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(sharesPath, privateCandidate, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	overwriteSambaTestFile(t, mainPath, managedMain, 0o600)
+	overwriteSambaTestFile(t, sharesPath, privateCandidate, 0o600)
 	if err := service.ReconcileSambaConfig(); err != nil {
 		t.Fatalf("resume error = %v", err)
 	}
@@ -674,13 +668,9 @@ func TestLegacyMigrationRejectsForgedManagedResumeCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(mainPath, managedMain, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	overwriteSambaTestFile(t, mainPath, managedMain, 0o600)
 	forged := []byte(sambaSharesConfigMarker + "# forged\n")
-	if err := os.WriteFile(sharesPath, forged, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	overwriteSambaTestFile(t, sharesPath, forged, 0o600)
 	if err := service.ReconcileSambaConfig(); err == nil {
 		t.Fatal("forged managed resume candidate was accepted")
 	}
@@ -744,6 +734,19 @@ func assertFileDataAndMode(t *testing.T, path string, expected []byte, mode os.F
 	}
 	if mode != 0 {
 		assertSambaMode(t, path, mode)
+	}
+}
+
+func overwriteSambaTestFile(t *testing.T, path string, data []byte, mode os.FileMode) {
+	t.Helper()
+	// os.WriteFile preserves an existing inode's mode. The migration fixtures
+	// start as upstream 0644/0777 files, while a successful CAS publication is
+	// always 0600, so model both content and permissions explicitly.
+	if err := os.WriteFile(path, data, mode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -911,8 +914,8 @@ func TestUpdateConfigFileReturnsWriteRestartAndDatabaseErrors(t *testing.T) {
 	if err := writeFailureService.UpdateConfigFile(); err == nil {
 		t.Fatal("UpdateConfigFile() unexpectedly ignored config write failure")
 	}
-	if !restartCalled {
-		t.Fatal("Samba restart was not attempted after restoring a possibly changed config")
+	if restartCalled {
+		t.Fatal("Samba restarted even though CAS proved no config was published")
 	}
 
 	restartFailure := errors.New("restart failed")
