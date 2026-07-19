@@ -3,6 +3,7 @@
 package filesecurity
 
 import (
+	"crypto/sha256"
 	"errors"
 	"io"
 	"io/fs"
@@ -208,6 +209,7 @@ func TestManagedRootsMkdirAllAndCreateExclusive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer created.Abort()
 	if _, err := created.Write([]byte("new")); err != nil {
 		t.Fatal(err)
 	}
@@ -228,6 +230,415 @@ func TestManagedRootsMkdirAllAndCreateExclusive(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(outside, "escaped")); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("outside directory was created: %v", err)
 	}
+}
+
+func TestManagedWritableAbortDoesNotPublishAndReleasesMutationLease(t *testing.T) {
+	root := t.TempDir()
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	target := filepath.Join(root, "target.txt")
+	writer, err := roots.CreateExclusive(target, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte("partial")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(target); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("unclosed exclusive file was published: %v", err)
+	}
+
+	started := make(chan struct{})
+	completed := make(chan error, 1)
+	go func() {
+		close(started)
+		completed <- roots.MkdirAll(filepath.Join(root, "after-abort"), 0o700)
+	}()
+	<-started
+	select {
+	case err := <-completed:
+		t.Fatalf("mutation bypassed active writer lease: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := writer.Abort(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-completed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("mutation lease was not released by Abort")
+	}
+	if _, err := os.Stat(target); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("aborted exclusive file was published: %v", err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".recasaos-create-") {
+			t.Fatalf("Abort leaked staging file %q", entry.Name())
+		}
+	}
+}
+
+func TestManagedMutationLeaseAllowsReadsWhileCloseWaits(t *testing.T) {
+	root := t.TempDir()
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := roots.AcquireMutation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeStarted := make(chan struct{})
+	closeCompleted := make(chan error, 1)
+	go func() {
+		close(closeStarted)
+		closeCompleted <- roots.Close()
+	}()
+	<-closeStarted
+	select {
+	case err := <-closeCompleted:
+		t.Fatalf("Close bypassed active mutation lease: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if _, err := roots.Match(root); err != nil {
+		t.Fatalf("read under mutation lease failed while Close waited: %v", err)
+	}
+	directory, err := roots.OpenDirectory(root)
+	if err != nil {
+		t.Fatalf("open under mutation lease failed while Close waited: %v", err)
+	}
+	if err := directory.Close(); err != nil {
+		t.Fatal(err)
+	}
+	release()
+	select {
+	case err := <-closeCompleted:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not complete after mutation lease release")
+	}
+}
+
+func TestManagedNamespaceMutationsExposeInjectedDirectorySyncFailure(t *testing.T) {
+	injected := errors.New("injected directory sync failure")
+	assertChanged := func(t *testing.T, err error) {
+		t.Helper()
+		if !errors.Is(err, injected) || !ManagedMutationChanged(err) || !ManagedMutationDurabilityUnknown(err) {
+			t.Fatalf("mutation error = %v", err)
+		}
+	}
+
+	t.Run("rewrite", func(t *testing.T) {
+		root := t.TempDir()
+		path := filepath.Join(root, "file")
+		if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		roots, err := OpenManagementFileRoots([]string{root})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer roots.Close()
+		roots.directorySync = func(int) error { return injected }
+		assertChanged(t, roots.RewriteRegular(path, []byte("new")))
+		content, err := os.ReadFile(path)
+		if err != nil || string(content) != "new" {
+			t.Fatalf("rewritten content = %q, %v", content, err)
+		}
+	})
+
+	t.Run("rename", func(t *testing.T) {
+		root := t.TempDir()
+		source := filepath.Join(root, "source")
+		destination := filepath.Join(root, "destination")
+		if err := os.WriteFile(source, []byte("data"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		roots, err := OpenManagementFileRoots([]string{root})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer roots.Close()
+		roots.directorySync = func(int) error { return injected }
+		assertChanged(t, roots.RenameNoReplace(source, destination))
+		if _, err := os.Stat(destination); err != nil {
+			t.Fatalf("renamed destination missing: %v", err)
+		}
+	})
+
+	t.Run("commit", func(t *testing.T) {
+		root := t.TempDir()
+		staging := filepath.Join(root, "staging")
+		destination := filepath.Join(root, "destination")
+		if err := os.WriteFile(staging, []byte("data"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		roots, err := OpenManagementFileRoots([]string{root})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer roots.Close()
+		roots.directorySync = func(int) error { return injected }
+		assertChanged(t, roots.CommitNoReplace(staging, destination))
+		if _, err := os.Stat(destination); err != nil {
+			t.Fatalf("committed destination missing: %v", err)
+		}
+	})
+
+	t.Run("exclusive-create", func(t *testing.T) {
+		root := t.TempDir()
+		destination := filepath.Join(root, "destination")
+		roots, err := OpenManagementFileRoots([]string{root})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer roots.Close()
+		writer, err := roots.CreateExclusive(destination, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Write([]byte("data")); err != nil {
+			t.Fatal(err)
+		}
+		roots.directorySync = func(int) error { return injected }
+		assertChanged(t, writer.Close())
+		if _, err := os.Stat(destination); err != nil {
+			t.Fatalf("exclusive destination missing: %v", err)
+		}
+	})
+
+	t.Run("mkdir", func(t *testing.T) {
+		root := t.TempDir()
+		destination := filepath.Join(root, "directory")
+		roots, err := OpenManagementFileRoots([]string{root})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer roots.Close()
+		roots.directorySync = func(int) error { return injected }
+		assertChanged(t, roots.MkdirAll(destination, 0o700))
+		if info, err := os.Stat(destination); err != nil || !info.IsDir() {
+			t.Fatalf("created directory = %v, %v", info, err)
+		}
+	})
+
+	t.Run("remove", func(t *testing.T) {
+		root := t.TempDir()
+		path := filepath.Join(root, "file")
+		if err := os.WriteFile(path, []byte("data"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		roots, err := OpenManagementFileRoots([]string{root})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer roots.Close()
+		roots.directorySync = func(int) error { return injected }
+		assertChanged(t, roots.Remove(path))
+		if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("removed path remains: %v", err)
+		}
+	})
+}
+
+func TestManagedMkdirAllPreservesEarlierCreationWhenLaterComponentBecomesSymlink(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	calls := 0
+	roots.directorySync = func(int) error {
+		calls++
+		if calls == 1 {
+			return os.Symlink(outside, filepath.Join(root, "first", "second"))
+		}
+		return nil
+	}
+	err = roots.MkdirAll(filepath.Join(root, "first", "second", "leaf"), 0o700)
+	if !errors.Is(err, ErrUnsafePath) || !ManagedMutationChanged(err) || ManagedMutationDurabilityUnknown(err) {
+		t.Fatalf("partial mkdir error = %v", err)
+	}
+	if info, statErr := os.Stat(filepath.Join(root, "first")); statErr != nil || !info.IsDir() {
+		t.Fatalf("first created component missing: %v, %v", info, statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(outside, "leaf")); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Fatalf("mkdir escaped through injected symlink: %v", statErr)
+	}
+}
+
+func TestManagedDirectDirectoryRenameRejectsNestedBindMount(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	mountedChild := filepath.Join(source, "mounted")
+	backing := t.TempDir()
+	if err := os.MkdirAll(mountedChild, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mount(backing, mountedChild, "", unix.MS_BIND, ""); err != nil {
+		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+			t.Skipf("bind mounts are unavailable in this Linux test environment: %v", err)
+		}
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := unix.Unmount(mountedChild, unix.MNT_DETACH); err != nil {
+			t.Errorf("unmount nested rename test path: %v", err)
+		}
+	}()
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	destination := filepath.Join(root, "renamed")
+	if err := roots.RenameNoReplace(source, destination); !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("nested-mount direct rename error = %v", err)
+	}
+	if _, err := os.Stat(source); err != nil {
+		t.Fatalf("rejected direct rename changed source: %v", err)
+	}
+	if _, err := os.Stat(destination); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("rejected direct rename created destination: %v", err)
+	}
+}
+
+func TestManagedRemoveAllReportsPartialDeletionAfterInjectedSyncFailure(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"one", "two"} {
+		if err := os.WriteFile(filepath.Join(target, name), []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	injected := errors.New("injected recursive removal sync failure")
+	roots.directorySync = func(int) error { return injected }
+	err = roots.RemoveAll(target)
+	if !errors.Is(err, injected) || !ManagedMutationChanged(err) || !ManagedMutationDurabilityUnknown(err) {
+		t.Fatalf("partial recursive removal error = %v", err)
+	}
+	entries, readErr := os.ReadDir(target)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("partial recursive removal entries = %v", entries)
+	}
+}
+
+func TestManagedRemoveAllBatchRejectsDuplicatesAndOverlapsBeforeDeletion(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "parent")
+	child := filepath.Join(parent, "child")
+	if err := os.MkdirAll(child, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	keep := filepath.Join(child, "keep")
+	if err := os.WriteFile(keep, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	for _, paths := range [][]string{{parent, parent}, {parent, child}} {
+		result, err := roots.RemoveAllBatch(paths)
+		if !errors.Is(err, ErrUnsafePath) || result.Changed || len(result.Completed) != 0 {
+			t.Fatalf("overlapping batch %v result = %+v, %v", paths, result, err)
+		}
+		assertManagedTestContent(t, keep, "keep")
+	}
+}
+
+func TestManagedRemovalPlanRejectsExternalTopLevelReplacement(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	moved := filepath.Join(root, "moved")
+	if err := os.WriteFile(target, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	release, err := roots.AcquireMutation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	plan, err := roots.preflightRemoveAllLocked(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(target, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := roots.removeAllPreflightedLocked(plan); !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("replacement removal error = %v", err)
+	}
+	assertManagedTestContent(t, target, "replacement")
+}
+
+func TestManagedRemoveAllPreflightsNestedMountBeforeDeletingSibling(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	mountedChild := filepath.Join(target, "mounted")
+	backing := t.TempDir()
+	if err := os.MkdirAll(mountedChild, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	keep := filepath.Join(target, "keep")
+	if err := os.WriteFile(keep, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mount(backing, mountedChild, "", unix.MS_BIND, ""); err != nil {
+		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+			t.Skipf("bind mounts are unavailable in this Linux test environment: %v", err)
+		}
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := unix.Unmount(mountedChild, unix.MNT_DETACH); err != nil {
+			t.Errorf("unmount nested removal test path: %v", err)
+		}
+	}()
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	err = roots.RemoveAll(target)
+	if !errors.Is(err, ErrUnsafePath) || ManagedMutationChanged(err) {
+		t.Fatalf("nested-mount removal preflight error = %v", err)
+	}
+	assertManagedTestContent(t, keep, "keep")
 }
 
 func TestManagedRootsChmodDirectoryDoesNotFollowSymlinks(t *testing.T) {
@@ -314,6 +725,58 @@ func TestManagedRootsRewriteRegularIsAtomicAndPreservesMetadata(t *testing.T) {
 	}
 }
 
+func TestManagedRootsRewriteRegularRejectsSameInodeChangesBeforePublish(t *testing.T) {
+	tests := []struct {
+		name        string
+		mutate      func(string) error
+		wantContent string
+		wantMode    fs.FileMode
+	}{
+		{
+			name: "content",
+			mutate: func(path string) error {
+				return os.WriteFile(path, []byte("external"), 0o600)
+			},
+			wantContent: "external",
+			wantMode:    0o600,
+		},
+		{
+			name: "permissions",
+			mutate: func(path string) error {
+				return os.Chmod(path, 0o640)
+			},
+			wantContent: "old",
+			wantMode:    0o640,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "file")
+			if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			roots, err := OpenManagementFileRoots([]string{root})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer roots.Close()
+			roots.rewriteBeforePublish = func() error { return test.mutate(path) }
+			if err := roots.RewriteRegular(path, []byte("recasaos")); !errors.Is(err, ErrUnsafePath) {
+				t.Fatalf("concurrent rewrite error = %v", err)
+			}
+			content, err := os.ReadFile(path)
+			if err != nil || string(content) != test.wantContent {
+				t.Fatalf("concurrent content = %q, %v", content, err)
+			}
+			info, err := os.Stat(path)
+			if err != nil || info.Mode().Perm() != test.wantMode {
+				t.Fatalf("concurrent mode = %v, %v", info, err)
+			}
+		})
+	}
+}
+
 func TestManagedRootsRemoveAllDoesNotFollowSymlink(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "managed")
@@ -395,6 +858,39 @@ func TestManagedRootsTreeSizeDepthBudget(t *testing.T) {
 	}
 }
 
+func TestManagedRootsTreeSizeRejectsNestedBindMount(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	nestedMount := filepath.Join(source, "mounted")
+	external := t.TempDir()
+	if err := os.MkdirAll(nestedMount, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(external, "data"), []byte("mounted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mount(external, nestedMount, "", unix.MS_BIND, ""); err != nil {
+		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+			t.Skipf("bind mounts are unavailable in this Linux test environment: %v", err)
+		}
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := unix.Unmount(nestedMount, unix.MNT_DETACH); err != nil {
+			t.Errorf("unmount nested test mount: %v", err)
+		}
+	}()
+
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	if _, err := roots.TreeSize(source); !errors.Is(err, ErrUnsafePath) || !strings.Contains(err.Error(), "mount boundary") {
+		t.Fatalf("nested mount size error = %v", err)
+	}
+}
+
 func TestManagedRootsCommitNoReplace(t *testing.T) {
 	root := t.TempDir()
 	staging := filepath.Join(root, "staging")
@@ -428,6 +924,259 @@ func TestManagedRootsCommitNoReplace(t *testing.T) {
 	content, err = os.ReadFile(destination)
 	if err != nil || string(content) != "new" {
 		t.Fatalf("destination changed to %q, %v", content, err)
+	}
+}
+
+func TestManagedRootsCommitNoReplaceReturnsBoundIdentity(t *testing.T) {
+	root := t.TempDir()
+	staging := filepath.Join(root, "staging")
+	destination := filepath.Join(root, "destination")
+	if err := os.WriteFile(staging, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	identity, err := roots.CommitNoReplaceWithIdentity(staging, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.Size != int64(len("original")) || identity.Inode == 0 {
+		t.Fatalf("published identity = %+v", identity)
+	}
+	if err := roots.VerifyRegularIdentity(destination, identity); err != nil {
+		t.Fatalf("fresh identity did not verify: %v", err)
+	}
+	if err := os.WriteFile(destination, []byte("modified"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := roots.VerifyRegularIdentity(destination, identity); !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("modified target identity error = %v", err)
+	}
+}
+
+func TestManagedRootsExpectedCommitRejectsAssemblyIdentityChanges(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(string) error
+	}{
+		{
+			name: "same inode content",
+			mutate: func(path string) error {
+				opened, err := os.OpenFile(path, os.O_WRONLY, 0)
+				if err != nil {
+					return err
+				}
+				_, writeErr := opened.WriteAt([]byte("evil"), 0)
+				return errors.Join(writeErr, opened.Close())
+			},
+		},
+		{
+			name: "renamed replacement inode",
+			mutate: func(path string) error {
+				if err := os.Rename(path, path+".original"); err != nil {
+					return err
+				}
+				return os.WriteFile(path, []byte("evil"), 0o600)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			staging := filepath.Join(root, "assembly")
+			destination := filepath.Join(root, "destination")
+			roots, err := OpenManagementFileRoots([]string{root})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer roots.Close()
+			writer, err := roots.CreateExclusive(staging, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := writer.Write([]byte("safe")); err != nil {
+				t.Fatal(err)
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			expected, err := writer.PublishedIdentity()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := test.mutate(staging); err != nil {
+				t.Fatal(err)
+			}
+			var current unix.Stat_t
+			if err := unix.Stat(staging, &current); err != nil {
+				t.Fatal(err)
+			}
+			if managedFileIdentityFromStat(&current) == expected {
+				// Some filesystems coarsen write timestamps. Force a distinct
+				// mtime, then assert the exact identity really changed before the
+				// commit rejection is evaluated.
+				if err := os.Chtimes(staging, time.Unix(1, 0), time.Unix(2, 0)); err != nil {
+					t.Fatal(err)
+				}
+				if err := unix.Stat(staging, &current); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if managedFileIdentityFromStat(&current) == expected {
+				t.Fatal("test mutation did not change the managed file identity")
+			}
+			if _, err := roots.CommitNoReplaceWithExpectedIdentity(staging, destination, expected); !errors.Is(err, ErrUnsafePath) {
+				t.Fatalf("identity change commit error = %v", err)
+			}
+			if _, err := os.Stat(destination); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("changed assembly was published: %v", err)
+			}
+			assertManagedTestContent(t, staging, "evil")
+		})
+	}
+}
+
+func TestManagedRootsExpectedCommitRejectsDigestMismatchWithMatchingIdentity(t *testing.T) {
+	root := t.TempDir()
+	staging := filepath.Join(root, "assembly")
+	destination := filepath.Join(root, "destination")
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	writer, err := roots.CreateExclusive(staging, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte("safe")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	expectedIdentity, err := writer.PublishedIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	forgedDigest := sha256.Sum256([]byte("evil"))
+	if _, err := roots.CommitNoReplaceWithExpectedIdentityAndDigest(staging, destination, expectedIdentity, forgedDigest); !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("matching identity with wrong digest error = %v", err)
+	}
+	if _, err := os.Stat(destination); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("digest-mismatched assembly was published: %v", err)
+	}
+	assertManagedTestContent(t, staging, "safe")
+}
+
+func TestManagedRootsCommitIdentityFailureIsPublishedDurabilityUnknown(t *testing.T) {
+	root := t.TempDir()
+	staging := filepath.Join(root, "staging")
+	destination := filepath.Join(root, "destination")
+	if err := os.WriteFile(staging, []byte("published"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	injected := errors.New("injected post-rename identity failure")
+	roots.commitIdentity = func(int, string) (ManagedFileIdentity, error) {
+		return ManagedFileIdentity{}, injected
+	}
+	identity, err := roots.CommitNoReplaceWithIdentity(staging, destination)
+	if identity != (ManagedFileIdentity{}) || !errors.Is(err, injected) {
+		t.Fatalf("identity failure result = %+v, %v", identity, err)
+	}
+	if !ManagedMutationChanged(err) || !ManagedMutationDurabilityUnknown(err) {
+		t.Fatalf("post-rename failure lost mutation state: %v", err)
+	}
+	contents, readErr := os.ReadFile(destination)
+	if readErr != nil || string(contents) != "published" {
+		t.Fatalf("published target = %q, %v", contents, readErr)
+	}
+}
+
+func TestManagedRootsCommitNoReplaceRejectsHardlinkedStaging(t *testing.T) {
+	root := t.TempDir()
+	staging := filepath.Join(root, "staging")
+	hardlink := filepath.Join(root, "staging-link")
+	destination := filepath.Join(root, "destination")
+	if err := os.WriteFile(staging, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(staging, hardlink); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	if err := roots.CommitNoReplace(staging, destination); !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("hardlinked staging error = %v", err)
+	}
+	if _, err := os.Stat(destination); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("hardlinked staging was published: %v", err)
+	}
+}
+
+func TestManagedRootsCommitNoReplaceRejectsSameSizeMutationDuringCopy(t *testing.T) {
+	root := t.TempDir()
+	staging := filepath.Join(root, "staging")
+	destination := filepath.Join(root, "destination")
+	if err := os.WriteFile(staging, []byte("safe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	roots.commitCopy = func(destination io.Writer, source io.Reader) (int64, error) {
+		written, copyErr := io.Copy(destination, source)
+		mutationErr := os.WriteFile(staging, []byte("evil"), 0o600)
+		return written, errors.Join(copyErr, mutationErr)
+	}
+	if err := roots.CommitNoReplace(staging, destination); !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("same-size mutation error = %v", err)
+	}
+	if _, err := os.Stat(destination); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("mutated staging was published: %v", err)
+	}
+}
+
+func TestManagedRootsCommitNoReplaceRejectsStagingNameReplacementDuringCopy(t *testing.T) {
+	root := t.TempDir()
+	staging := filepath.Join(root, "staging")
+	original := filepath.Join(root, "original")
+	destination := filepath.Join(root, "destination")
+	if err := os.WriteFile(staging, []byte("safe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	roots.commitCopy = func(destination io.Writer, source io.Reader) (int64, error) {
+		written, copyErr := io.Copy(destination, source)
+		renameErr := os.Rename(staging, original)
+		createErr := os.WriteFile(staging, []byte("evil"), 0o600)
+		return written, errors.Join(copyErr, renameErr, createErr)
+	}
+	if err := roots.CommitNoReplace(staging, destination); !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("staging replacement error = %v", err)
+	}
+	if _, err := os.Stat(destination); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("replaced staging was published: %v", err)
+	}
+	content, err := os.ReadFile(staging)
+	if err != nil || string(content) != "evil" {
+		t.Fatalf("external replacement was removed or changed: %q, %v", content, err)
 	}
 }
 

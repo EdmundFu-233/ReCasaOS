@@ -251,6 +251,7 @@ func (c *systemService) CreateFile(path string) (int, error) {
 			if createErr != nil {
 				return common_err.SERVICE_ERROR, createErr
 			}
+			defer created.Abort()
 			if err := created.Close(); err != nil {
 				return common_err.SERVICE_ERROR, err
 			}

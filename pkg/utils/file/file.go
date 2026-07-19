@@ -10,7 +10,6 @@ import (
 	"mime/multipart"
 	"os"
 	"path"
-	path2 "path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -197,150 +196,6 @@ func ReadFullFile(path string) []byte {
 	return content
 }
 
-// File copies a single file from src to dst
-func CopyFile(src, dst, style string) error {
-	var err error
-	var srcfd *os.File
-	var dstfd *os.File
-	var srcinfo os.FileInfo
-
-	lastPath := src[strings.LastIndex(src, "/")+1:]
-
-	if !strings.HasSuffix(dst, "/") {
-		dst += "/"
-	}
-	dst += lastPath
-	if Exists(dst) {
-		if style == "skip" {
-			return nil
-		} else {
-			os.Remove(dst)
-		}
-	}
-
-	if srcfd, err = os.Open(src); err != nil {
-		return err
-	}
-	defer srcfd.Close()
-
-	if dstfd, err = os.Create(dst); err != nil {
-		return err
-	}
-	defer dstfd.Close()
-
-	if _, err = io.Copy(dstfd, srcfd); err != nil {
-		return err
-	}
-	if srcinfo, err = os.Stat(src); err != nil {
-		return err
-	}
-	return os.Chmod(dst, srcinfo.Mode())
-}
-
-/**
- * @description:
- * @param {*} src
- * @param {*} dst
- * @param {string} style
- * @return {*}
- * @method:
- * @router:
- */
-func CopySingleFile(src, dst, style string) error {
-	var err error
-	var srcfd *os.File
-	var dstfd *os.File
-	var srcinfo os.FileInfo
-
-	if Exists(dst) {
-		if style == "skip" {
-			return nil
-		} else {
-			os.Remove(dst)
-		}
-	}
-
-	if srcfd, err = os.Open(src); err != nil {
-		return err
-	}
-	defer srcfd.Close()
-
-	if dstfd, err = os.Create(dst); err != nil {
-		return err
-	}
-	defer dstfd.Close()
-
-	if _, err = io.Copy(dstfd, srcfd); err != nil {
-		return err
-	}
-	if srcinfo, err = os.Stat(src); err != nil {
-		return err
-	}
-	return os.Chmod(dst, srcinfo.Mode())
-}
-
-// Check for duplicate file names
-func GetNoDuplicateFileName(fullPath string) string {
-	path, fileName := filepath.Split(fullPath)
-	fileSuffix := path2.Ext(fileName)
-	filenameOnly := strings.TrimSuffix(fileName, fileSuffix)
-	for i := 0; Exists(fullPath); i++ {
-		fullPath = path2.Join(path, filenameOnly+"("+strconv.Itoa(i+1)+")"+fileSuffix)
-	}
-	return fullPath
-}
-
-// Dir copies a whole directory recursively
-func CopyDir(src string, dst string, style string) error {
-	var err error
-	var fds []os.FileInfo
-	var srcinfo os.FileInfo
-
-	if srcinfo, err = os.Stat(src); err != nil {
-		return err
-	}
-	if !srcinfo.IsDir() {
-		if err = CopyFile(src, dst, style); err != nil {
-			fmt.Println(err)
-		}
-		return nil
-	}
-	// dstPath := dst
-	lastPath := src[strings.LastIndex(src, "/")+1:]
-	dst += "/" + lastPath
-	// for i := 0; Exists(dst); i++ {
-	// 	dst = dstPath + "/" + lastPath + strconv.Itoa(i+1)
-	// }
-	if Exists(dst) {
-		if style == "skip" {
-			return nil
-		} else {
-			os.Remove(dst)
-		}
-	}
-	if err = os.MkdirAll(dst, srcinfo.Mode()); err != nil {
-		return err
-	}
-	if fds, err = ioutil.ReadDir(src); err != nil {
-		return err
-	}
-	for _, fd := range fds {
-		srcfp := path.Join(src, fd.Name())
-		dstfp := dst // path.Join(dst, fd.Name())
-
-		if fd.IsDir() {
-			if err = CopyDir(srcfp, dstfp, style); err != nil {
-				fmt.Println(err)
-			}
-		} else {
-			if err = CopyFile(srcfp, dstfp, style); err != nil {
-				fmt.Println(err)
-			}
-		}
-	}
-	return nil
-}
-
 func WriteToPath(data []byte, path, name string) error {
 	fullPath := path
 	if strings.HasSuffix(path, "/") {
@@ -461,29 +316,7 @@ func CommonPrefix(sep byte, paths ...string) string {
 	return string(c)
 }
 
-func GetFileOrDirSize(path string) (int64, error) {
-	fileInfo, err := os.Stat(path)
-	if err != nil {
-		return 0, err
-	}
-	if fileInfo.IsDir() {
-		return DirSizeB(path + "/")
-	}
-	return fileInfo.Size(), nil
-}
-
-// getFileSize get file size by path(B)
-func DirSizeB(path string) (int64, error) {
-	var size int64
-	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
-		if !info.IsDir() {
-			size += info.Size()
-		}
-		return err
-	})
-	return size, err
-}
-
+// MoveFile supports the legacy Samba configuration migration path.
 func MoveFile(sourcePath, destPath string) error {
 	inputFile, err := os.Open(sourcePath)
 	if err != nil {
@@ -500,8 +333,7 @@ func MoveFile(sourcePath, destPath string) error {
 	if err != nil {
 		return fmt.Errorf("Writing to output file failed: %s", err)
 	}
-	err = os.Remove(sourcePath)
-	if err != nil {
+	if err := os.Remove(sourcePath); err != nil {
 		return fmt.Errorf("Failed removing original file: %s", err)
 	}
 	return nil

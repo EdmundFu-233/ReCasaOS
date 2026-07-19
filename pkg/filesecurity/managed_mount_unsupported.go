@@ -2,6 +2,12 @@
 
 package filesecurity
 
+import "os"
+
+func (m *ManagedRoots) MountID(*os.File) (uint64, error) {
+	return 0, ErrManagedRootsUnsupported
+}
+
 func (m *ManagedRoots) IsMountPoint(string) (bool, error) {
 	return false, ErrManagedRootsUnsupported
 }

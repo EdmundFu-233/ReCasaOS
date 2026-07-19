@@ -6,9 +6,26 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
+	"path/filepath"
 
 	"golang.org/x/sys/unix"
 )
+
+// MountID returns the kernel mount identity for an already opened managed
+// descriptor. Callers can pair it with a mutation lease to bind mountinfo
+// validation to the exact directory inode used before or after mount changes.
+func (m *ManagedRoots) MountID(opened *os.File) (uint64, error) {
+	if m == nil || opened == nil {
+		return 0, ErrUnsafePath
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return 0, fs.ErrClosed
+	}
+	return managedMountIDAt(int(opened.Fd()), "", unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
+}
 
 // IsMountPoint reports whether absolutePath is a mount boundary below one of
 // the pinned management roots. Both the parent and target are inspected with
@@ -27,7 +44,7 @@ func (m *ManagedRoots) IsMountPoint(absolutePath string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	parentFD, base, err := openManagedParent(root, location)
+	parentFD, _, err := openManagedParent(root, location)
 	if err != nil {
 		return false, err
 	}
@@ -37,15 +54,15 @@ func (m *ManagedRoots) IsMountPoint(absolutePath string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	targetFD, err := unix.Openat2(parentFD, base, &unix.OpenHow{
-		Flags:   unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC | unix.O_NOFOLLOW,
-		Resolve: managedResolvePolicy,
-	})
+	target, err := openManagedAt(root, location, unix.O_PATH, 0)
 	if err != nil {
-		return false, classifyManagedResolutionError(err)
+		return false, err
 	}
-	defer unix.Close(targetFD)
-	targetMountID, err := managedMountIDAt(targetFD, "", unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
+	defer target.Close()
+	if err := validateManagedOpenedFile(target, true); err != nil {
+		return false, err
+	}
+	targetMountID, err := managedMountIDAt(int(target.Fd()), "", unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
 	if err != nil {
 		return false, err
 	}
@@ -55,14 +72,11 @@ func (m *ManagedRoots) IsMountPoint(absolutePath string) (bool, error) {
 // RemoveEmptyDirectory removes exactly one empty, non-mounted directory. It
 // never recurses and refuses to remove a mount boundary.
 func (m *ManagedRoots) RemoveEmptyDirectory(absolutePath string) error {
-	if m == nil {
-		return ErrManagedPathOutsideRoots
+	release, err := m.AcquireMutation()
+	if err != nil {
+		return err
 	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.closed {
-		return fs.ErrClosed
-	}
+	defer release()
 	root, location, err := m.resolveLocked(absolutePath)
 	if err != nil {
 		return err
@@ -72,6 +86,13 @@ func (m *ManagedRoots) RemoveEmptyDirectory(absolutePath string) error {
 		return err
 	}
 	defer unix.Close(parentFD)
+	parentLocation, err := m.matchLocked(filepath.Dir(location.Canonical))
+	if err != nil {
+		return err
+	}
+	if err := m.validateManagedDestinationFD(root, parentFD, parentLocation); err != nil {
+		return err
+	}
 
 	parentMountID, err := managedMountIDAt(parentFD, "", unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
 	if err != nil {
@@ -90,5 +111,5 @@ func (m *ManagedRoots) RemoveEmptyDirectory(absolutePath string) error {
 		}
 		return err
 	}
-	return nil
+	return m.syncManagedDirectory(parentFD, "sync removed empty directory parent", true)
 }

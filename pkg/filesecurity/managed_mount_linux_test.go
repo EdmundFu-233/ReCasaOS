@@ -30,6 +30,17 @@ func TestManagedRootsMountInspectionAndEmptyDirectoryRemoval(t *testing.T) {
 	if mounted {
 		t.Fatal("ordinary directory reported as a mount point")
 	}
+	regular := filepath.Join(root, "regular")
+	if err := os.WriteFile(regular, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mounted, err = roots.IsMountPoint(regular)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mounted {
+		t.Fatal("ordinary regular file reported as a mount point")
+	}
 	if err := roots.RemoveEmptyDirectory(empty); err != nil {
 		t.Fatal(err)
 	}

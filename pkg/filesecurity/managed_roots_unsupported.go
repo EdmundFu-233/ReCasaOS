@@ -52,10 +52,6 @@ func (m *ManagedRoots) Stat(string) (os.FileInfo, error) {
 	return nil, ErrManagedRootsUnsupported
 }
 
-func (m *ManagedRoots) CreateExclusive(string, fs.FileMode) (*os.File, error) {
-	return nil, ErrManagedRootsUnsupported
-}
-
 func (m *ManagedRoots) RewriteRegular(string, []byte) error {
 	return ErrManagedRootsUnsupported
 }
@@ -72,6 +68,10 @@ func (m *ManagedRoots) RemoveAll(string) error {
 	return ErrManagedRootsUnsupported
 }
 
+func (m *ManagedRoots) RemoveAllBatch([]string) (ManagedBatchMutationResult, error) {
+	return ManagedBatchMutationResult{}, ErrManagedRootsUnsupported
+}
+
 func (m *ManagedRoots) RenameNoReplace(string, string) error {
 	return ErrManagedRootsUnsupported
 }
@@ -86,4 +86,28 @@ func (m *ManagedRoots) TreeSize(string) (int64, error) {
 
 func (m *ManagedRoots) CommitNoReplace(string, string) error {
 	return ErrManagedRootsUnsupported
+}
+
+func (m *ManagedRoots) CommitNoReplaceWithIdentity(string, string) (ManagedFileIdentity, error) {
+	return ManagedFileIdentity{}, ErrManagedRootsUnsupported
+}
+
+func (m *ManagedRoots) CommitNoReplaceWithExpectedIdentity(string, string, ManagedFileIdentity) (ManagedFileIdentity, error) {
+	return ManagedFileIdentity{}, ErrManagedRootsUnsupported
+}
+
+func (m *ManagedRoots) CommitNoReplaceWithExpectedIdentityAndDigest(string, string, ManagedFileIdentity, [32]byte) (ManagedFileIdentity, error) {
+	return ManagedFileIdentity{}, ErrManagedRootsUnsupported
+}
+
+func (m *ManagedRoots) VerifyRegularIdentity(string, ManagedFileIdentity) error {
+	return ErrManagedRootsUnsupported
+}
+
+func (m *ManagedRoots) CopyInto(string, string, ManagedConflictStyle) (ManagedTransferResult, error) {
+	return ManagedTransferResult{}, ErrManagedRootsUnsupported
+}
+
+func (m *ManagedRoots) MoveInto(string, string, ManagedConflictStyle) (ManagedTransferResult, error) {
+	return ManagedTransferResult{}, ErrManagedRootsUnsupported
 }

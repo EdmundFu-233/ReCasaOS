@@ -91,7 +91,20 @@ func (c *CasaOS) PostUploadFile(ctx echo.Context) error {
 		bin,
 	)
 	if err != nil {
-		return ctx.JSON(http.StatusInternalServerError, err)
+		return respondUploadMutationFailure(ctx, err)
 	}
 	return ctx.NoContent(http.StatusOK)
+}
+
+func respondUploadMutationFailure(ctx echo.Context, err error) error {
+	status := "FAILED"
+	if filesecurity.ManagedMutationChanged(err) {
+		status = "PARTIAL"
+	}
+	return ctx.JSON(http.StatusInternalServerError, map[string]interface{}{
+		"status":             status,
+		"changed":            filesecurity.ManagedMutationChanged(err),
+		"durability_unknown": filesecurity.ManagedMutationDurabilityUnknown(err),
+		"error":              err.Error(),
+	})
 }
