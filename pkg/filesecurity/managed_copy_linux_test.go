@@ -1450,7 +1450,7 @@ func TestManagedReplacePreservesPrivateStagingSubstitution(t *testing.T) {
 	}
 
 	result, err := roots.CopyInto(source, destination, ManagedConflictReplace)
-	if result.Changed || !errors.Is(err, ErrUnsafePath) || ManagedMutationChanged(err) {
+	if result.Changed || !errors.Is(err, ErrUnsafePath) || !ManagedMutationChanged(err) || ManagedMutationDurabilityUnknown(err) {
 		t.Fatalf("private staging replacement result = %+v, %v", result, err)
 	}
 	assertManagedTestContent(t, target, "old")
