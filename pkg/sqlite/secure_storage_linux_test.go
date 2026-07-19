@@ -14,7 +14,7 @@ import (
 )
 
 func TestPrepareSecureDatabaseDirectoryPreservesContentsAndSecuresArtifacts(t *testing.T) {
-	databasePath := filepath.Join(t.TempDir(), "database")
+	databasePath := filepath.Join(secureSQLiteTestRoot(t), "database")
 	if err := os.Mkdir(databasePath, 0o777); err != nil {
 		t.Fatal(err)
 	}
@@ -51,9 +51,10 @@ func TestPrepareSecureDatabaseDirectoryPreservesContentsAndSecuresArtifacts(t *t
 }
 
 func TestPrepareSecureDatabaseDirectoryIgnoresPermissiveUmask(t *testing.T) {
+	root := secureSQLiteTestRoot(t)
 	oldUmask := unix.Umask(0)
 	defer unix.Umask(oldUmask)
-	databasePath := filepath.Join(t.TempDir(), "nested", "database")
+	databasePath := filepath.Join(root, "nested", "database")
 	directory, err := prepareSecureDatabaseDirectory(databasePath)
 	if err != nil {
 		t.Fatal(err)
@@ -64,7 +65,7 @@ func TestPrepareSecureDatabaseDirectoryIgnoresPermissiveUmask(t *testing.T) {
 }
 
 func TestPrepareSecureDatabaseDirectoryRejectsSymlinkDirectoryWithoutChangingTarget(t *testing.T) {
-	root := t.TempDir()
+	root := secureSQLiteTestRoot(t)
 	target := filepath.Join(root, "target")
 	if err := os.Mkdir(target, 0o755); err != nil {
 		t.Fatal(err)
@@ -81,7 +82,7 @@ func TestPrepareSecureDatabaseDirectoryRejectsSymlinkDirectoryWithoutChangingTar
 func TestPrepareSecureDatabaseDirectoryRejectsSymlinkAndHardlinkedArtifacts(t *testing.T) {
 	for _, useHardlink := range []bool{false, true} {
 		t.Run(map[bool]string{false: "symlink", true: "hardlink"}[useHardlink], func(t *testing.T) {
-			root := t.TempDir()
+			root := secureSQLiteTestRoot(t)
 			databasePath := filepath.Join(root, "database")
 			if err := os.Mkdir(databasePath, 0o700); err != nil {
 				t.Fatal(err)
@@ -114,7 +115,7 @@ func TestPrepareSecureDatabaseDirectoryRejectsSymlinkAndHardlinkedArtifacts(t *t
 }
 
 func TestPrepareSecureDatabaseDirectoryRejectsReplaceableNonStickyAncestor(t *testing.T) {
-	root := t.TempDir()
+	root := secureSQLiteTestRoot(t)
 	replaceableParent := filepath.Join(root, "replaceable")
 	databasePath := filepath.Join(replaceableParent, "database")
 	if err := os.Mkdir(replaceableParent, 0o777); err != nil {
@@ -148,7 +149,7 @@ func TestPrepareSecureDatabaseDirectoryRejectsForeignOwnedChildInStickyAncestor(
 	if os.Geteuid() != 0 {
 		t.Skip("root is required to create a foreign-owned sticky-parent fixture")
 	}
-	root := t.TempDir()
+	root := secureSQLiteTestRoot(t)
 	stickyParent := filepath.Join(root, "sticky")
 	databasePath := filepath.Join(stickyParent, "database")
 	if err := os.Mkdir(stickyParent, 0o777); err != nil {
@@ -169,7 +170,7 @@ func TestPrepareSecureDatabaseDirectoryRejectsForeignOwnedChildInStickyAncestor(
 }
 
 func TestDatabaseDirectoryIdentityDetectsRenameAndReplacement(t *testing.T) {
-	databasePath := filepath.Join(t.TempDir(), "database")
+	databasePath := filepath.Join(secureSQLiteTestRoot(t), "database")
 	directory, err := prepareSecureDatabaseDirectory(databasePath)
 	if err != nil {
 		t.Fatal(err)
@@ -192,9 +193,10 @@ func TestDatabaseDirectoryIdentityDetectsRenameAndReplacement(t *testing.T) {
 }
 
 func TestSQLiteWALArtifactsRemainServiceOwnedSingleLinkMode0600(t *testing.T) {
+	root := secureSQLiteTestRoot(t)
 	oldUmask := unix.Umask(0)
 	defer unix.Umask(oldUmask)
-	databasePath := filepath.Join(t.TempDir(), "database")
+	databasePath := filepath.Join(root, "database")
 	directory, err := prepareSecureDatabaseDirectory(databasePath)
 	if err != nil {
 		t.Fatal(err)
@@ -238,6 +240,19 @@ func assertSQLiteArtifactMetadata(t *testing.T, path string) {
 	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != uint32(os.Geteuid()) || stat.Nlink != 1 || stat.Mode&0o777 != 0o600 {
 		t.Fatalf("unsafe SQLite artifact metadata for %s: uid=%d nlink=%d mode=%o", path, stat.Uid, stat.Nlink, stat.Mode&0o777)
 	}
+}
+
+func secureSQLiteTestRoot(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	// testing.TempDir requests mode 0777 for its numbered child and relies on
+	// the process umask. Make the fixture explicit so a permissive runner umask
+	// does not accidentally construct a topology that production must reject.
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	assertMode(t, root, 0o700)
+	return root
 }
 
 func assertMode(t *testing.T, path string, expected os.FileMode) {

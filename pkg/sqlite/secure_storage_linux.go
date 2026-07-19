@@ -130,8 +130,15 @@ func verifyDatabaseDirectoryPath(directory *os.File, dbPath string) error {
 	if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.IsDir() || !os.SameFile(pathInfo, openedInfo) {
 		return errors.New("canonical database directory no longer names the pinned directory")
 	}
-	stat, ok := openedInfo.Sys().(*unix.Stat_t)
-	if !ok || stat.Uid != uint32(os.Geteuid()) || openedInfo.Mode().Perm() != 0o700 {
+	// os.FileInfo.Sys exposes the standard library's syscall.Stat_t on Linux,
+	// which is not type-identical to x/sys/unix.Stat_t on every toolchain.
+	// Inspect the already pinned descriptor directly so the ownership check
+	// cannot fail merely because those implementation types differ.
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(directory.Fd()), &stat); err != nil {
+		return fmt.Errorf("inspect pinned database directory metadata: %w", err)
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != uint32(os.Geteuid()) || stat.Mode&0o777 != 0o700 {
 		return errors.New("canonical database directory is not service-owned mode 0700")
 	}
 	return nil
