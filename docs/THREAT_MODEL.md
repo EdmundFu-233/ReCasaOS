@@ -83,6 +83,25 @@ this repository, but recovery plans must account for them.
 | Supply-chain drift | The Message Bus OpenAPI input, generator, Go toolchain, and Actions are pinned, and dangerous inherited workflows plus remote-shell updates are disabled. UI/installer/runtime components are not yet locked as one release. | Follow `RECASAOS_COMPONENTS.md`; pin every release component/action to reviewed immutable revisions; generate before test; scan dependencies; verify checksums, SBOM, signatures, and provenance. |
 | Backup compromise or failed recovery | Backups contain files, tokens, databases, and configuration; an untested copy may be inconsistent. | Encrypt with separate keys, restrict/monitor access, use snapshots or quiesce databases, keep an offline/off-account copy, and regularly restore into an isolated host. |
 
+## Static-analysis triage boundary
+
+An automated alert dismissal is an audit classification, not proof that a
+surface is safe to expose. In particular, the inherited privileged file manager
+intentionally accepts administrator-selected host paths. Generic path-injection
+queries therefore reach filesystem sinks even when the behavior is the product's
+documented management capability. Those results remain an accepted limitation of
+this foundation, are tracked by issue #7 for descriptor-relative and allowed-root
+redesign, and reinforce the private/VPN-only management boundary.
+
+The public portal does not use those pathname helpers. It resolves only beneath
+its pinned share descriptor with Linux `openat2`. The generic outbound HTTPS
+client is likewise a custom sanitizer: it accepts only HTTPS on port 443, disables
+ambient proxies, resolves and dials only checked public addresses, repeats URL
+validation on redirects, and caps response bodies. Static-analysis results for
+either boundary must be reviewed against the complete data path; false-positive
+or accepted-risk classifications must retain a written justification and a
+tracking issue where hardening remains.
+
 ## Public-readiness blockers
 
 The portal and positive-allowlist edge examples close the root repository's
