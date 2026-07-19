@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/IceWhaleTech/CasaOS-Common/utils/logger"
@@ -70,9 +71,14 @@ func GetMountList() (MountList, error) {
 	if res.StatusCode() != 200 {
 		return result, fmt.Errorf("get mount list failed")
 	}
-	json.Unmarshal(res.Body(), &result)
+	if err := json.Unmarshal(res.Body(), &result); err != nil {
+		return result, fmt.Errorf("decode mount list: %w", err)
+	}
 	for i := 0; i < len(result.MountPoints); i++ {
-		result.MountPoints[i].Fs = result.MountPoints[i].Fs[:len(result.MountPoints[i].Fs)-1]
+		if !strings.HasSuffix(result.MountPoints[i].Fs, ":") || len(result.MountPoints[i].Fs) == 1 {
+			return MountList{}, fmt.Errorf("invalid rclone filesystem in mount list")
+		}
+		result.MountPoints[i].Fs = strings.TrimSuffix(result.MountPoints[i].Fs, ":")
 	}
 	return result, err
 }
@@ -112,16 +118,19 @@ func Unmount(mountPoint string) error {
 
 func CreateConfig(data map[string]string, name, t string) error {
 	data["config_is_local"] = "false"
-	dataStr, _ := json.Marshal(data)
+	dataStr, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("encode rclone config: %w", err)
+	}
 	res, err := NewRestyClient().R().SetFormData(map[string]string{
 		"name":       name,
 		"parameters": string(dataStr),
 		"type":       t,
 	}).Post("/config/create")
-	logger.Info("when create config then", zap.Any("res", res.Body()))
 	if err != nil {
 		return err
 	}
+	logger.Info("when create config then", zap.Int("status", res.StatusCode()))
 	if res.StatusCode() != 200 {
 		return fmt.Errorf("create config failed")
 	}
@@ -141,7 +150,9 @@ func GetConfigByName(name string) (map[string]string, error) {
 		return nil, fmt.Errorf("create config failed")
 	}
 	var result map[string]string
-	json.Unmarshal(res.Body(), &result)
+	if err := json.Unmarshal(res.Body(), &result); err != nil {
+		return nil, fmt.Errorf("decode rclone config: %w", err)
+	}
 	return result, nil
 }
 func GetAllConfigName() (RemotesResult, error) {
@@ -154,7 +165,9 @@ func GetAllConfigName() (RemotesResult, error) {
 		return result, fmt.Errorf("get config failed")
 	}
 
-	json.Unmarshal(res.Body(), &result)
+	if err := json.Unmarshal(res.Body(), &result); err != nil {
+		return result, fmt.Errorf("decode rclone remotes: %w", err)
+	}
 	return result, nil
 }
 func DeleteConfigByName(name string) error {
