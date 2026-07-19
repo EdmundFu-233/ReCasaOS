@@ -1,16 +1,15 @@
 package httper
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
-
-	"github.com/IceWhaleTech/CasaOS-Common/utils/logger"
-	"github.com/go-resty/resty/v2"
-	"go.uber.org/zap"
 )
 
 type MountList struct {
@@ -19,8 +18,12 @@ type MountList struct {
 type MountPoints struct {
 	MountPoint string `json:"MountPoint"`
 	Fs         string `json:"Fs"`
-	Icon       string `json:"Icon"`
-	Name       string `json:"Name"`
+	// FsPath is the path after rclone's remote-name colon. ReCasaOS-managed
+	// mounts require it to be empty (remote:), while unrelated remote:subdir
+	// mounts remain parseable without being mistaken for our mount.
+	FsPath string `json:"-"`
+	Icon   string `json:"Icon"`
+	Name   string `json:"Name"`
 }
 type MountPoint struct {
 	MountPoint string `json:"mount_point"`
@@ -42,143 +45,177 @@ type RemotesResult struct {
 	Remotes []string `json:"remotes"`
 }
 
-var UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.88 Safari/537.36"
+const (
+	rcloneUnixSocket       = "/var/run/rclone/rclone.sock"
+	maxRcloneResponseBytes = 1 << 20
+	maxRcloneListEntries   = 4096
+	maxRcloneConfigEntries = 256
+)
+
+var UserAgent = "ReCasaOS/rclone-rc"
 var DefaultTimeout = time.Second * 30
 
-func NewRestyClient() *resty.Client {
-
-	unixSocket := "/var/run/rclone/rclone.sock"
-
-	transport := http.Transport{
-		Dial: func(_, _ string) (net.Conn, error) {
-			return net.Dial("unix", unixSocket)
+var rcloneHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			dialer := net.Dialer{Timeout: 5 * time.Second}
+			return dialer.DialContext(ctx, "unix", rcloneUnixSocket)
 		},
+		MaxIdleConns:        4,
+		MaxIdleConnsPerHost: 4,
+		MaxConnsPerHost:     4,
+		IdleConnTimeout:     30 * time.Second,
+	},
+	Timeout: DefaultTimeout,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		// A 307/308 redirect would replay a mutating POST. The local Unix-socket
+		// RC API has no legitimate redirect flow, so return the original response
+		// and let callRclone reject its non-200 status.
+		return http.ErrUseLastResponse
+	},
+}
+
+// callRclone performs exactly one RC request. Mutating rclone operations are
+// not generally idempotent, so transport retries belong in the service state
+// machine where their effects can be reconciled explicitly.
+func callRclone(endpoint string, form url.Values) ([]byte, error) {
+	request, err := http.NewRequest(http.MethodPost, "http://localhost"+endpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
 	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("User-Agent", UserAgent)
+	response, err := rcloneHTTPClient.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("rclone RC %s: %w", endpoint, err)
+	}
+	defer response.Body.Close()
 
-	client := resty.New()
-
-	client.SetTransport(&transport).SetBaseURL("http://localhost")
-	client.SetRetryCount(3).SetRetryWaitTime(5*time.Second).SetTimeout(DefaultTimeout).SetHeader("User-Agent", UserAgent)
-	return client
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxRcloneResponseBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read rclone RC %s response: %w", endpoint, err)
+	}
+	if len(body) > maxRcloneResponseBytes {
+		return nil, fmt.Errorf("rclone RC %s response exceeds %d bytes", endpoint, maxRcloneResponseBytes)
+	}
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("rclone RC %s returned HTTP %d", endpoint, response.StatusCode)
+	}
+	return body, nil
 }
 
 func GetMountList() (MountList, error) {
 	var result MountList
-	res, err := NewRestyClient().R().Post("/mount/listmounts")
+	body, err := callRclone("/mount/listmounts", url.Values{})
 	if err != nil {
 		return result, err
 	}
-	if res.StatusCode() != 200 {
-		return result, fmt.Errorf("get mount list failed")
-	}
-	if err := json.Unmarshal(res.Body(), &result); err != nil {
+	if err := json.Unmarshal(body, &result); err != nil {
 		return result, fmt.Errorf("decode mount list: %w", err)
 	}
+	if len(result.MountPoints) > maxRcloneListEntries {
+		return MountList{}, fmt.Errorf("rclone mount list exceeds %d entries", maxRcloneListEntries)
+	}
 	for i := 0; i < len(result.MountPoints); i++ {
-		if !strings.HasSuffix(result.MountPoints[i].Fs, ":") || len(result.MountPoints[i].Fs) == 1 {
-			return MountList{}, fmt.Errorf("invalid rclone filesystem in mount list")
-		}
-		result.MountPoints[i].Fs = strings.TrimSuffix(result.MountPoints[i].Fs, ":")
+		normalizeRcloneMountFilesystem(&result.MountPoints[i])
 	}
-	return result, err
+	return result, nil
 }
 
-func Mount(mountPoint string, fs string) error {
-	res, err := NewRestyClient().R().SetFormData(map[string]string{
-		"mountPoint": mountPoint,
-		"fs":         fs,
-		"mountOpt":   `{"AllowOther": true}`,
-		"vfsOpt":     `{"CacheMode": 3}`,
-	}).Post("/mount/mount")
-	if err != nil {
-		return err
+func normalizeRcloneMountFilesystem(mounted *MountPoints) {
+	if mounted == nil {
+		return
 	}
-	if res.StatusCode() != 200 {
-		return fmt.Errorf("mount failed")
+	remote, remotePath, ok := splitRcloneFilesystem(mounted.Fs)
+	if !ok {
+		// Keep the record so callers can still detect an occupied mount point,
+		// but never let an unparsed local/malformed Fs compare equal to a managed
+		// remote name.
+		mounted.Fs = ""
+		mounted.FsPath = ""
+		return
 	}
-	logger.Info("mount then", zap.Any("res", res.Body()))
-	return nil
+	mounted.Fs = remote
+	mounted.FsPath = remotePath
 }
+
+func rcloneRemoteFromFilesystem(filesystem string) (string, bool) {
+	remote, _, ok := splitRcloneFilesystem(filesystem)
+	return remote, ok
+}
+
+func splitRcloneFilesystem(filesystem string) (string, string, bool) {
+	separator := strings.IndexByte(filesystem, ':')
+	if separator <= 0 {
+		return "", "", false
+	}
+	return filesystem[:separator], filesystem[separator+1:], true
+}
+
+func Mount(mountPoint string, filesystem string) error {
+	_, err := callRclone("/mount/mount", url.Values{
+		"mountPoint": []string{mountPoint},
+		"fs":         []string{filesystem},
+		"mountOpt":   []string{`{"AllowOther": true}`},
+		"vfsOpt":     []string{`{"CacheMode": 3}`},
+	})
+	return err
+}
+
 func Unmount(mountPoint string) error {
-	res, err := NewRestyClient().R().SetFormData(map[string]string{
-		"mountPoint": mountPoint,
-	}).Post("/mount/unmount")
-	if err != nil {
-		logger.Error("when unmount", zap.Error(err))
-		return err
-	}
-	if res.StatusCode() != 200 {
-		logger.Error("then unmount failed", zap.Any("res", res.Body()))
-		return fmt.Errorf("unmount failed")
-	}
-
-	logger.Info("unmount then", zap.Any("res", res.Body()))
-	return nil
+	_, err := callRclone("/mount/unmount", url.Values{"mountPoint": []string{mountPoint}})
+	return err
 }
 
 func CreateConfig(data map[string]string, name, t string) error {
-	data["config_is_local"] = "false"
-	dataStr, err := json.Marshal(data)
+	parameters := make(map[string]string, len(data)+1)
+	for key, value := range data {
+		parameters[key] = value
+	}
+	parameters["config_is_local"] = "false"
+	dataStr, err := json.Marshal(parameters)
 	if err != nil {
 		return fmt.Errorf("encode rclone config: %w", err)
 	}
-	res, err := NewRestyClient().R().SetFormData(map[string]string{
-		"name":       name,
-		"parameters": string(dataStr),
-		"type":       t,
-	}).Post("/config/create")
-	if err != nil {
-		return err
-	}
-	logger.Info("when create config then", zap.Int("status", res.StatusCode()))
-	if res.StatusCode() != 200 {
-		return fmt.Errorf("create config failed")
-	}
-
-	return nil
+	_, err = callRclone("/config/create", url.Values{
+		"name":       []string{name},
+		"parameters": []string{string(dataStr)},
+		"type":       []string{t},
+	})
+	return err
 }
 
 func GetConfigByName(name string) (map[string]string, error) {
-
-	res, err := NewRestyClient().R().SetFormData(map[string]string{
-		"name": name,
-	}).Post("/config/get")
+	body, err := callRclone("/config/get", url.Values{"name": []string{name}})
 	if err != nil {
 		return nil, err
 	}
-	if res.StatusCode() != 200 {
-		return nil, fmt.Errorf("create config failed")
-	}
 	var result map[string]string
-	if err := json.Unmarshal(res.Body(), &result); err != nil {
+	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("decode rclone config: %w", err)
+	}
+	if len(result) > maxRcloneConfigEntries {
+		return nil, fmt.Errorf("rclone config exceeds %d fields", maxRcloneConfigEntries)
 	}
 	return result, nil
 }
+
 func GetAllConfigName() (RemotesResult, error) {
 	var result RemotesResult
-	res, err := NewRestyClient().R().SetFormData(map[string]string{}).Post("/config/listremotes")
+	body, err := callRclone("/config/listremotes", url.Values{})
 	if err != nil {
 		return result, err
 	}
-	if res.StatusCode() != 200 {
-		return result, fmt.Errorf("get config failed")
-	}
-
-	if err := json.Unmarshal(res.Body(), &result); err != nil {
+	if err := json.Unmarshal(body, &result); err != nil {
 		return result, fmt.Errorf("decode rclone remotes: %w", err)
+	}
+	if len(result.Remotes) > maxRcloneListEntries {
+		return RemotesResult{}, fmt.Errorf("rclone remote list exceeds %d entries", maxRcloneListEntries)
 	}
 	return result, nil
 }
+
 func DeleteConfigByName(name string) error {
-	res, err := NewRestyClient().R().SetFormData(map[string]string{
-		"name": name,
-	}).Post("/config/delete")
-	if err != nil {
-		return err
-	}
-	if res.StatusCode() != 200 {
-		return fmt.Errorf("delete config failed")
-	}
-	return nil
+	_, err := callRclone("/config/delete", url.Values{"name": []string{name}})
+	return err
 }

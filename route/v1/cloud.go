@@ -1,8 +1,7 @@
 package v1
 
 import (
-	"errors"
-	"fmt"
+	"net/http"
 
 	"github.com/IceWhaleTech/CasaOS-Common/utils/logger"
 	"github.com/IceWhaleTech/CasaOS/drivers/dropbox"
@@ -42,30 +41,30 @@ func ListStorages(ctx echo.Context) error {
 	list := []httper.MountPoint{}
 
 	for _, v := range r.MountPoints {
-		list = append(list, httper.MountPoint(v))
+		list = append(list, httper.MountPoint{
+			MountPoint: v.MountPoint,
+			Fs:         v.Fs,
+			Icon:       v.Icon,
+			Name:       v.Name,
+		})
 	}
 
 	return ctx.JSON(common_err.SUCCESS, model.Result{Success: common_err.SUCCESS, Message: common_err.GetMsg(common_err.SUCCESS), Data: list})
 }
 
 func UmountStorage(ctx echo.Context) error {
+	ctx.Request().Body = http.MaxBytesReader(ctx.Response(), ctx.Request().Body, 4<<10)
 	request := struct {
 		MountPoint string `json:"mount_point" form:"mount_point"`
 	}{}
 	if err := ctx.Bind(&request); err != nil {
 		return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.CLIENT_ERROR, Message: common_err.GetMsg(common_err.CLIENT_ERROR), Data: "invalid unmount request"})
 	}
-	remote, err := service.CloudRemoteFromMountPoint(request.MountPoint)
-	if err != nil {
+	if _, err := service.CloudRemoteFromMountPoint(request.MountPoint); err != nil {
 		return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.CLIENT_ERROR, Message: common_err.GetMsg(common_err.CLIENT_ERROR), Data: err.Error()})
 	}
-	unmountErr := service.MyService.Storage().UnmountStorage(request.MountPoint)
-	if unmountErr != nil && !errors.Is(unmountErr, service.ErrStorageUnmountCleanup) {
-		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: unmountErr.Error()})
-	}
-	deleteErr := service.MyService.Storage().DeleteConfigByName(remote)
-	if operationErr := errors.Join(unmountErr, deleteErr); operationErr != nil {
-		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: fmt.Sprintf("cloud storage was unmounted, but cleanup was incomplete: %v", operationErr)})
+	if err := service.MyService.Storage().RemoveStorage(request.MountPoint); err != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
 	}
 	return ctx.JSON(common_err.SUCCESS, model.Result{Success: common_err.SUCCESS, Message: common_err.GetMsg(common_err.SUCCESS), Data: "success"})
 }
