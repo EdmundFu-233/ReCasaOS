@@ -122,3 +122,28 @@ func TestCallRcloneDoesNotReplayRedirectedPost(t *testing.T) {
 		t.Fatalf("transport calls = %d, want exactly one", calls)
 	}
 }
+
+func TestMountDoesNotExposeCloudFilesToOtherLocalUsers(t *testing.T) {
+	original := rcloneHTTPClient
+	t.Cleanup(func() { rcloneHTTPClient = original })
+	rcloneHTTPClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path != "/mount/mount" {
+			t.Fatalf("request path = %q", request.URL.Path)
+		}
+		if err := request.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		if mountOptions := request.PostForm.Get("mountOpt"); mountOptions != `{"AllowOther": false}` {
+			t.Fatalf("mount options = %q", mountOptions)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{}`)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+
+	if err := Mount("/var/lib/casaos/storage/cloud", "cloud:"); err != nil {
+		t.Fatal(err)
+	}
+}

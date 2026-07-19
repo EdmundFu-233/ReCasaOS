@@ -46,7 +46,7 @@ type RemotesResult struct {
 }
 
 const (
-	rcloneUnixSocket       = "/var/run/rclone/rclone.sock"
+	rcloneUnixSocket       = "/run/rclone/rclone.sock"
 	maxRcloneResponseBytes = 1 << 20
 	maxRcloneListEntries   = 4096
 	maxRcloneConfigEntries = 256
@@ -58,8 +58,7 @@ var DefaultTimeout = time.Second * 30
 var rcloneHTTPClient = &http.Client{
 	Transport: &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			dialer := net.Dialer{Timeout: 5 * time.Second}
-			return dialer.DialContext(ctx, "unix", rcloneUnixSocket)
+			return dialVerifiedRcloneSocket(ctx)
 		},
 		MaxIdleConns:        4,
 		MaxIdleConnsPerHost: 4,
@@ -156,8 +155,11 @@ func Mount(mountPoint string, filesystem string) error {
 	_, err := callRclone("/mount/mount", url.Values{
 		"mountPoint": []string{mountPoint},
 		"fs":         []string{filesystem},
-		"mountOpt":   []string{`{"AllowOther": true}`},
-		"vfsOpt":     []string{`{"CacheMode": 3}`},
+		// Keep the FUSE mount private to the rclone service account. Enabling
+		// AllowOther lets every local UID bypass the ReCasaOS API boundary and
+		// attempt direct access to cloud-backed files.
+		"mountOpt": []string{`{"AllowOther": false}`},
+		"vfsOpt":   []string{`{"CacheMode": 3}`},
 	})
 	return err
 }
