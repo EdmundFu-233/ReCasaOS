@@ -1,0 +1,69 @@
+# ReCasaOS read-only public file portal edge for stock Caddy 2.11.4+.
+#
+# REQUIRED before use:
+#   1. Replace recasaos.example.invalid and both documentation IPs.
+#   2. Set RECASAOS_PUBLIC_FILE_LISTEN=127.0.0.1:39777. The portal listener
+#      accepts a literal loopback address only.
+#   3. Keep the management Gateway on a private, firewalled, non-public port.
+#      It is not this edge's upstream.
+#   4. Enable and configure the portal as documented in
+#      docs/deployment/public-access.md.
+#   5. Keep RECASAOS_TRUST_LOOPBACK_AUTH_BYPASS unset or 0.
+#
+# This edge intentionally exposes ONLY /public-files. The dashboard and every
+# v1/v2/v3 management API remain unavailable on the public hostname.
+# Stock Caddy has no request-rate limiter in this example. Put a separately
+# reviewed rate-limiting edge/WAF in front before public deployment.
+{
+	auto_https disable_redirects
+}
+http://recasaos.example.invalid {
+	bind 203.0.113.10 [2001:db8::10]
+	redir https://recasaos.example.invalid{uri} 308
+}
+
+https://recasaos.example.invalid {
+	bind 203.0.113.10 [2001:db8::10]
+
+	encode zstd gzip
+
+	# The portal is GET/HEAD-only; reject unexpected bodies before proxying.
+	request_body {
+		max_size 1MB
+	}
+
+	header {
+		-Server
+		# Add includeSubDomains only after every subdomain is HTTPS-only.
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+		Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+	}
+
+	@portal path /public-files /public-files/*
+	handle @portal {
+		# Proxy the dedicated portal listener directly. The Gateway's
+		# /public-files route is an intentional 404 tombstone, not a data path.
+		reverse_proxy 127.0.0.1:39777 {
+			header_up Host {host}
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto https
+			flush_interval -1
+
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 60s
+				read_timeout 1h
+			}
+		}
+	}
+
+	# Positive allowlist: never replace this with a catch-all reverse_proxy.
+	handle {
+		respond 404
+	}
+}
