@@ -60,8 +60,41 @@ jobs:
       - name: Run tests
         run: go test ./...
 
+      - name: Exercise mount-boundary regressions in the ephemeral runner
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        shell: bash
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            GOTOOLCHAIN=local \
+            GOCACHE=/tmp/recasaos-go-build-cache \
+            go test -count=1 ./pkg/filesecurity \
+              -run '^(TestManagedRootsTreeSizeRejectsNestedBindMount|TestManagedDirectoryCopyRejectsBindMountAliasIntoSource|TestManagedReplaceCleanupRejectsBindAliasAncestorOfConfiguredRoot)$'
+
+      - name: Verify isolated Samba probe privilege boundary
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        shell: bash
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            GOTOOLCHAIN=local \
+            GOCACHE=/tmp/recasaos-go-build-cache \
+            go test -count=1 ./pkg/samba \
+              -run '^TestRealProbeSandboxDropsIdentityAndAppliesLimitsBeforeReady$'
+
+      - name: Verify SQLite sticky-directory ownership boundary
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        shell: bash
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            GOTOOLCHAIN=local \
+            GOCACHE=/tmp/recasaos-go-build-cache \
+            go test -count=1 ./pkg/sqlite \
+              -run '^TestPrepareSecureDatabaseDirectoryRejectsForeignOwnedChildInStickyAncestor$'
+
       - name: Run security-sensitive race tests
-        run: go test -race ./pkg/authsecurity ./pkg/filesecurity ./pkg/httpsecurity ./pkg/netsecurity ./pkg/publicfiles ./pkg/utils/file ./route/v1
+        run: go test -race ./pkg/authsecurity ./pkg/filesecurity ./pkg/httpsecurity ./pkg/netsecurity ./pkg/publicfiles ./pkg/samba ./pkg/sqlite ./pkg/utils/file ./pkg/utils/httper ./route/v1 ./service
 
       - name: Run vet
         run: go vet ./...
