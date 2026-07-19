@@ -1,14 +1,16 @@
-//go:generate bash -c "mkdir -p codegen && go run github.com/deepmap/oapi-codegen/cmd/oapi-codegen@v1.12.4 -generate types,server,spec -package codegen api/casaos/openapi.yaml > codegen/casaos_api.go"
-//go:generate bash -c "mkdir -p codegen/message_bus && go run github.com/deepmap/oapi-codegen/cmd/oapi-codegen@v1.12.4 -generate types,client -package message_bus https://raw.githubusercontent.com/IceWhaleTech/CasaOS-MessageBus/main/api/message_bus/openapi.yaml > codegen/message_bus/api.go"
+//go:generate bash -c "mkdir -p codegen && go tool oapi-codegen -generate types,server,spec -package codegen api/casaos/openapi.yaml > codegen/casaos_api.go"
+//go:generate bash -c "mkdir -p codegen/message_bus && go tool oapi-codegen -generate types,client -package message_bus https://raw.githubusercontent.com/IceWhaleTech/CasaOS-MessageBus/ba87168fcfa4ac5ff7a114f66a139eb5fe427646/api/message_bus/openapi.yaml > codegen/message_bus/api.go"
 package main
 
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -22,12 +24,16 @@ import (
 	"github.com/IceWhaleTech/CasaOS/common"
 	"github.com/IceWhaleTech/CasaOS/pkg/cache"
 	"github.com/IceWhaleTech/CasaOS/pkg/config"
+	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
+	"github.com/IceWhaleTech/CasaOS/pkg/publicfiles"
+	"github.com/IceWhaleTech/CasaOS/pkg/samba"
 	"github.com/IceWhaleTech/CasaOS/pkg/sqlite"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/file"
 	"github.com/IceWhaleTech/CasaOS/route"
 	"github.com/IceWhaleTech/CasaOS/service"
 	"github.com/coreos/go-systemd/daemon"
 	"go.uber.org/zap"
+	"golang.org/x/net/netutil"
 
 	"github.com/robfig/cron/v3"
 	"gorm.io/gorm"
@@ -50,12 +56,16 @@ var (
 	//go:embed build/sysroot/etc/casaos/casaos.conf.sample
 	_confSample string
 
-	configFlag  = flag.String("c", "", "config address")
-	dbFlag      = flag.String("db", "", "db path")
-	versionFlag = flag.Bool("v", false, "version")
+	configFlag     = flag.String("c", "", "config address")
+	dbFlag         = flag.String("db", "", "db path")
+	versionFlag    = flag.Bool("v", false, "version")
+	sambaProbeFlag = flag.Bool("internal-samba-probe", false, "internal use only")
 )
 
 func init() {
+	if isInternalSambaProbeInvocation() {
+		return
+	}
 	flag.Parse()
 	if *versionFlag {
 		fmt.Println("v" + common.VERSION)
@@ -81,8 +91,6 @@ func init() {
 
 	service.GetCPUThermalZone()
 
-	route.InitFunction()
-
 	//service.MyService.System().GenreateSystemEntry()
 	///
 	//service.MountLists = make(map[string]*mountlib.MountPoint)
@@ -101,21 +109,66 @@ func init() {
 // @name Authorization
 // @BasePath /v1
 func main() {
+	if isInternalSambaProbeInvocation() {
+		os.Exit(samba.RunInternalProbe())
+	}
 	if *versionFlag {
 		return
 	}
+	managementRoots, err := filesecurity.OpenManagementFileRootsFromEnvironment()
+	if err != nil {
+		panic(fmt.Errorf("initialize management file roots: %w", err))
+	}
+	defer managementRoots.Close()
+	if err := filesecurity.InstallManagementFileRoots(managementRoots); err != nil {
+		panic(err)
+	}
+	route.InitFunction()
 	v1Router := route.InitV1Router()
 
 	v2Router := route.InitV2Router()
 	v2DocRouter := route.InitV2DocRouter(_docHTML, _docYAML)
 	v3File := route.InitFile()
+	handlers := map[string]http.Handler{
+		"v1":           v1Router,
+		"v2":           v2Router,
+		"v3":           v3File,
+		"doc":          v2DocRouter,
+		"public-files": http.NotFoundHandler(),
+	}
+	publicFilePortal, portalErr := publicfiles.NewFromEnv()
+	if portalErr != nil && !errors.Is(portalErr, publicfiles.ErrDisabled) {
+		panic(portalErr)
+	}
+	if publicFilePortal != nil {
+		defer publicFilePortal.Close()
+		publicAddress, err := publicfiles.ListenAddressFromEnv()
+		if err != nil {
+			panic(err)
+		}
+		publicListener, err := net.Listen("tcp", publicAddress)
+		if err != nil {
+			panic(err)
+		}
+		publicListener = netutil.LimitListener(publicListener, 96)
+		publicServer := &http.Server{
+			Handler:           publicFilePortal,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       15 * time.Second,
+			WriteTimeout:      time.Hour,
+			IdleTimeout:       30 * time.Second,
+			MaxHeaderBytes:    32 << 10,
+		}
+		defer publicServer.Close()
+		go func() {
+			if err := publicServer.Serve(publicListener); err != nil && err != http.ErrServerClosed {
+				panic(err)
+			}
+		}()
+		logger.Info("ReCasaOS read-only public file portal is enabled", zap.String("address", publicListener.Addr().String()))
+	}
 	mux := &util_http.HandlerMultiplexer{
-		HandlerMap: map[string]http.Handler{
-			"v1":  v1Router,
-			"v2":  v2Router,
-			"v3":  v3File,
-			"doc": v2DocRouter,
-		},
+		HandlerMap: handlers,
 	}
 
 	crontab := cron.New(cron.WithSeconds())
@@ -148,6 +201,7 @@ func main() {
 		route.V2APIPath,
 		route.V2DocPath,
 		route.V3FilePath,
+		publicfiles.BasePath,
 	}
 	for _, apiPath := range routers {
 		err = service.MyService.Gateway().CreateRoute(&model.Route{
@@ -165,9 +219,16 @@ func main() {
 		response, err := service.MyService.MessageBus().RegisterEventTypesWithResponse(context.Background(), common.EventTypes)
 		if err != nil {
 			logger.Error("error when trying to register one or more event types - some event type will not be discoverable", zap.Error(err))
+			time.Sleep(time.Second)
+			continue
 		}
-		if response != nil && response.StatusCode() != http.StatusOK {
-			logger.Error("error when trying to register one or more event types - some event type will not be discoverable", zap.String("status", response.Status()), zap.String("body", string(response.Body)))
+		if response == nil {
+			logger.Error("message bus returned an empty registration response")
+			time.Sleep(time.Second)
+			continue
+		}
+		if response.StatusCode() != http.StatusOK {
+			logger.Error("error when trying to register one or more event types - some event type will not be discoverable", zap.String("status", response.Status()))
 		}
 		if response.StatusCode() == http.StatusOK {
 			break
@@ -218,12 +279,18 @@ func main() {
 	s := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second, // fix G112: Potential slowloris attack (see https://github.com/securego/gosec)
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	logger.Info("CasaOS main service is listening...", zap.Any("address", listener.Addr().String()))
 	// defer service.MyService.Storage().UnmountAllStorage()
 	err = s.Serve(listener) // not using http.serve() to fix G114: Use of net/http serve function that has no support for setting timeouts (see https://github.com/securego/gosec)
-	if err != nil {
+	if err != nil && err != http.ErrServerClosed {
 		panic(err)
 	}
+}
+
+func isInternalSambaProbeInvocation() bool {
+	return len(os.Args) == 2 && os.Args[1] == samba.InternalProbeArgument
 }

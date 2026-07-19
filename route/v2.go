@@ -5,23 +5,25 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/IceWhaleTech/CasaOS/codegen"
 	"github.com/IceWhaleTech/CasaOS/pkg/config"
+	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
+	"github.com/IceWhaleTech/CasaOS/pkg/httpsecurity"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/file"
 
 	"github.com/IceWhaleTech/CasaOS-Common/external"
-	"github.com/IceWhaleTech/CasaOS-Common/utils/jwt"
+	"github.com/IceWhaleTech/CasaOS/pkg/authsecurity"
 	v2Route "github.com/IceWhaleTech/CasaOS/route/v2"
-	"github.com/deepmap/oapi-codegen/pkg/middleware"
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/getkin/kin-openapi/openapi3filter"
+	echojwt "github.com/labstack/echo-jwt/v4"
 	"github.com/labstack/echo/v4"
 	echo_middleware "github.com/labstack/echo/v4/middleware"
+	"github.com/oapi-codegen/echo-middleware"
 )
 
 var (
@@ -55,42 +57,26 @@ func InitV2Router() http.Handler {
 
 	e := echo.New()
 
-	e.Use((echo_middleware.CORSWithConfig(echo_middleware.CORSConfig{
-		AllowOrigins:     []string{"*"},
-		AllowMethods:     []string{echo.POST, echo.GET, echo.OPTIONS, echo.PUT, echo.DELETE},
-		AllowHeaders:     []string{echo.HeaderAuthorization, echo.HeaderContentLength, echo.HeaderXCSRFToken, echo.HeaderContentType, echo.HeaderAccessControlAllowOrigin, echo.HeaderAccessControlAllowHeaders, echo.HeaderAccessControlAllowMethods, echo.HeaderConnection, echo.HeaderOrigin, echo.HeaderXRequestedWith},
-		ExposeHeaders:    []string{echo.HeaderContentLength, echo.HeaderAccessControlAllowOrigin, echo.HeaderAccessControlAllowHeaders},
-		MaxAge:           172800,
-		AllowCredentials: true,
-	})))
-
 	e.Use(echo_middleware.Gzip())
 
-	e.Use(echo_middleware.Logger())
+	e.Use(safeRequestLogger())
 
-	e.Use(echo_middleware.JWTWithConfig(echo_middleware.JWTConfig{
+	e.Use(echojwt.WithConfig(echojwt.Config{
 		Skipper: func(c echo.Context) bool {
-			return c.RealIP() == "::1" || c.RealIP() == "127.0.0.1"
-			// return true
+			return httpsecurity.LoopbackAuthBypassAllowed(c.Request())
 		},
-		ParseTokenFunc: func(token string, c echo.Context) (interface{}, error) {
-			valid, claims, err := jwt.Validate(token, func() (*ecdsa.PublicKey, error) { return external.GetPublicKey(config.CommonInfo.RuntimePath) })
-			if err != nil || !valid {
+		ParseTokenFunc: func(c echo.Context, token string) (interface{}, error) {
+			claims, err := authsecurity.ValidateAccessToken(token, func() (*ecdsa.PublicKey, error) { return external.GetPublicKey(config.CommonInfo.RuntimePath) })
+			if err != nil {
 				return nil, echo.ErrUnauthorized
 			}
 			c.Request().Header.Set("user_id", strconv.Itoa(claims.ID))
 
 			return claims, nil
 		},
-		TokenLookupFuncs: []echo_middleware.ValuesExtractor{
-			func(ctx echo.Context) ([]string, error) {
-				if len(ctx.Request().Header.Get(echo.HeaderAuthorization)) > 0 {
-					return []string{ctx.Request().Header.Get(echo.HeaderAuthorization)}, nil
-				}
-				return []string{ctx.QueryParam("token")}, nil
-			},
-		},
+		TokenLookup: "header:Authorization,query:token",
 	}))
+	e.Use(privateNoStoreResponses())
 
 	// e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
 	// 	return func(c echo.Context) error {
@@ -114,19 +100,19 @@ func InitV2Router() http.Handler {
 	// 	}
 	// })
 
-	e.Use(middleware.OapiRequestValidatorWithOptions(_swagger, &middleware.Options{
+	e.Use(echomiddleware.OapiRequestValidatorWithOptions(_swagger, &echomiddleware.Options{
 		Skipper: func(c echo.Context) bool {
 			// jump validate when upload file
 			// because file upload can't pass validate
 			// issue: https://github.com/deepmap/oapi-codegen/issues/514
-			return strings.Contains(c.Request().Header[echo.HeaderContentType][0], "multipart/form-data")
+			return strings.Contains(strings.ToLower(c.Request().Header.Get(echo.HeaderContentType)), "multipart/form-data")
 		},
 		Options: openapi3filter.Options{AuthenticationFunc: openapi3filter.NoopAuthenticationFunc},
 	}))
 
 	codegen.RegisterHandlersWithBaseURL(e, appManagement, V2APIPath)
 
-	return e
+	return httpsecurity.WithSecurityHeaders(httpsecurity.WithCORS(e, httpsecurity.AllowedOriginsFromEnv()))
 }
 
 func InitV2DocRouter(docHTML string, docYAML string) http.Handler {
@@ -147,28 +133,79 @@ func InitV2DocRouter(docHTML string, docYAML string) http.Handler {
 }
 
 func InitFile() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token := r.URL.Query().Get("token")
-		if len(token) == 0 {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte(`{"message": "token not found"}`))
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 			return
 		}
 
-		valid, _, errs := jwt.Validate(token, func() (*ecdsa.PublicKey, error) { return external.GetPublicKey(config.CommonInfo.RuntimePath) })
-		if errs != nil || !valid {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte(`{"message": "validation failure"}`))
+		token, ok := accessTokenFromRequest(r)
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 			return
 		}
+		if _, err := authsecurity.ValidateAccessToken(token, func() (*ecdsa.PublicKey, error) { return external.GetPublicKey(config.CommonInfo.RuntimePath) }); err != nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+
 		filePath := r.URL.Query().Get("path")
-		fileName := path.Base(filePath)
-		w.Header().Add("Content-Disposition", "attachment; filename*=utf-8''"+url.PathEscape(fileName))
-		http.ServeFile(w, r, filePath)
-		// http.ServeFile(w, r, filePath)
+		if strings.TrimSpace(filePath) == "" || strings.IndexByte(filePath, 0) >= 0 {
+			http.NotFound(w, r)
+			return
+		}
+		roots, err := filesecurity.ManagementFileRoots()
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+			return
+		}
+		opened, err := roots.OpenRegular(filePath)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		defer opened.Close()
+		info, err := opened.Stat()
+		if err != nil || !info.Mode().IsRegular() {
+			http.NotFound(w, r)
+			return
+		}
+
+		fileName := filepath.Base(filePath)
+		w.Header().Set("Cache-Control", "private, no-store")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Content-Disposition", "attachment; filename*=utf-8''"+url.PathEscape(fileName))
+		http.ServeContent(w, r, fileName, info.ModTime(), opened)
 	})
+	return httpsecurity.WithSecurityHeaders(handler)
+}
+
+func accessTokenFromRequest(r *http.Request) (string, bool) {
+	const maxTokenLength = 16 << 10
+
+	authorization := r.Header.Values(echo.HeaderAuthorization)
+	if len(authorization) > 0 {
+		if len(authorization) != 1 {
+			return "", false
+		}
+		scheme, token, found := strings.Cut(strings.TrimSpace(authorization[0]), " ")
+		token = strings.TrimSpace(token)
+		if !found || !strings.EqualFold(scheme, "Bearer") || token == "" || len(token) > maxTokenLength || strings.ContainsAny(token, " \t\r\n") {
+			return "", false
+		}
+		return token, true
+	}
+
+	// Query tokens are retained temporarily for compatibility with the current
+	// CasaOS UI. Request logging intentionally omits query strings.
+	queryTokens := r.URL.Query()["token"]
+	if len(queryTokens) != 1 || queryTokens[0] == "" || len(queryTokens[0]) > maxTokenLength || strings.ContainsAny(queryTokens[0], " \t\r\n") {
+		return "", false
+	}
+	return queryTokens[0], true
 }
 
 func InitDir() http.Handler {
@@ -181,8 +218,7 @@ func InitDir() http.Handler {
 			return
 		}
 
-		valid, _, errs := jwt.Validate(token, func() (*ecdsa.PublicKey, error) { return external.GetPublicKey(config.CommonInfo.RuntimePath) })
-		if errs != nil || !valid {
+		if _, err := authsecurity.ValidateAccessToken(token, func() (*ecdsa.PublicKey, error) { return external.GetPublicKey(config.CommonInfo.RuntimePath) }); err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			w.Write([]byte(`{"message": "validation failure"}`))
@@ -199,8 +235,13 @@ func InitDir() http.Handler {
 			return
 		}
 		list := strings.Split(files, ",")
+		roots, err := filesecurity.ManagementFileRoots()
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+			return
+		}
 		for _, v := range list {
-			if !file.Exists(v) {
+			if _, err := roots.Stat(v); err != nil {
 				// return ctx.JSON(common_err.SERVICE_ERROR, model.Result{
 				// 	Success: common_err.FILE_DOES_NOT_EXIST,
 				// 	Message: common_err.GetMsg(common_err.FILE_DOES_NOT_EXIST),
@@ -253,7 +294,7 @@ func InitDir() http.Handler {
 		name += extension
 		w.Header().Add("Content-Disposition", "attachment; filename*=utf-8''"+url.PathEscape(name))
 		for _, fname := range list {
-			err = file.AddFile(ar, fname, commonDir)
+			err = file.AddManagedFile(ar, roots, fname, commonDir)
 			if err != nil {
 				log.Printf("Failed to archive %s: %v", fname, err)
 			}

@@ -16,12 +16,13 @@ import (
 	"github.com/IceWhaleTech/CasaOS-Common/utils/command"
 	exec2 "github.com/IceWhaleTech/CasaOS-Common/utils/exec"
 
-	"github.com/IceWhaleTech/CasaOS-Common/utils/file"
 	"github.com/IceWhaleTech/CasaOS-Common/utils/logger"
 	"github.com/IceWhaleTech/CasaOS/common"
 	"github.com/IceWhaleTech/CasaOS/model"
 	"github.com/IceWhaleTech/CasaOS/pkg/config"
+	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/common_err"
+	"github.com/IceWhaleTech/CasaOS/pkg/utils/file"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/httper"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/ip_helper"
 	"github.com/tidwall/gjson"
@@ -35,7 +36,7 @@ import (
 )
 
 type SystemService interface {
-	UpdateSystemVersion(version string)
+	UpdateSystemVersion(version string) error
 	GetSystemConfigDebug() []string
 	GetCasaOSLogs(lineNumber int) string
 	UpdateAssist()
@@ -125,7 +126,10 @@ func (c *systemService) GenreateSystemEntry() {
 	modelsPath := "/var/lib/casaos/www/modules"
 	entryFileName := "entry.json"
 	entryFilePath := filepath.Join(config.AppInfo.DBPath, "db", entryFileName)
-	file.IsNotExistCreateFile(entryFilePath)
+	if err := file.IsNotExistCreateFile(entryFilePath); err != nil && !errors.Is(err, os.ErrExist) {
+		logger.Error("create entry file error", zap.Error(err))
+		return
+	}
 
 	dir, err := os.ReadDir(modelsPath)
 	if err != nil {
@@ -143,7 +147,7 @@ func (c *systemService) GenreateSystemEntry() {
 	}
 	json = strings.TrimRight(json, ",")
 	json += "]"
-	err = os.WriteFile(entryFilePath, []byte(json), 0o666)
+	err = os.WriteFile(entryFilePath, []byte(json), 0o600)
 	if err != nil {
 		logger.Error("write entry file error", zap.Error(err))
 		return
@@ -193,12 +197,18 @@ func (c *systemService) GetMacAddress() (string, error) {
 }
 
 func (c *systemService) MkdirAll(path string) (int, error) {
-	_, err := os.Stat(path)
+	roots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		return common_err.SERVICE_ERROR, err
+	}
+	_, err = roots.Stat(path)
 	if err == nil {
 		return common_err.DIR_ALREADY_EXISTS, nil
 	} else {
 		if os.IsNotExist(err) {
-			os.MkdirAll(path, os.ModePerm)
+			if err := roots.MkdirAll(path, 0o750); err != nil {
+				return common_err.SERVICE_ERROR, err
+			}
 			return common_err.SUCCESS, nil
 		} else if strings.Contains(err.Error(), ": not a directory") {
 			return common_err.FILE_OR_DIR_EXISTS, err
@@ -208,12 +218,16 @@ func (c *systemService) MkdirAll(path string) (int, error) {
 }
 
 func (c *systemService) RenameFile(oldF, newF string) (int, error) {
-	_, err := os.Stat(newF)
+	roots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		return common_err.SERVICE_ERROR, err
+	}
+	_, err = roots.Stat(newF)
 	if err == nil {
 		return common_err.DIR_ALREADY_EXISTS, nil
 	} else {
 		if os.IsNotExist(err) {
-			err := os.Rename(oldF, newF)
+			err := roots.RenameNoReplace(oldF, newF)
 			if err != nil {
 				return common_err.SERVICE_ERROR, err
 			}
@@ -224,12 +238,23 @@ func (c *systemService) RenameFile(oldF, newF string) (int, error) {
 }
 
 func (c *systemService) CreateFile(path string) (int, error) {
-	_, err := os.Stat(path)
+	roots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		return common_err.SERVICE_ERROR, err
+	}
+	_, err = roots.Stat(path)
 	if err == nil {
 		return common_err.FILE_OR_DIR_EXISTS, nil
 	} else {
 		if os.IsNotExist(err) {
-			file.CreateFile(path)
+			created, createErr := roots.CreateExclusive(path, 0o600)
+			if createErr != nil {
+				return common_err.SERVICE_ERROR, createErr
+			}
+			defer created.Abort()
+			if err := created.Close(); err != nil {
+				return common_err.SERVICE_ERROR, err
+			}
 			return common_err.SUCCESS, nil
 		}
 	}
@@ -269,7 +294,11 @@ func (c *systemService) GetNetState(name string) string {
 }
 
 func (c *systemService) GetDirPathOne(path string) (m model.Path) {
-	f, err := os.Stat(path)
+	roots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		return
+	}
+	f, err := roots.Stat(path)
 	if err != nil {
 		return
 	}
@@ -282,6 +311,9 @@ func (c *systemService) GetDirPathOne(path string) (m model.Path) {
 }
 
 func (c *systemService) GetDirPath(path string) ([]model.Path, error) {
+	if path == "" {
+		return []model.Path{{Name: "DATA", Path: "/DATA/", IsDir: true, Date: time.Now()}}, nil
+	}
 	if path == "/DATA" {
 		sysType := runtime.GOOS
 		if sysType == "windows" {
@@ -293,33 +325,42 @@ func (c *systemService) GetDirPath(path string) ([]model.Path, error) {
 
 	}
 
-	ls, err := os.ReadDir(path)
+	roots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		return []model.Path{}, err
+	}
+	location, err := roots.Match(path)
+	if err != nil {
+		return []model.Path{}, err
+	}
+	directory, err := roots.OpenDirectory(location.Canonical)
+	if err != nil {
+		return []model.Path{}, err
+	}
+	ls, err := directory.ReadDir(-1)
+	closeErr := directory.Close()
 	if err != nil {
 		logger.Error("when read dir", zap.Error(err))
 		return []model.Path{}, err
 	}
+	if closeErr != nil {
+		return []model.Path{}, closeErr
+	}
 	dirs := []model.Path{}
-	if len(path) > 0 {
-		for _, l := range ls {
-			filePath := filepath.Join(path, l.Name())
-			link, err := filepath.EvalSymlinks(filePath)
-			if err != nil {
-				link = filePath
-			}
-			tempFile, err := l.Info()
-			if err != nil {
-				logger.Error("when read dir", zap.Error(err))
-				return []model.Path{}, err
-			}
-			temp := model.Path{Name: l.Name(), Path: filePath, IsDir: l.IsDir(), Date: tempFile.ModTime(), Size: tempFile.Size()}
-			if filePath != link {
-				file, _ := os.Stat(link)
-				temp.IsDir = file.IsDir()
-			}
-			dirs = append(dirs, temp)
+	for _, l := range ls {
+		if l.Type()&os.ModeSymlink != 0 {
+			continue
 		}
-	} else {
-		dirs = append(dirs, model.Path{Name: "DATA", Path: "/DATA/", IsDir: true, Date: time.Now()})
+		filePath := filepath.Join(location.Canonical, l.Name())
+		tempFile, err := l.Info()
+		if err != nil {
+			logger.Error("when read dir", zap.Error(err))
+			return []model.Path{}, err
+		}
+		if !tempFile.IsDir() && !tempFile.Mode().IsRegular() {
+			continue
+		}
+		dirs = append(dirs, model.Path{Name: l.Name(), Path: filePath, IsDir: tempFile.IsDir(), Date: tempFile.ModTime(), Size: tempFile.Size()})
 	}
 	return dirs, nil
 }
@@ -370,23 +411,10 @@ func (c *systemService) GetNet(physics bool) []string {
 	}
 }
 
-func (s *systemService) UpdateSystemVersion(version string) {
+func (s *systemService) UpdateSystemVersion(_ string) error {
 	keyName := "casa_version"
 	Cache.Delete(keyName)
-	if file.Exists(config.AppInfo.LogPath + "/upgrade.log") {
-		os.Remove(config.AppInfo.LogPath + "/upgrade.log")
-	}
-	file.CreateFile(config.AppInfo.LogPath + "/upgrade.log")
-	// go command2.OnlyExec("curl -fsSL https://raw.githubusercontent.com/LinkLeong/casaos-alpha/main/update.sh | bash")
-	if len(config.ServerInfo.UpdateUrl) > 0 {
-		go command.OnlyExec("curl -fsSL " + config.ServerInfo.UpdateUrl + " | bash")
-	} else {
-		osRelease, _ := file.ReadOSRelease()
-		go command.OnlyExec("curl -fsSL https://get.casaos.io/update?t=" + osRelease["MANUFACTURER"] + " | bash")
-	}
-
-	// s.log.Error(config.AppInfo.ProjectPath + "/shell/tool.sh -r " + version)
-	// s.log.Error(command2.ExecResultStr(config.AppInfo.ProjectPath + "/shell/tool.sh -r " + version))
+	return errors.New("automatic updates are disabled until ReCasaOS publishes a signed component manifest and rollback-capable installer")
 }
 
 func (s *systemService) UpdateAssist() {

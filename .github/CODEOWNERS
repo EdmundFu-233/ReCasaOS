@@ -1,0 +1,18 @@
+# ReCasaOS security-sensitive surfaces require an explicit maintainer review.
+/.github/ @EdmundFu-233
+/.goreleaser.debug.yaml @EdmundFu-233
+/.goreleaser.yaml @EdmundFu-233
+/deploy/ @EdmundFu-233
+/docs/deployment/ @EdmundFu-233
+/docs/THREAT_MODEL.md @EdmundFu-233
+/go.mod @EdmundFu-233
+/go.sum @EdmundFu-233
+/main.go @EdmundFu-233
+/pkg/authsecurity/ @EdmundFu-233
+/pkg/filesecurity/ @EdmundFu-233
+/pkg/httpsecurity/ @EdmundFu-233
+/pkg/netsecurity/ @EdmundFu-233
+/pkg/publicfiles/ @EdmundFu-233
+/route/ @EdmundFu-233
+/service/ @EdmundFu-233
+/SECURITY.md @EdmundFu-233

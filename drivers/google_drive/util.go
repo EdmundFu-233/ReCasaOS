@@ -38,9 +38,9 @@ func (d *GoogleDrive) getRefreshToken() error {
 	if err != nil {
 		return err
 	}
-	logger.Info("get refresh token", zap.String("res", res.String()))
+	logger.Info("Google Drive OAuth token exchange completed", zap.Int("status", res.StatusCode()))
 	if e.Error != "" {
-		return fmt.Errorf(e.Error)
+		return fmt.Errorf("%s", e.Error)
 	}
 	d.RefreshToken = resp.RefreshToken
 	return nil
@@ -60,9 +60,9 @@ func (d *GoogleDrive) refreshToken() error {
 	if err != nil {
 		return err
 	}
-	log.Debug(res.String())
+	log.WithField("status", res.StatusCode()).Debug("Google Drive OAuth token refresh completed")
 	if e.Error != "" {
-		return fmt.Errorf(e.Error)
+		return fmt.Errorf("%s", e.Error)
 	}
 	d.AccessToken = resp.AccessToken
 	return nil

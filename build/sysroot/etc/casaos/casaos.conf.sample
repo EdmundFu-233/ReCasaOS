@@ -14,8 +14,8 @@ UserDataPath = /var/lib/casaos/conf
 
 [server]
 RunMode = release
-ServerApi = https://api.casaos.io/casaos-api
-Handshake = socket.casaos.io
+ServerApi =
+Handshake =
 Token = 
 USBAutoMount =
 

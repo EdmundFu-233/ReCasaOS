@@ -5,12 +5,10 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/IceWhaleTech/CasaOS-Common/utils/logger"
 	"github.com/IceWhaleTech/CasaOS/internal/driver"
 	"github.com/IceWhaleTech/CasaOS/model"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils"
 	"github.com/go-resty/resty/v2"
-	"go.uber.org/zap"
 )
 
 type Dropbox struct {
@@ -64,13 +62,12 @@ func (d *Dropbox) Link(ctx context.Context, file model.Obj, args model.LinkArgs)
 func (d *Dropbox) GetUserInfo(ctx context.Context) (string, error) {
 	url := "https://api.dropboxapi.com/2/users/get_current_account"
 	user := UserInfo{}
-	resp, err := d.request(url, http.MethodPost, func(req *resty.Request) {
+	_, err := d.request(url, http.MethodPost, func(req *resty.Request) {
 		req.SetHeader("Content-Type", "")
 	}, &user)
 	if err != nil {
 		return "", err
 	}
-	logger.Info("resp", zap.Any("resp", string(resp)))
 	return user.Email, nil
 }
 func (d *Dropbox) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {

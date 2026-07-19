@@ -1,0 +1,98 @@
+# Install under nginx's http context (for example, /etc/nginx/conf.d/).
+# REQUIRED before use:
+#   1. Replace recasaos.example.invalid and the documentation IPs.
+#   2. Replace the certificate paths.
+#   3. Set RECASAOS_PUBLIC_FILE_LISTEN=127.0.0.1:39777. The portal listener
+#      accepts a literal loopback address only.
+#   4. Keep the management Gateway on a private, firewalled, non-public port.
+#      It is not this edge's upstream.
+#   5. Enable the read-only portal as documented in
+#      docs/deployment/public-access.md.
+#   6. Keep RECASAOS_TRUST_LOOPBACK_AUTH_BYPASS unset or 0.
+#
+# This edge intentionally exposes ONLY /public-files. Every administrative,
+# setup, SSH, and v1/v2/v3 route returns 404 on the public hostname.
+
+log_format recasaos_no_query '$remote_addr - $remote_user [$time_local] '
+                              '"$request_method $uri $server_protocol" $status $body_bytes_sent '
+                              '"$http_user_agent"';
+
+limit_req_zone $binary_remote_addr zone=recasaos_public_files:10m rate=30r/s;
+limit_conn_zone $binary_remote_addr zone=recasaos_connections:10m;
+
+upstream recasaos_public_files {
+    # The Gateway's /public-files route is an intentional 404 tombstone.
+    server 127.0.0.1:39777;
+    keepalive 16;
+}
+
+server {
+    listen 203.0.113.10:80;
+    listen [2001:db8::10]:80;
+    server_name recasaos.example.invalid;
+    access_log /var/log/nginx/recasaos_access.log recasaos_no_query;
+
+    return 308 https://recasaos.example.invalid$request_uri;
+}
+
+server {
+    listen 203.0.113.10:443 ssl;
+    listen [2001:db8::10]:443 ssl;
+    http2 on;
+    server_name recasaos.example.invalid;
+
+    server_tokens off;
+    access_log /var/log/nginx/recasaos_access.log recasaos_no_query;
+    error_log /var/log/nginx/recasaos_error.log warn;
+
+    ssl_certificate /etc/letsencrypt/live/recasaos.example.invalid/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/recasaos.example.invalid/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:recasaos_tls:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    client_max_body_size 1m;
+    client_body_timeout 15s;
+    limit_req_status 429;
+    limit_conn_status 429;
+    limit_conn recasaos_connections 40;
+
+    # Add includeSubDomains only after every subdomain is HTTPS-only.
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()" always;
+    add_header Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'" always;
+
+    location = /public-files {
+        limit_req zone=recasaos_public_files burst=60 nodelay;
+        proxy_pass http://recasaos_public_files;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+    }
+
+    location ^~ /public-files/ {
+        limit_req zone=recasaos_public_files burst=60 nodelay;
+        proxy_pass http://recasaos_public_files;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+    }
+
+    location / {
+        return 404;
+    }
+}

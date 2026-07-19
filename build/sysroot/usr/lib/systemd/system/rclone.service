@@ -2,9 +2,11 @@
 Description=rclone
 
 [Service]
-ExecStartPre=/usr/bin/mkdir -p /var/run/rclone 
-ExecStartPre=/usr/bin/rm -f /var/run/rclone/rclone.sock
-ExecStart=/usr/bin/rclone rcd --rc-addr unix:///var/run/rclone/rclone.sock --rc-no-auth --rc-allow-origin "*"
+RuntimeDirectory=rclone
+RuntimeDirectoryMode=0700
+UMask=0077
+ExecStartPre=/usr/bin/rm -f /run/rclone/rclone.sock
+ExecStart=/usr/bin/rclone rcd --rc-addr unix:///run/rclone/rclone.sock --rc-no-auth
 Restart=always
 RestartSec=10
 

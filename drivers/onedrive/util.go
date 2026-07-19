@@ -81,7 +81,7 @@ func (d *Onedrive) getRefreshToken() error {
 	if err != nil {
 		return err
 	}
-	logger.Info("get refresh token", zap.String("res", res.String()))
+	logger.Info("OneDrive OAuth token exchange completed", zap.Int("status", res.StatusCode()))
 	if e.Error != "" {
 		return fmt.Errorf("%s", e.ErrorDescription)
 	}
@@ -107,7 +107,7 @@ func (d *Onedrive) _refreshToken() error {
 	if err != nil {
 		return err
 	}
-	logger.Info("get refresh token", zap.String("res", res.String()))
+	logger.Info("OneDrive OAuth token refresh completed", zap.Int("status", res.StatusCode()))
 	if e.Error != "" {
 		return fmt.Errorf("%s", e.ErrorDescription)
 	}

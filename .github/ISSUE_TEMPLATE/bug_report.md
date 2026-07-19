@@ -28,12 +28,12 @@ assignees: ''
 
 > If applicable, add screenshots to help explain your problem.
 
-**Desktop (please complete the following information):**
+**ReCasaOS build and client (please complete the following information):**
 
 ```
- - OS: [e.g. iOS]
- - Browser [e.g. chrome, safari]
- - Version [e.g. 22]
+ - ReCasaOS version and full commit SHA:
+ - Host OS and architecture:
+ - Browser/client and version:
 ```
 
 **System Time**
@@ -44,9 +44,9 @@ assignees: ''
 (timedatectl output here)
 ```
 
-**Logs**
+**Sanitized logs**
 
-> Run following command to collect corresponding logs:
+> Remove tokens, cookies, passwords, OAuth codes, private paths, public IPs, hostnames, email addresses, and personal data before posting. For security defects, use the private Security report link instead of a public issue.
 
 ```bash
 sudo journalctl -xef -u casaos-gateway

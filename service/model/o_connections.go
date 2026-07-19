@@ -21,6 +21,8 @@ type ConnectionsDBModel struct {
 	Status      string `json:"status"`
 	Directories string `json:"directories"` // string array
 	MountPoint  string `json:"mount_point"` //parent directory of mount point
+	BootID      string `json:"-"`
+	MountIDs    string `json:"-"` // JSON map of share name to Linux mount ID
 }
 
 func (p *ConnectionsDBModel) TableName() string {

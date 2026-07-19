@@ -34,13 +34,13 @@ func GetBlockInfo(fileSize int64) (blockSize int, length int) {
 	return
 }
 
-//get the hash of the data
+// get the hash of the data
 func GetHashByContent(data []byte) string {
 	sum := md5.Sum(data)
 	return hex.EncodeToString(sum[:])
 }
 
-//get the hash of the data
+// get the hash of the data
 func GetHashByPath(path string) string {
 	pFile, err := os.Open(path)
 	if err != nil {
@@ -52,13 +52,13 @@ func GetHashByPath(path string) string {
 	return hex.EncodeToString(md5h.Sum(nil))
 }
 
-//Comparison data hash
+// Comparison data hash
 func ComparisonHash(data []byte, hash string) bool {
 	sum := md5.Sum(data)
 	return hex.EncodeToString(sum[:]) == hash
 }
 
-//get prefix byte length
+// get prefix byte length
 func PrefixLength(byteLength int) []byte {
 	lengthByte := []byte{'0', '0', '0', '0', '0', '0'}
 	bSize := strconv.Itoa(byteLength)
@@ -69,7 +69,7 @@ func PrefixLength(byteLength int) []byte {
 	return lengthByte
 }
 
-//get data byte length
+// get data byte length
 func DataLength(length int) []byte {
 	lengthByte := []byte{'0', '0', '0', '0', '0', '0', '0', '0'}
 	bSize := strconv.Itoa(length)

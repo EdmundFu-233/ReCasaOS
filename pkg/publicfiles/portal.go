@@ -1,0 +1,415 @@
+package publicfiles
+
+import (
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"mime"
+	"net/http"
+	"net/url"
+	"os"
+	pathpkg "path"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+)
+
+const (
+	// BasePath is deliberately separate from the administrative CasaOS APIs.
+	BasePath = "/public-files"
+
+	DefaultMaxDirectoryEntries = 1_000
+	DefaultMaxActiveDownloads  = 64
+	maxBearerTokenBytes        = 4_096
+)
+
+var (
+	ErrDisabled    = errors.New("public file portal is disabled")
+	ErrUnsupported = errors.New("public file portal requires Linux openat2 support")
+	errEntryLimit  = errors.New("directory entry limit exceeded")
+)
+
+// Config contains the complete public-file security boundary. Root and
+// TokenFile must be absolute paths. The token is intentionally loaded from a
+// protected file instead of an environment variable.
+type Config struct {
+	Root         string
+	TokenFile    string
+	MaxEntries   int
+	MaxDownloads int
+}
+
+// Entry is the minimal metadata exposed by the directory-list endpoint.
+// Host paths, ownership, permissions, inode numbers and timestamps are never
+// returned.
+type Entry struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+	Size int64  `json:"size"`
+}
+
+// Portal is a read-only http.Handler rooted at a directory descriptor.
+type Portal struct {
+	root          *secureRoot
+	tokenDigest   [sha256.Size]byte
+	maxEntries    int
+	downloadSlots chan struct{}
+}
+
+// NewFromEnv creates a portal only when RECASAOS_PUBLIC_FILE_ENABLED is
+// exactly "1". An enabled but incomplete or unsafe configuration fails
+// closed with an error.
+func NewFromEnv() (*Portal, error) {
+	if os.Getenv("RECASAOS_PUBLIC_FILE_ENABLED") != "1" {
+		return nil, ErrDisabled
+	}
+
+	return New(Config{
+		Root:      os.Getenv("RECASAOS_PUBLIC_FILE_ROOT"),
+		TokenFile: os.Getenv("RECASAOS_PUBLIC_FILE_TOKEN_FILE"),
+	})
+}
+
+// New validates the configured paths, securely opens the root directory and
+// loads the bearer token. It does not provide a non-openat2 filesystem
+// fallback because a weaker path check would reintroduce symlink and TOCTOU
+// escapes.
+func New(config Config) (*Portal, error) {
+	rootPath, err := validateAbsoluteConfigPath(config.Root, false)
+	if err != nil {
+		return nil, fmt.Errorf("public file root is invalid: %w", err)
+	}
+	tokenPath, err := validateAbsoluteConfigPath(config.TokenFile, true)
+	if err != nil {
+		return nil, fmt.Errorf("public file token file is invalid: %w", err)
+	}
+	if pathContains(rootPath, tokenPath) {
+		return nil, errors.New("public file token file must be outside the shared root")
+	}
+
+	maxEntries := config.MaxEntries
+	if maxEntries == 0 {
+		maxEntries = DefaultMaxDirectoryEntries
+	}
+	if maxEntries < 1 || maxEntries > DefaultMaxDirectoryEntries {
+		return nil, fmt.Errorf("public file directory limit must be between 1 and %d", DefaultMaxDirectoryEntries)
+	}
+	maxDownloads := config.MaxDownloads
+	if maxDownloads == 0 {
+		maxDownloads = DefaultMaxActiveDownloads
+	}
+	if maxDownloads < 1 || maxDownloads > DefaultMaxActiveDownloads {
+		return nil, fmt.Errorf("public file download limit must be between 1 and %d", DefaultMaxActiveDownloads)
+	}
+
+	token, err := readTokenFileSecure(tokenPath)
+	if err != nil {
+		return nil, fmt.Errorf("public file token file is unsafe: %w", err)
+	}
+	tokenDigest := sha256.Sum256(token)
+	for index := range token {
+		token[index] = 0
+	}
+	root, err := openSecureRoot(rootPath)
+	if err != nil {
+		return nil, fmt.Errorf("public file root is unsafe: %w", err)
+	}
+
+	return &Portal{
+		root:          root,
+		tokenDigest:   tokenDigest,
+		maxEntries:    maxEntries,
+		downloadSlots: make(chan struct{}, maxDownloads),
+	}, nil
+}
+
+func validateAbsoluteConfigPath(value string, allowFile bool) (string, error) {
+	if value == "" || strings.IndexByte(value, 0) >= 0 || !filepath.IsAbs(value) {
+		return "", errors.New("an absolute path is required")
+	}
+	clean := filepath.Clean(value)
+	if clean != value {
+		return "", errors.New("the path must already be clean")
+	}
+	if clean == string(filepath.Separator) {
+		if allowFile {
+			return "", errors.New("the filesystem root is not a file")
+		}
+		return "", errors.New("the filesystem root cannot be shared")
+	}
+	return clean, nil
+}
+
+func pathContains(root, candidate string) bool {
+	relative, err := filepath.Rel(root, candidate)
+	if err != nil {
+		return false
+	}
+	return relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))
+}
+
+// Close releases the pinned root directory descriptor. Call it only after the
+// HTTP server has stopped accepting requests.
+func (p *Portal) Close() error {
+	if p == nil || p.root == nil {
+		return nil
+	}
+	return p.root.close()
+}
+
+func (p *Portal) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	setSecurityHeaders(w.Header())
+
+	switch r.URL.Path {
+	case BasePath:
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			writeError(w, r, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		http.Redirect(w, r, BasePath+"/", http.StatusPermanentRedirect)
+	case BasePath + "/":
+		p.serveAsset(w, r, "text/html; charset=utf-8", portalHTML)
+	case BasePath + "/app.js":
+		p.serveAsset(w, r, "text/javascript; charset=utf-8", portalJavaScript)
+	case BasePath + "/style.css":
+		p.serveAsset(w, r, "text/css; charset=utf-8", portalCSS)
+	case BasePath + "/api/list":
+		p.serveList(w, r)
+	case BasePath + "/api/file":
+		p.serveFile(w, r)
+	default:
+		writeError(w, r, http.StatusNotFound, "not found")
+	}
+}
+
+func setSecurityHeaders(header http.Header) {
+	header.Set("Cache-Control", "no-store")
+	header.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+	header.Set("Cross-Origin-Opener-Policy", "same-origin")
+	header.Set("Cross-Origin-Resource-Policy", "same-origin")
+	header.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
+	header.Set("Referrer-Policy", "no-referrer")
+	header.Set("X-Content-Type-Options", "nosniff")
+	header.Set("X-Frame-Options", "DENY")
+}
+
+func (p *Portal) serveAsset(w http.ResponseWriter, r *http.Request, contentType, content string) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		writeError(w, r, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", fmt.Sprint(len(content)))
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodGet {
+		_, _ = w.Write([]byte(content))
+	}
+}
+
+func (p *Portal) serveList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		writeError(w, r, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !p.authorized(r) {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="ReCasaOS public files"`)
+		writeError(w, r, http.StatusUnauthorized, "authorization required")
+		return
+	}
+	query, err := parseSafeQuery(r.URL.RawQuery)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid query")
+		return
+	}
+	relativePath, err := validateRelativePath(query.Get("path"), true)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid relative path")
+		return
+	}
+
+	entries, err := p.root.list(relativePath, p.maxEntries)
+	if err != nil {
+		if errors.Is(err, errEntryLimit) {
+			writeError(w, r, http.StatusRequestEntityTooLarge, "directory entry limit exceeded")
+			return
+		}
+		if isHiddenFilesystemError(err) {
+			writeError(w, r, http.StatusNotFound, "not found")
+			return
+		}
+		writeError(w, r, http.StatusInternalServerError, "unable to list directory")
+		return
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Type != entries[j].Type {
+			return entries[i].Type == "directory"
+		}
+		return entries[i].Name < entries[j].Name
+	})
+	writeJSON(w, r, http.StatusOK, struct {
+		Path    string  `json:"path"`
+		Entries []Entry `json:"entries"`
+	}{Path: relativePath, Entries: entries})
+}
+
+func (p *Portal) serveFile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		writeError(w, r, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !p.authorized(r) {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="ReCasaOS public files"`)
+		writeError(w, r, http.StatusUnauthorized, "authorization required")
+		return
+	}
+	query, err := parseSafeQuery(r.URL.RawQuery)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid query")
+		return
+	}
+	relativePath, err := validateRelativePath(query.Get("path"), false)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid relative path")
+		return
+	}
+	select {
+	case p.downloadSlots <- struct{}{}:
+		defer func() { <-p.downloadSlots }()
+	default:
+		w.Header().Set("Retry-After", "5")
+		writeError(w, r, http.StatusServiceUnavailable, "download capacity reached")
+		return
+	}
+
+	file, info, err := p.root.openRegular(relativePath)
+	if err != nil {
+		if isHiddenFilesystemError(err) {
+			writeError(w, r, http.StatusNotFound, "not found")
+			return
+		}
+		writeError(w, r, http.StatusInternalServerError, "unable to open file")
+		return
+	}
+	defer file.Close()
+
+	filename := pathpkg.Base(relativePath)
+	disposition := mime.FormatMediaType("attachment", map[string]string{"filename": filename})
+	if disposition == "" {
+		disposition = "attachment"
+	}
+	w.Header().Set("Content-Disposition", disposition)
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Accept-Ranges", "bytes")
+	http.ServeContent(w, r, filename, info.ModTime(), file)
+}
+
+func parseSafeQuery(rawQuery string) (url.Values, error) {
+	query, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return nil, err
+	}
+	for key := range query {
+		switch strings.ToLower(key) {
+		case "token", "access_token", "authorization", "api_key", "apikey":
+			return nil, errors.New("credentials are not accepted in the query string")
+		}
+		if key != "path" || len(query[key]) != 1 {
+			return nil, errors.New("only one path query parameter is accepted")
+		}
+	}
+	return query, nil
+}
+
+func validateRelativePath(value string, allowRoot bool) (string, error) {
+	if value == "" {
+		if allowRoot {
+			return "", nil
+		}
+		return "", errors.New("a file path is required")
+	}
+	if len(value) > 4_096 || strings.IndexByte(value, 0) >= 0 || strings.Contains(value, "\\") || strings.HasPrefix(value, "/") {
+		return "", errors.New("path must be relative")
+	}
+	parts := strings.Split(value, "/")
+	for _, part := range parts {
+		if !isSafeVisibleName(part) || part == "." || part == ".." || strings.HasPrefix(part, ".") {
+			return "", errors.New("path contains a forbidden component")
+		}
+	}
+	if pathpkg.Clean(value) != value {
+		return "", errors.New("path must already be clean")
+	}
+	return value, nil
+}
+
+func isSafeVisibleName(value string) bool {
+	if value == "" || !utf8.ValidString(value) {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *Portal) authorized(r *http.Request) bool {
+	candidate := []byte(nil)
+	values := r.Header.Values("Authorization")
+	if len(values) == 1 {
+		parts := strings.SplitN(values[0], " ", 2)
+		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") && len(parts[1]) <= maxBearerTokenBytes && !strings.ContainsAny(parts[1], " \t\r\n") {
+			candidate = []byte(parts[1])
+		}
+	}
+	candidateDigest := sha256.Sum256(candidate)
+	return subtle.ConstantTimeCompare(candidateDigest[:], p.tokenDigest[:]) == 1
+}
+
+func writeJSON(w http.ResponseWriter, r *http.Request, status int, value any) {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "unable to encode response")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Length", fmt.Sprint(len(payload)))
+	w.WriteHeader(status)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(payload)
+	}
+}
+
+func writeError(w http.ResponseWriter, r *http.Request, status int, message string) {
+	payload, _ := json.Marshal(struct {
+		Error string `json:"error"`
+	}{Error: message})
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Length", fmt.Sprint(len(payload)))
+	w.WriteHeader(status)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(payload)
+	}
+}
+
+// fileInfo is the subset used by http.ServeContent and keeps the platform
+// implementation private.
+type fileInfo interface {
+	Name() string
+	Size() int64
+	Mode() os.FileMode
+	ModTime() time.Time
+	IsDir() bool
+	Sys() any
+}

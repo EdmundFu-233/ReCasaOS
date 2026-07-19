@@ -1,14 +1,5 @@
-blank_issues_enabled: false
+blank_issues_enabled: true
 contact_links:
-  - name: App Request
-    url: https://github.com/IceWhaleTech/CasaOS-AppStore/issues/new?assignees=&labels=App+Request&template=app_request.yml&title=%5BApp+Request%5D+AppName
-    about: Request to add an app to the app store.
-  - name: Feature/Enhancement Ideas
-    url: https://github.com/IceWhaleTech/CasaOS/discussions/164
-    about: Have an idea for a new feature/enhancement?
-  - name: Questions, Discussions
-    url: https://github.com/IceWhaleTech/CasaOS/discussions
-    about: Ask questions, propose ideas, or discuss anything related to CasaOS
-  - name: Discord
-    url: https://discord.gg/knqAbbBbeX
-    about: Get help or share great ideas on Discord!
+  - name: Private security report
+    url: https://github.com/EdmundFu-233/ReCasaOS/security/advisories/new
+    about: Report a vulnerability privately; never place secrets or exploit details in a public issue.

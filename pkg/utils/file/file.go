@@ -3,21 +3,16 @@ package file
 import (
 	"bufio"
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"io/ioutil"
-	"log"
 	"mime/multipart"
 	"os"
 	"path"
-	path2 "path"
 	"path/filepath"
 	"strconv"
 	"strings"
-
-	"github.com/mholt/archiver/v3"
 )
 
 // GetSize get the file size
@@ -58,13 +53,11 @@ func IsNotExistMkDir(src string) error {
 
 // MkDir create a directory
 func MkDir(src string) error {
-	err := os.MkdirAll(src, os.ModePerm)
+	err := os.MkdirAll(src, 0o750)
 	if err != nil {
 		return err
 	}
-	os.Chmod(src, 0o777)
-
-	return nil
+	return os.Chmod(src, 0o750)
 }
 
 // RMDir remove a directory
@@ -156,7 +149,7 @@ func IsFile(path string) bool {
 }
 
 func CreateFile(path string) error {
-	file, err := os.Create(path)
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
@@ -165,7 +158,7 @@ func CreateFile(path string) error {
 }
 
 func CreateFileAndWriteContent(path string, content string) error {
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0o666)
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
@@ -203,150 +196,6 @@ func ReadFullFile(path string) []byte {
 	return content
 }
 
-// File copies a single file from src to dst
-func CopyFile(src, dst, style string) error {
-	var err error
-	var srcfd *os.File
-	var dstfd *os.File
-	var srcinfo os.FileInfo
-
-	lastPath := src[strings.LastIndex(src, "/")+1:]
-
-	if !strings.HasSuffix(dst, "/") {
-		dst += "/"
-	}
-	dst += lastPath
-	if Exists(dst) {
-		if style == "skip" {
-			return nil
-		} else {
-			os.Remove(dst)
-		}
-	}
-
-	if srcfd, err = os.Open(src); err != nil {
-		return err
-	}
-	defer srcfd.Close()
-
-	if dstfd, err = os.Create(dst); err != nil {
-		return err
-	}
-	defer dstfd.Close()
-
-	if _, err = io.Copy(dstfd, srcfd); err != nil {
-		return err
-	}
-	if srcinfo, err = os.Stat(src); err != nil {
-		return err
-	}
-	return os.Chmod(dst, srcinfo.Mode())
-}
-
-/**
- * @description:
- * @param {*} src
- * @param {*} dst
- * @param {string} style
- * @return {*}
- * @method:
- * @router:
- */
-func CopySingleFile(src, dst, style string) error {
-	var err error
-	var srcfd *os.File
-	var dstfd *os.File
-	var srcinfo os.FileInfo
-
-	if Exists(dst) {
-		if style == "skip" {
-			return nil
-		} else {
-			os.Remove(dst)
-		}
-	}
-
-	if srcfd, err = os.Open(src); err != nil {
-		return err
-	}
-	defer srcfd.Close()
-
-	if dstfd, err = os.Create(dst); err != nil {
-		return err
-	}
-	defer dstfd.Close()
-
-	if _, err = io.Copy(dstfd, srcfd); err != nil {
-		return err
-	}
-	if srcinfo, err = os.Stat(src); err != nil {
-		return err
-	}
-	return os.Chmod(dst, srcinfo.Mode())
-}
-
-// Check for duplicate file names
-func GetNoDuplicateFileName(fullPath string) string {
-	path, fileName := filepath.Split(fullPath)
-	fileSuffix := path2.Ext(fileName)
-	filenameOnly := strings.TrimSuffix(fileName, fileSuffix)
-	for i := 0; Exists(fullPath); i++ {
-		fullPath = path2.Join(path, filenameOnly+"("+strconv.Itoa(i+1)+")"+fileSuffix)
-	}
-	return fullPath
-}
-
-// Dir copies a whole directory recursively
-func CopyDir(src string, dst string, style string) error {
-	var err error
-	var fds []os.FileInfo
-	var srcinfo os.FileInfo
-
-	if srcinfo, err = os.Stat(src); err != nil {
-		return err
-	}
-	if !srcinfo.IsDir() {
-		if err = CopyFile(src, dst, style); err != nil {
-			fmt.Println(err)
-		}
-		return nil
-	}
-	// dstPath := dst
-	lastPath := src[strings.LastIndex(src, "/")+1:]
-	dst += "/" + lastPath
-	// for i := 0; Exists(dst); i++ {
-	// 	dst = dstPath + "/" + lastPath + strconv.Itoa(i+1)
-	// }
-	if Exists(dst) {
-		if style == "skip" {
-			return nil
-		} else {
-			os.Remove(dst)
-		}
-	}
-	if err = os.MkdirAll(dst, srcinfo.Mode()); err != nil {
-		return err
-	}
-	if fds, err = ioutil.ReadDir(src); err != nil {
-		return err
-	}
-	for _, fd := range fds {
-		srcfp := path.Join(src, fd.Name())
-		dstfp := dst // path.Join(dst, fd.Name())
-
-		if fd.IsDir() {
-			if err = CopyDir(srcfp, dstfp, style); err != nil {
-				fmt.Println(err)
-			}
-		} else {
-			if err = CopyFile(srcfp, dstfp, style); err != nil {
-				fmt.Println(err)
-			}
-		}
-	}
-	return nil
-}
-
 func WriteToPath(data []byte, path, name string) error {
 	fullPath := path
 	if strings.HasSuffix(path, "/") {
@@ -354,7 +203,7 @@ func WriteToPath(data []byte, path, name string) error {
 	} else {
 		fullPath += "/" + name
 	}
-	return WriteToFullPath(data, fullPath, 0o666)
+	return WriteToFullPath(data, fullPath, 0o600)
 }
 
 func WriteToFullPath(data []byte, fullPath string, perm fs.FileMode) error {
@@ -370,6 +219,9 @@ func WriteToFullPath(data []byte, fullPath string, perm fs.FileMode) error {
 		return err
 	}
 	defer file.Close()
+	if err := file.Chmod(perm); err != nil {
+		return err
+	}
 	_, err = file.Write(data)
 
 	return err
@@ -385,7 +237,7 @@ func SpliceFiles(dir, path string, length int, startPoint int) error {
 
 	file, _ := os.OpenFile(fullPath,
 		os.O_WRONLY|os.O_TRUNC|os.O_CREATE,
-		0o666,
+		0o600,
 	)
 
 	defer file.Close()
@@ -405,76 +257,6 @@ func SpliceFiles(dir, path string, length int, startPoint int) error {
 	}
 
 	bufferedWriter.Flush()
-
-	return nil
-}
-
-func GetCompressionAlgorithm(t string) (string, archiver.Writer, error) {
-	switch t {
-	case "zip", "":
-		return ".zip", archiver.NewZip(), nil
-	case "tar":
-		return ".tar", archiver.NewTar(), nil
-	case "targz":
-		return ".tar.gz", archiver.NewTarGz(), nil
-	case "tarbz2":
-		return ".tar.bz2", archiver.NewTarBz2(), nil
-	case "tarxz":
-		return ".tar.xz", archiver.NewTarXz(), nil
-	case "tarlz4":
-		return ".tar.lz4", archiver.NewTarLz4(), nil
-	case "tarsz":
-		return ".tar.sz", archiver.NewTarSz(), nil
-	default:
-		return "", nil, errors.New("format not implemented")
-	}
-}
-
-func AddFile(ar archiver.Writer, path, commonPath string) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-
-	if !info.IsDir() && !info.Mode().IsRegular() {
-		return nil
-	}
-
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	if path != commonPath {
-		//filename := info.Name()
-		filename := strings.TrimPrefix(path, commonPath)
-		filename = strings.TrimPrefix(filename, string(filepath.Separator))
-		err = ar.Write(archiver.File{
-			FileInfo: archiver.FileInfo{
-				FileInfo:   info,
-				CustomName: filename,
-			},
-			ReadCloser: file,
-		})
-		if err != nil {
-			return err
-		}
-	}
-
-	if info.IsDir() {
-		names, err := file.Readdirnames(0)
-		if err != nil {
-			return err
-		}
-
-		for _, name := range names {
-			err = AddFile(ar, filepath.Join(path, name), commonPath)
-			if err != nil {
-				log.Printf("Failed to archive %v", err)
-			}
-		}
-	}
 
 	return nil
 }
@@ -532,52 +314,6 @@ func CommonPrefix(sep byte, paths ...string) string {
 	}
 
 	return string(c)
-}
-
-func GetFileOrDirSize(path string) (int64, error) {
-	fileInfo, err := os.Stat(path)
-	if err != nil {
-		return 0, err
-	}
-	if fileInfo.IsDir() {
-		return DirSizeB(path + "/")
-	}
-	return fileInfo.Size(), nil
-}
-
-// getFileSize get file size by path(B)
-func DirSizeB(path string) (int64, error) {
-	var size int64
-	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
-		if !info.IsDir() {
-			size += info.Size()
-		}
-		return err
-	})
-	return size, err
-}
-
-func MoveFile(sourcePath, destPath string) error {
-	inputFile, err := os.Open(sourcePath)
-	if err != nil {
-		return fmt.Errorf("Couldn't open source file: %s", err)
-	}
-	outputFile, err := os.Create(destPath)
-	if err != nil {
-		inputFile.Close()
-		return fmt.Errorf("Couldn't open dest file: %s", err)
-	}
-	defer outputFile.Close()
-	_, err = io.Copy(outputFile, inputFile)
-	inputFile.Close()
-	if err != nil {
-		return fmt.Errorf("Writing to output file failed: %s", err)
-	}
-	err = os.Remove(sourcePath)
-	if err != nil {
-		return fmt.Errorf("Failed removing original file: %s", err)
-	}
-	return nil
 }
 
 func ReadLine(lineNumber int, path string) string {

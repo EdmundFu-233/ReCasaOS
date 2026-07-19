@@ -3,14 +3,13 @@ package service
 import (
 	"context"
 	"encoding/json"
-	json2 "encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/IceWhaleTech/CasaOS-Common/utils/logger"
 	"github.com/IceWhaleTech/CasaOS/common"
-	model2 "github.com/IceWhaleTech/CasaOS/model"
 	"github.com/IceWhaleTech/CasaOS/model/notify"
 	"github.com/IceWhaleTech/CasaOS/service/model"
 	"github.com/IceWhaleTech/CasaOS/types"
@@ -18,8 +17,13 @@ import (
 	"golang.org/x/sync/syncmap"
 
 	socketio "github.com/googollee/go-socket.io"
-	"github.com/gorilla/websocket"
 	"gorm.io/gorm"
+)
+
+var (
+	fileOperationNotifierMu        sync.Mutex
+	fileOperationNotifierRunning   bool
+	fileOperationNotifierRequested bool
 )
 
 type NotifyServer interface {
@@ -37,7 +41,7 @@ type NotifyServer interface {
 	//SendInstallAppBySocket(app notifyCommon.Application)
 	SendNotify(name string, message map[string]interface{})
 	SettingSystemTempData(message map[string]interface{})
-	GetSystemTempMap() syncmap.Map
+	GetSystemTempMap() *syncmap.Map
 }
 
 type notifyServer struct {
@@ -60,172 +64,133 @@ func (i *notifyServer) SendNotify(name string, message map[string]interface{}) {
 	}
 	response, err := MyService.MessageBus().PublishEventWithResponse(context.Background(), common.SERVICENAME, name, msg)
 	if err != nil {
-		logger.Error("failed to publish event to message bus", zap.Error(err), zap.Any("event", msg))
+		logger.Error("failed to publish event to message bus", zap.Error(err))
+		return
+	}
+	if response == nil {
+		logger.Error("message bus returned an empty publish response")
 		return
 	}
 	if response.StatusCode() != http.StatusOK {
-		logger.Error("failed to publish event to message bus", zap.String("status", response.Status()), zap.Any("response", response))
+		logger.Error("failed to publish event to message bus", zap.String("status", response.Status()))
 	}
 	// SocketServer.BroadcastToRoom("/", "public", path, message)
 }
 
-// Send periodic broadcast messages
-func (i *notifyServer) SendFileOperateNotify(nowSend bool) {
-	if nowSend {
-		len := 0
-		FileQueue.Range(func(k, v interface{}) bool {
-			len++
-			return true
-		})
+// StartFileOperationNotifications coalesces route requests into one publisher
+// loop. The queue's worker is independent; notification failures never start,
+// stop, or advance file operations.
+func StartFileOperationNotifications() {
+	fileOperationNotifierMu.Lock()
+	fileOperationNotifierRequested = true
+	if fileOperationNotifierRunning {
+		fileOperationNotifierMu.Unlock()
+		return
+	}
+	fileOperationNotifierRunning = true
+	fileOperationNotifierRequested = false
+	fileOperationNotifierMu.Unlock()
 
-		model := notify.NotifyModel{}
-		listMsg := make(map[string]interface{})
-		if len == 0 {
-			model.Data = []string{}
-			listMsg["file_operate"] = model
-			msg := make(map[string]string)
-			for k, v := range listMsg {
-				bt, _ := json.Marshal(v)
-				msg[k] = string(bt)
+	go func() {
+		for {
+			MyService.Notify().SendFileOperateNotify(false)
+			fileOperationNotifierMu.Lock()
+			if fileOperationNotifierRequested {
+				fileOperationNotifierRequested = false
+				fileOperationNotifierMu.Unlock()
+				continue
 			}
-			response, err := MyService.MessageBus().PublishEventWithResponse(context.Background(), common.SERVICENAME, "casaos:file:operate", msg)
-			if err != nil {
-				logger.Error("failed to publish event to message bus", zap.Error(err), zap.Any("event", msg))
-			}
-			if response.StatusCode() != http.StatusOK {
-				logger.Error("failed to publish event to message bus", zap.String("status", response.Status()), zap.Any("response", response))
-			}
+			fileOperationNotifierRunning = false
+			fileOperationNotifierMu.Unlock()
 			return
 		}
+	}()
+}
 
-		model.State = "NORMAL"
-		list := []notify.File{}
-		OpStrArrbak := OpStrArr
-
-		for _, v := range OpStrArrbak {
-			tempItem, ok := FileQueue.Load(v)
-			temp := tempItem.(model2.FileOperate)
-			if !ok {
-				continue
-			}
-			task := notify.File{}
-			task.Id = v
-			task.ProcessedSize = temp.ProcessedSize
-			task.TotalSize = temp.TotalSize
-			task.To = temp.To
-			task.Type = temp.Type
-			if task.ProcessedSize == 0 {
-				task.Status = "STARTING"
-			} else {
-				task.Status = "PROCESSING"
-			}
-
-			if temp.Finished || temp.ProcessedSize >= temp.TotalSize {
-
-				task.Finished = true
-				task.Status = "FINISHED"
-				FileQueue.Delete(v)
-				OpStrArr = OpStrArr[1:]
-				go ExecOpFile()
-				list = append(list, task)
-				continue
-			}
-			for _, v := range temp.Item {
-				if v.Size != v.ProcessedSize {
-					task.ProcessingPath = v.From
-					break
-				}
-			}
-
-			list = append(list, task)
+// SendFileOperateNotify publishes immutable queue snapshots. Terminal tasks
+// are acknowledged only after a successful message-bus response.
+func (i *notifyServer) SendFileOperateNotify(nowSend bool) {
+	publishedAtLeastOnce := false
+	for {
+		snapshots := FileOperationSnapshots()
+		files, terminalIDs := buildFileOperationNotifications(snapshots)
+		if len(snapshots) == 0 && publishedAtLeastOnce && !nowSend {
+			return
 		}
-		model.Data = list
-
-		listMsg["file_operate"] = model
-		msg := make(map[string]string)
-		for k, v := range listMsg {
-			bt, _ := json.Marshal(v)
-			msg[k] = string(bt)
+		if !publishFileOperationNotifications(files) {
+			return
 		}
-		response, err := MyService.MessageBus().PublishEventWithResponse(context.Background(), common.SERVICENAME, "casaos:file:operate", msg)
-		if err != nil {
-			logger.Error("failed to publish event to message bus", zap.Error(err), zap.Any("event", msg))
+		publishedAtLeastOnce = true
+		AcknowledgeTerminalFileOperations(terminalIDs)
+		if nowSend {
+			return
 		}
-		if response.StatusCode() != http.StatusOK {
-			logger.Error("failed to publish event to message bus", zap.String("status", response.Status()), zap.Any("response", response))
+		if len(FileOperationSnapshots()) == 0 {
+			return
 		}
-
-	} else {
-		for {
-
-			len := 0
-			FileQueue.Range(func(k, v interface{}) bool {
-				len++
-				return true
-			})
-			if len == 0 {
-				return
-			}
-			listMsg := make(map[string]interface{})
-			model := notify.NotifyModel{}
-			model.State = "NORMAL"
-			list := []notify.File{}
-			OpStrArrbak := OpStrArr
-
-			for _, v := range OpStrArrbak {
-				tempItem, ok := FileQueue.Load(v)
-				temp := tempItem.(model2.FileOperate)
-				if !ok {
-					continue
-				}
-				task := notify.File{}
-				task.Id = v
-				task.ProcessedSize = temp.ProcessedSize
-				task.TotalSize = temp.TotalSize
-				task.To = temp.To
-				task.Type = temp.Type
-				if task.ProcessedSize == 0 {
-					task.Status = "STARTING"
-				} else {
-					task.Status = "PROCESSING"
-				}
-				if temp.Finished || temp.ProcessedSize >= temp.TotalSize {
-
-					task.Finished = true
-					task.Status = "FINISHED"
-					FileQueue.Delete(v)
-					OpStrArr = OpStrArr[1:]
-					go ExecOpFile()
-					list = append(list, task)
-					continue
-				}
-				for _, v := range temp.Item {
-					if v.Size != v.ProcessedSize {
-						task.ProcessingPath = v.From
-						break
-					}
-				}
-
-				list = append(list, task)
-			}
-			model.Data = list
-
-			listMsg["file_operate"] = model
-			msg := make(map[string]string)
-			for k, v := range listMsg {
-				bt, _ := json.Marshal(v)
-				msg[k] = string(bt)
-			}
-			response, err := MyService.MessageBus().PublishEventWithResponse(context.Background(), common.SERVICENAME, "casaos:file:operate", msg)
-			if err != nil {
-				logger.Error("failed to publish event to message bus", zap.Error(err), zap.Any("event", msg))
-			}
-			if response.StatusCode() != http.StatusOK {
-				logger.Error("failed to publish event to message bus", zap.String("status", response.Status()), zap.Any("response", response))
-			}
-			time.Sleep(time.Second * 3)
+		if HasActiveFileOperations() {
+			time.Sleep(3 * time.Second)
 		}
 	}
+}
+
+func buildFileOperationNotifications(snapshots []FileOperationSnapshot) ([]notify.File, []string) {
+	files := make([]notify.File, 0, len(snapshots))
+	terminalIDs := make([]string, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		operation := snapshot.Operation
+		task := notify.File{
+			Id:                snapshot.ID,
+			ProcessedSize:     operation.ProcessedSize,
+			TotalSize:         operation.TotalSize,
+			To:                operation.To,
+			Type:              operation.Type,
+			Status:            operation.Status,
+			Error:             operation.Error,
+			DurabilityUnknown: operation.DurabilityUnknown,
+			Finished:          operation.Finished && fileOperationStatusTerminal(operation.Status),
+			Items:             make([]notify.FileItem, 0, len(operation.Item)),
+		}
+		for _, item := range operation.Item {
+			task.Items = append(task.Items, notify.FileItem{
+				From:              item.From,
+				Destination:       item.Destination,
+				Status:            item.Status,
+				Error:             item.Error,
+				DurabilityUnknown: item.DurabilityUnknown,
+			})
+			if task.ProcessingPath == "" && !item.Finished {
+				task.ProcessingPath = item.From
+			}
+		}
+		if task.Finished {
+			terminalIDs = append(terminalIDs, snapshot.ID)
+		}
+		files = append(files, task)
+	}
+	return files, terminalIDs
+}
+
+func publishFileOperationNotifications(files []notify.File) bool {
+	payload, err := json.Marshal(notify.NotifyModel{State: "NORMAL", Data: files})
+	if err != nil {
+		logger.Error("failed to encode file operation notification", zap.Error(err))
+		return false
+	}
+	response, err := MyService.MessageBus().PublishEventWithResponse(context.Background(), common.SERVICENAME, "casaos:file:operate", map[string]string{"file_operate": string(payload)})
+	if err != nil {
+		logger.Error("failed to publish event to message bus", zap.Error(err))
+		return false
+	}
+	if response == nil {
+		logger.Error("message bus returned an empty publish response")
+		return false
+	}
+	if response.StatusCode() != http.StatusOK {
+		logger.Error("failed to publish event to message bus", zap.String("status", response.Status()))
+		return false
+	}
+	return true
 }
 
 // func (i *notifyServer) SendInstallAppBySocket(app notifyCommon.Application) {
@@ -241,7 +206,7 @@ func (i *notifyServer) SSR() {
 	fmt.Println(server)
 }
 
-func (i notifyServer) GetList(c int) (list []model.AppNotify) {
+func (i *notifyServer) GetList(c int) (list []model.AppNotify) {
 	i.db.Where("class = ?", c).Where(i.db.Where("state = ?", types.NOTIFY_DYNAMICE).Or("state = ?", types.NOTIFY_UNREAD)).Find(&list)
 	return
 }
@@ -280,49 +245,6 @@ func (i *notifyServer) DelLog(id string) {
 	i.db.Where("custom_id = ?", id).Delete(&log)
 }
 
-func SendMeg() {
-	// for {
-	// 	mt, message, err := ws.ReadMessage()
-	// 	if err != nil {
-	// 		break
-	// 	}
-	// 	notify := model.NotifyMssage{}
-	// 	json2.Unmarshal(message, &notify)
-	// 	if notify.Type == "read" {
-	// 		service.MyService.Notify().MarkRead(notify.Data, types.NOTIFY_READ)
-	// 	}
-	// 	if notify.Type == "app" {
-	//		go func(ws *websocket.Conn) {
-
-	for {
-		list := MyService.Notify().GetList(types.NOTIFY_APP)
-		json, _ := json2.Marshal(list)
-
-		if len(list) > 0 {
-			var temp []*websocket.Conn
-			for _, v := range WebSocketConns {
-
-				err := v.WriteMessage(1, json)
-				if err == nil {
-					temp = append(temp, v)
-				}
-			}
-			WebSocketConns = temp
-			for _, v := range list {
-				MyService.Notify().MarkRead(v.Id, types.NOTIFY_READ)
-			}
-		}
-
-		if len(WebSocketConns) == 0 {
-			SocketRun = false
-		}
-		time.Sleep(time.Second * 2)
-	}
-	// 	}(ws)
-	// }
-	//	}
-}
-
 // func (i notifyServer) SendText(m model.AppNotify) {
 // 	list := []model.AppNotify{}
 // 	list = append(list, m)
@@ -342,8 +264,8 @@ func SendMeg() {
 // 	}
 
 // }
-func (i *notifyServer) GetSystemTempMap() syncmap.Map {
-	return i.SystemTempMap
+func (i *notifyServer) GetSystemTempMap() *syncmap.Map {
+	return &i.SystemTempMap
 }
 
 func NewNotifyService(db *gorm.DB) NotifyServer {

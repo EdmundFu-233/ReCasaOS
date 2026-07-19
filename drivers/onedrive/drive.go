@@ -6,11 +6,8 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/IceWhaleTech/CasaOS-Common/utils/logger"
-
 	"github.com/IceWhaleTech/CasaOS/internal/driver"
 	"github.com/IceWhaleTech/CasaOS/model"
-	"go.uber.org/zap"
 )
 
 type Onedrive struct {
@@ -56,11 +53,10 @@ func (d *Onedrive) GetSpaceSize(ctx context.Context) (used string, total string,
 	host := onedriveHostMap[d.Region]
 	url := fmt.Sprintf("%s/v1.0/me/drive/quota", host.Api)
 	size := About{}
-	resp, err := d.Request(url, http.MethodGet, nil, &size)
+	_, err = d.Request(url, http.MethodGet, nil, &size)
 	if err != nil {
 		return used, total, err
 	}
-	logger.Info("resp", zap.Any("resp", resp))
 	used = strconv.Itoa(size.Used)
 	total = strconv.Itoa(size.Total)
 	return
