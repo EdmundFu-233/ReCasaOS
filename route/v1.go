@@ -32,6 +32,7 @@ func InitV1Router() http.Handler {
 	e.GET("/v1/recover/:type", v1.GetRecoverStorage)
 	v1Group := e.Group("/v1")
 	//	e.Any("/v1/test", v1.CheckNetwork)
+	v1Group.Use(privateNoStoreResponses())
 	v1Group.Use(echojwt.WithConfig(echojwt.Config{
 		Skipper: func(c echo.Context) bool {
 			return httpsecurity.LoopbackAuthBypassAllowed(c.Request())
@@ -48,7 +49,6 @@ func InitV1Router() http.Handler {
 		},
 		TokenLookup: "header:Authorization,query:token",
 	}))
-	v1Group.Use(privateNoStoreResponses())
 	{
 
 		v1SysGroup := v1Group.Group("/sys")
@@ -94,6 +94,7 @@ func InitV1Router() http.Handler {
 		v1FileGroup := v1Group.Group("/file")
 		v1FileGroup.Use()
 		{
+			v1FileGroup.POST("/recovery/inventory", v1.PostManagedTransferInventory)
 			v1FileGroup.GET("", v1.GetDownloadSingleFile) // download/:path
 			v1FileGroup.POST("", v1.PostCreateFile)
 			v1FileGroup.PUT("", v1.PutFileContent)

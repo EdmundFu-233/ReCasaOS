@@ -85,6 +85,11 @@ operator controls. Keep the administrative API private/VPN-only even when its
 paths are confined; `RECASAOS_MANAGEMENT_FILE_ROOTS` is not a public sharing
 configuration and is separate from `RECASAOS_PUBLIC_FILE_ROOT`.
 
+Retained `.recasaos-transfer-*` directories are recovery evidence, not ordinary
+temporary files. The [managed transfer inventory guide](docs/operations/managed-transfer-inventory.md)
+documents the authenticated, read-only inspection endpoint and its intentionally
+non-destructive operator workflow. It does not provide or authorize cleanup.
+
 ## Development
 
 ReCasaOS currently requires Linux for the complete build and test suite. The Go

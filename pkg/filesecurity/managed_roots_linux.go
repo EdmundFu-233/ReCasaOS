@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 )
@@ -41,6 +42,7 @@ type managedRoot struct {
 // core private-management use case. Symlinks and magic links remain forbidden.
 type ManagedRoots struct {
 	mutationMu                    sync.Mutex
+	mutationGeneration            atomic.Uint64
 	mu                            sync.RWMutex
 	roots                         []managedRoot
 	closed                        bool
@@ -53,6 +55,7 @@ type ManagedRoots struct {
 	transactionBeforeStageSync    func() error
 	transactionBeforeCleanup      func() error
 	transactionAfterRmdir         func() error
+	inventoryAfterOpen            func(int, string) error
 	transferFilesystemEligibility func(int) (int64, bool, error)
 	rewriteBeforePublish          func() error
 }
@@ -153,6 +156,7 @@ func (m *ManagedRoots) Close() error {
 	}
 	m.mutationMu.Lock()
 	defer m.mutationMu.Unlock()
+	m.mutationGeneration.Add(1)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {

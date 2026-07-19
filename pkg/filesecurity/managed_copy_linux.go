@@ -1047,7 +1047,7 @@ func validateManagedTransactionReplacementType(sourceParentFD int, sourceName st
 }
 
 func createManagedTransferTransaction(parentFD int, parentMountID uint64) (*os.File, string, error) {
-	name, err := randomManagedTransferName(".recasaos-transfer-")
+	name, err := randomManagedTransferName(managedTransferTransactionPrefix)
 	if err != nil {
 		return nil, "", err
 	}
