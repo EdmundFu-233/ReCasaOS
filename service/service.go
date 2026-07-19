@@ -14,7 +14,6 @@ import (
 	"github.com/IceWhaleTech/CasaOS-Common/external"
 	"github.com/IceWhaleTech/CasaOS/codegen/message_bus"
 	"github.com/IceWhaleTech/CasaOS/pkg/config"
-	"github.com/gorilla/websocket"
 	"github.com/patrickmn/go-cache"
 	"gorm.io/gorm"
 )
@@ -23,11 +22,6 @@ var Cache *cache.Cache
 
 var (
 	MyService Repository
-)
-
-var (
-	WebSocketConns []*websocket.Conn
-	SocketRun      bool
 )
 
 type Repository interface {

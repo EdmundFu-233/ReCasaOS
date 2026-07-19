@@ -1,11 +1,8 @@
 package v1
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"runtime"
@@ -14,17 +11,15 @@ import (
 	"time"
 	"unsafe"
 
-	http2 "github.com/IceWhaleTech/CasaOS-Common/utils/http"
 	"github.com/IceWhaleTech/CasaOS-Common/utils/port"
 	"github.com/IceWhaleTech/CasaOS/common"
 	"github.com/IceWhaleTech/CasaOS/model"
 	"github.com/IceWhaleTech/CasaOS/pkg/config"
+	"github.com/IceWhaleTech/CasaOS/pkg/netsecurity"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/common_err"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/version"
 	"github.com/IceWhaleTech/CasaOS/service"
-	model2 "github.com/IceWhaleTech/CasaOS/service/model"
-	"github.com/IceWhaleTech/CasaOS/types"
 	"github.com/labstack/echo/v4"
 	"github.com/tidwall/gjson"
 )
@@ -38,16 +33,6 @@ import (
 // @Router /sys/version/check [get]
 func GetSystemCheckVersion(ctx echo.Context) error {
 	need, version := version.IsNeedUpdate(service.MyService.Casa().GetCasaosVersion())
-	if need {
-		installLog := model2.AppNotify{}
-		installLog.State = 0
-		installLog.Message = "New version " + version.Version + " is ready, ready to upgrade"
-		installLog.Type = types.NOTIFY_TYPE_NEED_CONFIRM
-		installLog.CreatedAt = strconv.FormatInt(time.Now().Unix(), 10)
-		installLog.UpdatedAt = strconv.FormatInt(time.Now().Unix(), 10)
-		installLog.Name = "CasaOS System"
-		service.MyService.Notify().AddLog(installLog)
-	}
 	data := make(map[string]interface{}, 3)
 	data["need_update"] = need
 	data["version"] = version
@@ -65,7 +50,9 @@ func GetSystemCheckVersion(ctx echo.Context) error {
 func SystemUpdate(ctx echo.Context) error {
 	need, version := version.IsNeedUpdate(service.MyService.Casa().GetCasaosVersion())
 	if need {
-		service.MyService.System().UpdateSystemVersion(version.Version)
+		if err := service.MyService.System().UpdateSystemVersion(version.Version); err != nil {
+			return ctx.JSON(http.StatusServiceUnavailable, model.Result{Success: common_err.SERVICE_ERROR, Message: err.Error()})
+		}
 	}
 	return ctx.JSON(common_err.SUCCESS, model.Result{Success: common_err.SUCCESS, Message: common_err.GetMsg(common_err.SUCCESS)})
 }
@@ -312,22 +299,22 @@ func GetSystemNetInfo(ctx echo.Context) error {
 }
 
 func GetSystemProxy(ctx echo.Context) error {
-	url := ctx.QueryParam("url")
-	resp, err := http2.Get(url, 30*time.Second)
+	resp, err := netsecurity.GetPublicHTTPS(ctx.Request().Context(), ctx.QueryParam("url"), 30*time.Second)
 	if err != nil {
-		return ctx.JSON(http.StatusInternalServerError, model.Result{Success: common_err.SERVICE_ERROR, Message: err.Error()})
+		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.INVALID_PARAMS, Message: "outbound URL rejected"})
 	}
 	defer resp.Body.Close()
-	for k, v := range ctx.Request().Header {
-		ctx.Request().Header.Add(k, v[0])
+	content, err := netsecurity.ReadBodyLimited(resp.Body, 10<<20)
+	if err != nil {
+		return ctx.JSON(http.StatusBadGateway, model.Result{Success: common_err.SERVICE_ERROR, Message: "upstream response rejected"})
 	}
-	rda, _ := ioutil.ReadAll(resp.Body)
-	//	json.NewEncoder(c.Writer).Encode(json.RawMessage(string(rda)))
-	// 响应状态码
-	ctx.Response().Writer.WriteHeader(resp.StatusCode)
-	// 复制转发的响应Body到响应Body
-	io.Copy(ctx.Response().Writer, ioutil.NopCloser(bytes.NewBuffer(rda)))
-	return nil
+	response := ctx.Response()
+	response.Header().Set("Cache-Control", "private, no-store")
+	response.Header().Set("X-Content-Type-Options", "nosniff")
+	if contentType := resp.Header.Get(echo.HeaderContentType); contentType != "" {
+		response.Header().Set(echo.HeaderContentType, contentType)
+	}
+	return ctx.Blob(resp.StatusCode, response.Header().Get(echo.HeaderContentType), content)
 }
 
 func PutSystemState(ctx echo.Context) error {

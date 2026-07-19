@@ -29,9 +29,9 @@ func (d *Dropbox) getRefreshToken() error {
 	if err != nil {
 		return err
 	}
-	logger.Info("get refresh token", zap.String("res", res.String()))
+	logger.Info("Dropbox OAuth token exchange completed", zap.Int("status", res.StatusCode()))
 	if e.Error != "" {
-		return fmt.Errorf(e.Error)
+		return fmt.Errorf("%s", e.Error)
 	}
 	d.RefreshToken = resp.RefreshToken
 	return nil
@@ -50,9 +50,9 @@ func (d *Dropbox) refreshToken() error {
 	if err != nil {
 		return err
 	}
-	logger.Info("get refresh token", zap.String("res", res.String()))
+	logger.Info("Dropbox OAuth token refresh completed", zap.Int("status", res.StatusCode()))
 	if e.Error != "" {
-		return fmt.Errorf(e.Error)
+		return fmt.Errorf("%s", e.Error)
 	}
 	d.AccessToken = resp.AccessToken
 	return nil

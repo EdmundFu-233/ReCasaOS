@@ -1,22 +1,14 @@
 package v2
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 
 	"github.com/IceWhaleTech/CasaOS/codegen"
+	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
 	"github.com/labstack/echo/v4"
 )
-
-// Path: route/v2/file.go
-
-func (s *CasaOS) GetFileTest(ctx echo.Context) error {
-
-	//http.ServeFile(w, r, r.URL.Path[1:])
-	http.ServeFile(ctx.Response().Writer, ctx.Request(), "/DATA/test.img")
-
-	return ctx.String(200, "pong")
-}
 
 func (c *CasaOS) CheckUploadChunk(ctx echo.Context, params codegen.CheckUploadChunkParams) error {
 	identifier := ctx.QueryParam("identifier")
@@ -33,6 +25,25 @@ func (c *CasaOS) CheckUploadChunk(ctx echo.Context, params codegen.CheckUploadCh
 }
 
 func (c *CasaOS) PostUploadFile(ctx echo.Context) error {
+	const multipartOverheadAllowance int64 = 1 << 20
+	const multipartMemory = 32 << 20
+	requestLimit := filesecurity.MaxUploadChunkSize + multipartOverheadAllowance
+	request := ctx.Request()
+	request.Body = http.MaxBytesReader(ctx.Response().Writer, request.Body, requestLimit)
+	if request.ContentLength > requestLimit {
+		return ctx.JSON(http.StatusRequestEntityTooLarge, map[string]string{"message": "upload request exceeds 256 MiB"})
+	}
+	if err := request.ParseMultipartForm(multipartMemory); err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			return ctx.JSON(http.StatusRequestEntityTooLarge, map[string]string{"message": "upload request exceeds 256 MiB"})
+		}
+		return ctx.JSON(http.StatusBadRequest, map[string]string{"message": "invalid multipart request"})
+	}
+	if request.MultipartForm != nil {
+		defer request.MultipartForm.RemoveAll()
+	}
+
 	path := ctx.FormValue("path")
 
 	// handle the request

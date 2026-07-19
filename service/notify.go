@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"encoding/json"
-	json2 "encoding/json"
 	"fmt"
 	"net/http"
 	"time"
@@ -18,7 +17,6 @@ import (
 	"golang.org/x/sync/syncmap"
 
 	socketio "github.com/googollee/go-socket.io"
-	"github.com/gorilla/websocket"
 	"gorm.io/gorm"
 )
 
@@ -37,7 +35,7 @@ type NotifyServer interface {
 	//SendInstallAppBySocket(app notifyCommon.Application)
 	SendNotify(name string, message map[string]interface{})
 	SettingSystemTempData(message map[string]interface{})
-	GetSystemTempMap() syncmap.Map
+	GetSystemTempMap() *syncmap.Map
 }
 
 type notifyServer struct {
@@ -60,11 +58,15 @@ func (i *notifyServer) SendNotify(name string, message map[string]interface{}) {
 	}
 	response, err := MyService.MessageBus().PublishEventWithResponse(context.Background(), common.SERVICENAME, name, msg)
 	if err != nil {
-		logger.Error("failed to publish event to message bus", zap.Error(err), zap.Any("event", msg))
+		logger.Error("failed to publish event to message bus", zap.Error(err))
+		return
+	}
+	if response == nil {
+		logger.Error("message bus returned an empty publish response")
 		return
 	}
 	if response.StatusCode() != http.StatusOK {
-		logger.Error("failed to publish event to message bus", zap.String("status", response.Status()), zap.Any("response", response))
+		logger.Error("failed to publish event to message bus", zap.String("status", response.Status()))
 	}
 	// SocketServer.BroadcastToRoom("/", "public", path, message)
 }
@@ -90,10 +92,15 @@ func (i *notifyServer) SendFileOperateNotify(nowSend bool) {
 			}
 			response, err := MyService.MessageBus().PublishEventWithResponse(context.Background(), common.SERVICENAME, "casaos:file:operate", msg)
 			if err != nil {
-				logger.Error("failed to publish event to message bus", zap.Error(err), zap.Any("event", msg))
+				logger.Error("failed to publish event to message bus", zap.Error(err))
+				return
+			}
+			if response == nil {
+				logger.Error("message bus returned an empty publish response")
+				return
 			}
 			if response.StatusCode() != http.StatusOK {
-				logger.Error("failed to publish event to message bus", zap.String("status", response.Status()), zap.Any("response", response))
+				logger.Error("failed to publish event to message bus", zap.String("status", response.Status()))
 			}
 			return
 		}
@@ -149,10 +156,15 @@ func (i *notifyServer) SendFileOperateNotify(nowSend bool) {
 		}
 		response, err := MyService.MessageBus().PublishEventWithResponse(context.Background(), common.SERVICENAME, "casaos:file:operate", msg)
 		if err != nil {
-			logger.Error("failed to publish event to message bus", zap.Error(err), zap.Any("event", msg))
+			logger.Error("failed to publish event to message bus", zap.Error(err))
+			return
+		}
+		if response == nil {
+			logger.Error("message bus returned an empty publish response")
+			return
 		}
 		if response.StatusCode() != http.StatusOK {
-			logger.Error("failed to publish event to message bus", zap.String("status", response.Status()), zap.Any("response", response))
+			logger.Error("failed to publish event to message bus", zap.String("status", response.Status()))
 		}
 
 	} else {
@@ -218,10 +230,15 @@ func (i *notifyServer) SendFileOperateNotify(nowSend bool) {
 			}
 			response, err := MyService.MessageBus().PublishEventWithResponse(context.Background(), common.SERVICENAME, "casaos:file:operate", msg)
 			if err != nil {
-				logger.Error("failed to publish event to message bus", zap.Error(err), zap.Any("event", msg))
+				logger.Error("failed to publish event to message bus", zap.Error(err))
+				return
+			}
+			if response == nil {
+				logger.Error("message bus returned an empty publish response")
+				return
 			}
 			if response.StatusCode() != http.StatusOK {
-				logger.Error("failed to publish event to message bus", zap.String("status", response.Status()), zap.Any("response", response))
+				logger.Error("failed to publish event to message bus", zap.String("status", response.Status()))
 			}
 			time.Sleep(time.Second * 3)
 		}
@@ -241,7 +258,7 @@ func (i *notifyServer) SSR() {
 	fmt.Println(server)
 }
 
-func (i notifyServer) GetList(c int) (list []model.AppNotify) {
+func (i *notifyServer) GetList(c int) (list []model.AppNotify) {
 	i.db.Where("class = ?", c).Where(i.db.Where("state = ?", types.NOTIFY_DYNAMICE).Or("state = ?", types.NOTIFY_UNREAD)).Find(&list)
 	return
 }
@@ -280,49 +297,6 @@ func (i *notifyServer) DelLog(id string) {
 	i.db.Where("custom_id = ?", id).Delete(&log)
 }
 
-func SendMeg() {
-	// for {
-	// 	mt, message, err := ws.ReadMessage()
-	// 	if err != nil {
-	// 		break
-	// 	}
-	// 	notify := model.NotifyMssage{}
-	// 	json2.Unmarshal(message, &notify)
-	// 	if notify.Type == "read" {
-	// 		service.MyService.Notify().MarkRead(notify.Data, types.NOTIFY_READ)
-	// 	}
-	// 	if notify.Type == "app" {
-	//		go func(ws *websocket.Conn) {
-
-	for {
-		list := MyService.Notify().GetList(types.NOTIFY_APP)
-		json, _ := json2.Marshal(list)
-
-		if len(list) > 0 {
-			var temp []*websocket.Conn
-			for _, v := range WebSocketConns {
-
-				err := v.WriteMessage(1, json)
-				if err == nil {
-					temp = append(temp, v)
-				}
-			}
-			WebSocketConns = temp
-			for _, v := range list {
-				MyService.Notify().MarkRead(v.Id, types.NOTIFY_READ)
-			}
-		}
-
-		if len(WebSocketConns) == 0 {
-			SocketRun = false
-		}
-		time.Sleep(time.Second * 2)
-	}
-	// 	}(ws)
-	// }
-	//	}
-}
-
 // func (i notifyServer) SendText(m model.AppNotify) {
 // 	list := []model.AppNotify{}
 // 	list = append(list, m)
@@ -342,8 +316,8 @@ func SendMeg() {
 // 	}
 
 // }
-func (i *notifyServer) GetSystemTempMap() syncmap.Map {
-	return i.SystemTempMap
+func (i *notifyServer) GetSystemTempMap() *syncmap.Map {
+	return &i.SystemTempMap
 }
 
 func NewNotifyService(db *gorm.DB) NotifyServer {

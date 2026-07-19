@@ -2,6 +2,7 @@ package v1
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -17,21 +18,19 @@ import (
 	"sync"
 	"time"
 
-	"github.com/IceWhaleTech/CasaOS-Common/utils/logger"
 	"github.com/IceWhaleTech/CasaOS/model"
+	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
+	"github.com/IceWhaleTech/CasaOS/pkg/httpsecurity"
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
 	"github.com/robfig/cron/v3"
-	"github.com/tidwall/gjson"
 
-	"github.com/IceWhaleTech/CasaOS/pkg/utils"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/common_err"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/file"
 	"github.com/IceWhaleTech/CasaOS/service"
 	model2 "github.com/IceWhaleTech/CasaOS/service/model"
 
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 
 	"github.com/h2non/filetype"
 )
@@ -67,13 +66,9 @@ type FsListResp struct {
 var (
 	// 升级成 WebSocket 协议
 	upgraderFile = websocket.Upgrader{
-		// 允许CORS跨域请求
-		CheckOrigin: func(r *http.Request) bool {
-			return true
-		},
+		CheckOrigin:      httpsecurity.WebSocketOriginAllowed,
+		HandshakeTimeout: 5 * time.Second,
 	}
-	conn *websocket.Conn
-	err  error
 )
 
 // @Summary 读取文件
@@ -155,37 +150,58 @@ func GetDownloadFile(ctx echo.Context) error {
 	}
 	list := strings.Split(files, ",")
 	for _, v := range list {
-		if !file.Exists(v) {
+		if strings.TrimSpace(v) == "" {
+			return ctx.JSON(common_err.CLIENT_ERROR, model.Result{
+				Success: common_err.INVALID_PARAMS,
+				Message: common_err.GetMsg(common_err.INVALID_PARAMS),
+			})
+		}
+		info, err := os.Stat(v)
+		if err != nil {
 			return ctx.JSON(common_err.SERVICE_ERROR, model.Result{
 				Success: common_err.FILE_DOES_NOT_EXIST,
 				Message: common_err.GetMsg(common_err.FILE_DOES_NOT_EXIST),
+				Data:    err.Error(),
+			})
+		}
+		if !info.IsDir() && !info.Mode().IsRegular() {
+			return ctx.JSON(common_err.CLIENT_ERROR, model.Result{
+				Success: common_err.INVALID_PARAMS,
+				Message: common_err.GetMsg(common_err.INVALID_PARAMS),
 			})
 		}
 	}
-	ctx.Request().Header.Add("Content-Type", "application/octet-stream")
-	ctx.Request().Header.Add("Content-Transfer-Encoding", "binary")
-	ctx.Request().Header.Add("Cache-Control", "no-cache")
 	// handles only single files not folders and multiple files
 	if len(list) == 1 {
-
 		filePath := list[0]
-		info, err := os.Stat(filePath)
+		fileHandle, err := os.Open(filePath)
 		if err != nil {
-			return ctx.JSON(http.StatusOK, model.Result{
+			return ctx.JSON(common_err.SERVICE_ERROR, model.Result{
 				Success: common_err.FILE_DOES_NOT_EXIST,
 				Message: common_err.GetMsg(common_err.FILE_DOES_NOT_EXIST),
+				Data:    err.Error(),
+			})
+		}
+		defer fileHandle.Close()
+
+		info, err := fileHandle.Stat()
+		if err != nil {
+			return ctx.JSON(common_err.SERVICE_ERROR, model.Result{
+				Success: common_err.FILE_READ_ERROR,
+				Message: common_err.GetMsg(common_err.FILE_READ_ERROR),
+				Data:    err.Error(),
 			})
 		}
 		if !info.IsDir() {
-
-			// 打开文件
-			fileTmp, _ := os.Open(filePath)
-			defer fileTmp.Close()
-
-			// 获取文件的名称
 			fileName := path.Base(filePath)
-			ctx.Response().Header().Add("Content-Disposition", "attachment; filename*=utf-8''"+url2.PathEscape(fileName))
-			ctx.File(filePath)
+			responseHeader := ctx.Response().Header()
+			responseHeader.Set("Content-Transfer-Encoding", "binary")
+			responseHeader.Set("Cache-Control", "private, no-store")
+			responseHeader.Set("X-Content-Type-Options", "nosniff")
+			responseHeader.Set("Content-Type", "application/octet-stream")
+			responseHeader.Set("Content-Disposition", "attachment; filename*=utf-8''"+url2.PathEscape(fileName))
+			http.ServeContent(ctx.Response().Writer, ctx.Request(), fileName, info.ModTime(), fileHandle)
+			return nil
 		}
 	}
 
@@ -196,30 +212,35 @@ func GetDownloadFile(ctx echo.Context) error {
 			Message: common_err.GetMsg(common_err.INVALID_PARAMS),
 		})
 	}
+	responseHeader := ctx.Response().Header()
+	responseHeader.Set("Content-Transfer-Encoding", "binary")
+	responseHeader.Set("Cache-Control", "private, no-store")
+	responseHeader.Set("X-Content-Type-Options", "nosniff")
+	responseHeader.Set("Content-Type", archiveContentType(extension))
 
-	err = ar.Create(ctx.Response().Writer)
-	if err != nil {
+	commonDir := file.CommonPrefix(filepath.Separator, list...)
+	currentPath := filepath.Base(filepath.Clean(commonDir))
+	if currentPath == "." || currentPath == string(filepath.Separator) || currentPath == "" {
+		currentPath = "download"
+	}
+	name := "_" + currentPath + extension
+	responseHeader.Set("Content-Disposition", "attachment; filename*=utf-8''"+url.PathEscape(name))
+
+	if err = ar.Create(ctx.Response().Writer); err != nil {
 		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{
 			Success: common_err.SERVICE_ERROR,
 			Message: common_err.GetMsg(common_err.SERVICE_ERROR),
 			Data:    err.Error(),
 		})
 	}
-	defer ar.Close()
-	commonDir := file.CommonPrefix(filepath.Separator, list...)
-
-	currentPath := filepath.Base(commonDir)
-
-	name := "_" + currentPath
-	name += extension
-	ctx.Request().Header.Add("Content-Disposition", "attachment; filename*=utf-8''"+url.PathEscape(name))
 	for _, fname := range list {
 		err = file.AddFile(ar, fname, commonDir)
 		if err != nil {
-			log.Printf("Failed to archive %s: %v", fname, err)
+			_ = ar.Close()
+			return fmt.Errorf("archive %s: %w", fname, err)
 		}
 	}
-	return nil
+	return ar.Close()
 }
 
 func GetDownloadSingleFile(ctx echo.Context) error {
@@ -231,43 +252,80 @@ func GetDownloadSingleFile(ctx echo.Context) error {
 		})
 	}
 	fileName := path.Base(filePath)
-	// c.Header("Content-Disposition", "inline")
-	ctx.Request().Header.Add("Content-Disposition", "attachment; filename*=utf-8''"+url2.PathEscape(fileName))
 
 	fi, err := os.Open(filePath)
-	if err != nil {
-		panic(err)
-	}
-
-	// We only have to pass the file header = first 261 bytes
-	buffer := make([]byte, 261)
-
-	_, _ = fi.Read(buffer)
-
-	kind, _ := filetype.Match(buffer)
-	if kind != filetype.Unknown {
-		ctx.Request().Header.Add("Content-Type", kind.MIME.Value)
-	}
-	node, err := os.Stat(filePath)
-	// Set the Last-Modified header to the timestamp
-	ctx.Request().Header.Add("Last-Modified", node.ModTime().UTC().Format(http.TimeFormat))
-
-	knownSize := node.Size() >= 0
-	if knownSize {
-		ctx.Request().Header.Add("Content-Length", strconv.FormatInt(node.Size(), 10))
-	}
-	http.ServeContent(ctx.Response().Writer, ctx.Request(), fileName, node.ModTime(), fi)
-	defer fi.Close()
-	fileTmp, err := os.Open(filePath)
 	if err != nil {
 		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{
 			Success: common_err.FILE_DOES_NOT_EXIST,
 			Message: common_err.GetMsg(common_err.FILE_DOES_NOT_EXIST),
+			Data:    err.Error(),
 		})
 	}
-	defer fileTmp.Close()
+	defer fi.Close()
 
+	node, err := fi.Stat()
+	if err != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{
+			Success: common_err.FILE_READ_ERROR,
+			Message: common_err.GetMsg(common_err.FILE_READ_ERROR),
+			Data:    err.Error(),
+		})
+	}
+	if !node.Mode().IsRegular() {
+		return ctx.JSON(common_err.CLIENT_ERROR, model.Result{
+			Success: common_err.INVALID_PARAMS,
+			Message: common_err.GetMsg(common_err.INVALID_PARAMS),
+		})
+	}
+
+	// We only have to pass the file header = first 261 bytes
+	buffer := make([]byte, 261)
+	n, readErr := fi.Read(buffer)
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{
+			Success: common_err.FILE_READ_ERROR,
+			Message: common_err.GetMsg(common_err.FILE_READ_ERROR),
+			Data:    readErr.Error(),
+		})
+	}
+	if _, err := fi.Seek(0, io.SeekStart); err != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{
+			Success: common_err.FILE_READ_ERROR,
+			Message: common_err.GetMsg(common_err.FILE_READ_ERROR),
+			Data:    err.Error(),
+		})
+	}
+
+	responseHeader := ctx.Response().Header()
+	responseHeader.Set("Content-Disposition", "attachment; filename*=utf-8''"+url2.PathEscape(fileName))
+	responseHeader.Set("Content-Type", "application/octet-stream")
+	responseHeader.Set("X-Content-Type-Options", "nosniff")
+	kind, _ := filetype.Match(buffer[:n])
+	if kind != filetype.Unknown {
+		responseHeader.Set("Content-Type", kind.MIME.Value)
+	}
+	// Set the Last-Modified header to the timestamp
+	responseHeader.Set("Last-Modified", node.ModTime().UTC().Format(http.TimeFormat))
+
+	knownSize := node.Size() >= 0
+	if knownSize {
+		responseHeader.Set("Content-Length", strconv.FormatInt(node.Size(), 10))
+	}
+	http.ServeContent(ctx.Response().Writer, ctx.Request(), fileName, node.ModTime(), fi)
 	return nil
+}
+
+func archiveContentType(extension string) string {
+	switch extension {
+	case ".zip":
+		return "application/zip"
+	case ".tar":
+		return "application/x-tar"
+	case ".tar.gz":
+		return "application/gzip"
+	default:
+		return "application/octet-stream"
+	}
 }
 
 // @Summary 获取目录列表
@@ -456,26 +514,27 @@ func PostCreateFile(ctx echo.Context) error {
 func GetFileUpload(ctx echo.Context) error {
 	relative := ctx.QueryParam("relativePath")
 	fileName := ctx.QueryParam("filename")
-	chunkNumber := ctx.QueryParam("chunkNumber")
-	totalChunks, _ := strconv.Atoi(utils.DefaultQuery(ctx, "totalChunks", "0"))
-	path := ctx.QueryParam("path")
-	dirPath := ""
-	hash := file.GetHashByContent([]byte(fileName))
-	if file.Exists(path + "/" + relative) {
-		return ctx.JSON(http.StatusConflict, model.Result{Success: http.StatusConflict, Message: common_err.GetMsg(common_err.FILE_ALREADY_EXISTS)})
-	}
-	tempDir := filepath.Join(path, ".temp", hash+strconv.Itoa(totalChunks)) + "/"
-	if fileName != relative {
-		dirPath = strings.TrimSuffix(relative, fileName)
-		tempDir += dirPath
-		file.MkDir(path + "/" + dirPath)
-	}
-	tempDir += chunkNumber
-	if !file.CheckNotExist(tempDir) {
-		return ctx.JSON(200, model.Result{Success: 200, Message: common_err.GetMsg(common_err.FILE_ALREADY_EXISTS)})
+	totalChunks, chunkNumber, err := parseUploadChunks(ctx.QueryParam("totalChunks"), ctx.QueryParam("chunkNumber"))
+	if err != nil {
+		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS), Data: err.Error()})
 	}
 
-	return ctx.JSON(204, model.Result{Success: 204, Message: common_err.GetMsg(common_err.SUCCESS)})
+	paths, err := buildV1UploadPaths(ctx.QueryParam("path"), relative, fileName, totalChunks, chunkNumber)
+	if err != nil {
+		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS), Data: err.Error()})
+	}
+	if _, err := os.Lstat(paths.target); err == nil {
+		return ctx.JSON(http.StatusConflict, model.Result{Success: http.StatusConflict, Message: common_err.GetMsg(common_err.FILE_ALREADY_EXISTS)})
+	} else if !os.IsNotExist(err) {
+		return ctx.JSON(http.StatusInternalServerError, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
+	}
+	if _, err := os.Stat(paths.chunk); err == nil {
+		return ctx.JSON(200, model.Result{Success: 200, Message: common_err.GetMsg(common_err.FILE_ALREADY_EXISTS)})
+	} else if !os.IsNotExist(err) {
+		return ctx.JSON(http.StatusInternalServerError, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
+	}
+
+	return ctx.NoContent(http.StatusNoContent)
 }
 
 // @Summary upload file
@@ -488,92 +547,322 @@ func GetFileUpload(ctx echo.Context) error {
 // @Success 200 {string} string "ok"
 // @Router /file/upload [post]
 func PostFileUpload(ctx echo.Context) error {
-	f, _, _ := ctx.Request().FormFile("file")
+	const multipartOverheadAllowance int64 = 1 << 20
+	request := ctx.Request()
+	request.Body = http.MaxBytesReader(ctx.Response().Writer, request.Body, filesecurity.MaxUploadChunkSize+multipartOverheadAllowance)
+	if request.ContentLength > filesecurity.MaxUploadChunkSize+multipartOverheadAllowance {
+		return ctx.JSON(http.StatusRequestEntityTooLarge, model.Result{Success: common_err.INVALID_PARAMS, Message: "upload request exceeds 256 MiB"})
+	}
+
+	f, fileHeader, err := request.FormFile("file")
+	if err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			return ctx.JSON(http.StatusRequestEntityTooLarge, model.Result{Success: common_err.INVALID_PARAMS, Message: "upload request exceeds 256 MiB"})
+		}
+		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS), Data: err.Error()})
+	}
+	defer f.Close()
+	if request.MultipartForm != nil {
+		defer request.MultipartForm.RemoveAll()
+	}
+	if fileHeader == nil || fileHeader.Size < 0 || fileHeader.Size > filesecurity.MaxUploadChunkSize {
+		return ctx.JSON(http.StatusRequestEntityTooLarge, model.Result{Success: common_err.INVALID_PARAMS, Message: "upload chunk exceeds 256 MiB"})
+	}
+
 	relative := ctx.FormValue("relativePath")
 	fileName := ctx.FormValue("filename")
-	totalChunks, _ := strconv.Atoi(utils.DefaultPostForm(ctx, "totalChunks", "0"))
-	chunkNumber := ctx.FormValue("chunkNumber")
-	dirPath := ""
-	path := ctx.FormValue("path")
-
-	hash := file.GetHashByContent([]byte(fileName))
-
-	if len(path) == 0 {
-		logger.Error("path should not be empty")
-		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
+	totalChunks, chunkNumber, err := parseUploadChunks(ctx.FormValue("totalChunks"), ctx.FormValue("chunkNumber"))
+	if err != nil {
+		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS), Data: err.Error()})
 	}
-	tempDir := filepath.Join(path, ".temp", hash+strconv.Itoa(totalChunks)) + "/"
-
-	if fileName != relative {
-		dirPath = strings.TrimSuffix(relative, fileName)
-		tempDir += dirPath
-		if err := file.MkDir(path + "/" + dirPath); err != nil {
-			logger.Error("error when trying to create `"+path+"/"+dirPath+"`", zap.Error(err))
-			return ctx.JSON(http.StatusInternalServerError, model.Result{Success: common_err.SERVICE_ERROR, Message: err.Error()})
+	base := ctx.FormValue("path")
+	paths, err := buildV1UploadPaths(base, relative, fileName, totalChunks, chunkNumber)
+	if err != nil {
+		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS), Data: err.Error()})
+	}
+	uploadSession, err := v1UploadSessions.acquire(paths, totalChunks)
+	if err != nil {
+		return ctx.JSON(http.StatusTooManyRequests, model.Result{Success: http.StatusTooManyRequests, Message: err.Error()})
+	}
+	sessionFinished := false
+	defer func() {
+		if !sessionFinished {
+			uploadSession.lock.Unlock()
 		}
+	}()
+
+	if err := os.MkdirAll(filepath.Dir(paths.target), 0o750); err != nil {
+		return ctx.JSON(http.StatusInternalServerError, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
+	}
+	if err := os.MkdirAll(paths.tempDir, 0o750); err != nil {
+		return ctx.JSON(http.StatusInternalServerError, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
+	}
+	// Recheck after creating parents so a pre-existing symlink cannot turn a
+	// previously missing prefix into an escape.
+	if checked, err := filesecurity.JoinWithinBase(base, relative); err != nil || checked != paths.target {
+		if err == nil {
+			err = filesecurity.ErrUnsafePath
+		}
+		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS), Data: err.Error()})
 	}
 
-	path += "/" + relative
-
-	if !file.CheckNotExist(tempDir + chunkNumber) {
-		if err := file.RMDir(tempDir + chunkNumber); err != nil {
-			logger.Error("error when trying to remove existing `"+tempDir+chunkNumber+"`", zap.Error(err))
-			return ctx.JSON(http.StatusInternalServerError, model.Result{Success: common_err.SERVICE_ERROR, Message: err.Error()})
+	if err := writeUploadChunk(paths.chunk, f); err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, errUploadTooLarge) {
+			status = http.StatusRequestEntityTooLarge
 		}
+		return ctx.JSON(status, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
 	}
 
-	if totalChunks > 1 {
-		if err := file.IsNotExistMkDir(tempDir); err != nil {
-			logger.Error("error when trying to create `"+tempDir+"`", zap.Error(err))
-			return ctx.JSON(http.StatusInternalServerError, model.Result{Success: common_err.SERVICE_ERROR, Message: err.Error()})
-		}
-
-		out, err := os.OpenFile(tempDir+chunkNumber, os.O_WRONLY|os.O_CREATE, 0o644)
-		if err != nil {
-			logger.Error("error when trying to open `"+tempDir+chunkNumber+"` for creation", zap.Error(err))
-			return ctx.JSON(http.StatusInternalServerError, model.Result{Success: common_err.SERVICE_ERROR, Message: err.Error()})
-		}
-
-		defer out.Close()
-
-		if _, err := io.Copy(out, f); err != nil { // recommend to use https://github.com/iceber/iouring-go for faster copy
-			logger.Error("error when trying to write to `"+tempDir+chunkNumber+"`", zap.Error(err))
-			return ctx.JSON(http.StatusInternalServerError, model.Result{Success: common_err.SERVICE_ERROR, Message: err.Error()})
-		}
-
-		fileNum, err := ioutil.ReadDir(tempDir)
-		if err != nil {
-			logger.Error("error when trying to read number of files under `"+tempDir+"`", zap.Error(err))
-			return ctx.JSON(http.StatusInternalServerError, model.Result{Success: common_err.SERVICE_ERROR, Message: err.Error()})
-		}
-
-		if totalChunks == len(fileNum) {
-			if err := file.SpliceFiles(tempDir, path, totalChunks, 1); err != nil {
-				logger.Error("error when trying to splice files under `"+tempDir+"`", zap.Error(err))
-				return ctx.JSON(http.StatusInternalServerError, model.Result{Success: common_err.SERVICE_ERROR, Message: err.Error()})
-			}
-			go func() {
-				time.Sleep(11 * time.Second)
-				if err := file.RMDir(tempDir); err != nil {
-					logger.Error("error when trying to remove `"+tempDir+"`", zap.Error(err))
-				}
-			}()
-		}
-	} else {
-		out, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0o644)
-		if err != nil {
-			logger.Error("error when trying to open `"+path+"` for creation", zap.Error(err))
-			return ctx.JSON(http.StatusInternalServerError, model.Result{Success: common_err.SERVICE_ERROR, Message: err.Error()})
-		}
-
-		defer out.Close()
-
-		if _, err := io.Copy(out, f); err != nil { // recommend to use https://github.com/iceber/iouring-go for faster copy
-			logger.Error("error when trying to write to `"+path+"`", zap.Error(err))
+	complete, err := allV1ChunksPresent(base, paths.tempRelative, totalChunks)
+	if err != nil {
+		return ctx.JSON(http.StatusInternalServerError, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
+	}
+	if complete {
+		if err := assembleV1Upload(base, relative, paths.tempRelative, paths.assembly, paths.target, totalChunks); err != nil {
+			v1UploadSessions.finish(paths.tempDir, uploadSession)
+			sessionFinished = true
 			return ctx.JSON(http.StatusInternalServerError, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
 		}
+		v1UploadSessions.finish(paths.tempDir, uploadSession)
+		sessionFinished = true
 	}
 	return ctx.JSON(http.StatusOK, model.Result{Success: common_err.SUCCESS, Message: common_err.GetMsg(common_err.SUCCESS)})
+}
+
+var errUploadTooLarge = errors.New("upload chunk exceeds 256 MiB")
+
+type v1UploadPaths struct {
+	target       string
+	tempDir      string
+	tempRelative string
+	chunk        string
+	assembly     string
+}
+
+const (
+	maxActiveV1UploadSessions = 16
+	v1UploadSessionTTL        = 6 * time.Hour
+)
+
+type v1UploadSession struct {
+	lock         sync.Mutex
+	closed       bool
+	target       string
+	tempDir      string
+	totalChunks  int64
+	lastActivity time.Time
+}
+
+type v1UploadSessionRegistry struct {
+	mu       sync.Mutex
+	sessions map[string]*v1UploadSession
+}
+
+var v1UploadSessions = v1UploadSessionRegistry{sessions: make(map[string]*v1UploadSession)}
+
+func (r *v1UploadSessionRegistry) acquire(paths v1UploadPaths, totalChunks int64) (*v1UploadSession, error) {
+	now := time.Now()
+	r.cleanup(now)
+	r.mu.Lock()
+	session := r.sessions[paths.tempDir]
+	if session == nil {
+		if len(r.sessions) >= maxActiveV1UploadSessions {
+			r.mu.Unlock()
+			return nil, errors.New("too many active upload sessions")
+		}
+		session = &v1UploadSession{target: paths.target, tempDir: paths.tempDir, totalChunks: totalChunks, lastActivity: now}
+		r.sessions[paths.tempDir] = session
+	}
+	r.mu.Unlock()
+
+	session.lock.Lock()
+	if session.closed || session.target != paths.target || session.tempDir != paths.tempDir || session.totalChunks != totalChunks {
+		session.lock.Unlock()
+		return nil, errors.New("upload session is closing or metadata changed")
+	}
+	session.lastActivity = now
+	return session, nil
+}
+
+func (r *v1UploadSessionRegistry) finish(key string, session *v1UploadSession) {
+	session.closed = true
+	session.lock.Unlock()
+	r.mu.Lock()
+	if r.sessions[key] == session {
+		_ = os.RemoveAll(session.tempDir)
+		delete(r.sessions, key)
+	}
+	r.mu.Unlock()
+}
+
+func (r *v1UploadSessionRegistry) cleanup(now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for key, session := range r.sessions {
+		if session == nil || !session.lock.TryLock() {
+			continue
+		}
+		expired := !session.closed && now.Sub(session.lastActivity) > v1UploadSessionTTL
+		if expired {
+			session.closed = true
+		}
+		session.lock.Unlock()
+		if expired && r.sessions[key] == session {
+			_ = os.RemoveAll(session.tempDir)
+			delete(r.sessions, key)
+		}
+	}
+}
+
+func parseUploadChunks(totalValue, chunkValue string) (int64, int64, error) {
+	totalChunks, err := strconv.ParseInt(totalValue, 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid totalChunks: %w", err)
+	}
+	chunkNumber, err := strconv.ParseInt(chunkValue, 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid chunkNumber: %w", err)
+	}
+	if err := filesecurity.ValidateChunk(totalChunks, chunkNumber); err != nil {
+		return 0, 0, err
+	}
+	return totalChunks, chunkNumber, nil
+}
+
+func buildV1UploadPaths(base, relative, fileName string, totalChunks, chunkNumber int64) (v1UploadPaths, error) {
+	if fileName == "" || fileName == "." || fileName == ".." || filepath.Base(fileName) != fileName {
+		return v1UploadPaths{}, fmt.Errorf("invalid filename")
+	}
+	if err := filesecurity.ValidateRelativePath(relative); err != nil {
+		return v1UploadPaths{}, err
+	}
+	cleanRelative := filepath.Clean(relative)
+	if filepath.Base(cleanRelative) != fileName {
+		return v1UploadPaths{}, fmt.Errorf("filename does not match relativePath")
+	}
+	if err := filesecurity.ValidateChunk(totalChunks, chunkNumber); err != nil {
+		return v1UploadPaths{}, err
+	}
+
+	target, err := filesecurity.JoinWithinBase(base, cleanRelative)
+	if err != nil {
+		return v1UploadPaths{}, err
+	}
+	uploadHash := file.GetHashByContent([]byte(cleanRelative + "\x00" + fileName))
+	tempRelative := filepath.Join(".temp", "upload-"+uploadHash+"-"+strconv.FormatInt(totalChunks, 10), filepath.Dir(cleanRelative))
+	tempDir, err := filesecurity.JoinWithinBase(base, tempRelative)
+	if err != nil {
+		return v1UploadPaths{}, err
+	}
+	chunk, err := filesecurity.JoinWithinBase(base, filepath.Join(tempRelative, strconv.FormatInt(chunkNumber, 10)))
+	if err != nil {
+		return v1UploadPaths{}, err
+	}
+	assembly, err := filesecurity.JoinWithinBase(base, filepath.Join(tempRelative, ".complete"))
+	if err != nil {
+		return v1UploadPaths{}, err
+	}
+
+	return v1UploadPaths{target: target, tempDir: tempDir, tempRelative: tempRelative, chunk: chunk, assembly: assembly}, nil
+}
+
+func writeUploadChunk(destination string, source io.Reader) error {
+	out, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := out.Chmod(0o600); err != nil {
+		_ = out.Close()
+		_ = os.Remove(destination)
+		return err
+	}
+	written, copyErr := io.Copy(out, io.LimitReader(source, filesecurity.MaxUploadChunkSize+1))
+	closeErr := out.Close()
+	if copyErr != nil {
+		_ = os.Remove(destination)
+		return copyErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(destination)
+		return closeErr
+	}
+	if written > filesecurity.MaxUploadChunkSize {
+		_ = os.Remove(destination)
+		return errUploadTooLarge
+	}
+	return nil
+}
+
+func allV1ChunksPresent(base, tempRelative string, totalChunks int64) (bool, error) {
+	for chunkNumber := int64(1); chunkNumber <= totalChunks; chunkNumber++ {
+		chunkPath, err := filesecurity.JoinWithinBase(base, filepath.Join(tempRelative, strconv.FormatInt(chunkNumber, 10)))
+		if err != nil {
+			return false, err
+		}
+		info, err := os.Stat(chunkPath)
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if !info.Mode().IsRegular() || info.Size() > filesecurity.MaxUploadChunkSize {
+			return false, fmt.Errorf("invalid upload chunk %d", chunkNumber)
+		}
+	}
+	return true, nil
+}
+
+func assembleV1Upload(base, targetRelative, tempRelative, assemblyPath, targetPath string, totalChunks int64) error {
+	out, err := os.OpenFile(assemblyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := out.Chmod(0o600); err != nil {
+		_ = out.Close()
+		return err
+	}
+
+	for chunkNumber := int64(1); chunkNumber <= totalChunks; chunkNumber++ {
+		chunkPath, err := filesecurity.JoinWithinBase(base, filepath.Join(tempRelative, strconv.FormatInt(chunkNumber, 10)))
+		if err != nil {
+			_ = out.Close()
+			return err
+		}
+		chunk, err := os.Open(chunkPath)
+		if err != nil {
+			_ = out.Close()
+			return err
+		}
+		written, copyErr := io.Copy(out, io.LimitReader(chunk, filesecurity.MaxUploadChunkSize+1))
+		closeErr := chunk.Close()
+		if copyErr != nil {
+			_ = out.Close()
+			return copyErr
+		}
+		if closeErr != nil {
+			_ = out.Close()
+			return closeErr
+		}
+		if written > filesecurity.MaxUploadChunkSize {
+			_ = out.Close()
+			return fmt.Errorf("upload chunk %d exceeds 256 MiB", chunkNumber)
+		}
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+
+	checkedTarget, err := filesecurity.JoinWithinBase(base, targetRelative)
+	if err != nil {
+		return err
+	}
+	if checkedTarget != targetPath {
+		return filesecurity.ErrUnsafePath
+	}
+	return filesecurity.CommitNoReplace(assemblyPath, targetPath)
 }
 
 func PostFileOctet(ctx echo.Context) error {
@@ -747,7 +1036,6 @@ func PutFileContent(ctx echo.Context) error {
 	if err != nil {
 		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.FILE_DELETE_ERROR, Message: common_err.GetMsg(common_err.FILE_DELETE_ERROR), Data: err})
 	}
-	os.OpenFile(fi.FilePath, os.O_CREATE, fm)
 	err = file.WriteToFullPath([]byte(fi.FileContent), fi.FilePath, fm)
 	if err != nil {
 		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
@@ -767,26 +1055,45 @@ func PutFileContent(ctx echo.Context) error {
 func GetFileImage(ctx echo.Context) error {
 	t := ctx.QueryParam("type")
 	path := ctx.QueryParam("path")
-	if !file.Exists(path) {
-		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.FILE_ALREADY_EXISTS, Message: common_err.GetMsg(common_err.FILE_ALREADY_EXISTS)})
+	if strings.TrimSpace(path) == "" {
+		return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
 	}
+	ctx.Response().Header().Set("X-Content-Type-Options", "nosniff")
 	if t == "thumbnail" {
-		f, err := file.GetImage(path, 100, 0)
+		thumbnail, err := file.GetImage(path, 100, 0)
 		if err != nil {
 			return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
 		}
-		ctx.Response().Writer.Write(f)
+		contentType := http.DetectContentType(thumbnail)
+		return ctx.Blob(http.StatusOK, contentType, thumbnail)
 	}
-	f, err := os.Open(path)
+	if t != "" && t != "original" {
+		return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
+	}
+
+	imageFile, err := os.Open(path)
 	if err != nil {
 		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
 	}
-	defer f.Close()
-	data, err := ioutil.ReadAll(f)
+	defer imageFile.Close()
+	info, err := imageFile.Stat()
 	if err != nil {
 		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
 	}
-	ctx.Response().Writer.Write(data)
+	if !info.Mode().IsRegular() {
+		return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
+	}
+
+	header := make([]byte, 512)
+	n, readErr := imageFile.Read(header)
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.FILE_READ_ERROR, Message: common_err.GetMsg(common_err.FILE_READ_ERROR), Data: readErr.Error()})
+	}
+	if _, err := imageFile.Seek(0, io.SeekStart); err != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.FILE_READ_ERROR, Message: common_err.GetMsg(common_err.FILE_READ_ERROR), Data: err.Error()})
+	}
+	ctx.Response().Header().Set("Content-Type", http.DetectContentType(header[:n]))
+	http.ServeContent(ctx.Response().Writer, ctx.Request(), filepath.Base(path), info.ModTime(), imageFile)
 	return nil
 }
 
@@ -835,12 +1142,9 @@ func GetFileCount(ctx echo.Context) error {
 }
 
 type CenterHandler struct {
+	mu sync.RWMutex
 	// 广播通道，有数据则循环每个用户广播出去
 	broadcast chan []byte
-	// 注册通道，有用户进来 则推到用户集合map中
-	register chan *Client
-	// 注销通道，有用户关闭连接 则将该用户剔出集合map中
-	unregister chan *Client
 	// 用户集合，每个用户本身也在跑两个协程，监听用户的读、写的状态
 	clients map[string]*Client
 }
@@ -848,6 +1152,8 @@ type CenterHandler struct {
 type Client struct {
 	handler *CenterHandler
 	conn    *websocket.Conn
+	done    chan struct{}
+	stop    sync.Once
 	// 每个用户自己的循环跑起来的状态监控
 	send         chan []byte
 	ID           string       `json:"id"`
@@ -864,97 +1170,73 @@ type PeerModel struct {
 	RtcSupported bool         `json:"rtcSupported"`
 }
 
+const (
+	fileWebSocketReadTimeout = 90 * time.Second
+	fileWebSocketWriteWait   = 10 * time.Second
+	fileWebSocketMaxLifetime = 12 * time.Hour
+)
+
 func ConnectWebSocket(ctx echo.Context) error {
-	peerId := ctx.QueryParam("peer")
 	writer := ctx.Response().Writer
 	request := ctx.Request()
+
 	key := uuid.NewString()
-	// peerModel := service.MyService.Peer().GetPeerByUserAgent(ctx.Request().UserAgent())
 	peerModel := model2.PeerDriveDBModel{}
 	name := service.GetName(request)
-	if conn, err = upgraderFile.Upgrade(writer, request, writer.Header()); err != nil {
-		log.Println(err)
+	client := &Client{handler: &handler, send: make(chan []byte, 64), done: make(chan struct{}), ID: key, IP: service.GetIP(request), Name: name, RtcSupported: true, LastBeat: time.Now()}
+
+	wsConn, err := upgraderFile.Upgrade(writer, request, nil)
+	if err != nil {
+		return nil
 	}
-	client := &Client{handler: &handler, conn: conn, send: make(chan []byte, 256), ID: service.GetPeerId(request, key), IP: service.GetIP(request), Name: name, RtcSupported: true, TimerId: 0, LastBeat: time.Now()}
-	if peerId != "" || len(peerModel.ID) > 0 {
-		if len(peerModel.ID) == 0 {
-			peerModel = service.MyService.Peer().GetPeerByID(peerId)
-		}
-		if len(peerModel.ID) > 0 {
-			key = peerId
-			client.ID = peerModel.ID
-			client.Name = service.GetNameByDB(peerModel)
-		}
-	}
-	list := service.MyService.Peer().GetPeers()
-	if len(peerModel.ID) == 0 {
-		peerModel.ID = key
-		peerModel.DisplayName = name.DisplayName
-		peerModel.DeviceName = name.DeviceName
-		peerModel.Model = name.Model
-		peerModel.OS = name.OS
-		peerModel.Browser = name.Browser
-		peerModel.UserAgent = ctx.Request().UserAgent()
-		peerModel.IP = client.IP
-		service.MyService.Peer().CreatePeer(&peerModel)
-		list = append(list, peerModel)
+	wsConn.SetReadLimit(64 << 10)
+	_ = wsConn.SetReadDeadline(time.Now().Add(fileWebSocketReadTimeout))
+	wsConn.SetPongHandler(func(string) error {
+		return wsConn.SetReadDeadline(time.Now().Add(fileWebSocketReadTimeout))
+	})
+	client.conn = wsConn
+	if !handler.tryAdd(client, 32) {
+		_ = wsConn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "too many active file WebSocket connections"), time.Now().Add(time.Second))
+		_ = wsConn.Close()
+		return nil
 	}
 
-	cookie := http.Cookie{
-		Name:  "peerid",
-		Value: key,
-		Path:  "/",
-	}
-	http.SetCookie(writer, &cookie)
+	// Peer IDs are connection-scoped. A reusable unsigned cookie allowed a
+	// client with a matching User-Agent to claim another offline peer identity.
+	peerModel.ID = key
+	peerModel.DisplayName = name.DisplayName
+	peerModel.DeviceName = name.DeviceName
+	peerModel.Model = name.Model
+	peerModel.OS = name.OS
+	peerModel.Browser = name.Browser
+	peerModel.UserAgent = ctx.Request().UserAgent()
+	peerModel.IP = client.IP
+	service.MyService.Peer().CreatePeer(&peerModel)
+	list := service.MyService.Peer().GetPeers()
 	if len(list) > 10 {
-		kickoutList := []Client{}
 		count := len(list) - 10
 		for i := len(list) - 1; count > 0 && i > -1; i-- {
-			if _, ok := handler.clients[list[i].ID]; !ok {
+			if !handler.has(list[i].ID) {
 				count--
-				kickoutList = append(kickoutList, Client{ID: list[i].ID, Name: service.GetNameByDB(list[i]), IP: list[i].IP})
 				service.MyService.Peer().DeletePeer(list[i].ID)
 			}
 		}
-		// if len(kickoutList) > 0 {
-		// 	other := make(map[string]interface{})
-		// 	other["type"] = "kickout"
-		// 	other["peers"] = kickoutList
-		// 	otherBy, err := json.Marshal(other)
-		// 	fmt.Println(err)
-		// 	client.handler.broadcast <- otherBy
-		// }
 	}
-	list = service.MyService.Peer().GetPeers()
-	if len(list) > 10 {
-		fmt.Println("解决完后依然有溢出", list)
-	}
+
 	currentPeer := PeerModel{ID: client.ID, Name: client.Name, RtcSupported: client.RtcSupported}
-	pmsg := make(map[string]interface{})
-	pmsg["type"] = "peer-joined"
-	pmsg["peer"] = currentPeer
-	pby, err := json.Marshal(pmsg)
-	fmt.Println(err)
-	for _, v := range handler.clients {
-		v.send <- pby
+	pby, err := json.Marshal(map[string]interface{}{"type": "peer-joined", "peer": currentPeer})
+	if err == nil {
+		handler.broadcast <- pby
 	}
-	// client.handler.broadcast <- pby
+
 	clients := []PeerModel{}
-	for _, v := range client.handler.clients {
-		if _, ok := handler.clients[v.ID]; ok {
-			clients = append(clients, PeerModel{ID: v.ID, Name: v.Name, RtcSupported: v.RtcSupported})
-		}
+	for _, connected := range client.handler.snapshot() {
+		clients = append(clients, PeerModel{ID: connected.ID, Name: connected.Name, RtcSupported: connected.RtcSupported})
 	}
 
-	other := make(map[string]interface{})
-	other["type"] = "peers"
-	other["peers"] = clients
-	otherBy, err := json.Marshal(other)
-	fmt.Println(err)
-	client.send <- otherBy
-
-	// 推给监控中心注册到用户集合中
-	handler.register <- client
+	if otherBy, err := json.Marshal(map[string]interface{}{"type": "peers", "peers": clients}); err == nil {
+		client.send <- otherBy
+	}
 
 	client.send <- []byte(`{"type":"ping"}`)
 
@@ -965,20 +1247,69 @@ func ConnectWebSocket(ctx echo.Context) error {
 	msg := make(map[string]interface{})
 	msg["type"] = "display-name"
 	msg["message"] = data
-	by, _ := json.Marshal(msg)
-	client.send <- by
+	if by, err := json.Marshal(msg); err == nil {
+		client.send <- by
+	}
 
 	// 每个 client 都挂起 2 个新的协程，监控读、写状态
 	go client.writePump()
 	go client.readPump()
-	return ctx.JSON(common_err.SUCCESS, model.Result{Success: common_err.SUCCESS, Message: common_err.GetMsg(common_err.SUCCESS)})
+	return nil
 }
 
 var handler = CenterHandler{
-	broadcast:  make(chan []byte),
-	register:   make(chan *Client),
-	unregister: make(chan *Client),
-	clients:    make(map[string]*Client),
+	broadcast: make(chan []byte, 64),
+	clients:   make(map[string]*Client),
+}
+
+func (ch *CenterHandler) has(id string) bool {
+	ch.mu.RLock()
+	defer ch.mu.RUnlock()
+	_, ok := ch.clients[id]
+	return ok
+}
+
+func (ch *CenterHandler) count() int {
+	ch.mu.RLock()
+	defer ch.mu.RUnlock()
+	return len(ch.clients)
+}
+
+func (ch *CenterHandler) tryAdd(client *Client, maximum int) bool {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	if maximum < 1 || len(ch.clients) >= maximum {
+		return false
+	}
+	if _, exists := ch.clients[client.ID]; exists {
+		return false
+	}
+	ch.clients[client.ID] = client
+	return true
+}
+
+func (ch *CenterHandler) remove(client *Client) {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	if current := ch.clients[client.ID]; current == client {
+		delete(ch.clients, client.ID)
+	}
+}
+
+func (ch *CenterHandler) get(id string) *Client {
+	ch.mu.RLock()
+	defer ch.mu.RUnlock()
+	return ch.clients[id]
+}
+
+func (ch *CenterHandler) snapshot() []*Client {
+	ch.mu.RLock()
+	defer ch.mu.RUnlock()
+	clients := make([]*Client, 0, len(ch.clients))
+	for _, client := range ch.clients {
+		clients = append(clients, client)
+	}
+	return clients
 }
 
 func init() {
@@ -1000,16 +1331,25 @@ func init() {
 }
 
 func (c *Client) writePump() {
-	defer func() {
-		c.handler.unregister <- c
-
-		c.conn.Close()
-	}()
+	defer c.shutdown()
+	lifetime := time.NewTimer(fileWebSocketMaxLifetime)
+	defer lifetime.Stop()
 	for {
-		// 广播推过来的新消息，马上通过websocket推给自己
-		message, _ := <-c.send
-		fmt.Println("推送消息", string(message), "1")
-		if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+		select {
+		case <-c.done:
+			return
+		case message, ok := <-c.send:
+			if !ok {
+				return
+			}
+			if err := c.conn.SetWriteDeadline(time.Now().Add(fileWebSocketWriteWait)); err != nil {
+				return
+			}
+			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				return
+			}
+		case <-lifetime.C:
+			_ = c.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "connection lifetime reached"), time.Now().Add(fileWebSocketWriteWait))
 			return
 		}
 	}
@@ -1017,10 +1357,7 @@ func (c *Client) writePump() {
 
 // 读，监听客户端是否有推送内容过来服务端
 func (c *Client) readPump() {
-	defer func() {
-		c.handler.unregister <- c
-		c.conn.Close()
-	}()
+	defer c.shutdown()
 	for {
 		// 循环监听是否该用户是否要发言
 		_, message, err := c.conn.ReadMessage()
@@ -1034,10 +1371,11 @@ func (c *Client) readPump() {
 		}
 		// 要的话，推给广播中心，广播中心再推给每个用户
 
-		t := gjson.GetBytes(message, "type")
-		if t.String() == "disconnect" {
-			c.handler.unregister <- c
-			c.conn.Close()
+		messageType, target, normalized, err := normalizeClientPeerMessage(message, c.ID)
+		if err != nil {
+			continue
+		}
+		if messageType == "disconnect" {
 			// clients := []Client{}
 			// list := service.MyService.Peer().GetPeers()
 			// for _, v := range list {
@@ -1055,45 +1393,85 @@ func (c *Client) readPump() {
 			c.handler.broadcast <- []byte(`{"type":"peer-left","peerId":"` + c.ID + `"}`)
 			// c.handler.broadcast <- otherBy
 			break
-		} else if t.String() == "pong" {
+		} else if messageType == "pong" {
 			c.LastBeat = time.Now()
+			_ = c.conn.SetReadDeadline(time.Now().Add(fileWebSocketReadTimeout))
 			continue
 		}
-		to := gjson.GetBytes(message, "to")
 
-		if len(to.String()) > 0 {
-			toC := c.handler.clients[to.String()]
+		if target != "" {
+			toC := c.handler.get(target)
 			if toC == nil {
 				continue
 			}
-			data := map[string]interface{}{}
-			json.Unmarshal(message, &data)
-			data["sender"] = c.ID
-			delete(data, "to")
-			message, err = json.Marshal(data)
-			toC.send <- message
+			select {
+			case toC.send <- normalized:
+			default:
+			}
 			continue
 		}
 
-		c.handler.broadcast <- message
+		c.handler.broadcast <- normalized
 	}
+}
+
+func (c *Client) shutdown() {
+	c.stop.Do(func() {
+		if c.handler != nil {
+			c.handler.remove(c)
+		}
+		if c.done != nil {
+			close(c.done)
+		}
+		if c.conn != nil {
+			_ = c.conn.Close()
+		}
+	})
+}
+
+func normalizeClientPeerMessage(message []byte, sender string) (messageType, target string, normalized []byte, err error) {
+	data := make(map[string]interface{})
+	if err := json.Unmarshal(message, &data); err != nil {
+		return "", "", nil, err
+	}
+	messageType, ok := data["type"].(string)
+	if !ok || len(messageType) == 0 || len(messageType) > 64 {
+		return "", "", nil, errors.New("invalid peer message type")
+	}
+	if messageType == "disconnect" || messageType == "pong" {
+		return messageType, "", nil, nil
+	}
+	switch messageType {
+	case "peer-left", "peer-joined", "peers", "ping", "display-name":
+		return "", "", nil, errors.New("client cannot send a server control message")
+	}
+	if rawTarget, exists := data["to"]; exists {
+		var ok bool
+		target, ok = rawTarget.(string)
+		if !ok || len(target) == 0 || len(target) > 128 {
+			return "", "", nil, errors.New("invalid peer message target")
+		}
+	}
+	data["sender"] = sender
+	delete(data, "to")
+	normalized, err = json.Marshal(data)
+	if err != nil {
+		return "", "", nil, err
+	}
+	return messageType, target, normalized, nil
 }
 
 func (ch *CenterHandler) monitoring() {
 	for {
 		select {
-		// 注册，新用户连接过来会推进注册通道，这里接收推进来的用户指针
-		case client := <-ch.register:
-			ch.clients[client.ID] = client
-			// 注销，关闭连接或连接异常会将用户推出群聊
-		case client := <-ch.unregister:
-			delete(ch.clients, client.ID)
-			// 消息，监听到有新消息到来
+		// 消息，监听到有新消息到来
 		case message := <-ch.broadcast:
-			println("消息来了，message：" + string(message))
 			// 推送给每个用户的通道，每个用户都有跑协程起了writePump的监听
-			for _, client := range ch.clients {
-				client.send <- message
+			for _, client := range ch.snapshot() {
+				select {
+				case client.send <- message:
+				default:
+				}
 			}
 		}
 	}
@@ -1102,7 +1480,7 @@ func (ch *CenterHandler) monitoring() {
 func GetPeers(ctx echo.Context) error {
 	peers := service.MyService.Peer().GetPeers()
 	for i := 0; i < len(peers); i++ {
-		if _, ok := handler.clients[peers[i].ID]; ok {
+		if handler.has(peers[i].ID) {
 			peers[i].Online = true
 		}
 	}

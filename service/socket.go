@@ -1,9 +1,9 @@
 package service
 
 import (
+	"net"
 	"net/http"
 	"strconv"
-	"strings"
 
 	model2 "github.com/IceWhaleTech/CasaOS/service/model"
 	"github.com/mileusna/useragent"
@@ -29,17 +29,14 @@ func GetPeerId(request *http.Request, id string) string {
 }
 
 func GetIP(request *http.Request) string {
-	ip := ""
-	if len(request.Header.Get("x-forwarded-for")) > 0 {
-		ip = strings.Split(request.Header.Get("x-forwarded-for"), ",")[0]
-	} else {
-		ip = request.RemoteAddr
+	host, _, err := net.SplitHostPort(request.RemoteAddr)
+	if err != nil {
+		host = request.RemoteAddr
 	}
-
-	if ip == "::1" || ip == "::ffff:127.0.0.1" {
-		ip = "127.0.0.1"
+	if address := net.ParseIP(host); address != nil {
+		return address.String()
 	}
-	return ip
+	return host
 }
 
 func GetName(request *http.Request) Name {

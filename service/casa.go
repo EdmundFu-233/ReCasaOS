@@ -2,6 +2,7 @@ package service
 
 import (
 	json2 "encoding/json"
+	"strings"
 	"time"
 
 	"github.com/IceWhaleTech/CasaOS/model"
@@ -24,6 +25,9 @@ func (o *casaService) GetCasaosVersion() model.Version {
 	keyName := "casa_version"
 	var dataStr string
 	var version model.Version
+	if strings.TrimSpace(config.ServerInfo.ServerApi) == "" {
+		return version
+	}
 	if result, ok := Cache.Get(keyName); ok {
 		dataStr, ok = result.(string)
 		if ok {

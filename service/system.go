@@ -16,12 +16,12 @@ import (
 	"github.com/IceWhaleTech/CasaOS-Common/utils/command"
 	exec2 "github.com/IceWhaleTech/CasaOS-Common/utils/exec"
 
-	"github.com/IceWhaleTech/CasaOS-Common/utils/file"
 	"github.com/IceWhaleTech/CasaOS-Common/utils/logger"
 	"github.com/IceWhaleTech/CasaOS/common"
 	"github.com/IceWhaleTech/CasaOS/model"
 	"github.com/IceWhaleTech/CasaOS/pkg/config"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/common_err"
+	"github.com/IceWhaleTech/CasaOS/pkg/utils/file"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/httper"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/ip_helper"
 	"github.com/tidwall/gjson"
@@ -35,7 +35,7 @@ import (
 )
 
 type SystemService interface {
-	UpdateSystemVersion(version string)
+	UpdateSystemVersion(version string) error
 	GetSystemConfigDebug() []string
 	GetCasaOSLogs(lineNumber int) string
 	UpdateAssist()
@@ -125,7 +125,10 @@ func (c *systemService) GenreateSystemEntry() {
 	modelsPath := "/var/lib/casaos/www/modules"
 	entryFileName := "entry.json"
 	entryFilePath := filepath.Join(config.AppInfo.DBPath, "db", entryFileName)
-	file.IsNotExistCreateFile(entryFilePath)
+	if err := file.IsNotExistCreateFile(entryFilePath); err != nil && !errors.Is(err, os.ErrExist) {
+		logger.Error("create entry file error", zap.Error(err))
+		return
+	}
 
 	dir, err := os.ReadDir(modelsPath)
 	if err != nil {
@@ -143,7 +146,7 @@ func (c *systemService) GenreateSystemEntry() {
 	}
 	json = strings.TrimRight(json, ",")
 	json += "]"
-	err = os.WriteFile(entryFilePath, []byte(json), 0o666)
+	err = os.WriteFile(entryFilePath, []byte(json), 0o600)
 	if err != nil {
 		logger.Error("write entry file error", zap.Error(err))
 		return
@@ -198,7 +201,9 @@ func (c *systemService) MkdirAll(path string) (int, error) {
 		return common_err.DIR_ALREADY_EXISTS, nil
 	} else {
 		if os.IsNotExist(err) {
-			os.MkdirAll(path, os.ModePerm)
+			if err := os.MkdirAll(path, 0o750); err != nil {
+				return common_err.SERVICE_ERROR, err
+			}
 			return common_err.SUCCESS, nil
 		} else if strings.Contains(err.Error(), ": not a directory") {
 			return common_err.FILE_OR_DIR_EXISTS, err
@@ -229,7 +234,9 @@ func (c *systemService) CreateFile(path string) (int, error) {
 		return common_err.FILE_OR_DIR_EXISTS, nil
 	} else {
 		if os.IsNotExist(err) {
-			file.CreateFile(path)
+			if err := file.CreateFile(path); err != nil {
+				return common_err.SERVICE_ERROR, err
+			}
 			return common_err.SUCCESS, nil
 		}
 	}
@@ -370,23 +377,10 @@ func (c *systemService) GetNet(physics bool) []string {
 	}
 }
 
-func (s *systemService) UpdateSystemVersion(version string) {
+func (s *systemService) UpdateSystemVersion(_ string) error {
 	keyName := "casa_version"
 	Cache.Delete(keyName)
-	if file.Exists(config.AppInfo.LogPath + "/upgrade.log") {
-		os.Remove(config.AppInfo.LogPath + "/upgrade.log")
-	}
-	file.CreateFile(config.AppInfo.LogPath + "/upgrade.log")
-	// go command2.OnlyExec("curl -fsSL https://raw.githubusercontent.com/LinkLeong/casaos-alpha/main/update.sh | bash")
-	if len(config.ServerInfo.UpdateUrl) > 0 {
-		go command.OnlyExec("curl -fsSL " + config.ServerInfo.UpdateUrl + " | bash")
-	} else {
-		osRelease, _ := file.ReadOSRelease()
-		go command.OnlyExec("curl -fsSL https://get.casaos.io/update?t=" + osRelease["MANUFACTURER"] + " | bash")
-	}
-
-	// s.log.Error(config.AppInfo.ProjectPath + "/shell/tool.sh -r " + version)
-	// s.log.Error(command2.ExecResultStr(config.AppInfo.ProjectPath + "/shell/tool.sh -r " + version))
+	return errors.New("automatic updates are disabled until ReCasaOS publishes a signed component manifest and rollback-capable installer")
 }
 
 func (s *systemService) UpdateAssist() {

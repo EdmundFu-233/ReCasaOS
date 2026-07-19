@@ -17,7 +17,6 @@ import (
 	"strings"
 	"time"
 
-	file1 "github.com/IceWhaleTech/CasaOS-Common/utils/file"
 	"github.com/IceWhaleTech/CasaOS-Common/utils/logger"
 	"github.com/IceWhaleTech/CasaOS/common"
 	"github.com/IceWhaleTech/CasaOS/model"
@@ -54,7 +53,7 @@ func InitInfo() {
 	}
 	mb.Hash = encryption.GetMD5ByStr(mac)
 	mb.Version = common.VERSION
-	osRelease, _ := file1.ReadOSRelease()
+	osRelease, _ := file.ReadOSRelease()
 
 	mb.DriveModel = osRelease["MODEL"]
 	if len(mb.DriveModel) == 0 {
@@ -66,7 +65,9 @@ func InitInfo() {
 		logger.Error("init info err", zap.Any("err", err))
 		return
 	}
-	file.WriteToFullPath(by, config.AppInfo.DBPath+"/baseinfo.conf", 0o666)
+	if err := file.WriteToFullPath(by, config.AppInfo.DBPath+"/baseinfo.conf", 0o600); err != nil {
+		logger.Error("write baseinfo.conf", zap.Error(err))
+	}
 }
 
 func InitNetworkMount() {
@@ -77,7 +78,7 @@ func InitNetworkMount() {
 		directories, err := samba.GetSambaSharesList(connection.Host, connection.Port, connection.Username, connection.Password)
 		if err != nil {
 			service.MyService.Connections().DeleteConnection(fmt.Sprint(connection.ID))
-			logger.Error("mount samba err", zap.Any("err", err), zap.Any("info", connection))
+			logger.Error("mount samba connection failed", zap.Error(err), zap.Uint("connection_id", connection.ID))
 			continue
 		}
 		baseHostPath := "/mnt/" + connection.Host

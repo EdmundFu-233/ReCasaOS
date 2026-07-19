@@ -7,13 +7,11 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/IceWhaleTech/CasaOS-Common/utils/logger"
 	"github.com/IceWhaleTech/CasaOS/drivers/base"
 	"github.com/IceWhaleTech/CasaOS/internal/driver"
 	"github.com/IceWhaleTech/CasaOS/model"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils"
 	"github.com/go-resty/resty/v2"
-	"go.uber.org/zap"
 )
 
 type GoogleDrive struct {
@@ -72,11 +70,10 @@ func (d *GoogleDrive) Link(ctx context.Context, file model.Obj, args model.LinkA
 func (d *GoogleDrive) GetUserInfo(ctx context.Context) (string, error) {
 	url := "https://content.googleapis.com/drive/v3/about?fields=user"
 	user := UserInfo{}
-	resp, err := d.request(url, http.MethodGet, nil, &user)
+	_, err := d.request(url, http.MethodGet, nil, &user)
 	if err != nil {
 		return "", err
 	}
-	logger.Info("resp", zap.Any("resp", resp))
 	return user.User.EmailAddress, nil
 }
 

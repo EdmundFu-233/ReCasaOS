@@ -6,10 +6,12 @@ import (
 	"strconv"
 
 	"github.com/IceWhaleTech/CasaOS-Common/external"
-	"github.com/IceWhaleTech/CasaOS-Common/utils/jwt"
 	"github.com/IceWhaleTech/CasaOS/common"
+	"github.com/IceWhaleTech/CasaOS/pkg/authsecurity"
 	"github.com/IceWhaleTech/CasaOS/pkg/config"
+	"github.com/IceWhaleTech/CasaOS/pkg/httpsecurity"
 	v1 "github.com/IceWhaleTech/CasaOS/route/v1"
+	echojwt "github.com/labstack/echo-jwt/v4"
 	"github.com/labstack/echo/v4"
 	echo_middleware "github.com/labstack/echo/v4/middleware"
 )
@@ -17,21 +19,10 @@ import (
 func InitV1Router() http.Handler {
 	e := echo.New()
 
-	e.Use((echo_middleware.CORSWithConfig(echo_middleware.CORSConfig{
-		AllowOrigins:     []string{"*"},
-		AllowMethods:     []string{echo.POST, echo.GET, echo.OPTIONS, echo.PUT, echo.DELETE},
-		AllowHeaders:     []string{echo.HeaderAuthorization, echo.HeaderContentLength, echo.HeaderXCSRFToken, echo.HeaderContentType, echo.HeaderAccessControlAllowOrigin, echo.HeaderAccessControlAllowHeaders, echo.HeaderAccessControlAllowMethods, echo.HeaderConnection, echo.HeaderOrigin, echo.HeaderXRequestedWith},
-		ExposeHeaders:    []string{echo.HeaderContentLength, echo.HeaderAccessControlAllowOrigin, echo.HeaderAccessControlAllowHeaders},
-		MaxAge:           172800,
-		AllowCredentials: true,
-	})))
 	e.Use(echo_middleware.Gzip())
 	e.Use(echo_middleware.Recover())
-	e.Use(echo_middleware.Logger())
+	e.Use(safeRequestLogger())
 
-	e.GET("/v1/sys/debug", v1.GetSystemConfigDebug) // //debug
-
-	e.GET("/v1/sys/version/check", v1.GetSystemCheckVersion)
 	e.GET("/v1/sys/version/current", func(ctx echo.Context) error {
 		return ctx.String(200, common.VERSION)
 	})
@@ -41,13 +32,13 @@ func InitV1Router() http.Handler {
 	e.GET("/v1/recover/:type", v1.GetRecoverStorage)
 	v1Group := e.Group("/v1")
 	//	e.Any("/v1/test", v1.CheckNetwork)
-	v1Group.Use(echo_middleware.JWTWithConfig(echo_middleware.JWTConfig{
+	v1Group.Use(echojwt.WithConfig(echojwt.Config{
 		Skipper: func(c echo.Context) bool {
-			return c.RealIP() == "::1" || c.RealIP() == "127.0.0.1"
+			return httpsecurity.LoopbackAuthBypassAllowed(c.Request())
 		},
-		ParseTokenFunc: func(token string, c echo.Context) (interface{}, error) {
-			valid, claims, err := jwt.Validate(token, func() (*ecdsa.PublicKey, error) { return external.GetPublicKey(config.CommonInfo.RuntimePath) })
-			if err != nil || !valid {
+		ParseTokenFunc: func(c echo.Context, token string) (interface{}, error) {
+			claims, err := authsecurity.ValidateAccessToken(token, func() (*ecdsa.PublicKey, error) { return external.GetPublicKey(config.CommonInfo.RuntimePath) })
+			if err != nil {
 				return nil, echo.ErrUnauthorized
 			}
 
@@ -55,20 +46,15 @@ func InitV1Router() http.Handler {
 
 			return claims, nil
 		},
-		TokenLookupFuncs: []echo_middleware.ValuesExtractor{
-			func(ctx echo.Context) ([]string, error) {
-				if len(ctx.Request().Header.Get(echo.HeaderAuthorization)) > 0 {
-					return []string{ctx.Request().Header.Get(echo.HeaderAuthorization)}, nil
-				}
-				return []string{ctx.QueryParam("token")}, nil
-			},
-		},
+		TokenLookup: "header:Authorization,query:token",
 	}))
+	v1Group.Use(privateNoStoreResponses())
 	{
 
 		v1SysGroup := v1Group.Group("/sys")
 		v1SysGroup.Use()
 		{
+			v1SysGroup.GET("/debug", v1.GetSystemConfigDebug)
 			v1SysGroup.GET("/version", v1.GetSystemCheckVersion) // version/check
 
 			v1SysGroup.POST("/update", v1.SystemUpdate)
@@ -197,5 +183,5 @@ func InitV1Router() http.Handler {
 		}
 	}
 
-	return e
+	return httpsecurity.WithSecurityHeaders(httpsecurity.WithCORS(e, httpsecurity.AllowedOriginsFromEnv()))
 }

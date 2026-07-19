@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"net/url"
 	"strings"
 	"sync"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/IceWhaleTech/CasaOS-Common/utils/logger"
 	"github.com/IceWhaleTech/CasaOS/model"
+	"github.com/IceWhaleTech/CasaOS/pkg/netsecurity"
 	"github.com/go-resty/resty/v2"
 	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
@@ -101,14 +103,13 @@ func (s *otherService) Search(key string) ([]model.SearchEngine, error) {
 }
 
 func (s *otherService) AgentSearch(url string) ([]byte, error) {
-	client := resty.New()
-	client.SetTimeout(3 * time.Second) // 设置全局超时时间
-	resp, err := client.R().Get(url)
+	resp, err := netsecurity.GetPublicHTTPS(context.Background(), url, 3*time.Second)
 	if err != nil {
-		logger.Error("Then get search result error: %v", zap.Error(err), zap.String("url", url))
+		logger.Error("search proxy request rejected", zap.Error(err))
 		return nil, err
 	}
-	return resp.Body(), nil
+	defer resp.Body.Close()
+	return netsecurity.ReadBodyLimited(resp.Body, 2<<20)
 }
 
 func NewOtherService() OtherService {
