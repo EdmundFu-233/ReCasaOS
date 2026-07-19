@@ -316,29 +316,6 @@ func CommonPrefix(sep byte, paths ...string) string {
 	return string(c)
 }
 
-// MoveFile supports the legacy Samba configuration migration path.
-func MoveFile(sourcePath, destPath string) error {
-	inputFile, err := os.Open(sourcePath)
-	if err != nil {
-		return fmt.Errorf("Couldn't open source file: %s", err)
-	}
-	outputFile, err := os.Create(destPath)
-	if err != nil {
-		inputFile.Close()
-		return fmt.Errorf("Couldn't open dest file: %s", err)
-	}
-	defer outputFile.Close()
-	_, err = io.Copy(outputFile, inputFile)
-	inputFile.Close()
-	if err != nil {
-		return fmt.Errorf("Writing to output file failed: %s", err)
-	}
-	if err := os.Remove(sourcePath); err != nil {
-		return fmt.Errorf("Failed removing original file: %s", err)
-	}
-	return nil
-}
-
 func ReadLine(lineNumber int, path string) string {
 	file, err := os.Open(path)
 	if err != nil {

@@ -619,7 +619,10 @@ func IsMounted(path string) bool {
 	if mounted {
 		return true
 	}
-	connections := MyService.Connections().GetConnectionsList()
+	connections, err := MyService.Connections().GetConnectionsList()
+	if err != nil {
+		return false
+	}
 	for _, v := range connections {
 		if v.MountPoint == path {
 			return true

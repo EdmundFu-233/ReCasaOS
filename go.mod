@@ -25,7 +25,6 @@ require (
 	github.com/labstack/echo/v4 v4.15.1
 	github.com/maruel/natural v1.1.0
 	github.com/mileusna/useragent v1.2.1
-	github.com/moby/sys/mount v0.3.3
 	github.com/moby/sys/mountinfo v0.6.2
 	github.com/oapi-codegen/echo-middleware v1.0.2
 	github.com/oapi-codegen/runtime v1.6.0

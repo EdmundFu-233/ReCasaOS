@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	"github.com/IceWhaleTech/CasaOS/pkg/config"
 	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
 	"github.com/IceWhaleTech/CasaOS/pkg/publicfiles"
+	"github.com/IceWhaleTech/CasaOS/pkg/samba"
 	"github.com/IceWhaleTech/CasaOS/pkg/sqlite"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/file"
 	"github.com/IceWhaleTech/CasaOS/route"
@@ -54,12 +56,16 @@ var (
 	//go:embed build/sysroot/etc/casaos/casaos.conf.sample
 	_confSample string
 
-	configFlag  = flag.String("c", "", "config address")
-	dbFlag      = flag.String("db", "", "db path")
-	versionFlag = flag.Bool("v", false, "version")
+	configFlag     = flag.String("c", "", "config address")
+	dbFlag         = flag.String("db", "", "db path")
+	versionFlag    = flag.Bool("v", false, "version")
+	sambaProbeFlag = flag.Bool("internal-samba-probe", false, "internal use only")
 )
 
 func init() {
+	if isInternalSambaProbeInvocation() {
+		return
+	}
 	flag.Parse()
 	if *versionFlag {
 		fmt.Println("v" + common.VERSION)
@@ -103,6 +109,9 @@ func init() {
 // @name Authorization
 // @BasePath /v1
 func main() {
+	if isInternalSambaProbeInvocation() {
+		os.Exit(samba.RunInternalProbe())
+	}
 	if *versionFlag {
 		return
 	}
@@ -280,4 +289,8 @@ func main() {
 	if err != nil && err != http.ErrServerClosed {
 		panic(err)
 	}
+}
+
+func isInternalSambaProbeInvocation() bool {
+	return len(os.Args) == 2 && os.Args[1] == samba.InternalProbeArgument
 }
