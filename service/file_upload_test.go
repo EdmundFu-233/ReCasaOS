@@ -45,6 +45,7 @@ func TestV2UploadRegistryPublishesSameKeyOnce(t *testing.T) {
 
 func TestV2UploadRegistryCapAndTerminalCleanup(t *testing.T) {
 	service := NewFileUploadService()
+	service.removeTree = os.RemoveAll
 	base := t.TempDir()
 	for index := int64(0); index < maxActiveUploadSessions; index++ {
 		candidate := &FileInfo{init: true, tempDir: filepath.Join(base, fmt.Sprintf("temp-%d", index))}

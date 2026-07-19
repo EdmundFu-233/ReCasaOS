@@ -11,10 +11,10 @@
 package v1
 
 import (
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -24,6 +24,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/IceWhaleTech/CasaOS/model"
+	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
 	"github.com/IceWhaleTech/CasaOS/pkg/samba"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/common_err"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/file"
@@ -69,12 +70,20 @@ func GetSambaSharesList(ctx echo.Context) error {
 func PostSambaSharesCreate(ctx echo.Context) error {
 	shares := []model.Shares{}
 	ctx.Bind(&shares)
+	managementRoots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR)})
+	}
 	for _, v := range shares {
 		if v.Path == "" {
 			return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INSUFFICIENT_PERMISSIONS, Message: common_err.GetMsg(common_err.INSUFFICIENT_PERMISSIONS)})
 		}
-		if !file.Exists(v.Path) {
+		directory, openErr := managementRoots.OpenDirectory(v.Path)
+		if openErr != nil {
 			return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.DIR_NOT_EXISTS, Message: common_err.GetMsg(common_err.DIR_NOT_EXISTS)})
+		}
+		if closeErr := directory.Close(); closeErr != nil {
+			return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR)})
 		}
 		if len(service.MyService.Shares().GetSharesByPath(v.Path)) > 0 {
 			return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.SHARE_ALREADY_EXISTS, Message: common_err.GetMsg(common_err.SHARE_ALREADY_EXISTS)})
@@ -88,7 +97,9 @@ func PostSambaSharesCreate(ctx echo.Context) error {
 		shareDBModel.Anonymous = true
 		shareDBModel.Path = v.Path
 		shareDBModel.Name = filepath.Base(v.Path)
-		os.Chmod(v.Path, 0o777)
+		if err := managementRoots.ChmodDirectory(v.Path, 0o777); err != nil {
+			return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
+		}
 		service.MyService.Shares().CreateShare(shareDBModel)
 	}
 
@@ -148,6 +159,9 @@ func PostSambaConnectionsCreate(ctx echo.Context) error {
 	// }
 
 	connection.Host = strings.Split(connection.Host, "/")[0]
+	if err := filesecurity.ValidatePathComponent(connection.Host); err != nil {
+		return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
+	}
 	// check is exists
 	connections := service.MyService.Connections().GetConnectionByHost(connection.Host)
 	if len(connections) > 0 {
@@ -158,6 +172,15 @@ func PostSambaConnectionsCreate(ctx echo.Context) error {
 	if err != nil {
 		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
 	}
+	for _, directory := range directories {
+		if err := filesecurity.ValidatePathComponent(directory); err != nil {
+			return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
+		}
+	}
+	managementRoots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR)})
+	}
 
 	connectionDBModel := model2.ConnectionsDBModel{}
 	connectionDBModel.Username = connection.Username
@@ -165,13 +188,17 @@ func PostSambaConnectionsCreate(ctx echo.Context) error {
 	connectionDBModel.Host = connection.Host
 	connectionDBModel.Port = connection.Port
 	connectionDBModel.Directories = strings.Join(directories, ",")
-	baseHostPath := "/mnt/" + connection.Host
+	baseHostPath := filepath.Join("/mnt", connection.Host)
 	connectionDBModel.MountPoint = baseHostPath
 	connection.MountPoint = baseHostPath
-	file.IsNotExistMkDir(baseHostPath)
+	if err := managementRoots.MkdirAll(baseHostPath, 0o750); err != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
+	}
 	for _, v := range directories {
-		mountPoint := baseHostPath + "/" + v
-		file.IsNotExistMkDir(mountPoint)
+		mountPoint := filepath.Join(baseHostPath, v)
+		if err := managementRoots.MkdirAll(mountPoint, 0o750); err != nil {
+			return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
+		}
 		service.MyService.Connections().MountSmaba(connectionDBModel.Username, connectionDBModel.Host, v, connectionDBModel.Port, mountPoint, connectionDBModel.Password)
 	}
 
@@ -192,19 +219,42 @@ func DeleteSambaConnections(ctx echo.Context) error {
 	if err != nil {
 		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
 	}
-	baseHostPath := "/mnt/" + connection.Host
+	if err := filesecurity.ValidatePathComponent(connection.Host); err != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
+	}
+	baseHostPath := filepath.Join("/mnt", connection.Host)
 	for _, v := range mountPointList {
-		if service.IsMounted(baseHostPath + "/" + v) {
-			err := service.MyService.Connections().UnmountSmaba(baseHostPath + "/" + v)
+		if err := filesecurity.ValidatePathComponent(v); err != nil {
+			return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
+		}
+		mountPoint := filepath.Join(baseHostPath, v)
+		if service.IsMounted(mountPoint) {
+			err := service.MyService.Connections().UnmountSmaba(mountPoint)
 			if err != nil {
-				logger.Error("unmount smaba error", zap.Error(err), zap.Any("path", baseHostPath+"/"+v))
+				logger.Error("unmount smaba error", zap.Error(err), zap.Any("path", mountPoint))
 				return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
 			}
 		}
 	}
-	dir, _ := ioutil.ReadDir(connection.MountPoint)
-	if len(dir) == 0 {
-		os.RemoveAll(connection.MountPoint)
+	managementRoots, rootsErr := filesecurity.ManagementFileRoots()
+	if rootsErr != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR)})
+	}
+	directory, openErr := managementRoots.OpenDirectory(baseHostPath)
+	if openErr != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: openErr.Error()})
+	}
+	_, readErr := directory.ReadDir(1)
+	closeErr := directory.Close()
+	if closeErr != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: closeErr.Error()})
+	}
+	if errors.Is(readErr, io.EOF) {
+		if err := managementRoots.RemoveAll(baseHostPath); err != nil {
+			return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
+		}
+	} else if readErr != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: readErr.Error()})
 	}
 	service.MyService.Connections().DeleteConnection(id)
 	return ctx.JSON(common_err.SUCCESS, model.Result{Success: common_err.SUCCESS, Message: common_err.GetMsg(common_err.SUCCESS), Data: id})

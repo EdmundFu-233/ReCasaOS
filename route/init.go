@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/IceWhaleTech/CasaOS/common"
 	"github.com/IceWhaleTech/CasaOS/model"
 	"github.com/IceWhaleTech/CasaOS/pkg/config"
+	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
 	"github.com/IceWhaleTech/CasaOS/pkg/samba"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/encryption"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/file"
@@ -72,6 +74,11 @@ func InitInfo() {
 
 func InitNetworkMount() {
 	time.Sleep(time.Second * 10)
+	managementRoots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		logger.Error("management file roots unavailable", zap.Error(err))
+		return
+	}
 	connections := service.MyService.Connections().GetConnectionsList()
 	for _, v := range connections {
 		connection := service.MyService.Connections().GetConnectionByID(fmt.Sprint(v.ID))
@@ -81,7 +88,22 @@ func InitNetworkMount() {
 			logger.Error("mount samba connection failed", zap.Error(err), zap.Uint("connection_id", connection.ID))
 			continue
 		}
-		baseHostPath := "/mnt/" + connection.Host
+		if err := filesecurity.ValidatePathComponent(connection.Host); err != nil {
+			logger.Error("invalid samba host path component", zap.Uint("connection_id", connection.ID))
+			continue
+		}
+		invalidShare := false
+		for _, directory := range directories {
+			if err := filesecurity.ValidatePathComponent(directory); err != nil {
+				logger.Error("invalid samba share path component", zap.Uint("connection_id", connection.ID))
+				invalidShare = true
+				break
+			}
+		}
+		if invalidShare {
+			continue
+		}
+		baseHostPath := filepath.Join("/mnt", connection.Host)
 
 		mountPointList, err := service.MyService.System().GetDirPath(baseHostPath)
 		if err != nil {
@@ -92,18 +114,27 @@ func InitNetworkMount() {
 			service.MyService.Connections().UnmountSmaba(v.Path)
 		}
 
-		os.RemoveAll(baseHostPath)
+		if err := managementRoots.RemoveAll(baseHostPath); err != nil {
+			logger.Error("remove stale samba host mount directory", zap.Error(err), zap.Uint("connection_id", connection.ID))
+			continue
+		}
 
-		file.IsNotExistMkDir(baseHostPath)
+		if err := managementRoots.MkdirAll(baseHostPath, 0o750); err != nil {
+			logger.Error("create samba host mount directory", zap.Error(err), zap.Uint("connection_id", connection.ID))
+			continue
+		}
 		for _, v := range directories {
-			mountPoint := baseHostPath + "/" + v
-			file.IsNotExistMkDir(mountPoint)
+			mountPoint := filepath.Join(baseHostPath, v)
+			if err := managementRoots.MkdirAll(mountPoint, 0o750); err != nil {
+				logger.Error("create samba share mount directory", zap.Error(err), zap.Uint("connection_id", connection.ID))
+				continue
+			}
 			service.MyService.Connections().MountSmaba(connection.Username, connection.Host, v, connection.Port, mountPoint, connection.Password)
 		}
 		connection.Directories = strings.Join(directories, ",")
 		service.MyService.Connections().UpdateConnection(&connection)
 	}
-	err := service.MyService.Storage().CheckAndMountAll()
+	err = service.MyService.Storage().CheckAndMountAll()
 	if err != nil {
 		logger.Error("mount storage err", zap.Any("err", err))
 	}

@@ -20,6 +20,7 @@ import (
 	"github.com/IceWhaleTech/CasaOS/common"
 	"github.com/IceWhaleTech/CasaOS/model"
 	"github.com/IceWhaleTech/CasaOS/pkg/config"
+	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/common_err"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/file"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/httper"
@@ -196,12 +197,16 @@ func (c *systemService) GetMacAddress() (string, error) {
 }
 
 func (c *systemService) MkdirAll(path string) (int, error) {
-	_, err := os.Stat(path)
+	roots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		return common_err.SERVICE_ERROR, err
+	}
+	_, err = roots.Stat(path)
 	if err == nil {
 		return common_err.DIR_ALREADY_EXISTS, nil
 	} else {
 		if os.IsNotExist(err) {
-			if err := os.MkdirAll(path, 0o750); err != nil {
+			if err := roots.MkdirAll(path, 0o750); err != nil {
 				return common_err.SERVICE_ERROR, err
 			}
 			return common_err.SUCCESS, nil
@@ -213,12 +218,16 @@ func (c *systemService) MkdirAll(path string) (int, error) {
 }
 
 func (c *systemService) RenameFile(oldF, newF string) (int, error) {
-	_, err := os.Stat(newF)
+	roots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		return common_err.SERVICE_ERROR, err
+	}
+	_, err = roots.Stat(newF)
 	if err == nil {
 		return common_err.DIR_ALREADY_EXISTS, nil
 	} else {
 		if os.IsNotExist(err) {
-			err := os.Rename(oldF, newF)
+			err := roots.RenameNoReplace(oldF, newF)
 			if err != nil {
 				return common_err.SERVICE_ERROR, err
 			}
@@ -229,12 +238,20 @@ func (c *systemService) RenameFile(oldF, newF string) (int, error) {
 }
 
 func (c *systemService) CreateFile(path string) (int, error) {
-	_, err := os.Stat(path)
+	roots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		return common_err.SERVICE_ERROR, err
+	}
+	_, err = roots.Stat(path)
 	if err == nil {
 		return common_err.FILE_OR_DIR_EXISTS, nil
 	} else {
 		if os.IsNotExist(err) {
-			if err := file.CreateFile(path); err != nil {
+			created, createErr := roots.CreateExclusive(path, 0o600)
+			if createErr != nil {
+				return common_err.SERVICE_ERROR, createErr
+			}
+			if err := created.Close(); err != nil {
 				return common_err.SERVICE_ERROR, err
 			}
 			return common_err.SUCCESS, nil
@@ -276,7 +293,11 @@ func (c *systemService) GetNetState(name string) string {
 }
 
 func (c *systemService) GetDirPathOne(path string) (m model.Path) {
-	f, err := os.Stat(path)
+	roots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		return
+	}
+	f, err := roots.Stat(path)
 	if err != nil {
 		return
 	}
@@ -289,6 +310,9 @@ func (c *systemService) GetDirPathOne(path string) (m model.Path) {
 }
 
 func (c *systemService) GetDirPath(path string) ([]model.Path, error) {
+	if path == "" {
+		return []model.Path{{Name: "DATA", Path: "/DATA/", IsDir: true, Date: time.Now()}}, nil
+	}
 	if path == "/DATA" {
 		sysType := runtime.GOOS
 		if sysType == "windows" {
@@ -300,33 +324,42 @@ func (c *systemService) GetDirPath(path string) ([]model.Path, error) {
 
 	}
 
-	ls, err := os.ReadDir(path)
+	roots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		return []model.Path{}, err
+	}
+	location, err := roots.Match(path)
+	if err != nil {
+		return []model.Path{}, err
+	}
+	directory, err := roots.OpenDirectory(location.Canonical)
+	if err != nil {
+		return []model.Path{}, err
+	}
+	ls, err := directory.ReadDir(-1)
+	closeErr := directory.Close()
 	if err != nil {
 		logger.Error("when read dir", zap.Error(err))
 		return []model.Path{}, err
 	}
+	if closeErr != nil {
+		return []model.Path{}, closeErr
+	}
 	dirs := []model.Path{}
-	if len(path) > 0 {
-		for _, l := range ls {
-			filePath := filepath.Join(path, l.Name())
-			link, err := filepath.EvalSymlinks(filePath)
-			if err != nil {
-				link = filePath
-			}
-			tempFile, err := l.Info()
-			if err != nil {
-				logger.Error("when read dir", zap.Error(err))
-				return []model.Path{}, err
-			}
-			temp := model.Path{Name: l.Name(), Path: filePath, IsDir: l.IsDir(), Date: tempFile.ModTime(), Size: tempFile.Size()}
-			if filePath != link {
-				file, _ := os.Stat(link)
-				temp.IsDir = file.IsDir()
-			}
-			dirs = append(dirs, temp)
+	for _, l := range ls {
+		if l.Type()&os.ModeSymlink != 0 {
+			continue
 		}
-	} else {
-		dirs = append(dirs, model.Path{Name: "DATA", Path: "/DATA/", IsDir: true, Date: time.Now()})
+		filePath := filepath.Join(location.Canonical, l.Name())
+		tempFile, err := l.Info()
+		if err != nil {
+			logger.Error("when read dir", zap.Error(err))
+			return []model.Path{}, err
+		}
+		if !tempFile.IsDir() && !tempFile.Mode().IsRegular() {
+			continue
+		}
+		dirs = append(dirs, model.Path{Name: l.Name(), Path: filePath, IsDir: tempFile.IsDir(), Date: tempFile.ModTime(), Size: tempFile.Size()})
 	}
 	return dirs, nil
 }

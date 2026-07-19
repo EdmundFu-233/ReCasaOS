@@ -9,7 +9,7 @@ import (
 )
 
 func TestV1UploadSessionSerializesSameUploadAndCleansOnFinish(t *testing.T) {
-	registry := v1UploadSessionRegistry{sessions: make(map[string]*v1UploadSession)}
+	registry := v1UploadSessionRegistry{sessions: make(map[string]*v1UploadSession), removeTree: os.RemoveAll}
 	tempDir := filepath.Join(t.TempDir(), "upload")
 	if err := os.Mkdir(tempDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -50,7 +50,7 @@ func TestV1UploadSessionSerializesSameUploadAndCleansOnFinish(t *testing.T) {
 }
 
 func TestV1UploadSessionCapAndExpiry(t *testing.T) {
-	registry := v1UploadSessionRegistry{sessions: make(map[string]*v1UploadSession)}
+	registry := v1UploadSessionRegistry{sessions: make(map[string]*v1UploadSession), removeTree: os.RemoveAll}
 	base := t.TempDir()
 	for index := 0; index < maxActiveV1UploadSessions; index++ {
 		paths := v1UploadPaths{target: filepath.Join(base, fmt.Sprintf("target-%d", index)), tempDir: filepath.Join(base, fmt.Sprintf("temp-%d", index))}
@@ -77,7 +77,7 @@ func TestV1UploadSessionCapAndExpiry(t *testing.T) {
 }
 
 func TestV1UploadSessionRejectsSeventeenthActiveUpload(t *testing.T) {
-	registry := v1UploadSessionRegistry{sessions: make(map[string]*v1UploadSession)}
+	registry := v1UploadSessionRegistry{sessions: make(map[string]*v1UploadSession), removeTree: os.RemoveAll}
 	base := t.TempDir()
 	for index := 0; index < maxActiveV1UploadSessions; index++ {
 		paths := v1UploadPaths{target: filepath.Join(base, fmt.Sprintf("target-%d", index)), tempDir: filepath.Join(base, fmt.Sprintf("temp-%d", index))}

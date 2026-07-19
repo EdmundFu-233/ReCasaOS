@@ -5,13 +5,13 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/IceWhaleTech/CasaOS/codegen"
 	"github.com/IceWhaleTech/CasaOS/pkg/config"
+	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
 	"github.com/IceWhaleTech/CasaOS/pkg/httpsecurity"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/file"
 
@@ -155,7 +155,12 @@ func InitFile() http.Handler {
 			http.NotFound(w, r)
 			return
 		}
-		opened, err := os.Open(filePath)
+		roots, err := filesecurity.ManagementFileRoots()
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+			return
+		}
+		opened, err := roots.OpenRegular(filePath)
 		if err != nil {
 			http.NotFound(w, r)
 			return
@@ -230,8 +235,13 @@ func InitDir() http.Handler {
 			return
 		}
 		list := strings.Split(files, ",")
+		roots, err := filesecurity.ManagementFileRoots()
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+			return
+		}
 		for _, v := range list {
-			if !file.Exists(v) {
+			if _, err := roots.Stat(v); err != nil {
 				// return ctx.JSON(common_err.SERVICE_ERROR, model.Result{
 				// 	Success: common_err.FILE_DOES_NOT_EXIST,
 				// 	Message: common_err.GetMsg(common_err.FILE_DOES_NOT_EXIST),
@@ -284,7 +294,7 @@ func InitDir() http.Handler {
 		name += extension
 		w.Header().Add("Content-Disposition", "attachment; filename*=utf-8''"+url.PathEscape(name))
 		for _, fname := range list {
-			err = file.AddFile(ar, fname, commonDir)
+			err = file.AddManagedFile(ar, roots, fname, commonDir)
 			if err != nil {
 				log.Printf("Failed to archive %s: %v", fname, err)
 			}

@@ -68,6 +68,23 @@ TLS edge. Never enable `RECASAOS_TRUST_LOOPBACK_AUTH_BYPASS=1` behind a reverse
 proxy. The Nginx example includes rate and connection limits; a public stock
 Caddy deployment needs a separately reviewed rate-limiting edge/WAF in front.
 
+## Privileged management file roots
+
+The private administrative file APIs fail closed outside the roots in
+`RECASAOS_MANAGEMENT_FILE_ROOTS`. The value is a comma-separated list of
+canonical absolute directories; when unset it defaults to `/DATA,/mnt,/media`.
+Every configured root must already exist, `/` is forbidden, and ReCasaOS pins
+the roots at startup before it registers file routes. Changing the setting or
+replacing a configured mount requires a service restart.
+
+This boundary requires Linux 5.8 or newer for `openat2` and mount-ID checks.
+Reads and writes may cross operator-configured mounts below `/mnt` or `/media`
+for CasaOS storage compatibility, but recursive deletion refuses to cross a
+mount boundary. Treat the host mount namespace and `CAP_SYS_ADMIN` as trusted
+operator controls. Keep the administrative API private/VPN-only even when its
+paths are confined; `RECASAOS_MANAGEMENT_FILE_ROOTS` is not a public sharing
+configuration and is separate from `RECASAOS_PUBLIC_FILE_ROOT`.
+
 ## Development
 
 ReCasaOS currently requires Linux for the complete build and test suite. The Go

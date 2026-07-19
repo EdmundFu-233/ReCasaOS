@@ -23,6 +23,7 @@ import (
 	"github.com/IceWhaleTech/CasaOS/common"
 	"github.com/IceWhaleTech/CasaOS/pkg/cache"
 	"github.com/IceWhaleTech/CasaOS/pkg/config"
+	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
 	"github.com/IceWhaleTech/CasaOS/pkg/publicfiles"
 	"github.com/IceWhaleTech/CasaOS/pkg/sqlite"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/file"
@@ -84,8 +85,6 @@ func init() {
 
 	service.GetCPUThermalZone()
 
-	route.InitFunction()
-
 	//service.MyService.System().GenreateSystemEntry()
 	///
 	//service.MountLists = make(map[string]*mountlib.MountPoint)
@@ -107,6 +106,15 @@ func main() {
 	if *versionFlag {
 		return
 	}
+	managementRoots, err := filesecurity.OpenManagementFileRootsFromEnvironment()
+	if err != nil {
+		panic(fmt.Errorf("initialize management file roots: %w", err))
+	}
+	defer managementRoots.Close()
+	if err := filesecurity.InstallManagementFileRoots(managementRoots); err != nil {
+		panic(err)
+	}
+	route.InitFunction()
 	v1Router := route.InitV1Router()
 
 	v2Router := route.InitV2Router()

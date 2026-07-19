@@ -3,10 +3,10 @@ package service
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -32,15 +32,17 @@ type FileInfo struct {
 	totalSize        int64
 	chunkSize        int64
 	lastActivity     time.Time
+	roots            *filesecurity.ManagedRoots
 }
 
 type FileUploadService struct {
 	sessionsMu   sync.Mutex
 	uploadStatus map[string]*FileInfo
+	removeTree   func(string) error
 }
 
 func NewFileUploadService() *FileUploadService {
-	return &FileUploadService{uploadStatus: make(map[string]*FileInfo)}
+	return &FileUploadService{uploadStatus: make(map[string]*FileInfo), removeTree: filesecurity.RemoveManagementTree}
 }
 
 const (
@@ -57,10 +59,15 @@ func (s *FileUploadService) TestChunk(
 	if err := validateUploadIdentifier(identifier); err != nil {
 		return err
 	}
-	targetPath, err := filesecurity.JoinWithinBase(c.QueryParam("path"), c.QueryParam("relativePath"))
+	roots, err := filesecurity.ManagementFileRoots()
 	if err != nil {
 		return err
 	}
+	targetLocation, err := roots.MatchChild(c.QueryParam("path"), c.QueryParam("relativePath"))
+	if err != nil {
+		return err
+	}
+	targetPath := targetLocation.Canonical
 
 	key := boundUploadIdentifier(identifier, targetPath)
 	s.sessionsMu.Lock()
@@ -126,36 +133,44 @@ func (s *FileUploadService) UploadFile(
 		return fmt.Errorf("uploaded chunk size does not match currentChunkSize")
 	}
 
-	targetPath, err := filesecurity.JoinWithinBase(path, relativePath)
+	roots, err := filesecurity.ManagementFileRoots()
 	if err != nil {
 		return err
 	}
+	targetLocation, err := roots.MatchChild(path, relativePath)
+	if err != nil {
+		return err
+	}
+	targetPath := targetLocation.Canonical
 	uploadHash := boundUploadIdentifier(identifier, targetPath)
 	tempRelative := filepath.Join(".temp", "v2-upload-"+uploadHash)
-	tempDir, err := filesecurity.JoinWithinBase(path, tempRelative)
+	tempLocation, err := roots.MatchChild(path, tempRelative)
 	if err != nil {
 		return err
 	}
-	chunkPath, err := filesecurity.JoinWithinBase(path, filepath.Join(tempRelative, strconv.FormatInt(chunkNumber, 10)))
+	tempDir := tempLocation.Canonical
+	chunkLocation, err := roots.MatchChild(path, filepath.Join(tempRelative, strconv.FormatInt(chunkNumber, 10)))
 	if err != nil {
 		return err
 	}
-	assemblyPath, err := filesecurity.JoinWithinBase(path, filepath.Join(tempRelative, ".complete"))
+	chunkPath := chunkLocation.Canonical
+	assemblyLocation, err := roots.MatchChild(path, filepath.Join(tempRelative, ".complete"))
 	if err != nil {
 		return err
 	}
+	assemblyPath := assemblyLocation.Canonical
 
-	if err := os.MkdirAll(filepath.Dir(targetPath), 0o750); err != nil {
+	if err := roots.MkdirAll(filepath.Dir(targetPath), 0o750); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(tempDir, 0o750); err != nil {
+	if err := roots.MkdirAll(tempDir, 0o700); err != nil {
 		return err
 	}
-	checkedTarget, err := filesecurity.JoinWithinBase(path, relativePath)
+	checkedTarget, err := roots.MatchChild(path, relativePath)
 	if err != nil {
 		return err
 	}
-	if checkedTarget != targetPath {
+	if checkedTarget.Canonical != targetPath {
 		return filesecurity.ErrUnsafePath
 	}
 
@@ -173,10 +188,13 @@ func (s *FileUploadService) UploadFile(
 		totalSize:      totalSize,
 		chunkSize:      chunkSize,
 		lastActivity:   time.Now(),
+		roots:          roots,
 	}
 	fileInfo, err := s.getOrCreateUploadSession(key, candidate)
 	if err != nil {
-		_ = os.RemoveAll(candidate.tempDir)
+		if s.removeTree != nil {
+			_ = s.removeTree(candidate.tempDir)
+		}
 		return err
 	}
 
@@ -192,7 +210,7 @@ func (s *FileUploadService) UploadFile(
 		fileInfo.lock.Unlock()
 		return err
 	}
-	written, writeErr := writeServiceChunk(chunkPath, source)
+	written, writeErr := writeServiceChunk(roots, chunkPath, source)
 	closeErr := source.Close()
 	if writeErr != nil {
 		fileInfo.lock.Unlock()
@@ -203,7 +221,7 @@ func (s *FileUploadService) UploadFile(
 		return closeErr
 	}
 	if written != currentChunkSize {
-		_ = os.Remove(chunkPath)
+		_ = roots.Remove(chunkPath)
 		fileInfo.lock.Unlock()
 		return fmt.Errorf("uploaded chunk contains %d bytes, expected %d", written, currentChunkSize)
 	}
@@ -245,7 +263,9 @@ func (s *FileUploadService) cleanupExpiredUploads(now time.Time) {
 		fileInfo.lock.Unlock()
 		if expired && s.uploadStatus[key] == fileInfo {
 			delete(s.uploadStatus, key)
-			_ = os.RemoveAll(fileInfo.tempDir)
+			if s.removeTree != nil {
+				_ = s.removeTree(fileInfo.tempDir)
+			}
 		}
 	}
 }
@@ -269,7 +289,9 @@ func (s *FileUploadService) deleteUploadSession(key string, fileInfo *FileInfo) 
 		// Remove the generation's staging directory before making the key
 		// available to a new session. Otherwise late cleanup could delete the
 		// replacement session's chunks.
-		_ = os.RemoveAll(fileInfo.tempDir)
+		if s.removeTree != nil {
+			_ = s.removeTree(fileInfo.tempDir)
+		}
 		delete(s.uploadStatus, key)
 	}
 	s.sessionsMu.Unlock()
@@ -321,51 +343,58 @@ func boundUploadIdentifier(identifier, targetPath string) string {
 	return hex.EncodeToString(digest[:])
 }
 
-func writeServiceChunk(destination string, source io.Reader) (int64, error) {
-	out, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+func writeServiceChunk(roots *filesecurity.ManagedRoots, destination string, source io.Reader) (int64, error) {
+	out, err := roots.CreateExclusive(destination, 0o600)
 	if err != nil {
 		return 0, err
 	}
-	if err := out.Chmod(0o600); err != nil {
-		_ = out.Close()
-		_ = os.Remove(destination)
-		return 0, err
-	}
 	written, copyErr := io.Copy(out, io.LimitReader(source, filesecurity.MaxUploadChunkSize+1))
+	syncErr := out.Sync()
 	closeErr := out.Close()
 	if copyErr != nil {
-		_ = os.Remove(destination)
+		_ = roots.Remove(destination)
 		return written, copyErr
 	}
+	if syncErr != nil {
+		_ = roots.Remove(destination)
+		return written, syncErr
+	}
 	if closeErr != nil {
-		_ = os.Remove(destination)
+		_ = roots.Remove(destination)
 		return written, closeErr
 	}
 	if written > filesecurity.MaxUploadChunkSize {
-		_ = os.Remove(destination)
+		_ = roots.Remove(destination)
 		return written, fmt.Errorf("upload chunk exceeds %d bytes", filesecurity.MaxUploadChunkSize)
 	}
 	return written, nil
 }
 
 func assembleServiceUpload(fileInfo *FileInfo) error {
-	out, err := os.OpenFile(fileInfo.assemblyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if fileInfo.roots == nil {
+		return errors.New("management file roots are unavailable")
+	}
+	_ = fileInfo.roots.Remove(fileInfo.assemblyPath)
+	out, err := fileInfo.roots.CreateExclusive(fileInfo.assemblyPath, 0o600)
 	if err != nil {
 		return err
 	}
-	if err := out.Chmod(0o600); err != nil {
+	committed := false
+	defer func() {
 		_ = out.Close()
-		return err
-	}
+		if !committed {
+			_ = fileInfo.roots.Remove(fileInfo.assemblyPath)
+		}
+	}()
 
 	var totalWritten int64
 	for chunkNumber := int64(1); chunkNumber <= fileInfo.totalChunks; chunkNumber++ {
-		chunkPath, err := filesecurity.JoinWithinBase(fileInfo.base, filepath.Join(fileInfo.tempRelative, strconv.FormatInt(chunkNumber, 10)))
+		chunkLocation, err := fileInfo.roots.MatchChild(fileInfo.base, filepath.Join(fileInfo.tempRelative, strconv.FormatInt(chunkNumber, 10)))
 		if err != nil {
 			_ = out.Close()
 			return err
 		}
-		info, err := os.Stat(chunkPath)
+		info, err := fileInfo.roots.Stat(chunkLocation.Canonical)
 		if err != nil {
 			_ = out.Close()
 			return err
@@ -375,7 +404,7 @@ func assembleServiceUpload(fileInfo *FileInfo) error {
 			return fmt.Errorf("invalid upload chunk %d", chunkNumber)
 		}
 
-		chunk, err := os.Open(chunkPath)
+		chunk, err := fileInfo.roots.OpenRegular(chunkLocation.Canonical)
 		if err != nil {
 			_ = out.Close()
 			return err
@@ -396,6 +425,9 @@ func assembleServiceUpload(fileInfo *FileInfo) error {
 		}
 		totalWritten += written
 	}
+	if err := out.Sync(); err != nil {
+		return err
+	}
 	if err := out.Close(); err != nil {
 		return err
 	}
@@ -403,12 +435,16 @@ func assembleServiceUpload(fileInfo *FileInfo) error {
 		return fmt.Errorf("assembled file contains %d bytes, expected %d", totalWritten, fileInfo.totalSize)
 	}
 
-	checkedTarget, err := filesecurity.JoinWithinBase(fileInfo.base, fileInfo.targetRelative)
+	checkedTarget, err := fileInfo.roots.MatchChild(fileInfo.base, fileInfo.targetRelative)
 	if err != nil {
 		return err
 	}
-	if checkedTarget != fileInfo.targetPath {
+	if checkedTarget.Canonical != fileInfo.targetPath {
 		return filesecurity.ErrUnsafePath
 	}
-	return filesecurity.CommitNoReplace(fileInfo.assemblyPath, fileInfo.targetPath)
+	if err := fileInfo.roots.CommitNoReplace(fileInfo.assemblyPath, fileInfo.targetPath); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -71,6 +70,8 @@ var (
 	}
 )
 
+const maxManagedTextFileSize int64 = 16 << 20
+
 // @Summary 读取文件
 // @Produce  application/json
 // @Accept application/json
@@ -87,20 +88,22 @@ func GetFilerContent(ctx echo.Context) error {
 			Message: common_err.GetMsg(common_err.INVALID_PARAMS),
 		})
 	}
-	if !file.Exists(filePath) {
-		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{
-			Success: common_err.FILE_DOES_NOT_EXIST,
-			Message: common_err.GetMsg(common_err.FILE_DOES_NOT_EXIST),
-		})
+	roots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR)})
 	}
-	// 文件读取任务是将文件内容读取到内存中。
-	info, err := ioutil.ReadFile(filePath)
+	opened, err := roots.OpenRegular(filePath)
 	if err != nil {
 		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{
 			Success: common_err.FILE_READ_ERROR,
 			Message: common_err.GetMsg(common_err.FILE_READ_ERROR),
 			Data:    err.Error(),
 		})
+	}
+	defer opened.Close()
+	info, err := io.ReadAll(io.LimitReader(opened, maxManagedTextFileSize+1))
+	if err != nil || int64(len(info)) > maxManagedTextFileSize {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.FILE_READ_ERROR, Message: common_err.GetMsg(common_err.FILE_READ_ERROR)})
 	}
 	result := string(info)
 
@@ -112,20 +115,31 @@ func GetFilerContent(ctx echo.Context) error {
 }
 
 func GetLocalFile(ctx echo.Context) error {
-	path := ctx.QueryParam("path")
-	if len(path) == 0 {
+	filePath := ctx.QueryParam("path")
+	if len(filePath) == 0 {
 		return ctx.JSON(http.StatusOK, model.Result{
 			Success: common_err.INVALID_PARAMS,
 			Message: common_err.GetMsg(common_err.INVALID_PARAMS),
 		})
 	}
-	if !file.Exists(path) {
+	roots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR)})
+	}
+	opened, err := roots.OpenRegular(filePath)
+	if err != nil {
 		return ctx.JSON(http.StatusOK, model.Result{
 			Success: common_err.FILE_DOES_NOT_EXIST,
 			Message: common_err.GetMsg(common_err.FILE_DOES_NOT_EXIST),
 		})
 	}
-	return ctx.File(path)
+	defer opened.Close()
+	info, err := opened.Stat()
+	if err != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.FILE_READ_ERROR, Message: common_err.GetMsg(common_err.FILE_READ_ERROR)})
+	}
+	http.ServeContent(ctx.Response().Writer, ctx.Request(), filepath.Base(filePath), info.ModTime(), opened)
+	return nil
 }
 
 // @Summary download
@@ -149,6 +163,10 @@ func GetDownloadFile(ctx echo.Context) error {
 		})
 	}
 	list := strings.Split(files, ",")
+	roots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR)})
+	}
 	for _, v := range list {
 		if strings.TrimSpace(v) == "" {
 			return ctx.JSON(common_err.CLIENT_ERROR, model.Result{
@@ -156,7 +174,7 @@ func GetDownloadFile(ctx echo.Context) error {
 				Message: common_err.GetMsg(common_err.INVALID_PARAMS),
 			})
 		}
-		info, err := os.Stat(v)
+		info, err := roots.Stat(v)
 		if err != nil {
 			return ctx.JSON(common_err.SERVICE_ERROR, model.Result{
 				Success: common_err.FILE_DOES_NOT_EXIST,
@@ -174,7 +192,7 @@ func GetDownloadFile(ctx echo.Context) error {
 	// handles only single files not folders and multiple files
 	if len(list) == 1 {
 		filePath := list[0]
-		fileHandle, err := os.Open(filePath)
+		fileHandle, err := roots.OpenPath(filePath)
 		if err != nil {
 			return ctx.JSON(common_err.SERVICE_ERROR, model.Result{
 				Success: common_err.FILE_DOES_NOT_EXIST,
@@ -192,7 +210,7 @@ func GetDownloadFile(ctx echo.Context) error {
 				Data:    err.Error(),
 			})
 		}
-		if !info.IsDir() {
+		if info.Mode().IsRegular() {
 			fileName := path.Base(filePath)
 			responseHeader := ctx.Response().Header()
 			responseHeader.Set("Content-Transfer-Encoding", "binary")
@@ -202,6 +220,9 @@ func GetDownloadFile(ctx echo.Context) error {
 			responseHeader.Set("Content-Disposition", "attachment; filename*=utf-8''"+url2.PathEscape(fileName))
 			http.ServeContent(ctx.Response().Writer, ctx.Request(), fileName, info.ModTime(), fileHandle)
 			return nil
+		}
+		if !info.IsDir() {
+			return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
 		}
 	}
 
@@ -234,7 +255,7 @@ func GetDownloadFile(ctx echo.Context) error {
 		})
 	}
 	for _, fname := range list {
-		err = file.AddFile(ar, fname, commonDir)
+		err = file.AddManagedFile(ar, roots, fname, commonDir)
 		if err != nil {
 			_ = ar.Close()
 			return fmt.Errorf("archive %s: %w", fname, err)
@@ -253,7 +274,11 @@ func GetDownloadSingleFile(ctx echo.Context) error {
 	}
 	fileName := path.Base(filePath)
 
-	fi, err := os.Open(filePath)
+	roots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR)})
+	}
+	fi, err := roots.OpenRegular(filePath)
 	if err != nil {
 		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{
 			Success: common_err.FILE_DOES_NOT_EXIST,
@@ -519,16 +544,20 @@ func GetFileUpload(ctx echo.Context) error {
 		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS), Data: err.Error()})
 	}
 
-	paths, err := buildV1UploadPaths(ctx.QueryParam("path"), relative, fileName, totalChunks, chunkNumber)
+	roots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		return ctx.JSON(http.StatusServiceUnavailable, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR)})
+	}
+	paths, err := buildV1UploadPaths(roots, ctx.QueryParam("path"), relative, fileName, totalChunks, chunkNumber)
 	if err != nil {
 		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS), Data: err.Error()})
 	}
-	if _, err := os.Lstat(paths.target); err == nil {
+	if _, err := roots.Stat(paths.target); err == nil {
 		return ctx.JSON(http.StatusConflict, model.Result{Success: http.StatusConflict, Message: common_err.GetMsg(common_err.FILE_ALREADY_EXISTS)})
 	} else if !os.IsNotExist(err) {
 		return ctx.JSON(http.StatusInternalServerError, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
 	}
-	if _, err := os.Stat(paths.chunk); err == nil {
+	if _, err := roots.Stat(paths.chunk); err == nil {
 		return ctx.JSON(200, model.Result{Success: 200, Message: common_err.GetMsg(common_err.FILE_ALREADY_EXISTS)})
 	} else if !os.IsNotExist(err) {
 		return ctx.JSON(http.StatusInternalServerError, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
@@ -577,7 +606,11 @@ func PostFileUpload(ctx echo.Context) error {
 		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS), Data: err.Error()})
 	}
 	base := ctx.FormValue("path")
-	paths, err := buildV1UploadPaths(base, relative, fileName, totalChunks, chunkNumber)
+	roots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		return ctx.JSON(http.StatusServiceUnavailable, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR)})
+	}
+	paths, err := buildV1UploadPaths(roots, base, relative, fileName, totalChunks, chunkNumber)
 	if err != nil {
 		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS), Data: err.Error()})
 	}
@@ -592,22 +625,22 @@ func PostFileUpload(ctx echo.Context) error {
 		}
 	}()
 
-	if err := os.MkdirAll(filepath.Dir(paths.target), 0o750); err != nil {
+	if err := roots.MkdirAll(filepath.Dir(paths.target), 0o750); err != nil {
 		return ctx.JSON(http.StatusInternalServerError, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
 	}
-	if err := os.MkdirAll(paths.tempDir, 0o750); err != nil {
+	if err := roots.MkdirAll(paths.tempDir, 0o700); err != nil {
 		return ctx.JSON(http.StatusInternalServerError, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
 	}
 	// Recheck after creating parents so a pre-existing symlink cannot turn a
 	// previously missing prefix into an escape.
-	if checked, err := filesecurity.JoinWithinBase(base, relative); err != nil || checked != paths.target {
+	if checked, err := roots.MatchChild(base, relative); err != nil || checked.Canonical != paths.target {
 		if err == nil {
 			err = filesecurity.ErrUnsafePath
 		}
 		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS), Data: err.Error()})
 	}
 
-	if err := writeUploadChunk(paths.chunk, f); err != nil {
+	if err := writeUploadChunk(roots, paths.chunk, f); err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, errUploadTooLarge) {
 			status = http.StatusRequestEntityTooLarge
@@ -615,12 +648,12 @@ func PostFileUpload(ctx echo.Context) error {
 		return ctx.JSON(status, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
 	}
 
-	complete, err := allV1ChunksPresent(base, paths.tempRelative, totalChunks)
+	complete, err := allV1ChunksPresent(roots, base, paths.tempRelative, totalChunks)
 	if err != nil {
 		return ctx.JSON(http.StatusInternalServerError, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
 	}
 	if complete {
-		if err := assembleV1Upload(base, relative, paths.tempRelative, paths.assembly, paths.target, totalChunks); err != nil {
+		if err := assembleV1Upload(roots, base, relative, paths.tempRelative, paths.assembly, paths.target, totalChunks); err != nil {
 			v1UploadSessions.finish(paths.tempDir, uploadSession)
 			sessionFinished = true
 			return ctx.JSON(http.StatusInternalServerError, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
@@ -656,11 +689,12 @@ type v1UploadSession struct {
 }
 
 type v1UploadSessionRegistry struct {
-	mu       sync.Mutex
-	sessions map[string]*v1UploadSession
+	mu         sync.Mutex
+	sessions   map[string]*v1UploadSession
+	removeTree func(string) error
 }
 
-var v1UploadSessions = v1UploadSessionRegistry{sessions: make(map[string]*v1UploadSession)}
+var v1UploadSessions = v1UploadSessionRegistry{sessions: make(map[string]*v1UploadSession), removeTree: filesecurity.RemoveManagementTree}
 
 func (r *v1UploadSessionRegistry) acquire(paths v1UploadPaths, totalChunks int64) (*v1UploadSession, error) {
 	now := time.Now()
@@ -691,7 +725,9 @@ func (r *v1UploadSessionRegistry) finish(key string, session *v1UploadSession) {
 	session.lock.Unlock()
 	r.mu.Lock()
 	if r.sessions[key] == session {
-		_ = os.RemoveAll(session.tempDir)
+		if r.removeTree != nil {
+			_ = r.removeTree(session.tempDir)
+		}
 		delete(r.sessions, key)
 	}
 	r.mu.Unlock()
@@ -710,7 +746,9 @@ func (r *v1UploadSessionRegistry) cleanup(now time.Time) {
 		}
 		session.lock.Unlock()
 		if expired && r.sessions[key] == session {
-			_ = os.RemoveAll(session.tempDir)
+			if r.removeTree != nil {
+				_ = r.removeTree(session.tempDir)
+			}
 			delete(r.sessions, key)
 		}
 	}
@@ -731,7 +769,10 @@ func parseUploadChunks(totalValue, chunkValue string) (int64, int64, error) {
 	return totalChunks, chunkNumber, nil
 }
 
-func buildV1UploadPaths(base, relative, fileName string, totalChunks, chunkNumber int64) (v1UploadPaths, error) {
+func buildV1UploadPaths(roots *filesecurity.ManagedRoots, base, relative, fileName string, totalChunks, chunkNumber int64) (v1UploadPaths, error) {
+	if roots == nil {
+		return v1UploadPaths{}, errors.New("management file roots are unavailable")
+	}
 	if fileName == "" || fileName == "." || fileName == ".." || filepath.Base(fileName) != fileName {
 		return v1UploadPaths{}, fmt.Errorf("invalid filename")
 	}
@@ -746,62 +787,66 @@ func buildV1UploadPaths(base, relative, fileName string, totalChunks, chunkNumbe
 		return v1UploadPaths{}, err
 	}
 
-	target, err := filesecurity.JoinWithinBase(base, cleanRelative)
+	targetLocation, err := roots.MatchChild(base, cleanRelative)
 	if err != nil {
 		return v1UploadPaths{}, err
 	}
+	target := targetLocation.Canonical
 	uploadHash := file.GetHashByContent([]byte(cleanRelative + "\x00" + fileName))
 	tempRelative := filepath.Join(".temp", "upload-"+uploadHash+"-"+strconv.FormatInt(totalChunks, 10), filepath.Dir(cleanRelative))
-	tempDir, err := filesecurity.JoinWithinBase(base, tempRelative)
+	tempLocation, err := roots.MatchChild(base, tempRelative)
 	if err != nil {
 		return v1UploadPaths{}, err
 	}
-	chunk, err := filesecurity.JoinWithinBase(base, filepath.Join(tempRelative, strconv.FormatInt(chunkNumber, 10)))
+	tempDir := tempLocation.Canonical
+	chunkLocation, err := roots.MatchChild(base, filepath.Join(tempRelative, strconv.FormatInt(chunkNumber, 10)))
 	if err != nil {
 		return v1UploadPaths{}, err
 	}
-	assembly, err := filesecurity.JoinWithinBase(base, filepath.Join(tempRelative, ".complete"))
+	chunk := chunkLocation.Canonical
+	assemblyLocation, err := roots.MatchChild(base, filepath.Join(tempRelative, ".complete"))
 	if err != nil {
 		return v1UploadPaths{}, err
 	}
+	assembly := assemblyLocation.Canonical
 
 	return v1UploadPaths{target: target, tempDir: tempDir, tempRelative: tempRelative, chunk: chunk, assembly: assembly}, nil
 }
 
-func writeUploadChunk(destination string, source io.Reader) error {
-	out, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+func writeUploadChunk(roots *filesecurity.ManagedRoots, destination string, source io.Reader) error {
+	out, err := roots.CreateExclusive(destination, 0o600)
 	if err != nil {
 		return err
 	}
-	if err := out.Chmod(0o600); err != nil {
-		_ = out.Close()
-		_ = os.Remove(destination)
-		return err
-	}
 	written, copyErr := io.Copy(out, io.LimitReader(source, filesecurity.MaxUploadChunkSize+1))
+	syncErr := out.Sync()
 	closeErr := out.Close()
 	if copyErr != nil {
-		_ = os.Remove(destination)
+		_ = roots.Remove(destination)
 		return copyErr
 	}
+	if syncErr != nil {
+		_ = roots.Remove(destination)
+		return syncErr
+	}
 	if closeErr != nil {
-		_ = os.Remove(destination)
+		_ = roots.Remove(destination)
 		return closeErr
 	}
 	if written > filesecurity.MaxUploadChunkSize {
-		_ = os.Remove(destination)
+		_ = roots.Remove(destination)
 		return errUploadTooLarge
 	}
 	return nil
 }
 
-func allV1ChunksPresent(base, tempRelative string, totalChunks int64) (bool, error) {
+func allV1ChunksPresent(roots *filesecurity.ManagedRoots, base, tempRelative string, totalChunks int64) (bool, error) {
 	for chunkNumber := int64(1); chunkNumber <= totalChunks; chunkNumber++ {
-		chunkPath, err := filesecurity.JoinWithinBase(base, filepath.Join(tempRelative, strconv.FormatInt(chunkNumber, 10)))
+		chunkLocation, err := roots.MatchChild(base, filepath.Join(tempRelative, strconv.FormatInt(chunkNumber, 10)))
 		if err != nil {
 			return false, err
 		}
-		info, err := os.Stat(chunkPath)
+		info, err := roots.Stat(chunkLocation.Canonical)
 		if os.IsNotExist(err) {
 			return false, nil
 		}
@@ -815,23 +860,27 @@ func allV1ChunksPresent(base, tempRelative string, totalChunks int64) (bool, err
 	return true, nil
 }
 
-func assembleV1Upload(base, targetRelative, tempRelative, assemblyPath, targetPath string, totalChunks int64) error {
-	out, err := os.OpenFile(assemblyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+func assembleV1Upload(roots *filesecurity.ManagedRoots, base, targetRelative, tempRelative, assemblyPath, targetPath string, totalChunks int64) error {
+	_ = roots.Remove(assemblyPath)
+	out, err := roots.CreateExclusive(assemblyPath, 0o600)
 	if err != nil {
 		return err
 	}
-	if err := out.Chmod(0o600); err != nil {
+	committed := false
+	defer func() {
 		_ = out.Close()
-		return err
-	}
+		if !committed {
+			_ = roots.Remove(assemblyPath)
+		}
+	}()
 
 	for chunkNumber := int64(1); chunkNumber <= totalChunks; chunkNumber++ {
-		chunkPath, err := filesecurity.JoinWithinBase(base, filepath.Join(tempRelative, strconv.FormatInt(chunkNumber, 10)))
+		chunkLocation, err := roots.MatchChild(base, filepath.Join(tempRelative, strconv.FormatInt(chunkNumber, 10)))
 		if err != nil {
 			_ = out.Close()
 			return err
 		}
-		chunk, err := os.Open(chunkPath)
+		chunk, err := roots.OpenRegular(chunkLocation.Canonical)
 		if err != nil {
 			_ = out.Close()
 			return err
@@ -851,75 +900,25 @@ func assembleV1Upload(base, targetRelative, tempRelative, assemblyPath, targetPa
 			return fmt.Errorf("upload chunk %d exceeds 256 MiB", chunkNumber)
 		}
 	}
+	if err := out.Sync(); err != nil {
+		return err
+	}
 	if err := out.Close(); err != nil {
 		return err
 	}
 
-	checkedTarget, err := filesecurity.JoinWithinBase(base, targetRelative)
+	checkedTarget, err := roots.MatchChild(base, targetRelative)
 	if err != nil {
 		return err
 	}
-	if checkedTarget != targetPath {
+	if checkedTarget.Canonical != targetPath {
 		return filesecurity.ErrUnsafePath
 	}
-	return filesecurity.CommitNoReplace(assemblyPath, targetPath)
-}
-
-func PostFileOctet(ctx echo.Context) error {
-	content_length := ctx.Request().ContentLength
-	if content_length <= 0 || content_length > 1024*1024*1024*2*1024 {
-		log.Printf("content_length error\n")
-		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.CLIENT_ERROR, Message: common_err.GetMsg(common_err.CLIENT_ERROR), Data: "content_length error"})
+	if err := roots.CommitNoReplace(assemblyPath, targetPath); err != nil {
+		return err
 	}
-	content_type_, has_key := ctx.Request().Header["Content-Type"]
-	if !has_key {
-		log.Printf("Content-Type error\n")
-		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.CLIENT_ERROR, Message: common_err.GetMsg(common_err.CLIENT_ERROR), Data: "Content-Type error"})
-	}
-	if len(content_type_) != 1 {
-		log.Printf("Content-Type count error\n")
-		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.CLIENT_ERROR, Message: common_err.GetMsg(common_err.CLIENT_ERROR), Data: "Content-Type count error"})
-	}
-	content_type := content_type_[0]
-	const BOUNDARY string = "; boundary="
-	loc := strings.Index(content_type, BOUNDARY)
-	if loc == -1 {
-		log.Printf("Content-Type error, no boundary\n")
-		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.CLIENT_ERROR, Message: common_err.GetMsg(common_err.CLIENT_ERROR), Data: "Content-Type error, no boundary"})
-	}
-	boundary := []byte(content_type[(loc + len(BOUNDARY)):])
-	log.Printf("[%s]\n\n", boundary)
-	read_data := make([]byte, 1024*24)
-	var read_total int = 0
-	for {
-		file_header, file_data, err := file.ParseFromHead(read_data, read_total, append(boundary, []byte("\r\n")...), ctx.Request().Body)
-		if err != nil {
-			log.Printf("%v", err)
-		}
-		log.Printf("file :%s\n", file_header)
-		//
-		//os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0o644)
-		f, err := os.OpenFile(file_header["path"]+"/"+file_header["filename"], os.O_WRONLY|os.O_CREATE, 0o644)
-		if err != nil {
-			log.Printf("create file fail:%v\n", err)
-		}
-		f.Write(file_data)
-		file_data = nil
-
-		temp_data, reach_end, err := file.ReadToBoundary(boundary, ctx.Request().Body, f)
-		f.Close()
-		if err != nil {
-			log.Printf("%v\n", err)
-		}
-		if reach_end {
-			break
-		} else {
-			copy(read_data[0:], temp_data)
-			read_total = len(temp_data)
-			continue
-		}
-	}
-	return ctx.JSON(http.StatusOK, model.Result{Success: common_err.SUCCESS, Message: common_err.GetMsg(common_err.SUCCESS)})
+	committed = true
+	return nil
 }
 
 // @Summary copy or move file
@@ -985,14 +984,23 @@ func PostOperateFileOrDir(ctx echo.Context) error {
 // @Router /file/delete [delete]
 func DeleteFile(ctx echo.Context) error {
 	paths := []string{}
-	ctx.Bind(&paths)
+	if err := ctx.Bind(&paths); err != nil {
+		return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
+	}
 	if len(paths) == 0 {
 		return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
 	}
 	//	path := ctx.QueryParam("path")
 
 	//	paths := strings.Split(path, ",")
+	roots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR)})
+	}
 	for _, v := range paths {
+		if _, err := roots.Match(v); err != nil {
+			return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
+		}
 		mounted := service.IsMounted(v)
 		if mounted {
 			return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.MOUNTED_DIRECTIORIES, Message: common_err.GetMsg(common_err.MOUNTED_DIRECTIORIES), Data: common_err.GetMsg(common_err.MOUNTED_DIRECTIORIES)})
@@ -1000,7 +1008,7 @@ func DeleteFile(ctx echo.Context) error {
 	}
 
 	for _, v := range paths {
-		err := os.RemoveAll(v)
+		err := roots.RemoveAll(v)
 		if err != nil {
 			return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.FILE_DELETE_ERROR, Message: common_err.GetMsg(common_err.FILE_DELETE_ERROR), Data: err})
 		}
@@ -1020,23 +1028,15 @@ func DeleteFile(ctx echo.Context) error {
 // @Router /file/update [put]
 func PutFileContent(ctx echo.Context) error {
 	fi := model.FileUpdate{}
-	ctx.Bind(&fi)
+	if err := ctx.Bind(&fi); err != nil || len(fi.FileContent) > int(maxManagedTextFileSize) {
+		return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
+	}
 
-	// path := ctx.FormValue("path")
-	// content := ctx.FormValue("content")
-	if !file.Exists(fi.FilePath) {
-		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.FILE_ALREADY_EXISTS, Message: common_err.GetMsg(common_err.FILE_ALREADY_EXISTS)})
-	}
-	// err := os.Remove(path)
-	f, err := os.Stat(fi.FilePath)
+	roots, err := filesecurity.ManagementFileRoots()
 	if err != nil {
-		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.FILE_ALREADY_EXISTS, Message: common_err.GetMsg(common_err.FILE_ALREADY_EXISTS)})
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR)})
 	}
-	fm := f.Mode()
-	if err != nil {
-		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.FILE_DELETE_ERROR, Message: common_err.GetMsg(common_err.FILE_DELETE_ERROR), Data: err})
-	}
-	err = file.WriteToFullPath([]byte(fi.FileContent), fi.FilePath, fm)
+	err = roots.RewriteRegular(fi.FilePath, []byte(fi.FileContent))
 	if err != nil {
 		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
 	}
@@ -1059,8 +1059,17 @@ func GetFileImage(ctx echo.Context) error {
 		return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
 	}
 	ctx.Response().Header().Set("X-Content-Type-Options", "nosniff")
+	roots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR)})
+	}
+	imageFile, err := roots.OpenRegular(path)
+	if err != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
+	}
+	defer imageFile.Close()
 	if t == "thumbnail" {
-		thumbnail, err := file.GetImage(path, 100, 0)
+		thumbnail, err := file.GetImageFromFile(imageFile, path, 100, 0)
 		if err != nil {
 			return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
 		}
@@ -1071,11 +1080,6 @@ func GetFileImage(ctx echo.Context) error {
 		return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
 	}
 
-	imageFile, err := os.Open(path)
-	if err != nil {
-		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
-	}
-	defer imageFile.Close()
 	info, err := imageFile.Stat()
 	if err != nil {
 		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
@@ -1121,9 +1125,15 @@ func DeleteOperateFileOrDir(ctx echo.Context) error {
 
 func GetSize(ctx echo.Context) error {
 	json := make(map[string]string)
-	ctx.Bind(&json)
+	if err := ctx.Bind(&json); err != nil {
+		return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
+	}
 	path := json["path"]
-	size, err := file.GetFileOrDirSize(path)
+	roots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR)})
+	}
+	size, err := roots.TreeSize(path)
 	if err != nil {
 		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
 	}
@@ -1132,13 +1142,19 @@ func GetSize(ctx echo.Context) error {
 
 func GetFileCount(ctx echo.Context) error {
 	json := make(map[string]string)
-	ctx.Bind(&json)
+	if err := ctx.Bind(&json); err != nil {
+		return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
+	}
 	path := json["path"]
-	list, err := ioutil.ReadDir(path)
+	roots, err := filesecurity.ManagementFileRoots()
+	if err != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR)})
+	}
+	count, err := roots.DirectoryCount(path)
 	if err != nil {
 		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
 	}
-	return ctx.JSON(common_err.SUCCESS, model.Result{Success: common_err.SUCCESS, Message: common_err.GetMsg(common_err.SUCCESS), Data: len(list)})
+	return ctx.JSON(common_err.SUCCESS, model.Result{Success: common_err.SUCCESS, Message: common_err.GetMsg(common_err.SUCCESS), Data: count})
 }
 
 type CenterHandler struct {
