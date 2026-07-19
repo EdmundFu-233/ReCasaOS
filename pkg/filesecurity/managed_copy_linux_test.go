@@ -63,6 +63,211 @@ func TestManagedRootsCopyIntoConflictStyles(t *testing.T) {
 	assertManagedTestContent(t, source, "new")
 }
 
+func TestManagedReplaceAllowsExchangeCtimeChangeAndRemovesHiddenTarget(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.txt")
+	destination := filepath.Join(root, "destination")
+	target := filepath.Join(destination, filepath.Base(source))
+	if err := os.WriteFile(source, []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+
+	result, err := roots.CopyInto(source, destination, ManagedConflictReplace)
+	if err != nil || !result.Changed || result.Destination != target {
+		t.Fatalf("replace result = %+v, %v", result, err)
+	}
+	entries, err := os.ReadDir(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(target) {
+		t.Fatalf("replacement left hidden old target: %v", entries)
+	}
+	assertManagedTestContent(t, target, "new")
+}
+
+func TestSameManagedExchangeStatAllowsOnlyCtimeChange(t *testing.T) {
+	before := unix.Stat_t{
+		Dev:   11,
+		Ino:   22,
+		Mode:  unix.S_IFREG | 0o600,
+		Nlink: 1,
+		Size:  33,
+		Mtim:  unix.Timespec{Sec: 44, Nsec: 55},
+		Ctim:  unix.Timespec{Sec: 66, Nsec: 77},
+	}
+	after := before
+	after.Ctim = unix.Timespec{Sec: 88, Nsec: 99}
+	if !sameManagedExchangeStat(&before, &after) {
+		t.Fatal("expected exchange ctime transition was rejected")
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*unix.Stat_t)
+	}{
+		{name: "device", mutate: func(stat *unix.Stat_t) { stat.Dev++ }},
+		{name: "inode", mutate: func(stat *unix.Stat_t) { stat.Ino++ }},
+		{name: "mode", mutate: func(stat *unix.Stat_t) { stat.Mode ^= 0o100 }},
+		{name: "links", mutate: func(stat *unix.Stat_t) { stat.Nlink++ }},
+		{name: "uid", mutate: func(stat *unix.Stat_t) { stat.Uid++ }},
+		{name: "gid", mutate: func(stat *unix.Stat_t) { stat.Gid++ }},
+		{name: "rdev", mutate: func(stat *unix.Stat_t) { stat.Rdev++ }},
+		{name: "size", mutate: func(stat *unix.Stat_t) { stat.Size++ }},
+		{name: "block-size", mutate: func(stat *unix.Stat_t) { stat.Blksize++ }},
+		{name: "blocks", mutate: func(stat *unix.Stat_t) { stat.Blocks++ }},
+		{name: "mtime", mutate: func(stat *unix.Stat_t) { stat.Mtim.Nsec++ }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			changed := after
+			test.mutate(&changed)
+			if sameManagedExchangeStat(&before, &changed) {
+				t.Fatalf("exchange comparator accepted changed %s", test.name)
+			}
+		})
+	}
+}
+
+func TestManagedTransferTransactionIsPinnedPrivateAndSameMount(t *testing.T) {
+	root := t.TempDir()
+	parent, err := os.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	mountID, err := managedMountIDAt(int(parent.Fd()), "", unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transaction, name, err := createManagedTransferTransaction(int(parent.Fd()), mountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transaction.Close()
+	if !strings.HasPrefix(name, ".recasaos-transfer-") {
+		t.Fatalf("transfer transaction name = %q", name)
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(transaction.Fd()), &stat); err != nil {
+		t.Fatal(err)
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0o7777 != 0o700 || stat.Uid != uint32(os.Geteuid()) {
+		t.Fatalf("transfer transaction metadata = mode %#o uid %d", stat.Mode, stat.Uid)
+	}
+	if err := validateManagedTransferTransaction(int(parent.Fd()), mountID, name, transaction); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Fchmod(int(transaction.Fd()), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateManagedTransferTransaction(int(parent.Fd()), mountID, name, transaction); !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("permissive transfer transaction error = %v", err)
+	}
+}
+
+func TestValidateManagedTransferTransactionStatAcceptsBtrfsLinkCount(t *testing.T) {
+	stat := unix.Stat_t{
+		Mode:  unix.S_IFDIR | 0o700,
+		Nlink: 1,
+		Uid:   1234,
+	}
+	if err := validateManagedTransferTransactionStat(&stat, stat.Uid); err != nil {
+		t.Fatalf("linked Btrfs-style directory metadata rejected: %v", err)
+	}
+	stat.Nlink = 0
+	if err := validateManagedTransferTransactionStat(&stat, stat.Uid); !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("unlinked directory metadata error = %v, want ErrUnsafePath", err)
+	}
+}
+
+func TestManagedTransferTransactionCreationFailureNamesRetainedDirectory(t *testing.T) {
+	root := t.TempDir()
+	parent, err := os.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	mountID, err := managedMountIDAt(int(parent.Fd()), "", unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongMountID := mountID ^ 1
+	transaction, name, err := createManagedTransferTransaction(int(parent.Fd()), wrongMountID)
+	if transaction != nil {
+		transaction.Close()
+		t.Fatal("transaction unexpectedly opened with wrong mount identity")
+	}
+	if err == nil || name == "" || !strings.Contains(err.Error(), "retained") || !strings.Contains(err.Error(), name) {
+		t.Fatalf("transaction creation result = %q, %v", name, err)
+	}
+	entries, readErr := os.ReadDir(root)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 1 || entries[0].Name() != name || !entries[0].IsDir() {
+		t.Fatalf("failed transaction creation did not retain exact private directory: %v", entries)
+	}
+	info, err := os.Stat(filepath.Join(root, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("retained transaction permissions = %#o", info.Mode().Perm())
+	}
+}
+
+func TestManagedReplaceFilesystemPolicy(t *testing.T) {
+	tests := []struct {
+		name      string
+		magic     int64
+		certified bool
+	}{
+		{name: "ext2-ext4", magic: int64(unix.EXT4_SUPER_MAGIC), certified: true},
+		{name: "xfs", magic: int64(unix.XFS_SUPER_MAGIC), certified: true},
+		{name: "btrfs", magic: int64(unix.BTRFS_SUPER_MAGIC), certified: true},
+		{name: "tmpfs", magic: int64(unix.TMPFS_MAGIC), certified: true},
+		{name: "f2fs", magic: int64(unix.F2FS_SUPER_MAGIC), certified: true},
+		{name: "unknown", magic: int64(0x7f7f7f7f)},
+		{name: "fuse", magic: int64(unix.FUSE_SUPER_MAGIC)},
+		{name: "aafs", magic: int64(unix.AAFS_MAGIC)},
+		{name: "afs", magic: int64(unix.AFS_FS_MAGIC)},
+		{name: "afs-super", magic: int64(unix.AFS_SUPER_MAGIC)},
+		{name: "ceph", magic: int64(unix.CEPH_SUPER_MAGIC)},
+		{name: "cifs", magic: int64(unix.CIFS_SUPER_MAGIC)},
+		{name: "coda", magic: int64(unix.CODA_SUPER_MAGIC)},
+		{name: "ncp", magic: int64(unix.NCP_SUPER_MAGIC)},
+		{name: "ocfs2", magic: int64(unix.OCFS2_SUPER_MAGIC)},
+		{name: "smb", magic: int64(unix.SMB_SUPER_MAGIC)},
+		{name: "smb2", magic: int64(unix.SMB2_SUPER_MAGIC)},
+		{name: "nfs", magic: int64(unix.NFS_SUPER_MAGIC)},
+		{name: "9p", magic: int64(unix.V9FS_MAGIC)},
+		{name: "xenfs", magic: int64(unix.XENFS_SUPER_MAGIC)},
+		{name: "fat", magic: int64(unix.MSDOS_SUPER_MAGIC)},
+		{name: "exfat", magic: int64(unix.EXFAT_SUPER_MAGIC)},
+		{name: "ntfs", magic: int64(0x5346544e)},
+		{name: "signed-cifs-386", magic: -11317950},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := managedReplaceFilesystemCertified(test.magic); got != test.certified {
+				t.Fatalf("certified = %v, want %v for magic %#x", got, test.certified, uint32(test.magic))
+			}
+		})
+	}
+}
+
 func TestManagedReplaceRejectsTopLevelTypeChanges(t *testing.T) {
 	root := t.TempDir()
 	destination := filepath.Join(root, "destination")
@@ -102,6 +307,150 @@ func TestManagedReplaceRejectsTopLevelTypeChanges(t *testing.T) {
 		t.Fatalf("directory-over-regular result = %+v, %v", result, err)
 	}
 	assertManagedTestContent(t, directoryTarget, "old")
+}
+
+func TestManagedReplaceRejectsNonemptyDirectoryTarget(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	destination := filepath.Join(root, "destination")
+	target := filepath.Join(destination, filepath.Base(source))
+	if err := os.Mkdir(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	old := filepath.Join(target, "old")
+	if err := os.WriteFile(old, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+
+	result, err := roots.CopyInto(source, destination, ManagedConflictReplace)
+	if result.Changed || !errors.Is(err, ErrUnsafePath) || !strings.Contains(err.Error(), "nonempty directories") {
+		t.Fatalf("nonempty directory replacement result = %+v, %v", result, err)
+	}
+	assertManagedTestContent(t, old, "keep")
+	if info, err := os.Stat(source); err != nil || !info.IsDir() {
+		t.Fatalf("source directory changed: %v, %v", info, err)
+	}
+	entries, err := os.ReadDir(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(target) {
+		t.Fatalf("rejected directory replacement left transaction entries: %v", entries)
+	}
+}
+
+func TestManagedReplaceAllowsEmptyDirectoryTarget(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	destination := filepath.Join(root, "destination")
+	target := filepath.Join(destination, filepath.Base(source))
+	if err := os.Mkdir(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "new"), []byte("published"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+
+	result, err := roots.CopyInto(source, destination, ManagedConflictReplace)
+	if err != nil || !result.Changed || result.Destination != target {
+		t.Fatalf("empty directory replacement result = %+v, %v", result, err)
+	}
+	assertManagedTestContent(t, filepath.Join(target, "new"), "published")
+	assertManagedTestContent(t, filepath.Join(source, "new"), "published")
+	entries, err := os.ReadDir(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(target) {
+		t.Fatalf("directory replacement left transaction entries: %v", entries)
+	}
+}
+
+func TestManagedReplaceRetainsEmptyDirectoryWhenChildAppearsAfterExchange(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	destination := filepath.Join(root, "destination")
+	target := filepath.Join(destination, filepath.Base(source))
+	if err := os.Mkdir(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "new"), []byte("published"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldTarget, err := os.Open(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer oldTarget.Close()
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	roots.replaceBeforeCleanup = func() error {
+		fd, err := unix.Openat(int(oldTarget.Fd()), "injected", unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC, 0o600)
+		if err != nil {
+			return err
+		}
+		injected := os.NewFile(uintptr(fd), "injected")
+		if injected == nil {
+			unix.Close(fd)
+			return errors.New("open injected child")
+		}
+		_, writeErr := injected.Write([]byte("preserve"))
+		return errors.Join(writeErr, injected.Close())
+	}
+
+	result, err := roots.CopyInto(source, destination, ManagedConflictReplace)
+	if !result.Changed || result.Destination != target || !errors.Is(err, ErrUnsafePath) || !ManagedMutationChanged(err) {
+		t.Fatalf("post-exchange directory mutation result = %+v, %v", result, err)
+	}
+	assertManagedTestContent(t, filepath.Join(target, "new"), "published")
+	entries, readErr := os.ReadDir(destination)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("mutated old directory transaction was not retained: %v", entries)
+	}
+	var retained string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".recasaos-transfer-") {
+			retained = filepath.Join(destination, entry.Name(), "entry", "injected")
+		}
+	}
+	if retained == "" {
+		t.Fatalf("retained old directory transaction missing: %v", entries)
+	}
+	assertManagedTestContent(t, retained, "preserve")
 }
 
 func TestManagedTransferWaitsForExclusiveWriterLifecycle(t *testing.T) {
@@ -192,7 +541,7 @@ func TestManagedRootsCopyDirectoryRejectsSymlinkAndCleansStaging(t *testing.T) {
 	assertManagedTestContent(t, outside, "secret")
 }
 
-func TestManagedFailedCopySurfacesStagingCleanupSyncFailureWithoutLeak(t *testing.T) {
+func TestManagedFailedCopyRetainsPrivateTransactionWhenCleanupSyncFails(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "source")
 	destination := filepath.Join(root, "destination")
@@ -214,18 +563,35 @@ func TestManagedFailedCopySurfacesStagingCleanupSyncFailureWithoutLeak(t *testin
 	}
 	defer roots.Close()
 	injected := errors.New("injected staging cleanup sync failure")
-	roots.directorySync = func(int) error { return injected }
+	syncCalls := 0
+	roots.directorySync = func(fd int) error {
+		syncCalls++
+		if syncCalls == 2 {
+			return injected
+		}
+		return unix.Fsync(fd)
+	}
 
 	result, err := roots.CopyInto(source, destination, ManagedConflictSkip)
 	if result.Changed || !errors.Is(err, ErrUnsafePath) || !errors.Is(err, injected) || !ManagedMutationDurabilityUnknown(err) {
 		t.Fatalf("failed-copy cleanup result = %+v, %v", result, err)
 	}
+	if syncCalls != 2 {
+		t.Fatalf("directory sync calls = %d, want 2", syncCalls)
+	}
 	entries, readErr := os.ReadDir(destination)
 	if readErr != nil {
 		t.Fatal(readErr)
 	}
-	if len(entries) != 0 {
-		t.Fatalf("failed copy leaked staging entries: %v", entries)
+	if len(entries) != 1 || !strings.HasPrefix(entries[0].Name(), ".recasaos-transfer-") || !entries[0].IsDir() {
+		t.Fatalf("failed copy did not retain one private transaction: %v", entries)
+	}
+	retained, err := os.ReadDir(filepath.Join(destination, entries[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retained) != 0 {
+		t.Fatalf("failed copy transaction retained unexpected data: %v", retained)
 	}
 }
 
@@ -295,18 +661,35 @@ func TestManagedCopyReportsPublishedResultWhenDestinationSyncFails(t *testing.T)
 	}
 	defer roots.Close()
 	injected := errors.New("injected directory sync failure")
-	roots.directorySync = func(int) error { return injected }
+	syncCalls := 0
+	roots.directorySync = func(fd int) error {
+		syncCalls++
+		if syncCalls == 3 {
+			return injected
+		}
+		return unix.Fsync(fd)
+	}
 
 	result, err := roots.CopyInto(source, destination, ManagedConflictSkip)
 	expectedTarget := filepath.Join(destination, filepath.Base(source))
 	if !errors.Is(err, injected) || !ManagedMutationDurabilityUnknown(err) || !result.Changed || result.Destination != expectedTarget {
 		t.Fatalf("directory-sync copy result = %+v, %v", result, err)
 	}
+	if syncCalls != 4 {
+		t.Fatalf("directory sync calls = %d, want 4", syncCalls)
+	}
 	assertManagedTestContent(t, expectedTarget, "new")
 	assertManagedTestContent(t, source, "new")
+	entries, readErr := os.ReadDir(destination)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("publish sync failure did not retain empty private transaction: %v", entries)
+	}
 }
 
-func TestManagedReplaceCleanupSyncFailureDoesNotRetryDeletedTemporaryName(t *testing.T) {
+func TestManagedReplaceSyncFailureRetainsOldTargetInPrivateTransaction(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "source.txt")
 	destination := filepath.Join(root, "destination")
@@ -329,7 +712,7 @@ func TestManagedReplaceCleanupSyncFailureDoesNotRetryDeletedTemporaryName(t *tes
 	syncCalls := 0
 	roots.directorySync = func(fd int) error {
 		syncCalls++
-		if syncCalls == 2 {
+		if syncCalls == 3 {
 			return injected
 		}
 		return unix.Fsync(fd)
@@ -339,20 +722,30 @@ func TestManagedReplaceCleanupSyncFailureDoesNotRetryDeletedTemporaryName(t *tes
 	if !errors.Is(err, injected) || !result.Changed || result.Destination != target {
 		t.Fatalf("replacement cleanup result = %+v, %v", result, err)
 	}
-	if syncCalls != 2 {
-		t.Fatalf("directory sync calls = %d, want 2", syncCalls)
+	if syncCalls != 4 {
+		t.Fatalf("directory sync calls = %d, want 4", syncCalls)
 	}
 	entries, readErr := os.ReadDir(destination)
 	if readErr != nil {
 		t.Fatal(readErr)
 	}
-	if len(entries) != 1 || entries[0].Name() != filepath.Base(target) {
-		t.Fatalf("replacement left hidden staging entries: %v", entries)
+	if len(entries) != 2 {
+		t.Fatalf("replacement did not retain private transaction: %v", entries)
+	}
+	var retained string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".recasaos-transfer-") {
+			retained = filepath.Join(destination, entry.Name(), "entry")
+		}
+	}
+	if retained == "" {
+		t.Fatalf("replacement private transaction missing: %v", entries)
 	}
 	assertManagedTestContent(t, target, "new")
+	assertManagedTestContent(t, retained, "old")
 }
 
-func TestManagedReplacePreservesUnexpectedTargetExchangedIntoHiddenName(t *testing.T) {
+func TestManagedReplaceRejectsTargetPathReplacementBeforeExchange(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "source.txt")
 	destination := filepath.Join(root, "destination")
@@ -379,8 +772,221 @@ func TestManagedReplacePreservesUnexpectedTargetExchangedIntoHiddenName(t *testi
 	}
 
 	result, err := roots.CopyInto(source, destination, ManagedConflictReplace)
-	if !result.Changed || result.Destination != target || !errors.Is(err, ErrUnsafePath) || !ManagedMutationChanged(err) {
+	if result.Changed || !errors.Is(err, ErrUnsafePath) || ManagedMutationChanged(err) {
 		t.Fatalf("replacement identity race result = %+v, %v", result, err)
+	}
+	assertManagedTestContent(t, target, "unexpected")
+	assertManagedTestContent(t, source, "published")
+	entries, readErr := os.ReadDir(destination)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(target) {
+		t.Fatalf("rejected target replacement left transaction entries: %v", entries)
+	}
+}
+
+func TestManagedReplaceRejectsSameInodeTargetMutationBeforeExchange(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.txt")
+	destination := filepath.Join(root, "destination")
+	target := filepath.Join(destination, filepath.Base(source))
+	if err := os.WriteFile(source, []byte("published"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	roots.replaceBeforeExchange = func() error {
+		return os.WriteFile(target, []byte("same-inode mutation"), 0o600)
+	}
+
+	result, err := roots.CopyInto(source, destination, ManagedConflictReplace)
+	if result.Changed || !errors.Is(err, ErrUnsafePath) || ManagedMutationChanged(err) {
+		t.Fatalf("replacement same-inode race result = %+v, %v", result, err)
+	}
+	assertManagedTestContent(t, target, "same-inode mutation")
+	assertManagedTestContent(t, source, "published")
+	entries, readErr := os.ReadDir(destination)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(target) {
+		t.Fatalf("rejected same-inode mutation left transaction entries: %v", entries)
+	}
+}
+
+func TestManagedReplaceRejectsCtimeOnlyMutationBeforeExchange(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.txt")
+	destination := filepath.Join(root, "destination")
+	target := filepath.Join(destination, filepath.Base(source))
+	if err := os.WriteFile(source, []byte("published"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	roots.replaceBeforeExchange = func() error {
+		var before unix.Stat_t
+		if err := unix.Stat(target, &before); err != nil {
+			return err
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			if err := os.Chmod(target, 0o640); err != nil {
+				return err
+			}
+			if err := os.Chmod(target, 0o600); err != nil {
+				return err
+			}
+			var after unix.Stat_t
+			if err := unix.Stat(target, &after); err != nil {
+				return err
+			}
+			if sameManagedExchangeStat(&before, &after) && !sameManagedTransferStat(&before, &after) {
+				return nil
+			}
+			if time.Now().After(deadline) {
+				return errors.New("could not produce a ctime-only target mutation")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	result, err := roots.CopyInto(source, destination, ManagedConflictReplace)
+	if result.Changed || !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("ctime-only replacement race result = %+v, %v", result, err)
+	}
+	assertManagedTestContent(t, target, "old")
+	assertManagedTestContent(t, source, "published")
+	entries, readErr := os.ReadDir(destination)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(target) {
+		t.Fatalf("rejected pre-exchange mutation left staging entries: %v", entries)
+	}
+}
+
+func TestManagedReplacePreservesPrivateStagingSubstitution(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.txt")
+	destination := filepath.Join(root, "destination")
+	target := filepath.Join(destination, filepath.Base(source))
+	if err := os.WriteFile(source, []byte("published"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	roots.replaceBeforeExchange = func() error {
+		entries, err := os.ReadDir(destination)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.Name(), ".recasaos-transfer-") {
+				continue
+			}
+			transactionEntry := filepath.Join(destination, entry.Name(), "entry")
+			if err := os.Remove(transactionEntry); err != nil {
+				return err
+			}
+			return os.WriteFile(transactionEntry, []byte("attacker payload"), 0o600)
+		}
+		return errors.New("private transfer transaction not found")
+	}
+
+	result, err := roots.CopyInto(source, destination, ManagedConflictReplace)
+	if result.Changed || !errors.Is(err, ErrUnsafePath) || ManagedMutationChanged(err) {
+		t.Fatalf("private staging replacement result = %+v, %v", result, err)
+	}
+	assertManagedTestContent(t, target, "old")
+	assertManagedTestContent(t, source, "published")
+	entries, readErr := os.ReadDir(destination)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("substituted private staging was not retained: %v", entries)
+	}
+	var transactionEntry string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".recasaos-transfer-") {
+			transactionEntry = filepath.Join(destination, entry.Name(), "entry")
+		}
+	}
+	if transactionEntry == "" {
+		t.Fatalf("substituted private staging missing: %v", entries)
+	}
+	assertManagedTestContent(t, transactionEntry, "attacker payload")
+}
+
+func TestManagedReplacePreservesSubstitutionInsidePrivateTransaction(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.txt")
+	destination := filepath.Join(root, "destination")
+	target := filepath.Join(destination, filepath.Base(source))
+	if err := os.WriteFile(source, []byte("published"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	roots.replaceBeforeCleanup = func() error {
+		entries, err := os.ReadDir(destination)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.Name(), ".recasaos-transfer-") {
+				continue
+			}
+			transactionEntry := filepath.Join(destination, entry.Name(), "entry")
+			if err := os.Remove(transactionEntry); err != nil {
+				return err
+			}
+			return os.WriteFile(transactionEntry, []byte("unexpected"), 0o600)
+		}
+		return errors.New("private transfer transaction not found")
+	}
+
+	result, err := roots.CopyInto(source, destination, ManagedConflictReplace)
+	if !result.Changed || result.Destination != target || !errors.Is(err, ErrUnsafePath) || !ManagedMutationChanged(err) {
+		t.Fatalf("pre-cleanup replacement race result = %+v, %v", result, err)
 	}
 	assertManagedTestContent(t, target, "published")
 	entries, readErr := os.ReadDir(destination)
@@ -388,18 +994,117 @@ func TestManagedReplacePreservesUnexpectedTargetExchangedIntoHiddenName(t *testi
 		t.Fatal(readErr)
 	}
 	if len(entries) != 2 {
-		t.Fatalf("unexpected exchanged target was not preserved: %v", entries)
+		t.Fatalf("substituted transaction target was not preserved: %v", entries)
 	}
-	var hidden string
+	var transactionEntry string
 	for _, entry := range entries {
 		if strings.HasPrefix(entry.Name(), ".recasaos-transfer-") {
-			hidden = filepath.Join(destination, entry.Name())
+			transactionEntry = filepath.Join(destination, entry.Name(), "entry")
 		}
 	}
-	if hidden == "" {
-		t.Fatalf("hidden exchanged target missing: %v", entries)
+	if transactionEntry == "" {
+		t.Fatalf("substituted transaction target missing: %v", entries)
 	}
-	assertManagedTestContent(t, hidden, "unexpected")
+	assertManagedTestContent(t, transactionEntry, "unexpected")
+}
+
+func TestManagedReplacePreservesPostExchangeDestinationSwap(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.txt")
+	destination := filepath.Join(root, "destination")
+	target := filepath.Join(destination, filepath.Base(source))
+	publishedAside := target + ".published-aside"
+	if err := os.WriteFile(source, []byte("published"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	roots.replaceBeforeCleanup = func() error {
+		if err := os.Rename(target, publishedAside); err != nil {
+			return err
+		}
+		return os.WriteFile(target, []byte("replacement"), 0o600)
+	}
+
+	result, err := roots.CopyInto(source, destination, ManagedConflictReplace)
+	if !result.Changed || result.Destination != target || !errors.Is(err, ErrUnsafePath) || !ManagedMutationChanged(err) {
+		t.Fatalf("post-exchange destination swap result = %+v, %v", result, err)
+	}
+	assertManagedTestContent(t, target, "replacement")
+	assertManagedTestContent(t, publishedAside, "published")
+	entries, readErr := os.ReadDir(destination)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("post-exchange swap did not retain private old target: %v", entries)
+	}
+	var retained string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".recasaos-transfer-") {
+			retained = filepath.Join(destination, entry.Name(), "entry")
+		}
+	}
+	if retained == "" {
+		t.Fatalf("private old target transaction missing: %v", entries)
+	}
+	assertManagedTestContent(t, retained, "old")
+}
+
+func TestManagedReplacePreservesOldTargetWhenTransactionNameMoves(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.txt")
+	destination := filepath.Join(root, "destination")
+	target := filepath.Join(destination, filepath.Base(source))
+	if err := os.WriteFile(source, []byte("published"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	var movedTransaction string
+	roots.replaceBeforeCleanup = func() error {
+		entries, err := os.ReadDir(destination)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.Name(), ".recasaos-transfer-") {
+				continue
+			}
+			current := filepath.Join(destination, entry.Name())
+			movedTransaction = current + ".moved"
+			return os.Rename(current, movedTransaction)
+		}
+		return errors.New("private transfer transaction not found")
+	}
+
+	result, err := roots.CopyInto(source, destination, ManagedConflictReplace)
+	if !result.Changed || result.Destination != target || !errors.Is(err, ErrUnsafePath) || !ManagedMutationChanged(err) {
+		t.Fatalf("transaction name move result = %+v, %v", result, err)
+	}
+	assertManagedTestContent(t, target, "published")
+	if movedTransaction == "" {
+		t.Fatal("transaction move hook did not run")
+	}
+	assertManagedTestContent(t, filepath.Join(movedTransaction, "entry"), "old")
 }
 
 func TestManagedMoveReportsPartialWhenSourceCleanupSyncFails(t *testing.T) {
@@ -425,7 +1130,7 @@ func TestManagedMoveReportsPartialWhenSourceCleanupSyncFails(t *testing.T) {
 	syncCalls := 0
 	roots.directorySync = func(fd int) error {
 		syncCalls++
-		if syncCalls == 3 {
+		if syncCalls == 7 {
 			return injected
 		}
 		return unix.Fsync(fd)
@@ -435,8 +1140,8 @@ func TestManagedMoveReportsPartialWhenSourceCleanupSyncFails(t *testing.T) {
 	if !errors.Is(err, injected) || !ManagedMutationDurabilityUnknown(err) || !result.Changed || result.Destination != target {
 		t.Fatalf("source cleanup result = %+v, %v", result, err)
 	}
-	if syncCalls != 3 {
-		t.Fatalf("directory sync calls = %d, want 3", syncCalls)
+	if syncCalls != 7 {
+		t.Fatalf("directory sync calls = %d, want 7", syncCalls)
 	}
 	if _, statErr := os.Stat(source); !errors.Is(statErr, fs.ErrNotExist) {
 		t.Fatalf("source unlink did not occur before sync failure: %v", statErr)
@@ -831,7 +1536,7 @@ func TestVerifyManagedNameIdentityRejectsModifiedSource(t *testing.T) {
 	}
 }
 
-func TestManagedCleanupPresenceRejectsExternalReplacement(t *testing.T) {
+func TestManagedCleanupIdentityRejectsExternalReplacement(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "staging")
 	if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
@@ -852,9 +1557,8 @@ func TestManagedCleanupPresenceRejectsExternalReplacement(t *testing.T) {
 	if err := os.WriteFile(path, []byte("replacement"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	present, err := managedNamePresentAt(int(parent.Fd()), "staging", &expected)
-	if present || !errors.Is(err, ErrUnsafePath) {
-		t.Fatalf("replacement cleanup presence = %v, %v", present, err)
+	if err := verifyManagedNameIdentity(int(parent.Fd()), "staging", &expected); !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("replacement cleanup identity error = %v", err)
 	}
 	assertManagedTestContent(t, path, "replacement")
 }

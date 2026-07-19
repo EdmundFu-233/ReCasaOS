@@ -249,44 +249,42 @@ func (m *ManagedRoots) renameManagedSourceNoReplace(sourceRoot *managedRoot, sou
 }
 
 func (m *ManagedRoots) copyManagedTransfer(source *os.File, sourceStat *unix.Stat_t, destinationFD int, destinationMountID uint64, destinationLocation ManagedLocation, base string, style ManagedConflictStyle) (result ManagedTransferResult, resultErr error) {
-	temporaryName, err := randomManagedTransferName(".recasaos-transfer-")
+	transaction, transactionName, err := createManagedTransferTransaction(destinationFD, destinationMountID)
 	if err != nil {
 		return ManagedTransferResult{}, err
 	}
-	budget := &managedTransferBudget{}
-	created, err := copyManagedOpenedToNew(source, sourceStat, destinationFD, temporaryName, 0, budget)
-	if err != nil {
-		if created {
-			var temporaryStat unix.Stat_t
-			if statErr := unix.Fstatat(destinationFD, temporaryName, &temporaryStat, unix.AT_SYMLINK_NOFOLLOW); statErr != nil {
-				err = errors.Join(err, statErr)
-			} else {
-				cleanupBudget := int64(0)
-				err = errors.Join(err, m.removeManagedEntryAt(destinationFD, temporaryName, destinationMountID, 0, &cleanupBudget))
-			}
-		}
-		return ManagedTransferResult{}, err
-	}
-	var cleanupExpected unix.Stat_t
-	if err := unix.Fstatat(destinationFD, temporaryName, &cleanupExpected, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return ManagedTransferResult{}, err
-	}
-
-	temporaryPresent := true
+	cleanupAllowed := true
+	entryPresent := false
 	defer func() {
-		if !temporaryPresent {
-			return
+		if cleanupAllowed {
+			resultErr = errors.Join(resultErr, m.cleanupManagedTransferTransaction(destinationFD, destinationMountID, transactionName, transaction, entryPresent))
 		}
-		present, presenceErr := managedNamePresentAt(destinationFD, temporaryName, &cleanupExpected)
-		resultErr = errors.Join(resultErr, presenceErr)
-		if !present {
-			return
+		resultErr = errors.Join(resultErr, transaction.Close())
+		if !cleanupAllowed && resultErr != nil {
+			resultErr = fmt.Errorf("private managed transfer transaction %q retained: %w", transactionName, resultErr)
 		}
-		cleanupBudget := int64(0)
-		resultErr = errors.Join(resultErr, m.removeManagedEntryAt(destinationFD, temporaryName, destinationMountID, 0, &cleanupBudget))
 	}()
+	if err := m.syncManagedDirectory(destinationFD, "sync created managed transfer transaction", true); err != nil {
+		cleanupAllowed = false
+		return ManagedTransferResult{}, err
+	}
 
-	result, temporaryPresent, err = m.publishManagedTransfer(destinationFD, destinationMountID, temporaryName, destinationLocation, base, style, &cleanupExpected)
+	const transactionEntry = "entry"
+	budget := &managedTransferBudget{}
+	created, err := copyManagedOpenedToNew(source, sourceStat, int(transaction.Fd()), transactionEntry, 0, budget)
+	entryPresent = created
+	if err != nil {
+		return ManagedTransferResult{}, err
+	}
+	var stagingExpected unix.Stat_t
+	if err := unix.Fstatat(int(transaction.Fd()), transactionEntry, &stagingExpected, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return ManagedTransferResult{}, err
+	}
+	if err := m.syncManagedDirectory(int(transaction.Fd()), "sync staged managed transfer transaction", true); err != nil {
+		cleanupAllowed = false
+		return ManagedTransferResult{}, err
+	}
+	result, cleanupAllowed, entryPresent, err = m.publishManagedTransaction(destinationFD, destinationMountID, transactionName, transaction, destinationLocation, base, style, &stagingExpected)
 	if err != nil {
 		return result, err
 	}
@@ -720,7 +718,37 @@ func openManagedTransferChild(parentFD int, name string) (*os.File, error) {
 	return opened, nil
 }
 
-func (m *ManagedRoots) publishManagedTransfer(destinationFD int, destinationMountID uint64, temporaryName string, destinationLocation ManagedLocation, base string, style ManagedConflictStyle, cleanupExpected *unix.Stat_t) (ManagedTransferResult, bool, error) {
+func (m *ManagedRoots) publishManagedTransaction(destinationFD int, destinationMountID uint64, transactionName string, transaction *os.File, destinationLocation ManagedLocation, base string, style ManagedConflictStyle, stagingExpected *unix.Stat_t) (ManagedTransferResult, bool, bool, error) {
+	const transactionEntry = "entry"
+	if transaction == nil || stagingExpected == nil {
+		return ManagedTransferResult{}, false, true, fmt.Errorf("%w: managed transfer transaction is incomplete", ErrUnsafePath)
+	}
+	if err := validateManagedTransferTransaction(destinationFD, destinationMountID, transactionName, transaction); err != nil {
+		return ManagedTransferResult{}, false, true, err
+	}
+	staging, err := openManagedTransferChild(int(transaction.Fd()), transactionEntry)
+	if err != nil {
+		return ManagedTransferResult{}, false, true, err
+	}
+	closeStaging := func() error {
+		if staging == nil {
+			return nil
+		}
+		err := staging.Close()
+		staging = nil
+		return err
+	}
+	var stagingOpened unix.Stat_t
+	if err := unix.Fstat(int(staging.Fd()), &stagingOpened); err != nil {
+		return ManagedTransferResult{}, false, true, errors.Join(err, closeStaging())
+	}
+	if !sameManagedTransferStat(stagingExpected, &stagingOpened) {
+		return ManagedTransferResult{}, false, true, errors.Join(fmt.Errorf("%w: private staging identity changed before publication", ErrUnsafePath), closeStaging())
+	}
+	if err := verifyManagedNameIdentity(int(transaction.Fd()), transactionEntry, &stagingOpened); err != nil {
+		return ManagedTransferResult{}, false, true, errors.Join(err, closeStaging())
+	}
+
 	limit := 1
 	if style == ManagedConflictRename {
 		limit = maxManagedRenameCandidates
@@ -728,73 +756,201 @@ func (m *ManagedRoots) publishManagedTransfer(destinationFD int, destinationMoun
 	for index := 0; index < limit; index++ {
 		candidate, err := managedRenameCandidate(base, index)
 		if err != nil {
-			return ManagedTransferResult{}, true, err
+			return ManagedTransferResult{}, true, true, errors.Join(err, closeStaging())
 		}
 		target := filepath.Join(destinationLocation.Canonical, candidate)
-		renameErr := unix.Renameat2(destinationFD, temporaryName, destinationFD, candidate, unix.RENAME_NOREPLACE)
+		var stagingBefore unix.Stat_t
+		if err := unix.Fstat(int(staging.Fd()), &stagingBefore); err != nil {
+			return ManagedTransferResult{}, false, true, errors.Join(err, closeStaging())
+		}
+		if !sameManagedTransferStat(&stagingOpened, &stagingBefore) {
+			return ManagedTransferResult{}, false, true, errors.Join(fmt.Errorf("%w: private staging changed before publication", ErrUnsafePath), closeStaging())
+		}
+		if err := verifyManagedNameIdentity(int(transaction.Fd()), transactionEntry, &stagingBefore); err != nil {
+			return ManagedTransferResult{}, false, true, errors.Join(err, closeStaging())
+		}
+		renameErr := unix.Renameat2(int(transaction.Fd()), transactionEntry, destinationFD, candidate, unix.RENAME_NOREPLACE)
 		if renameErr == nil {
 			result := ManagedTransferResult{Destination: target, Changed: true}
-			return result, false, m.syncManagedDirectory(destinationFD, "sync published managed destination", true)
+			var publishedStat unix.Stat_t
+			if err := unix.Fstat(int(staging.Fd()), &publishedStat); err != nil {
+				return result, false, false, managedChangedMutationError("managed transfer published but staging descriptor revalidation failed", false, errors.Join(err, closeStaging()))
+			}
+			if !sameManagedExchangeStat(&stagingBefore, &publishedStat) {
+				return result, false, false, managedChangedMutationError("managed transfer published but staging changed during rename", false, errors.Join(ErrUnsafePath, closeStaging()))
+			}
+			if err := verifyManagedNameIdentity(destinationFD, candidate, &publishedStat); err != nil {
+				return result, false, false, managedChangedMutationError("managed transfer destination does not identify pinned staging", false, errors.Join(err, closeStaging()))
+			}
+			destinationSyncErr := m.syncManagedDirectory(destinationFD, "sync published managed destination", true)
+			transactionSyncErr := m.syncManagedDirectory(int(transaction.Fd()), "sync published managed transaction", true)
+			if err := errors.Join(destinationSyncErr, transactionSyncErr); err != nil {
+				return result, false, false, errors.Join(err, closeStaging())
+			}
+			var publishedAfterSync unix.Stat_t
+			if err := unix.Fstat(int(staging.Fd()), &publishedAfterSync); err != nil {
+				return result, false, false, managedChangedMutationError("managed transfer published but final staging revalidation failed", false, errors.Join(err, closeStaging()))
+			}
+			if !sameManagedTransferStat(&publishedStat, &publishedAfterSync) {
+				return result, false, false, managedChangedMutationError("managed transfer destination changed during publication sync", false, errors.Join(ErrUnsafePath, closeStaging()))
+			}
+			if err := verifyManagedNameIdentity(destinationFD, candidate, &publishedAfterSync); err != nil {
+				return result, false, false, managedChangedMutationError("managed transfer destination no longer identifies pinned staging", false, errors.Join(err, closeStaging()))
+			}
+			if err := closeStaging(); err != nil {
+				return result, false, false, managedChangedMutationError("managed transfer published but staging descriptor close failed", false, err)
+			}
+			return result, true, false, nil
 		}
 		if !errors.Is(renameErr, unix.EEXIST) {
-			return ManagedTransferResult{}, true, classifyManagedResolutionError(renameErr)
+			return ManagedTransferResult{}, true, true, errors.Join(classifyManagedResolutionError(renameErr), closeStaging())
 		}
 		switch style {
 		case ManagedConflictSkip:
-			return ManagedTransferResult{Destination: target, Changed: false}, true, nil
+			return ManagedTransferResult{Destination: target, Changed: false}, true, true, closeStaging()
 		case ManagedConflictRename:
 			continue
 		case ManagedConflictReplace:
-			replacedStat, err := validateManagedReplacementType(destinationFD, temporaryName, candidate)
-			if err != nil {
-				return ManagedTransferResult{}, true, err
+			if err := validateManagedReplaceFilesystem(destinationFD); err != nil {
+				return ManagedTransferResult{}, true, true, errors.Join(err, closeStaging())
 			}
-			if err := m.validateManagedReplacementAt(destinationFD, candidate, destinationMountID, target); err != nil {
-				return ManagedTransferResult{}, true, err
+			replacedStat, err := validateManagedTransactionReplacementType(int(transaction.Fd()), transactionEntry, destinationFD, candidate)
+			if err != nil {
+				return ManagedTransferResult{}, true, true, errors.Join(err, closeStaging())
+			}
+			replaced, err := m.validateManagedReplacementAt(destinationFD, candidate, destinationMountID, target, &replacedStat)
+			if err != nil {
+				return ManagedTransferResult{}, true, true, errors.Join(err, closeStaging())
+			}
+			closeReplaced := func() error {
+				if replaced == nil {
+					return nil
+				}
+				err := replaced.Close()
+				replaced = nil
+				return err
+			}
+			closePinned := func() error {
+				return errors.Join(closeStaging(), closeReplaced())
 			}
 			if m.replaceBeforeExchange != nil {
 				if err := m.replaceBeforeExchange(); err != nil {
-					return ManagedTransferResult{}, true, err
+					return ManagedTransferResult{}, false, true, errors.Join(err, closePinned())
 				}
 			}
-			if err := unix.Renameat2(destinationFD, temporaryName, destinationFD, candidate, unix.RENAME_EXCHANGE); err != nil {
-				return ManagedTransferResult{}, true, classifyManagedResolutionError(err)
+			if err := validateManagedTransferTransaction(destinationFD, destinationMountID, transactionName, transaction); err != nil {
+				return ManagedTransferResult{}, false, true, errors.Join(err, closePinned())
 			}
-			if cleanupExpected != nil {
-				*cleanupExpected = replacedStat
+			if err := unix.Fstat(int(staging.Fd()), &stagingBefore); err != nil {
+				return ManagedTransferResult{}, false, true, errors.Join(err, closePinned())
 			}
+			if !sameManagedTransferStat(&stagingOpened, &stagingBefore) {
+				return ManagedTransferResult{}, false, true, errors.Join(fmt.Errorf("%w: private staging changed before exchange", ErrUnsafePath), closePinned())
+			}
+			if err := verifyManagedNameIdentity(int(transaction.Fd()), transactionEntry, &stagingBefore); err != nil {
+				return ManagedTransferResult{}, false, true, errors.Join(err, closePinned())
+			}
+			var exchangeBefore unix.Stat_t
+			if err := unix.Fstat(int(replaced.Fd()), &exchangeBefore); err != nil {
+				return ManagedTransferResult{}, true, true, errors.Join(err, closePinned())
+			}
+			if !sameManagedTransferStat(&replacedStat, &exchangeBefore) {
+				return ManagedTransferResult{}, true, true, errors.Join(fmt.Errorf("%w: replacement target changed before exchange", ErrUnsafePath), closePinned())
+			}
+			if err := verifyManagedNameIdentity(destinationFD, candidate, &exchangeBefore); err != nil {
+				return ManagedTransferResult{}, true, true, errors.Join(err, closePinned())
+			}
+			if err := unix.Renameat2(int(transaction.Fd()), transactionEntry, destinationFD, candidate, unix.RENAME_EXCHANGE); err != nil {
+				return ManagedTransferResult{}, false, true, errors.Join(classifyManagedResolutionError(err), closePinned())
+			}
+
 			result := ManagedTransferResult{Destination: target, Changed: true}
-			if err := m.syncManagedDirectory(destinationFD, "sync exchanged managed destination", true); err != nil {
-				// The destination was exchanged, but an unsynchronized old target
-				// is safer left at the hidden staging name than removed by a later
-				// pathname retry.
-				return result, false, err
+			var publishedStat unix.Stat_t
+			if err := unix.Fstat(int(staging.Fd()), &publishedStat); err != nil {
+				return result, false, true, managedChangedMutationError("replacement published but staging descriptor revalidation failed", false, errors.Join(err, closePinned()))
 			}
-			present, presenceErr := managedNamePresentAt(destinationFD, temporaryName, &replacedStat)
-			if presenceErr != nil {
-				return result, true, managedChangedMutationError("replacement published but hidden old target identity changed", false, presenceErr)
+			if !sameManagedExchangeStat(&stagingBefore, &publishedStat) {
+				return result, false, true, managedChangedMutationError("replacement published but staging changed during exchange", false, errors.Join(ErrUnsafePath, closePinned()))
 			}
-			if !present {
-				return result, false, managedChangedMutationError("replacement published but hidden old target disappeared", false, ErrUnsafePath)
+			if err := verifyManagedNameIdentity(destinationFD, candidate, &publishedStat); err != nil {
+				return result, false, true, managedChangedMutationError("replacement destination does not identify pinned staging", false, errors.Join(err, closePinned()))
 			}
-			cleanupBudget := int64(0)
-			if err := m.removeManagedEntryAt(destinationFD, temporaryName, destinationMountID, 0, &cleanupBudget); err != nil {
-				temporaryPresent, presenceErr := managedNamePresentAt(destinationFD, temporaryName, &replacedStat)
-				return result, temporaryPresent, errors.Join(fmt.Errorf("replacement published but old destination cleanup failed: %w", err), presenceErr)
+			var exchangedStat unix.Stat_t
+			if err := unix.Fstat(int(replaced.Fd()), &exchangedStat); err != nil {
+				return result, false, true, managedChangedMutationError("replacement published but old target descriptor revalidation failed", false, errors.Join(err, closePinned()))
 			}
-			return result, false, nil
+			if !sameManagedExchangeStat(&exchangeBefore, &exchangedStat) {
+				return result, false, true, managedChangedMutationError("replacement published but old target changed during exchange", false, errors.Join(ErrUnsafePath, closePinned()))
+			}
+			if err := verifyManagedNameIdentity(int(transaction.Fd()), transactionEntry, &exchangedStat); err != nil {
+				return result, false, true, managedChangedMutationError("private transaction does not identify exchanged old target", false, errors.Join(err, closePinned()))
+			}
+			destinationSyncErr := m.syncManagedDirectory(destinationFD, "sync exchanged managed destination", true)
+			transactionSyncErr := m.syncManagedDirectory(int(transaction.Fd()), "sync exchanged managed transaction", true)
+			if err := errors.Join(destinationSyncErr, transactionSyncErr); err != nil {
+				return result, false, true, errors.Join(err, closePinned())
+			}
+			if m.replaceBeforeCleanup != nil {
+				if err := m.replaceBeforeCleanup(); err != nil {
+					return result, false, true, managedChangedMutationError("replacement published but cleanup interlock failed", false, errors.Join(err, closePinned()))
+				}
+			}
+			if err := validateManagedTransferTransaction(destinationFD, destinationMountID, transactionName, transaction); err != nil {
+				return result, false, true, managedChangedMutationError("replacement private transaction name changed before cleanup", false, errors.Join(err, closePinned()))
+			}
+			var publishedBeforeCleanup unix.Stat_t
+			if err := unix.Fstat(int(staging.Fd()), &publishedBeforeCleanup); err != nil {
+				return result, false, true, managedChangedMutationError("replacement published staging revalidation failed before cleanup", false, errors.Join(err, closePinned()))
+			}
+			if !sameManagedTransferStat(&publishedStat, &publishedBeforeCleanup) {
+				return result, false, true, managedChangedMutationError("replacement destination changed before old target cleanup", false, errors.Join(ErrUnsafePath, closePinned()))
+			}
+			if err := verifyManagedNameIdentity(destinationFD, candidate, &publishedBeforeCleanup); err != nil {
+				return result, false, true, managedChangedMutationError("replacement destination no longer identifies pinned staging", false, errors.Join(err, closePinned()))
+			}
+			var cleanupBefore unix.Stat_t
+			if err := unix.Fstat(int(replaced.Fd()), &cleanupBefore); err != nil {
+				return result, false, true, managedChangedMutationError("replacement published but cleanup descriptor revalidation failed", false, errors.Join(err, closePinned()))
+			}
+			if !sameManagedTransferStat(&exchangedStat, &cleanupBefore) {
+				return result, false, true, managedChangedMutationError("replacement published but old target changed before cleanup", false, errors.Join(ErrUnsafePath, closePinned()))
+			}
+			if err := verifyManagedNameIdentity(int(transaction.Fd()), transactionEntry, &cleanupBefore); err != nil {
+				return result, false, true, managedChangedMutationError("private transaction old target identity changed before cleanup", false, errors.Join(err, closePinned()))
+			}
+			unlinkFlags := 0
+			if cleanupBefore.Mode&unix.S_IFMT == unix.S_IFDIR {
+				unlinkFlags = unix.AT_REMOVEDIR
+			}
+			if err := unix.Unlinkat(int(transaction.Fd()), transactionEntry, unlinkFlags); err != nil {
+				return result, false, true, managedChangedMutationError("replacement published but private old target removal failed", false, errors.Join(err, closePinned()))
+			}
+			if err := m.syncManagedDirectory(int(transaction.Fd()), "sync removed private replacement target", true); err != nil {
+				return result, false, false, errors.Join(err, closePinned())
+			}
+			var removedStat unix.Stat_t
+			if err := unix.Fstat(int(replaced.Fd()), &removedStat); err != nil {
+				return result, false, false, managedChangedMutationError("replacement cleanup could not verify removed old target", false, errors.Join(err, closePinned()))
+			}
+			if removedStat.Nlink != 0 {
+				return result, false, false, managedChangedMutationError("replacement cleanup did not unlink expected old target", false, errors.Join(ErrUnsafePath, closePinned()))
+			}
+			if err := closePinned(); err != nil {
+				return result, false, false, managedChangedMutationError("replacement cleanup completed but pinned descriptor close failed", false, err)
+			}
+			return result, true, false, nil
 		}
 	}
-	return ManagedTransferResult{}, true, fmt.Errorf("no available managed destination name after %d attempts", limit)
+	return ManagedTransferResult{}, true, true, errors.Join(fmt.Errorf("no available managed destination name after %d attempts", limit), closeStaging())
 }
 
-func validateManagedReplacementType(parentFD int, sourceName, targetName string) (unix.Stat_t, error) {
+func validateManagedTransactionReplacementType(sourceParentFD int, sourceName string, targetParentFD int, targetName string) (unix.Stat_t, error) {
 	var sourceStat unix.Stat_t
-	if err := unix.Fstatat(parentFD, sourceName, &sourceStat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+	if err := unix.Fstatat(sourceParentFD, sourceName, &sourceStat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		return unix.Stat_t{}, err
 	}
 	var targetStat unix.Stat_t
-	if err := unix.Fstatat(parentFD, targetName, &targetStat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+	if err := unix.Fstatat(targetParentFD, targetName, &targetStat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		return unix.Stat_t{}, err
 	}
 	sourceType := sourceStat.Mode & unix.S_IFMT
@@ -805,34 +961,222 @@ func validateManagedReplacementType(parentFD int, sourceName, targetName string)
 	return targetStat, nil
 }
 
-func managedNamePresentAt(parentFD int, name string, expected *unix.Stat_t) (bool, error) {
-	var stat unix.Stat_t
-	if err := unix.Fstatat(parentFD, name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		if errors.Is(err, unix.ENOENT) {
-			return false, nil
-		}
-		return false, err
+func createManagedTransferTransaction(parentFD int, parentMountID uint64) (*os.File, string, error) {
+	name, err := randomManagedTransferName(".recasaos-transfer-")
+	if err != nil {
+		return nil, "", err
 	}
-	if expected == nil || !sameManagedTransferStat(expected, &stat) {
-		return false, fmt.Errorf("%w: managed cleanup name no longer identifies the expected staging entry", ErrUnsafePath)
+	if err := unix.Mkdirat(parentFD, name, 0o700); err != nil {
+		return nil, "", classifyManagedResolutionError(err)
 	}
-	return true, nil
+	fd, err := unix.Openat2(parentFD, name, &unix.OpenHow{
+		Flags:   unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC | unix.O_NOFOLLOW | unix.O_NONBLOCK,
+		Resolve: managedResolvePolicy,
+	})
+	if err != nil {
+		return nil, name, fmt.Errorf("private managed transfer transaction %q retained after open failure: %w", name, classifyManagedResolutionError(err))
+	}
+	transaction := os.NewFile(uintptr(fd), name)
+	if transaction == nil {
+		unix.Close(fd)
+		return nil, name, fmt.Errorf("private managed transfer transaction %q retained after descriptor conversion failure", name)
+	}
+	if err := unix.Fchmod(fd, 0o700); err != nil {
+		return nil, name, fmt.Errorf("private managed transfer transaction %q retained after chmod failure: %w", name, errors.Join(err, transaction.Close()))
+	}
+	if err := validateManagedTransferTransaction(parentFD, parentMountID, name, transaction); err != nil {
+		return nil, name, fmt.Errorf("private managed transfer transaction %q retained after validation failure: %w", name, errors.Join(err, transaction.Close()))
+	}
+	return transaction, name, nil
 }
 
-func (m *ManagedRoots) validateManagedReplacementAt(parentFD int, name string, parentMountID uint64, canonical string) error {
-	opened, err := openManagedTransferChild(parentFD, name)
+func validateManagedTransferTransactionFD(parentMountID uint64, transaction *os.File) error {
+	if transaction == nil {
+		return fmt.Errorf("%w: managed transfer transaction is not open", ErrUnsafePath)
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(transaction.Fd()), &stat); err != nil {
+		return err
+	}
+	if err := validateManagedTransferTransactionStat(&stat, uint32(os.Geteuid())); err != nil {
+		return err
+	}
+	mountID, err := managedMountIDAt(int(transaction.Fd()), "", unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
 	if err != nil {
 		return err
 	}
+	if mountID != parentMountID {
+		return fmt.Errorf("%w: managed transfer transaction crossed a mount boundary", ErrUnsafePath)
+	}
+	return nil
+}
+
+func validateManagedTransferTransactionStat(stat *unix.Stat_t, effectiveUID uint32) error {
+	if stat == nil {
+		return fmt.Errorf("%w: managed transfer transaction metadata is unavailable", ErrUnsafePath)
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0o7777 != 0o700 {
+		return fmt.Errorf("%w: managed transfer transaction is not a private directory", ErrUnsafePath)
+	}
+	if stat.Uid != effectiveUID {
+		return fmt.Errorf("%w: managed transfer transaction is not owned by the effective uid", ErrUnsafePath)
+	}
+	// Btrfs intentionally reports st_nlink=1 for linked directories. The
+	// descriptor/name identity check performed by validateManagedTransferTransaction
+	// proves which directory is linked; zero alone means this descriptor has no
+	// live directory entry.
+	if stat.Nlink == 0 {
+		return fmt.Errorf("%w: managed transfer transaction has an invalid link count", ErrUnsafePath)
+	}
+	return nil
+}
+
+func validateManagedReplaceFilesystem(fd int) error {
+	var stat unix.Statfs_t
+	if err := unix.Fstatfs(fd, &stat); err != nil {
+		return err
+	}
+	if !managedReplaceFilesystemCertified(int64(stat.Type)) {
+		return fmt.Errorf("%w: replace requires a certified local filesystem; filesystem type %#x is not certified", ErrUnsafePath, uint32(stat.Type))
+	}
+	return nil
+}
+
+func managedReplaceFilesystemCertified(magic int64) bool {
+	switch uint32(magic) {
+	case uint32(unix.EXT4_SUPER_MAGIC), // Shared by ext2, ext3, and ext4.
+		uint32(unix.XFS_SUPER_MAGIC),
+		uint32(unix.BTRFS_SUPER_MAGIC),
+		uint32(unix.TMPFS_MAGIC),
+		uint32(unix.F2FS_SUPER_MAGIC):
+		return true
+	default:
+		return false
+	}
+}
+
+func validateManagedTransferTransaction(parentFD int, parentMountID uint64, name string, transaction *os.File) error {
+	if err := validateManagedTransferTransactionFD(parentMountID, transaction); err != nil {
+		return err
+	}
+	var descriptorStat unix.Stat_t
+	if err := unix.Fstat(int(transaction.Fd()), &descriptorStat); err != nil {
+		return err
+	}
+	var nameStat unix.Stat_t
+	if err := unix.Fstatat(parentFD, name, &nameStat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return err
+	}
+	if !sameManagedTransferStat(&descriptorStat, &nameStat) {
+		return fmt.Errorf("%w: managed transfer transaction name changed", ErrUnsafePath)
+	}
+	return nil
+}
+
+func validateManagedTransferTransactionEmpty(parentFD int, parentMountID uint64, name string, transaction *os.File) error {
+	if err := validateManagedTransferTransaction(parentFD, parentMountID, name, transaction); err != nil {
+		return err
+	}
+	entries, err := transaction.ReadDir(1)
+	if len(entries) != 0 {
+		return fmt.Errorf("%w: managed transfer transaction is not empty", ErrUnsafePath)
+	}
+	if !errors.Is(err, io.EOF) {
+		if err == nil {
+			return fmt.Errorf("%w: could not prove managed transfer transaction is empty", ErrUnsafePath)
+		}
+		return err
+	}
+	return validateManagedTransferTransaction(parentFD, parentMountID, name, transaction)
+}
+
+func (m *ManagedRoots) cleanupManagedTransferTransaction(parentFD int, parentMountID uint64, name string, transaction *os.File, entryPresent bool) error {
+	if err := validateManagedTransferTransaction(parentFD, parentMountID, name, transaction); err != nil {
+		return fmt.Errorf("private managed transfer transaction %q retained: %w", name, err)
+	}
+	if entryPresent {
+		cleanupBudget := int64(0)
+		if err := m.removeManagedEntryAt(int(transaction.Fd()), "entry", parentMountID, 0, &cleanupBudget); err != nil {
+			return fmt.Errorf("private managed transfer transaction %q retained after entry cleanup failure: %w", name, err)
+		}
+	}
+	if err := validateManagedTransferTransactionEmpty(parentFD, parentMountID, name, transaction); err != nil {
+		return fmt.Errorf("private managed transfer transaction %q retained after empty-state validation failure: %w", name, err)
+	}
+	// Linux has no descriptor-relative rmdir-by-handle operation. The private
+	// directory is proven empty immediately above and AT_REMOVEDIR refuses a
+	// nonempty substitute. A non-cooperating writer on the parent can therefore
+	// race this final step only into removing another empty directory; it cannot
+	// make cleanup delete a data-bearing replacement. A same-UID writer could
+	// first unlink the original empty directory and then substitute another empty
+	// directory, making that substitution undetectable by the pinned Nlink check.
+	// This trusted-host residual is tracked in follow-up issues #7 and #17.
+	if err := unix.Unlinkat(parentFD, name, unix.AT_REMOVEDIR); err != nil {
+		return fmt.Errorf("private managed transfer transaction %q retained after rmdir failure: %w", name, err)
+	}
+	var removed unix.Stat_t
+	if err := unix.Fstat(int(transaction.Fd()), &removed); err != nil {
+		return err
+	}
+	if removed.Nlink != 0 {
+		return fmt.Errorf("%w: managed transfer transaction removal did not unlink the pinned directory", ErrUnsafePath)
+	}
+	return m.syncManagedDirectory(parentFD, "sync removed managed transfer transaction", true)
+}
+
+func (m *ManagedRoots) validateManagedReplacementAt(parentFD int, name string, parentMountID uint64, canonical string, expected *unix.Stat_t) (*os.File, error) {
+	opened, err := openManagedTransferChild(parentFD, name)
+	if err != nil {
+		return nil, err
+	}
+	closeWithError := func(err error) (*os.File, error) {
+		return nil, errors.Join(err, opened.Close())
+	}
+	var openedBefore unix.Stat_t
+	if err := unix.Fstat(int(opened.Fd()), &openedBefore); err != nil {
+		return closeWithError(err)
+	}
+	if expected == nil || !sameManagedTransferStat(expected, &openedBefore) {
+		return closeWithError(fmt.Errorf("%w: replacement target changed before validation", ErrUnsafePath))
+	}
 	if err := m.rejectConfiguredRootAtOrBelow(opened, canonical); err != nil {
-		_ = opened.Close()
-		return err
+		return closeWithError(err)
 	}
-	if err := opened.Close(); err != nil {
-		return err
+	if openedBefore.Mode&unix.S_IFMT == unix.S_IFDIR {
+		mountID, err := managedMountIDAt(int(opened.Fd()), "", unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
+		if err != nil {
+			return closeWithError(err)
+		}
+		if mountID != parentMountID {
+			return closeWithError(fmt.Errorf("%w: refusing to replace a directory mount boundary", ErrUnsafePath))
+		}
+		entries, readErr := opened.ReadDir(1)
+		if len(entries) != 0 {
+			return closeWithError(fmt.Errorf("%w: replacing nonempty directories is disabled", ErrUnsafePath))
+		}
+		if !errors.Is(readErr, io.EOF) {
+			if readErr == nil {
+				return closeWithError(fmt.Errorf("%w: could not prove replacement directory is empty", ErrUnsafePath))
+			}
+			return closeWithError(readErr)
+		}
+	} else {
+		budget := int64(0)
+		if err := validateManagedRemovableEntryAt(parentFD, name, parentMountID, 0, &budget, false); err != nil {
+			return closeWithError(err)
+		}
 	}
-	budget := int64(0)
-	return validateManagedRemovableEntryAt(parentFD, name, parentMountID, 0, &budget, false)
+	var openedAfter unix.Stat_t
+	if err := unix.Fstat(int(opened.Fd()), &openedAfter); err != nil {
+		return closeWithError(err)
+	}
+	if !sameManagedTransferStat(&openedBefore, &openedAfter) {
+		return closeWithError(fmt.Errorf("%w: replacement target changed during validation", ErrUnsafePath))
+	}
+	if err := verifyManagedNameIdentity(parentFD, name, &openedAfter); err != nil {
+		return closeWithError(err)
+	}
+	return opened, nil
 }
 
 func validateManagedRemovableEntryAt(parentFD int, name string, parentMountID uint64, depth int, entries *int64, nested bool) error {
@@ -934,9 +1278,32 @@ func sameManagedTransferStat(before, after *unix.Stat_t) bool {
 		before.Ino == after.Ino &&
 		before.Mode == after.Mode &&
 		before.Nlink == after.Nlink &&
+		before.Uid == after.Uid &&
+		before.Gid == after.Gid &&
+		before.Rdev == after.Rdev &&
 		before.Size == after.Size &&
+		before.Blksize == after.Blksize &&
+		before.Blocks == after.Blocks &&
 		before.Mtim == after.Mtim &&
 		before.Ctim == after.Ctim
+}
+
+// sameManagedExchangeStat permits only the inode ctime transition caused by
+// renameat2(RENAME_EXCHANGE). The old target remains pinned by an open
+// descriptor across the syscall; every other identity and content signal must
+// remain unchanged before its hidden name can be removed.
+func sameManagedExchangeStat(before, after *unix.Stat_t) bool {
+	return before.Dev == after.Dev &&
+		before.Ino == after.Ino &&
+		before.Mode == after.Mode &&
+		before.Nlink == after.Nlink &&
+		before.Uid == after.Uid &&
+		before.Gid == after.Gid &&
+		before.Rdev == after.Rdev &&
+		before.Size == after.Size &&
+		before.Blksize == after.Blksize &&
+		before.Blocks == after.Blocks &&
+		before.Mtim == after.Mtim
 }
 
 func managedRenameCandidate(base string, index int) (string, error) {

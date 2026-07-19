@@ -48,6 +48,7 @@ type ManagedRoots struct {
 	commitCopy            func(io.Writer, io.Reader) (int64, error)
 	commitIdentity        func(int, string) (ManagedFileIdentity, error)
 	replaceBeforeExchange func() error
+	replaceBeforeCleanup  func() error
 	rewriteBeforePublish  func() error
 }
 
