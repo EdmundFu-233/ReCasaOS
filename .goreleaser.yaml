@@ -1,12 +1,15 @@
+version: 2
+
 # This is an example .goreleaser.yml file with some sensible defaults.
 # Make sure to check the documentation at https://goreleaser.com
-project_name: casaos
+project_name: recasaos
 before:
   hooks:
-    - go generate
-    - go run github.com/google/go-licenses@latest check . --disallowed_types=restricted
-    - go mod tidy
-    - go test -race -v ./...
+    - .github/scripts/check-release-policy.sh
+    - go generate ./...
+    - go mod verify
+    - go test ./...
+    - go vet ./...
 
 builds:
   - id: casaos-amd64
@@ -19,12 +22,6 @@ builds:
     ldflags:
       - -X main.commit={{.Commit}}
       - -X main.date={{.Date}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/google_drive.client_id={{.Env.GoogleID}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/google_drive.client_secret={{.Env.GoogleSecret}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/onedrive.client_id={{.Env.OneDriveID}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/onedrive.client_secret={{.Env.OneDriveSecret}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/dropbox.app_key={{.Env.DropboxKey}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/dropbox.app_secret={{.Env.DropboxSecret}}
       - -s
       - -w
       - -extldflags "-static"
@@ -46,12 +43,6 @@ builds:
     ldflags:
       - -X main.commit={{.Commit}}
       - -X main.date={{.Date}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/google_drive.client_id={{.Env.GoogleID}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/google_drive.client_secret={{.Env.GoogleSecret}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/onedrive.client_id={{.Env.OneDriveID}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/onedrive.client_secret={{.Env.OneDriveSecret}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/dropbox.app_key={{.Env.DropboxKey}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/dropbox.app_secret={{.Env.DropboxSecret}}
       - -s
       - -w
       - -extldflags "-static"
@@ -73,12 +64,6 @@ builds:
     ldflags:
       - -X main.commit={{.Commit}}
       - -X main.date={{.Date}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/google_drive.client_id={{.Env.GoogleID}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/google_drive.client_secret={{.Env.GoogleSecret}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/onedrive.client_id={{.Env.OneDriveID}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/onedrive.client_secret={{.Env.OneDriveSecret}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/dropbox.app_key={{.Env.DropboxKey}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/dropbox.app_secret={{.Env.DropboxSecret}}
       - -s
       - -w
       - -extldflags "-static"
@@ -99,12 +84,6 @@ builds:
     ldflags:
       - -X main.commit={{.Commit}}
       - -X main.date={{.Date}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/google_drive.client_id={{.Env.GoogleID}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/google_drive.client_secret={{.Env.GoogleSecret}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/onedrive.client_id={{.Env.OneDriveID}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/onedrive.client_secret={{.Env.OneDriveSecret}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/dropbox.app_key={{.Env.DropboxKey}}
-      - -X github.com/IceWhaleTech/CasaOS/drivers/dropbox.app_secret={{.Env.DropboxSecret}}
       - -s
       - -w
       - -extldflags "-static"
@@ -207,7 +186,7 @@ archives:
   - name_template:  >- 
       {{ .Os }}-{{- if eq .Arch "arm" }}arm-7{{- else }}{{ .Arch }}{{- end }}-{{ .ProjectName }}-v{{ .Version }}
     id: casaos
-    builds:
+    ids:
       - casaos-amd64
       - casaos-arm64
       - casaos-arm-7
@@ -217,7 +196,7 @@ archives:
   - name_template: >-
       {{ .Os }}-{{- if eq .Arch "arm" }}arm-7{{- else }}{{ .Arch }}{{- end }}-{{ .ProjectName }}-migration-tool-v{{ .Version }}
     id: casaos-migration-tool
-    builds:
+    ids:
       - casaos-migration-tool-amd64
       - casaos-migration-tool-arm64
       - casaos-migration-tool-arm-7
@@ -227,25 +206,19 @@ archives:
 checksum:
   name_template: "checksums.txt"
 snapshot:
-  name_template: "{{ incpatch .Version }}"
+  version_template: "{{ incpatch .Version }}"
 changelog:
   sort: asc
   filters:
     exclude:
       - "^docs:"
       - "^test:"
-# release:
-#   github:
-#     owner: IceWhaleTech
-#     name: CasaOS
-#   draft: true
-#   prerelease: auto
-#   mode: replace
-#   name_template: "v{{ .Version }}"
 release:
+  # Binary releases remain disabled until the component BOM and installer are pinned.
+  disable: true
   github:
-    owner: IceWhaleTech
-    name: CasaOS
+    owner: EdmundFu-233
+    name: ReCasaOS
   draft: true
   prerelease: auto
   mode: replace
