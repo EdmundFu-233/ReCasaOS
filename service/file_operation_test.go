@@ -110,12 +110,9 @@ func (f *fakeManagedFileOperationRoots) CopyInto(source, destination string, sty
 	if source == f.failSource {
 		return filesecurity.ManagedTransferResult{}, errors.New("copy\nfailed")
 	}
-	if source == f.partialSource {
-		return filesecurity.ManagedTransferResult{Destination: filepath.Join(destination, filepath.Base(source)), Changed: true}, errors.New("destination published but cleanup failed")
-	}
 	if source == f.changedErrorSource {
-		return filesecurity.ManagedTransferResult{}, &filesecurity.ManagedMutationError{
-			Operation:         "sync published destination",
+		return filesecurity.ManagedTransferResult{Destination: filepath.Join(destination, filepath.Base(source))}, &filesecurity.ManagedMutationError{
+			Operation:         "sync private transfer transaction",
 			Changed:           true,
 			DurabilityUnknown: true,
 			Err:               errors.New("injected sync failure"),
@@ -127,6 +124,14 @@ func (f *fakeManagedFileOperationRoots) CopyInto(source, destination string, sty
 func (f *fakeManagedFileOperationRoots) MoveInto(source, destination string, style filesecurity.ManagedConflictStyle) (filesecurity.ManagedTransferResult, error) {
 	f.moveCalls++
 	f.observedStyle = style
+	if source == f.partialSource {
+		return filesecurity.ManagedTransferResult{Destination: filepath.Join(destination, filepath.Base(source)), Changed: true}, &filesecurity.ManagedMutationError{
+			Operation:         "copy-first managed move retained source",
+			Changed:           true,
+			DurabilityUnknown: false,
+			Err:               filesecurity.ErrManagedMoveSourceRetained,
+		}
+	}
 	return filesecurity.ManagedTransferResult{Destination: filepath.Join(destination, filepath.Base(source)), Changed: true}, nil
 }
 
@@ -359,7 +364,7 @@ func TestExecutePreparedFileOperationPreservesPublishedPartialResult(t *testing.
 	}
 	roots := &fakeManagedFileOperationRoots{root: root, partialSource: source}
 	prepared, err := PrepareFileOperation(roots, model.FileOperate{
-		Type:  "copy",
+		Type:  "move",
 		Style: "replace",
 		To:    destination,
 		Item:  []model.FileItem{{From: source}},
@@ -369,10 +374,10 @@ func TestExecutePreparedFileOperationPreservesPublishedPartialResult(t *testing.
 	}
 	result := executePreparedFileOperation(roots, prepared)
 	expectedDestination := filepath.Join(destination, filepath.Base(source))
-	if result.Status != FileOperationPartial || !result.Finished || result.ProcessedSize != result.TotalSize {
+	if result.Status != FileOperationPartial || !result.Finished || result.ProcessedSize != result.TotalSize || result.DurabilityUnknown {
 		t.Fatalf("partial task = %+v", result)
 	}
-	if item := result.Item[0]; item.Status != FileOperationPartial || !item.Finished || item.Destination != expectedDestination || item.Error == "" {
+	if item := result.Item[0]; item.Status != FileOperationPartial || !item.Finished || item.Destination != expectedDestination || item.ProcessedSize != item.Size || item.Error == "" || item.DurabilityUnknown {
 		t.Fatalf("partial item = %+v", item)
 	}
 	files, terminal := buildFileOperationNotifications([]FileOperationSnapshot{{ID: "partial", Operation: result}})
@@ -405,11 +410,11 @@ func TestExecutePreparedFileOperationUsesChangedMutationErrorForPartialState(t *
 		t.Fatal(err)
 	}
 	result := executePreparedFileOperation(roots, prepared)
-	if result.Status != FileOperationPartial || result.ProcessedSize != result.TotalSize || !result.DurabilityUnknown {
+	if result.Status != FileOperationPartial || result.ProcessedSize != 0 || !result.DurabilityUnknown {
 		t.Fatalf("changed-error task = %+v", result)
 	}
 	item := result.Item[0]
-	if item.Status != FileOperationPartial || !item.Finished || item.ProcessedSize != item.Size || item.Error == "" || !item.DurabilityUnknown {
+	if item.Status != FileOperationPartial || !item.Finished || item.ProcessedSize != 0 || item.Destination != "" || item.Error == "" || !item.DurabilityUnknown {
 		t.Fatalf("changed-error item = %+v", item)
 	}
 	files, _ := buildFileOperationNotifications([]FileOperationSnapshot{{ID: "durability", Operation: result}})

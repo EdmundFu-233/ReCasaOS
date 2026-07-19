@@ -21,6 +21,7 @@ var ErrInvalidManagedConflictStyle = errors.New("invalid managed copy conflict s
 var (
 	ErrUnsafeManagedDirectoryTransfer           = errors.New("unsafe managed directory transfer")
 	ErrManagedDirectoryMoveRequiresAtomicRename = errors.New("managed directory move requires a same-filesystem atomic rename")
+	ErrManagedMoveSourceRetained                = errors.New("managed copy-first move published the destination but retained the source")
 )
 
 // ParseManagedConflictStyle accepts only the policies implemented by
@@ -68,9 +69,10 @@ type ManagedFileIdentity struct {
 	ChangedNanoseconds  int64
 }
 
-// ManagedMutationError reports that a namespace mutation happened before an
-// error made the final durability state uncertain. Callers must not retry such
-// an operation as though nothing changed.
+// ManagedMutationError reports that a namespace mutation happened before the
+// requested operation completed. Callers must not retry such an operation as
+// though nothing changed. DurabilityUnknown distinguishes an incomplete but
+// fully synchronized operation from one whose final persistence is uncertain.
 type ManagedMutationError struct {
 	Operation         string
 	Changed           bool
