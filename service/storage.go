@@ -20,8 +20,6 @@ const cloudMountRoot = "/mnt"
 
 const maxCloudConfigsPerScan = 256
 
-var ErrStorageUnmountCleanup = errors.New("cloud storage unmounted but mount directory cleanup failed")
-
 type StorageService interface {
 	MountStorage(mountPoint, fs string) error
 	RemoveStorage(mountPoint string) error
@@ -53,9 +51,9 @@ type cloudRcloneClient interface {
 }
 
 type cloudManagedRoots interface {
+	AcquireMutation() (func(), error)
 	MkdirAll(string, fs.FileMode) error
 	IsMountPoint(string) (bool, error)
-	RemoveEmptyDirectory(string) error
 	OpenDirectory(string) (*os.File, error)
 }
 
@@ -185,6 +183,20 @@ func managedMountState(roots cloudManagedRoots, mountPoint string) (bool, error)
 	return mounted, err
 }
 
+func acquireCloudMutation(roots cloudManagedRoots) (func(), error) {
+	if roots == nil {
+		return nil, errors.New("managed roots are unavailable")
+	}
+	release, err := roots.AcquireMutation()
+	if err != nil {
+		return nil, err
+	}
+	var once sync.Once
+	return func() {
+		once.Do(release)
+	}, nil
+}
+
 func mountListContains(list httper.MountList, mountPoint, remote string) (bool, error) {
 	found := false
 	for _, mounted := range list.MountPoints {
@@ -233,6 +245,25 @@ func (s *storageStruct) mountStorageLocked(mountPoint, remoteFS string) error {
 	if err != nil {
 		return err
 	}
+	if err := roots.MkdirAll(mountPoint, 0o750); err != nil {
+		return fmt.Errorf("create managed cloud mount directory: %w", err)
+	}
+	releaseMutation, err := acquireCloudMutation(roots)
+	if err != nil {
+		return fmt.Errorf("acquire managed cloud mount transaction: %w", err)
+	}
+	defer releaseMutation()
+
+	// Re-read every external state input after acquiring the filesystem
+	// mutation lease. The empty-directory check, mount request and both
+	// independent postconditions must form one namespace transaction.
+	config, err = s.rcloneClient().GetConfigByName(remote)
+	if err != nil {
+		return fmt.Errorf("revalidate cloud config before mount: %w", err)
+	}
+	if config["mount_point"] != mountPoint || !isSupportedCloudStorageType(config["type"]) {
+		return fmt.Errorf("cloud config %q changed before mount", remote)
+	}
 	listedMounts, err := s.rcloneClient().GetMountList()
 	if err != nil {
 		return fmt.Errorf("list rclone mounts before mount: %w", err)
@@ -240,9 +271,6 @@ func (s *storageStruct) mountStorageLocked(mountPoint, remoteFS string) error {
 	listed, err := mountListContains(listedMounts, mountPoint, remote)
 	if err != nil {
 		return err
-	}
-	if err := roots.MkdirAll(mountPoint, 0o750); err != nil {
-		return fmt.Errorf("create managed cloud mount directory: %w", err)
 	}
 	alreadyMounted, err := managedMountState(roots, mountPoint)
 	if err != nil {
@@ -320,6 +348,19 @@ func (s *storageStruct) unmountStorageLocked(mountPoint string) error {
 	if err != nil {
 		return err
 	}
+	releaseMutation, err := acquireCloudMutation(roots)
+	if err != nil {
+		return fmt.Errorf("acquire managed cloud unmount transaction: %w", err)
+	}
+	defer releaseMutation()
+
+	config, err = s.rcloneClient().GetConfigByName(remote)
+	if err != nil {
+		return fmt.Errorf("revalidate cloud config before unmount: %w", err)
+	}
+	if config["mount_point"] != mountPoint {
+		return fmt.Errorf("persisted rclone mount_point for %q changed", remote)
+	}
 	listedMounts, err := s.rcloneClient().GetMountList()
 	if err != nil {
 		return fmt.Errorf("list rclone mounts before unmount: %w", err)
@@ -353,19 +394,12 @@ func (s *storageStruct) unmountStorageLocked(mountPoint string) error {
 			return errors.Join(unmountErr, fmt.Errorf("cloud storage remained mounted after rclone unmount (rclone=%t, mount-boundary=%t)", stillListed, mounted))
 		}
 	}
-	if err := roots.RemoveEmptyDirectory(mountPoint); err != nil {
-		switch {
-		case errors.Is(err, fs.ErrNotExist), errors.Is(err, unix.ENOENT):
-			return nil
-		case errors.Is(err, unix.ENOTEMPTY):
-			return fmt.Errorf("%w: managed mount directory is not empty", ErrStorageUnmountCleanup)
-		default:
-			// EBUSY, ErrUnsafePath and descriptor/type failures may indicate a
-			// replacement mount or path race. They are not cleanup-only errors and
-			// must stop config deletion.
-			return fmt.Errorf("remove managed cloud mount directory: %w", err)
-		}
-	}
+	// Keep the mountpoint directory. Releasing this transaction and then
+	// reacquiring the ManagedRoots mutation lock to remove an empty directory
+	// would leave a TOCTOU window in which another file operation could replace
+	// it with a new, meaningful empty directory. The retained directory does not
+	// widen permissions, is revalidated before every mount, and can be safely
+	// reused by a later configuration with the same name.
 	return nil
 }
 
@@ -376,8 +410,8 @@ func isRecoverableStaleMountError(err error) bool {
 // RemoveStorage is the only route-facing removal operation. It validates the
 // persisted mapping, proves that the remote has no unexpected mount, unmounts
 // and rechecks it, then deletes the config without releasing the operation
-// lock. A cleanup-only error is returned after config deletion because it
-// cannot leave a live orphan mount.
+// lock. The verified-unmounted mountpoint directory is deliberately retained
+// to avoid deleting a concurrently replaced empty directory.
 func (s *storageStruct) RemoveStorage(mountPoint string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -394,7 +428,7 @@ func (s *storageStruct) RemoveStorage(mountPoint string) error {
 		return fmt.Errorf("persisted rclone mount_point for %q changed", remote)
 	}
 	unmountErr := s.unmountStorageLocked(mountPoint)
-	if unmountErr != nil && !errors.Is(unmountErr, ErrStorageUnmountCleanup) {
+	if unmountErr != nil {
 		return unmountErr
 	}
 	// Re-read external rclone state immediately before deletion. The in-process
@@ -402,13 +436,13 @@ func (s *storageStruct) RemoveStorage(mountPoint string) error {
 	// fails closed if another privileged actor changed the config meanwhile.
 	config, err = s.getConfigByNameLocked(remote)
 	if err != nil {
-		return errors.Join(unmountErr, fmt.Errorf("revalidate cloud config before deletion: %w", err))
+		return fmt.Errorf("revalidate cloud config before deletion: %w", err)
 	}
 	if config["mount_point"] != mountPoint {
-		return errors.Join(unmountErr, fmt.Errorf("persisted rclone mount_point for %q changed", remote))
+		return fmt.Errorf("persisted rclone mount_point for %q changed", remote)
 	}
 	deleteErr := s.deleteConfigByNameLocked(remote)
-	return errors.Join(unmountErr, deleteErr)
+	return deleteErr
 }
 
 func (s *storageStruct) GetStorages() (httper.MountList, error) {

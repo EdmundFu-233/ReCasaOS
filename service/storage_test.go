@@ -9,17 +9,45 @@ import (
 	"testing"
 	"time"
 
-	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/httper"
 	"golang.org/x/sys/unix"
 )
 
 type fakeCloudRoots struct {
-	directory  string
-	mounted    bool
-	stateErr   error
-	removeErr  error
-	mkdirCalls int
+	directory       string
+	mounted         bool
+	stateErr        error
+	removeCalls     int
+	mkdirCalls      int
+	mutationMu      sync.Mutex
+	mutationHeld    bool
+	mutationAcquire int
+	mutationRelease int
+}
+
+func (roots *fakeCloudRoots) AcquireMutation() (func(), error) {
+	roots.mutationMu.Lock()
+	defer roots.mutationMu.Unlock()
+	if roots.mutationHeld {
+		return nil, errors.New("fake managed mutation already held")
+	}
+	roots.mutationHeld = true
+	roots.mutationAcquire++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			roots.mutationMu.Lock()
+			roots.mutationHeld = false
+			roots.mutationRelease++
+			roots.mutationMu.Unlock()
+		})
+	}, nil
+}
+
+func (roots *fakeCloudRoots) mutationIsHeld() bool {
+	roots.mutationMu.Lock()
+	defer roots.mutationMu.Unlock()
+	return roots.mutationHeld
 }
 
 func (roots *fakeCloudRoots) MkdirAll(string, fs.FileMode) error {
@@ -30,25 +58,28 @@ func (roots *fakeCloudRoots) IsMountPoint(string) (bool, error) {
 	return roots.mounted, roots.stateErr
 }
 func (roots *fakeCloudRoots) RemoveEmptyDirectory(string) error {
-	return roots.removeErr
+	roots.removeCalls++
+	return nil
 }
 func (roots *fakeCloudRoots) OpenDirectory(string) (*os.File, error) {
 	return os.Open(roots.directory)
 }
 
 type fakeCloudRclone struct {
-	configs        map[string]map[string]string
-	mounts         httper.MountList
-	roots          *fakeCloudRoots
-	mountErr       error
-	unmountErr     error
-	deleteErr      error
-	mountApplies   bool
-	unmountApplies bool
-	deleteApplies  bool
-	mountCalls     int
-	unmountCalls   int
-	deleteCalls    int
+	configs         map[string]map[string]string
+	mounts          httper.MountList
+	roots           *fakeCloudRoots
+	mountErr        error
+	unmountErr      error
+	deleteErr       error
+	mountApplies    bool
+	unmountApplies  bool
+	deleteApplies   bool
+	mountCalls      int
+	unmountCalls    int
+	deleteCalls     int
+	mountUnleased   bool
+	unmountUnleased bool
 }
 
 type blockingCloudRclone struct {
@@ -80,6 +111,9 @@ func (client *fakeCloudRclone) GetMountList() (httper.MountList, error) {
 }
 func (client *fakeCloudRclone) Mount(mountPoint, filesystem string) error {
 	client.mountCalls++
+	if !client.roots.mutationIsHeld() {
+		client.mountUnleased = true
+	}
 	if client.mountApplies {
 		client.mounts.MountPoints = []httper.MountPoints{{MountPoint: mountPoint, Fs: strings.TrimSuffix(filesystem, ":")}}
 		client.roots.mounted = true
@@ -88,6 +122,9 @@ func (client *fakeCloudRclone) Mount(mountPoint, filesystem string) error {
 }
 func (client *fakeCloudRclone) Unmount(string) error {
 	client.unmountCalls++
+	if !client.roots.mutationIsHeld() {
+		client.unmountUnleased = true
+	}
 	if client.unmountApplies {
 		client.mounts.MountPoints = nil
 		client.roots.mounted = false
@@ -282,34 +319,27 @@ func TestRemoveStorageReconcilesAmbiguousUnmountBeforeDeletingConfig(t *testing.
 	if client.unmountCalls != 1 || client.deleteCalls != 1 {
 		t.Fatalf("calls: unmount=%d delete=%d", client.unmountCalls, client.deleteCalls)
 	}
+	if client.unmountUnleased || roots.mutationAcquire != 1 || roots.mutationRelease != 1 {
+		t.Fatalf("unmount lease: unleased=%t acquire=%d release=%d", client.unmountUnleased, roots.mutationAcquire, roots.mutationRelease)
+	}
 	if _, exists := client.configs["cloud"]; exists {
 		t.Fatal("verified-unmounted config remains")
 	}
 }
 
-func TestRemoveStorageDoesNotDeleteConfigAfterUnsafeCleanup(t *testing.T) {
+func TestRemoveStoragePreservesUnmountedMountDirectory(t *testing.T) {
 	storage, client, roots := newFakeCloudStorage(t)
-	roots.removeErr = filesecurity.ErrUnsafePath
-
-	err := storage.RemoveStorage("/mnt/cloud")
-	if err == nil || errors.Is(err, ErrStorageUnmountCleanup) {
-		t.Fatalf("RemoveStorage() error = %v, want non-cleanup safety error", err)
-	}
-	if client.deleteCalls != 0 {
-		t.Fatal("config was deleted after an unsafe cleanup result")
-	}
-}
-
-func TestRemoveStorageDeletesConfigAfterNonEmptyDirectoryPreservation(t *testing.T) {
-	storage, client, roots := newFakeCloudStorage(t)
-	roots.removeErr = unix.ENOTEMPTY
-
-	err := storage.RemoveStorage("/mnt/cloud")
-	if !errors.Is(err, ErrStorageUnmountCleanup) {
-		t.Fatalf("RemoveStorage() error = %v, want cleanup warning", err)
+	if err := storage.RemoveStorage("/mnt/cloud"); err != nil {
+		t.Fatalf("RemoveStorage() error = %v", err)
 	}
 	if client.deleteCalls != 1 {
 		t.Fatalf("delete calls = %d, want 1", client.deleteCalls)
+	}
+	if roots.removeCalls != 0 {
+		t.Fatalf("unmounted directory cleanup calls = %d, want 0", roots.removeCalls)
+	}
+	if info, err := os.Stat(roots.directory); err != nil || !info.IsDir() {
+		t.Fatalf("retained mount directory = (%v, %v)", info, err)
 	}
 }
 
@@ -327,7 +357,7 @@ func TestRemoveStorageReconcilesAmbiguousConfigDeletion(t *testing.T) {
 }
 
 func TestMountStorageReconcilesAmbiguousSuccessfulMount(t *testing.T) {
-	storage, client, _ := newFakeCloudStorage(t)
+	storage, client, roots := newFakeCloudStorage(t)
 	client.mountApplies = true
 	client.mountErr = errors.New("response lost after mount")
 
@@ -336,6 +366,9 @@ func TestMountStorageReconcilesAmbiguousSuccessfulMount(t *testing.T) {
 	}
 	if client.mountCalls != 1 {
 		t.Fatalf("mount calls = %d, want exactly one", client.mountCalls)
+	}
+	if client.mountUnleased || roots.mutationAcquire != 1 || roots.mutationRelease != 1 {
+		t.Fatalf("mount lease: unleased=%t acquire=%d release=%d", client.mountUnleased, roots.mutationAcquire, roots.mutationRelease)
 	}
 }
 
