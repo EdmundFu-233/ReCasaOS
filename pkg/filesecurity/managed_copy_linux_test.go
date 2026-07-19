@@ -4,6 +4,7 @@ package filesecurity
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -209,7 +210,7 @@ func TestManagedTransferTransactionCreationFailureNamesRetainedDirectory(t *test
 		transaction.Close()
 		t.Fatal("transaction unexpectedly opened with wrong mount identity")
 	}
-	if err == nil || name == "" || !strings.Contains(err.Error(), "retained") || !strings.Contains(err.Error(), name) {
+	if err == nil || name == "" || !strings.Contains(err.Error(), "retained") || !strings.Contains(err.Error(), name) || !ManagedMutationChanged(err) || !ManagedMutationDurabilityUnknown(err) {
 		t.Fatalf("transaction creation result = %q, %v", name, err)
 	}
 	entries, readErr := os.ReadDir(root)
@@ -228,17 +229,49 @@ func TestManagedTransferTransactionCreationFailureNamesRetainedDirectory(t *test
 	}
 }
 
-func TestManagedReplaceFilesystemPolicy(t *testing.T) {
+func TestManagedTransferTransactionPostRmdirFailureReportsUnknownDurability(t *testing.T) {
+	root := t.TempDir()
+	parent, err := os.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	mountID, err := managedMountIDAt(int(parent.Fd()), "", unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transaction, name, err := createManagedTransferTransaction(int(parent.Fd()), mountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transaction.Close()
+	injected := errors.New("injected post-rmdir failure")
+	roots := &ManagedRoots{transactionAfterRmdir: func() error { return injected }}
+
+	err = roots.cleanupManagedTransferTransaction(int(parent.Fd()), mountID, name, transaction, false)
+	if !errors.Is(err, injected) || !ManagedMutationChanged(err) || !ManagedMutationDurabilityUnknown(err) {
+		t.Fatalf("post-rmdir failure = %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, name)); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Fatalf("transaction name remains after rmdir: %v", statErr)
+	}
+	var removed unix.Stat_t
+	if statErr := unix.Fstat(int(transaction.Fd()), &removed); statErr != nil || removed.Nlink != 0 {
+		t.Fatalf("removed transaction descriptor = nlink %d, %v", removed.Nlink, statErr)
+	}
+}
+
+func TestManagedTransactionalFilesystemPolicy(t *testing.T) {
 	tests := []struct {
-		name      string
-		magic     int64
-		certified bool
+		name        string
+		magic       int64
+		allowlisted bool
 	}{
-		{name: "ext2-ext4", magic: int64(unix.EXT4_SUPER_MAGIC), certified: true},
-		{name: "xfs", magic: int64(unix.XFS_SUPER_MAGIC), certified: true},
-		{name: "btrfs", magic: int64(unix.BTRFS_SUPER_MAGIC), certified: true},
-		{name: "tmpfs", magic: int64(unix.TMPFS_MAGIC), certified: true},
-		{name: "f2fs", magic: int64(unix.F2FS_SUPER_MAGIC), certified: true},
+		{name: "ext2-ext4", magic: int64(unix.EXT4_SUPER_MAGIC), allowlisted: true},
+		{name: "xfs", magic: int64(unix.XFS_SUPER_MAGIC), allowlisted: true},
+		{name: "btrfs", magic: int64(unix.BTRFS_SUPER_MAGIC), allowlisted: true},
+		{name: "tmpfs", magic: int64(unix.TMPFS_MAGIC), allowlisted: true},
+		{name: "f2fs", magic: int64(unix.F2FS_SUPER_MAGIC), allowlisted: true},
 		{name: "unknown", magic: int64(0x7f7f7f7f)},
 		{name: "fuse", magic: int64(unix.FUSE_SUPER_MAGIC)},
 		{name: "aafs", magic: int64(unix.AAFS_MAGIC)},
@@ -261,10 +294,288 @@ func TestManagedReplaceFilesystemPolicy(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := managedReplaceFilesystemCertified(test.magic); got != test.certified {
-				t.Fatalf("certified = %v, want %v for magic %#x", got, test.certified, uint32(test.magic))
+			if got := managedTransactionalFilesystemAllowed(test.magic); got != test.allowlisted {
+				t.Fatalf("allowlisted = %v, want %v for magic %#x", got, test.allowlisted, uint32(test.magic))
 			}
 		})
+	}
+}
+
+func TestManagedNoReplaceFailureClassificationRetainsAmbiguousEvidence(t *testing.T) {
+	probeErr := errors.New("injected fstatfs failure")
+	tests := []struct {
+		name               string
+		renameErr          error
+		filesystemAllowed  bool
+		filesystemErr      error
+		wantCleanupAllowed bool
+		wantAmbiguous      bool
+	}{
+		{name: "allowlisted-local-error", renameErr: unix.EIO, filesystemAllowed: true, wantCleanupAllowed: true},
+		{name: "non-allowlisted-error", renameErr: unix.EIO, wantAmbiguous: true},
+		{name: "eligibility-unproven", renameErr: unix.EIO, filesystemErr: probeErr, wantAmbiguous: true},
+		{name: "allowlisted-eexist", renameErr: unix.EEXIST, filesystemAllowed: true, wantCleanupAllowed: true},
+		{name: "non-allowlisted-eexist", renameErr: unix.EEXIST, wantAmbiguous: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, cleanupAllowed, err := classifyManagedNoReplacePublicationFailure(test.renameErr, test.filesystemAllowed, test.filesystemErr)
+			if result.Changed || result.Destination != "" || cleanupAllowed != test.wantCleanupAllowed || !errors.Is(err, test.renameErr) {
+				t.Fatalf("classification = result %+v, cleanup %v, error %v", result, cleanupAllowed, err)
+			}
+			if got := ManagedMutationChanged(err); got != test.wantAmbiguous {
+				t.Fatalf("changed metadata = %v, want %v: %v", got, test.wantAmbiguous, err)
+			}
+			if got := ManagedMutationDurabilityUnknown(err); got != test.wantAmbiguous {
+				t.Fatalf("durability metadata = %v, want %v: %v", got, test.wantAmbiguous, err)
+			}
+			if test.filesystemErr != nil && !errors.Is(err, test.filesystemErr) {
+				t.Fatalf("classification did not retain filesystem probe error: %v", err)
+			}
+		})
+	}
+}
+
+func TestManagedCopyRetainsTransactionForNonAllowlistedEEXIST(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.txt")
+	destination := filepath.Join(root, "destination")
+	target := filepath.Join(destination, filepath.Base(source))
+	if err := os.WriteFile(source, []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	destinationIdentity := managedTestPathIdentity(t, destination)
+	eligibilityCalls := 0
+	roots.transferFilesystemEligibility = func(fd int) (int64, bool, error) {
+		identity, err := managedTestFDIdentity(fd)
+		if err != nil {
+			return 0, false, err
+		}
+		if identity != destinationIdentity {
+			return 0, false, fmt.Errorf("filesystem eligibility probed unexpected fd identity: %+v", identity)
+		}
+		eligibilityCalls++
+		return int64(unix.FUSE_SUPER_MAGIC), false, nil
+	}
+
+	result, err := roots.CopyInto(source, destination, ManagedConflictSkip)
+	if result.Changed || result.Destination != "" || !errors.Is(err, unix.EEXIST) || !ManagedMutationChanged(err) || !ManagedMutationDurabilityUnknown(err) {
+		t.Fatalf("non-allowlisted EEXIST result = %+v, %v", result, err)
+	}
+	if eligibilityCalls != 1 || !strings.Contains(err.Error(), "retained") {
+		t.Fatalf("filesystem eligibility calls/error = %d, %v", eligibilityCalls, err)
+	}
+	assertManagedTestContent(t, source, "new")
+	assertManagedTestContent(t, target, "old")
+	entries, readErr := os.ReadDir(destination)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("ambiguous EEXIST did not retain transaction evidence: %v", entries)
+	}
+	var retainedEntry string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".recasaos-transfer-") {
+			retainedEntry = filepath.Join(destination, entry.Name(), "entry")
+		}
+	}
+	if retainedEntry == "" {
+		t.Fatalf("ambiguous EEXIST transaction missing: %v", entries)
+	}
+	assertManagedTestContent(t, retainedEntry, "new")
+}
+
+func TestManagedCopyPromotesPlainRetainedCleanupFailureToChanged(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.txt")
+	destination := filepath.Join(root, "destination")
+	target := filepath.Join(destination, filepath.Base(source))
+	if err := os.WriteFile(source, []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	destinationIdentity := managedTestPathIdentity(t, destination)
+	roots.transferFilesystemEligibility = func(fd int) (int64, bool, error) {
+		identity, err := managedTestFDIdentity(fd)
+		if err != nil {
+			return 0, false, err
+		}
+		if identity != destinationIdentity {
+			return 0, false, fmt.Errorf("filesystem eligibility probed unexpected fd identity: %+v", identity)
+		}
+		return int64(unix.EXT4_SUPER_MAGIC), true, nil
+	}
+	injected := errors.New("injected plain transaction cleanup failure")
+	cleanupCalls := 0
+	roots.transactionBeforeCleanup = func() error {
+		cleanupCalls++
+		return injected
+	}
+
+	result, err := roots.CopyInto(source, destination, ManagedConflictSkip)
+	if result.Changed || result.Destination != target || !errors.Is(err, injected) || !ManagedMutationChanged(err) || ManagedMutationDurabilityUnknown(err) {
+		t.Fatalf("plain retained cleanup result = %+v, %v", result, err)
+	}
+	if cleanupCalls != 1 || !strings.Contains(err.Error(), "retained") {
+		t.Fatalf("cleanup calls/error = %d, %v", cleanupCalls, err)
+	}
+	assertManagedTestContent(t, source, "new")
+	assertManagedTestContent(t, target, "old")
+	entries, readErr := os.ReadDir(destination)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("plain cleanup failure did not retain transaction: %v", entries)
+	}
+	var retainedEntry string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".recasaos-transfer-") {
+			retainedEntry = filepath.Join(destination, entry.Name(), "entry")
+		}
+	}
+	if retainedEntry == "" {
+		t.Fatalf("plain cleanup failure transaction missing: %v", entries)
+	}
+	assertManagedTestContent(t, retainedEntry, "new")
+}
+
+func TestManagedCopyMarksUnsyncedRetainedEntryDurabilityUnknown(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.txt")
+	destination := filepath.Join(root, "destination")
+	target := filepath.Join(destination, filepath.Base(source))
+	if err := os.WriteFile(source, []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	stageErr := errors.New("injected pre-stage-sync failure")
+	cleanupErr := errors.New("injected plain transaction cleanup failure")
+	stageCalls := 0
+	cleanupCalls := 0
+	roots.transactionBeforeStageSync = func() error {
+		stageCalls++
+		return stageErr
+	}
+	roots.transactionBeforeCleanup = func() error {
+		cleanupCalls++
+		return cleanupErr
+	}
+
+	result, err := roots.CopyInto(source, destination, ManagedConflictSkip)
+	if result.Changed || result.Destination != "" || !errors.Is(err, stageErr) || !errors.Is(err, cleanupErr) || !ManagedMutationChanged(err) || !ManagedMutationDurabilityUnknown(err) {
+		t.Fatalf("unsynced retained entry result = %+v, %v", result, err)
+	}
+	if stageCalls != 1 || cleanupCalls != 1 || !strings.Contains(err.Error(), "retained") {
+		t.Fatalf("stage/cleanup calls/error = %d/%d, %v", stageCalls, cleanupCalls, err)
+	}
+	assertManagedTestContent(t, source, "new")
+	if _, statErr := os.Stat(target); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Fatalf("unsynced staging entry was published: %v", statErr)
+	}
+	entries, readErr := os.ReadDir(destination)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 1 || !strings.HasPrefix(entries[0].Name(), ".recasaos-transfer-") {
+		t.Fatalf("unsynced entry transaction evidence = %v", entries)
+	}
+	assertManagedTestContent(t, filepath.Join(destination, entries[0].Name(), "entry"), "new")
+}
+
+func TestManagedMoveRejectsNonAllowlistedSourceBeforePublication(t *testing.T) {
+	const source = "/proc/version"
+	if info, err := os.Stat(source); err != nil || !info.Mode().IsRegular() {
+		t.Skipf("regular /proc/version unavailable: %v", err)
+	}
+	root := t.TempDir()
+	destination := filepath.Join(root, "destination")
+	target := filepath.Join(destination, filepath.Base(source))
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("old-target"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{"/proc", root})
+	if err != nil {
+		t.Skipf("managed /proc root unavailable: %v", err)
+	}
+	defer roots.Close()
+
+	result, err := roots.MoveInto(source, destination, ManagedConflictReplace)
+	if result.Changed || !errors.Is(err, ErrUnsafePath) || !strings.Contains(err.Error(), "allowlisted local source filesystem") {
+		t.Fatalf("non-allowlisted source result = %+v, %v", result, err)
+	}
+	assertManagedTestContent(t, target, "old-target")
+	if _, statErr := os.Stat(source); statErr != nil {
+		t.Fatalf("rejected move changed source: %v", statErr)
+	}
+	if transactions := managedMoveSourceTransactionPaths(t, root); len(transactions) != 0 {
+		t.Fatalf("rejected source filesystem created move transactions: %v", transactions)
+	}
+}
+
+func TestManagedMoveRejectsNonAllowlistedDestinationBeforePublication(t *testing.T) {
+	const destination = "/proc"
+	if info, err := os.Stat(destination); err != nil || !info.IsDir() {
+		t.Skipf("/proc destination unavailable: %v", err)
+	}
+	root := t.TempDir()
+	source := filepath.Join(root, "source.txt")
+	if err := os.WriteFile(source, []byte("source"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root, destination})
+	if err != nil {
+		t.Skipf("managed /proc root unavailable: %v", err)
+	}
+	defer roots.Close()
+	renameBoundaryCalls := 0
+	roots.moveBeforeDirectRename = func() error {
+		renameBoundaryCalls++
+		return errors.New("direct rename boundary unexpectedly reached")
+	}
+
+	result, err := roots.MoveInto(source, destination, ManagedConflictSkip)
+	if result.Changed || !errors.Is(err, ErrUnsafePath) || !strings.Contains(err.Error(), "allowlisted local destination filesystem") {
+		t.Fatalf("non-allowlisted destination result = %+v, %v", result, err)
+	}
+	if renameBoundaryCalls != 0 {
+		t.Fatalf("non-allowlisted destination reached direct rename boundary %d times", renameBoundaryCalls)
+	}
+	assertManagedTestContent(t, source, "source")
+	if transactions := managedMoveSourceTransactionPaths(t, root); len(transactions) != 0 {
+		t.Fatalf("rejected destination filesystem created move transactions: %v", transactions)
 	}
 }
 
@@ -563,21 +874,34 @@ func TestManagedFailedCopyRetainsPrivateTransactionWhenCleanupSyncFails(t *testi
 	}
 	defer roots.Close()
 	injected := errors.New("injected staging cleanup sync failure")
-	syncCalls := 0
+	destinationIdentity := managedTestPathIdentity(t, destination)
+	destinationSyncCalls := 0
+	transactionSyncCalls := 0
+	var transactionIdentity managedTestFileIdentity
 	roots.directorySync = func(fd int) error {
-		syncCalls++
-		if syncCalls == 2 {
-			return injected
+		identity, err := managedTestFDIdentity(fd)
+		if err != nil {
+			return err
 		}
-		return unix.Fsync(fd)
+		if identity == destinationIdentity {
+			destinationSyncCalls++
+			return unix.Fsync(fd)
+		}
+		transactionSyncCalls++
+		if transactionIdentity == (managedTestFileIdentity{}) {
+			transactionIdentity = identity
+		} else if identity != transactionIdentity {
+			return fmt.Errorf("unexpected sync fd identity: got %+v, transaction %+v", identity, transactionIdentity)
+		}
+		return injected
 	}
 
 	result, err := roots.CopyInto(source, destination, ManagedConflictSkip)
-	if result.Changed || !errors.Is(err, ErrUnsafePath) || !errors.Is(err, injected) || !ManagedMutationDurabilityUnknown(err) {
+	if result.Changed || !errors.Is(err, ErrUnsafePath) || !errors.Is(err, injected) || !ManagedMutationChanged(err) || !ManagedMutationDurabilityUnknown(err) {
 		t.Fatalf("failed-copy cleanup result = %+v, %v", result, err)
 	}
-	if syncCalls != 2 {
-		t.Fatalf("directory sync calls = %d, want 2", syncCalls)
+	if destinationSyncCalls != 1 || transactionSyncCalls != 1 {
+		t.Fatalf("sync roles = destination %d, transaction %d", destinationSyncCalls, transactionSyncCalls)
 	}
 	entries, readErr := os.ReadDir(destination)
 	if readErr != nil {
@@ -595,7 +919,7 @@ func TestManagedFailedCopyRetainsPrivateTransactionWhenCleanupSyncFails(t *testi
 	}
 }
 
-func TestManagedRootsMoveIntoSkipRenameAndReplace(t *testing.T) {
+func TestManagedRootsMoveIntoSkipRenameAndCopyFirstReplaceRetainsSource(t *testing.T) {
 	root := t.TempDir()
 	destination := filepath.Join(root, "destination")
 	if err := os.Mkdir(destination, 0o700); err != nil {
@@ -635,17 +959,188 @@ func TestManagedRootsMoveIntoSkipRenameAndReplace(t *testing.T) {
 	if err := os.WriteFile(replacementSource, []byte("replacement"), 0o640); err != nil {
 		t.Fatal(err)
 	}
+	sourceIdentityBeforeCopyFirstMove := managedTestPathIdentity(t, replacementSource)
 	result, err = roots.MoveInto(replacementSource, destination, ManagedConflictReplace)
-	if err != nil || !result.Changed || result.Destination != target {
+	if !errors.Is(err, ErrManagedMoveSourceRetained) || !ManagedMutationChanged(err) || ManagedMutationDurabilityUnknown(err) || !result.Changed || result.Destination != target {
 		t.Fatalf("replace move result = %+v, %v", result, err)
 	}
-	if _, err := os.Stat(replacementSource); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("replacement source remains: %v", err)
+	if sourceIdentityAfterCopyFirstMove := managedTestPathIdentity(t, replacementSource); sourceIdentityAfterCopyFirstMove != sourceIdentityBeforeCopyFirstMove {
+		t.Fatalf("copy-first move changed source identity: before %+v, after %+v", sourceIdentityBeforeCopyFirstMove, sourceIdentityAfterCopyFirstMove)
 	}
+	assertManagedTestContent(t, replacementSource, "replacement")
 	assertManagedTestContent(t, target, "replacement")
+	if transactions := managedMoveSourceTransactionPaths(t, root); len(transactions) != 0 {
+		t.Fatalf("copy-first replace created source transactions: %v", transactions)
+	}
 }
 
-func TestManagedCopyReportsPublishedResultWhenDestinationSyncFails(t *testing.T) {
+func TestManagedCopyFirstMoveJoinsSourceRetainedWithTransactionCleanupFailure(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.txt")
+	destination := filepath.Join(root, "destination")
+	target := filepath.Join(destination, filepath.Base(source))
+	if err := os.WriteFile(source, []byte("new"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	sourceIdentityBefore := managedTestPathIdentity(t, source)
+	injected := errors.New("injected post-publication transaction rmdir failure")
+	cleanupCalls := 0
+	roots.transactionAfterRmdir = func() error {
+		cleanupCalls++
+		return injected
+	}
+
+	result, err := roots.MoveInto(source, destination, ManagedConflictReplace)
+	if !result.Changed || result.Destination != target || !errors.Is(err, injected) || !errors.Is(err, ErrManagedMoveSourceRetained) || !ManagedMutationChanged(err) || !ManagedMutationDurabilityUnknown(err) {
+		t.Fatalf("copy-first move cleanup failure result = %+v, %v", result, err)
+	}
+	if cleanupCalls != 1 {
+		t.Fatalf("post-rmdir cleanup hook calls = %d, want 1", cleanupCalls)
+	}
+	if sourceIdentityAfter := managedTestPathIdentity(t, source); sourceIdentityAfter != sourceIdentityBefore {
+		t.Fatalf("copy-first move cleanup failure changed source identity: before %+v, after %+v", sourceIdentityBefore, sourceIdentityAfter)
+	}
+	assertManagedTestContent(t, source, "new")
+	assertManagedTestContent(t, target, "new")
+	entries, readErr := os.ReadDir(destination)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(target) {
+		t.Fatalf("post-rmdir cleanup failure left unexpected destination evidence: %v", entries)
+	}
+}
+
+func TestManagedCopyFirstMoveJoinsSourceRetainedWithDestinationSyncFailure(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.txt")
+	destination := filepath.Join(root, "destination")
+	target := filepath.Join(destination, filepath.Base(source))
+	if err := os.WriteFile(source, []byte("new"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	sourceIdentityBefore := managedTestPathIdentity(t, source)
+	destinationIdentity := managedTestPathIdentity(t, destination)
+	injected := errors.New("injected copy-first move destination publication sync failure")
+	destinationSyncCalls := 0
+	transactionSyncCalls := 0
+	var transactionIdentity managedTestFileIdentity
+	roots.directorySync = func(fd int) error {
+		identity, err := managedTestFDIdentity(fd)
+		if err != nil {
+			return err
+		}
+		if identity == destinationIdentity {
+			destinationSyncCalls++
+			if destinationSyncCalls == 2 {
+				return injected
+			}
+			return unix.Fsync(fd)
+		}
+		transactionSyncCalls++
+		if transactionIdentity == (managedTestFileIdentity{}) {
+			transactionIdentity = identity
+		} else if identity != transactionIdentity {
+			return fmt.Errorf("unexpected sync fd identity: got %+v, transaction %+v", identity, transactionIdentity)
+		}
+		return unix.Fsync(fd)
+	}
+
+	result, err := roots.MoveInto(source, destination, ManagedConflictReplace)
+	if !result.Changed || result.Destination != target || !errors.Is(err, injected) || !errors.Is(err, ErrManagedMoveSourceRetained) || !ManagedMutationChanged(err) || !ManagedMutationDurabilityUnknown(err) {
+		t.Fatalf("copy-first move destination sync result = %+v, %v", result, err)
+	}
+	if destinationSyncCalls != 2 || transactionSyncCalls != 1 {
+		t.Fatalf("sync roles = destination %d, transaction %d; destination failure must short-circuit post-exchange transaction sync", destinationSyncCalls, transactionSyncCalls)
+	}
+	if sourceIdentityAfter := managedTestPathIdentity(t, source); sourceIdentityAfter != sourceIdentityBefore {
+		t.Fatalf("copy-first move destination sync failure changed source identity: before %+v, after %+v", sourceIdentityBefore, sourceIdentityAfter)
+	}
+	assertManagedTestContent(t, source, "new")
+	assertManagedTestContent(t, target, "new")
+	entries, readErr := os.ReadDir(destination)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("destination sync failure did not retain transaction evidence: %v", entries)
+	}
+	var retainedOldTarget string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".recasaos-transfer-") {
+			retainedOldTarget = filepath.Join(destination, entry.Name(), "entry")
+		}
+	}
+	if retainedOldTarget == "" {
+		t.Fatalf("destination sync failure transaction evidence missing: %v", entries)
+	}
+	assertManagedTestContent(t, retainedOldTarget, "old")
+}
+
+func TestManagedDirectMoveDetectsSourceSwapAtRenameBoundary(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.txt")
+	sourceAside := filepath.Join(root, "source-aside.txt")
+	destination := filepath.Join(root, "destination")
+	target := filepath.Join(destination, filepath.Base(source))
+	if err := os.WriteFile(source, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	roots.moveBeforeDirectRename = func() error {
+		if err := os.Rename(source, sourceAside); err != nil {
+			return err
+		}
+		return os.WriteFile(source, []byte("replacement"), 0o600)
+	}
+
+	result, err := roots.MoveInto(source, destination, ManagedConflictSkip)
+	if !result.Changed || result.Destination != target || !errors.Is(err, ErrUnsafePath) || !ManagedMutationChanged(err) || !ManagedMutationDurabilityUnknown(err) {
+		t.Fatalf("direct source swap result = %+v, %v", result, err)
+	}
+	if !strings.Contains(err.Error(), "destination does not identify pinned source") {
+		t.Fatalf("direct source swap error = %v", err)
+	}
+	assertManagedTestContent(t, sourceAside, "original")
+	assertManagedTestContent(t, target, "replacement")
+	if _, statErr := os.Stat(source); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Fatalf("direct source swap unexpectedly left the moved replacement: %v", statErr)
+	}
+	if transactions := managedMoveSourceTransactionPaths(t, root); len(transactions) != 0 {
+		t.Fatalf("direct source swap created copy-first transactions: %v", transactions)
+	}
+}
+
+func TestManagedNoReplaceDestinationSyncFailureShortCircuitsTransactionSync(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "source.txt")
 	destination := filepath.Join(root, "destination")
@@ -660,12 +1155,28 @@ func TestManagedCopyReportsPublishedResultWhenDestinationSyncFails(t *testing.T)
 		t.Fatal(err)
 	}
 	defer roots.Close()
-	injected := errors.New("injected directory sync failure")
-	syncCalls := 0
+	destinationIdentity := managedTestPathIdentity(t, destination)
+	injected := errors.New("injected destination publication sync failure")
+	destinationSyncCalls := 0
+	transactionSyncCalls := 0
+	var transactionIdentity managedTestFileIdentity
 	roots.directorySync = func(fd int) error {
-		syncCalls++
-		if syncCalls == 3 {
-			return injected
+		identity, err := managedTestFDIdentity(fd)
+		if err != nil {
+			return err
+		}
+		if identity == destinationIdentity {
+			destinationSyncCalls++
+			if destinationSyncCalls == 2 {
+				return injected
+			}
+			return unix.Fsync(fd)
+		}
+		transactionSyncCalls++
+		if transactionIdentity == (managedTestFileIdentity{}) {
+			transactionIdentity = identity
+		} else if identity != transactionIdentity {
+			return fmt.Errorf("unexpected sync fd identity: got %+v, transaction %+v", identity, transactionIdentity)
 		}
 		return unix.Fsync(fd)
 	}
@@ -675,8 +1186,8 @@ func TestManagedCopyReportsPublishedResultWhenDestinationSyncFails(t *testing.T)
 	if !errors.Is(err, injected) || !ManagedMutationDurabilityUnknown(err) || !result.Changed || result.Destination != expectedTarget {
 		t.Fatalf("directory-sync copy result = %+v, %v", result, err)
 	}
-	if syncCalls != 4 {
-		t.Fatalf("directory sync calls = %d, want 4", syncCalls)
+	if destinationSyncCalls != 2 || transactionSyncCalls != 1 {
+		t.Fatalf("sync roles = destination %d, transaction %d; destination failure must short-circuit the post-publication transaction sync", destinationSyncCalls, transactionSyncCalls)
 	}
 	assertManagedTestContent(t, expectedTarget, "new")
 	assertManagedTestContent(t, source, "new")
@@ -689,7 +1200,7 @@ func TestManagedCopyReportsPublishedResultWhenDestinationSyncFails(t *testing.T)
 	}
 }
 
-func TestManagedReplaceSyncFailureRetainsOldTargetInPrivateTransaction(t *testing.T) {
+func TestManagedReplaceDestinationSyncFailureShortCircuitsTransactionSync(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "source.txt")
 	destination := filepath.Join(root, "destination")
@@ -708,22 +1219,38 @@ func TestManagedReplaceSyncFailureRetainsOldTargetInPrivateTransaction(t *testin
 		t.Fatal(err)
 	}
 	defer roots.Close()
-	injected := errors.New("injected replacement cleanup sync failure")
-	syncCalls := 0
+	destinationIdentity := managedTestPathIdentity(t, destination)
+	injected := errors.New("injected replacement destination sync failure")
+	destinationSyncCalls := 0
+	transactionSyncCalls := 0
+	var transactionIdentity managedTestFileIdentity
 	roots.directorySync = func(fd int) error {
-		syncCalls++
-		if syncCalls == 3 {
-			return injected
+		identity, err := managedTestFDIdentity(fd)
+		if err != nil {
+			return err
+		}
+		if identity == destinationIdentity {
+			destinationSyncCalls++
+			if destinationSyncCalls == 2 {
+				return injected
+			}
+			return unix.Fsync(fd)
+		}
+		transactionSyncCalls++
+		if transactionIdentity == (managedTestFileIdentity{}) {
+			transactionIdentity = identity
+		} else if identity != transactionIdentity {
+			return fmt.Errorf("unexpected sync fd identity: got %+v, transaction %+v", identity, transactionIdentity)
 		}
 		return unix.Fsync(fd)
 	}
 
 	result, err := roots.CopyInto(source, destination, ManagedConflictReplace)
-	if !errors.Is(err, injected) || !result.Changed || result.Destination != target {
+	if !errors.Is(err, injected) || !ManagedMutationChanged(err) || !ManagedMutationDurabilityUnknown(err) || !result.Changed || result.Destination != target {
 		t.Fatalf("replacement cleanup result = %+v, %v", result, err)
 	}
-	if syncCalls != 4 {
-		t.Fatalf("directory sync calls = %d, want 4", syncCalls)
+	if destinationSyncCalls != 2 || transactionSyncCalls != 1 {
+		t.Fatalf("sync roles = destination %d, transaction %d; destination failure must short-circuit the post-exchange transaction sync", destinationSyncCalls, transactionSyncCalls)
 	}
 	entries, readErr := os.ReadDir(destination)
 	if readErr != nil {
@@ -1036,7 +1563,7 @@ func TestManagedReplacePreservesPostExchangeDestinationSwap(t *testing.T) {
 	}
 
 	result, err := roots.CopyInto(source, destination, ManagedConflictReplace)
-	if !result.Changed || result.Destination != target || !errors.Is(err, ErrUnsafePath) || !ManagedMutationChanged(err) {
+	if !result.Changed || result.Destination != target || !errors.Is(err, ErrUnsafePath) || !ManagedMutationChanged(err) || ManagedMutationDurabilityUnknown(err) {
 		t.Fatalf("post-exchange destination swap result = %+v, %v", result, err)
 	}
 	assertManagedTestContent(t, target, "replacement")
@@ -1097,7 +1624,7 @@ func TestManagedReplacePreservesOldTargetWhenTransactionNameMoves(t *testing.T) 
 	}
 
 	result, err := roots.CopyInto(source, destination, ManagedConflictReplace)
-	if !result.Changed || result.Destination != target || !errors.Is(err, ErrUnsafePath) || !errors.Is(err, unix.ENOENT) || !ManagedMutationChanged(err) {
+	if !result.Changed || result.Destination != target || !errors.Is(err, ErrUnsafePath) || !errors.Is(err, unix.ENOENT) || !ManagedMutationChanged(err) || ManagedMutationDurabilityUnknown(err) {
 		t.Fatalf("transaction name move result = %+v, %v", result, err)
 	}
 	assertManagedTestContent(t, target, "published")
@@ -1105,48 +1632,6 @@ func TestManagedReplacePreservesOldTargetWhenTransactionNameMoves(t *testing.T) 
 		t.Fatal("transaction move hook did not run")
 	}
 	assertManagedTestContent(t, filepath.Join(movedTransaction, "entry"), "old")
-}
-
-func TestManagedMoveReportsPartialWhenSourceCleanupSyncFails(t *testing.T) {
-	root := t.TempDir()
-	source := filepath.Join(root, "source.txt")
-	destination := filepath.Join(root, "destination")
-	target := filepath.Join(destination, filepath.Base(source))
-	if err := os.WriteFile(source, []byte("new"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(destination, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	roots, err := OpenManagementFileRoots([]string{root})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer roots.Close()
-	injected := errors.New("injected source cleanup sync failure")
-	syncCalls := 0
-	roots.directorySync = func(fd int) error {
-		syncCalls++
-		if syncCalls == 7 {
-			return injected
-		}
-		return unix.Fsync(fd)
-	}
-
-	result, err := roots.MoveInto(source, destination, ManagedConflictReplace)
-	if !errors.Is(err, injected) || !ManagedMutationDurabilityUnknown(err) || !result.Changed || result.Destination != target {
-		t.Fatalf("source cleanup result = %+v, %v", result, err)
-	}
-	if syncCalls != 7 {
-		t.Fatalf("directory sync calls = %d, want 7", syncCalls)
-	}
-	if _, statErr := os.Stat(source); !errors.Is(statErr, fs.ErrNotExist) {
-		t.Fatalf("source unlink did not occur before sync failure: %v", statErr)
-	}
-	assertManagedTestContent(t, target, "new")
 }
 
 func TestManagedAtomicMoveDoesNotReportSuccessWhenParentSyncFails(t *testing.T) {
@@ -1166,11 +1651,84 @@ func TestManagedAtomicMoveDoesNotReportSuccessWhenParentSyncFails(t *testing.T) 
 	}
 	defer roots.Close()
 	injected := errors.New("injected atomic move sync failure")
-	roots.directorySync = func(int) error { return injected }
+	destinationIdentity := managedTestPathIdentity(t, destination)
+	sourceParentIdentity := managedTestPathIdentity(t, root)
+	destinationSyncCalls := 0
+	sourceParentSyncCalls := 0
+	roots.directorySync = func(fd int) error {
+		identity, err := managedTestFDIdentity(fd)
+		if err != nil {
+			return err
+		}
+		switch identity {
+		case destinationIdentity:
+			destinationSyncCalls++
+			return injected
+		case sourceParentIdentity:
+			sourceParentSyncCalls++
+			return unix.Fsync(fd)
+		default:
+			return fmt.Errorf("unexpected atomic move sync fd identity: %+v", identity)
+		}
+	}
 
 	result, err := roots.MoveInto(source, destination, ManagedConflictSkip)
-	if !errors.Is(err, injected) || !result.Changed || result.Destination != target {
+	if !errors.Is(err, injected) || !ManagedMutationChanged(err) || !ManagedMutationDurabilityUnknown(err) || !result.Changed || result.Destination != target {
 		t.Fatalf("atomic move sync result = %+v, %v", result, err)
+	}
+	if destinationSyncCalls != 1 || sourceParentSyncCalls != 0 {
+		t.Fatalf("sync roles = destination %d, source parent %d; source parent sync must wait for destination sync", destinationSyncCalls, sourceParentSyncCalls)
+	}
+	if _, statErr := os.Stat(source); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Fatalf("atomic rename did not move source: %v", statErr)
+	}
+	assertManagedTestContent(t, target, "new")
+}
+
+func TestManagedAtomicMoveReportsUnknownDurabilityWhenSourceParentSyncFails(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.txt")
+	destination := filepath.Join(root, "destination")
+	target := filepath.Join(destination, filepath.Base(source))
+	if err := os.WriteFile(source, []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	injected := errors.New("injected atomic move source parent sync failure")
+	destinationIdentity := managedTestPathIdentity(t, destination)
+	sourceParentIdentity := managedTestPathIdentity(t, root)
+	destinationSyncCalls := 0
+	sourceParentSyncCalls := 0
+	roots.directorySync = func(fd int) error {
+		identity, err := managedTestFDIdentity(fd)
+		if err != nil {
+			return err
+		}
+		switch identity {
+		case destinationIdentity:
+			destinationSyncCalls++
+			return unix.Fsync(fd)
+		case sourceParentIdentity:
+			sourceParentSyncCalls++
+			return injected
+		default:
+			return fmt.Errorf("unexpected atomic move sync fd identity: %+v", identity)
+		}
+	}
+
+	result, err := roots.MoveInto(source, destination, ManagedConflictSkip)
+	if !errors.Is(err, injected) || !ManagedMutationChanged(err) || !ManagedMutationDurabilityUnknown(err) || !result.Changed || result.Destination != target {
+		t.Fatalf("atomic move source parent sync result = %+v, %v", result, err)
+	}
+	if destinationSyncCalls != 1 || sourceParentSyncCalls != 1 {
+		t.Fatalf("sync roles = destination %d, source parent %d", destinationSyncCalls, sourceParentSyncCalls)
 	}
 	if _, statErr := os.Stat(source); !errors.Is(statErr, fs.ErrNotExist) {
 		t.Fatalf("atomic rename did not move source: %v", statErr)
@@ -1569,6 +2127,33 @@ func TestClassifyManagedResolutionErrorTreatsENOTDIRAsUnsafe(t *testing.T) {
 	}
 }
 
+type managedTestFileIdentity struct {
+	device uint64
+	inode  uint64
+}
+
+func managedTestFDIdentity(fd int) (managedTestFileIdentity, error) {
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return managedTestFileIdentity{}, err
+	}
+	return managedTestFileIdentity{device: uint64(stat.Dev), inode: stat.Ino}, nil
+}
+
+func managedTestPathIdentity(t *testing.T, path string) managedTestFileIdentity {
+	t.Helper()
+	opened, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, identityErr := managedTestFDIdentity(int(opened.Fd()))
+	closeErr := opened.Close()
+	if err := errors.Join(identityErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
+	return identity
+}
+
 func assertManagedTestContent(t *testing.T, path, expected string) {
 	t.Helper()
 	content, err := os.ReadFile(path)
@@ -1578,6 +2163,21 @@ func assertManagedTestContent(t *testing.T, path, expected string) {
 	if string(content) != expected {
 		t.Fatalf("%s content = %q, want %q", path, content, expected)
 	}
+}
+
+func managedMoveSourceTransactionPaths(t *testing.T, parent string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := make([]string, 0)
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), ".recasaos-move-source-") {
+			paths = append(paths, filepath.Join(parent, entry.Name()))
+		}
+	}
+	return paths
 }
 
 func TestManagedRenameCandidateFailsClosedWhenSuffixExceedsNameLimit(t *testing.T) {

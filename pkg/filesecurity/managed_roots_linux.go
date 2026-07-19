@@ -40,16 +40,21 @@ type managedRoot struct {
 // network filesystems below /mnt and /media; RESOLVE_NO_XDEV would break that
 // core private-management use case. Symlinks and magic links remain forbidden.
 type ManagedRoots struct {
-	mutationMu            sync.Mutex
-	mu                    sync.RWMutex
-	roots                 []managedRoot
-	closed                bool
-	directorySync         func(int) error
-	commitCopy            func(io.Writer, io.Reader) (int64, error)
-	commitIdentity        func(int, string) (ManagedFileIdentity, error)
-	replaceBeforeExchange func() error
-	replaceBeforeCleanup  func() error
-	rewriteBeforePublish  func() error
+	mutationMu                    sync.Mutex
+	mu                            sync.RWMutex
+	roots                         []managedRoot
+	closed                        bool
+	directorySync                 func(int) error
+	commitCopy                    func(io.Writer, io.Reader) (int64, error)
+	commitIdentity                func(int, string) (ManagedFileIdentity, error)
+	replaceBeforeExchange         func() error
+	replaceBeforeCleanup          func() error
+	moveBeforeDirectRename        func() error
+	transactionBeforeStageSync    func() error
+	transactionBeforeCleanup      func() error
+	transactionAfterRmdir         func() error
+	transferFilesystemEligibility func(int) (int64, bool, error)
+	rewriteBeforePublish          func() error
 }
 
 func RemoveManagementTree(path string) error {
