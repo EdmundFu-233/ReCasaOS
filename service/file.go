@@ -522,20 +522,29 @@ func executePreparedFileOperation(roots ManagedFileOperationRoots, temp model.Fi
 		temp.Item[i].DurabilityUnknown = false
 		result, operationErr := executeManagedFileOperationItem(roots, temp.Type, temp.Item[i].From, temp.To, style)
 		if operationErr != nil {
-			temp.Item[i].Destination = result.Destination
 			temp.Item[i].Error = safeFileOperationError(operationErr)
-			// For transfer APIs, Changed on either the typed result or mutation
-			// error means the destination was published before a durability or
-			// source-cleanup failure. Only that state contributes processed bytes.
-			targetPublished := result.Changed || filesecurity.ManagedMutationChanged(operationErr)
+			// Only the typed transfer result can prove that this item's
+			// destination was published. A mutation error can describe an
+			// auxiliary transaction or cleanup change; that still makes the item
+			// partial, but must not fabricate destination progress or bytes.
+			destinationPublished := result.Changed
+			auxiliaryChanged := filesecurity.ManagedMutationChanged(operationErr)
 			temp.Item[i].DurabilityUnknown = filesecurity.ManagedMutationDurabilityUnknown(operationErr)
 			temp.DurabilityUnknown = temp.DurabilityUnknown || temp.Item[i].DurabilityUnknown
-			if targetPublished {
+			if destinationPublished || auxiliaryChanged {
 				temp.Item[i].Status = FileOperationPartial
-				temp.Item[i].ProcessedSize = temp.Item[i].Size
-				temp.ProcessedSize += temp.Item[i].Size
+				if destinationPublished {
+					temp.Item[i].Destination = result.Destination
+					temp.Item[i].ProcessedSize = temp.Item[i].Size
+					temp.ProcessedSize += temp.Item[i].Size
+				} else {
+					temp.Item[i].Destination = ""
+					temp.Item[i].ProcessedSize = 0
+				}
 				partiallyChanged++
 			} else {
+				temp.Item[i].Destination = ""
+				temp.Item[i].ProcessedSize = 0
 				temp.Item[i].Status = FileOperationFailed
 			}
 			temp.Item[i].Finished = true

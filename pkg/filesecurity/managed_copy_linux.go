@@ -32,9 +32,10 @@ func (m *ManagedRoots) CopyInto(sourcePath, destinationDirectory string, style M
 
 // MoveInto moves one regular file or directory below destinationDirectory.
 // Directories are accepted only when a non-replacing same-filesystem atomic
-// rename succeeds. Regular-file cross-filesystem and replacing moves publish a
-// complete copy first and unlink the source only after full identity
-// revalidation, so a failed cleanup cannot lose the source.
+// rename succeeds. Regular-file cross-filesystem and replacing moves retain
+// the source and return ErrManagedMoveSourceRetained once destination namespace
+// publication is reported. Normal completion is synchronized and verified;
+// joined publication/transaction errors may instead set DurabilityUnknown.
 func (m *ManagedRoots) MoveInto(sourcePath, destinationDirectory string, style ManagedConflictStyle) (ManagedTransferResult, error) {
 	return m.transferInto(sourcePath, destinationDirectory, style, true)
 }
@@ -98,21 +99,41 @@ func (m *ManagedRoots) transferInto(sourcePath, destinationDirectory string, sty
 	if err != nil {
 		return ManagedTransferResult{}, err
 	}
+	sourceParentFD := -1
+	sourceParentBase := ""
 	if move {
-		sourceParentFD, _, err := openManagedParent(sourceRoot, sourceLocation)
+		sourceParentFD, sourceParentBase, err = openManagedParent(sourceRoot, sourceLocation)
 		if err != nil {
 			return ManagedTransferResult{}, err
 		}
-		mountErr := validateManagedMoveMountBoundary(sourceParentFD, int(source.Fd()))
-		_ = unix.Close(sourceParentFD)
-		if mountErr != nil {
-			return ManagedTransferResult{}, mountErr
+		defer unix.Close(sourceParentFD)
+		sourceParentLocation, err := m.matchLocked(filepath.Dir(sourceLocation.Canonical))
+		if err != nil {
+			return ManagedTransferResult{}, err
+		}
+		if err := m.validateManagedDestinationFD(sourceRoot, sourceParentFD, sourceParentLocation); err != nil {
+			return ManagedTransferResult{}, err
+		}
+		if err := verifyManagedNameIdentity(sourceParentFD, sourceParentBase, &sourceStat); err != nil {
+			return ManagedTransferResult{}, err
+		}
+		if err := validateManagedMoveMountBoundary(sourceParentFD, int(source.Fd())); err != nil {
+			return ManagedTransferResult{}, err
+		}
+		if err := validateManagedMoveFilesystem(sourceParentFD, "source"); err != nil {
+			return ManagedTransferResult{}, err
+		}
+		if err := validateManagedMoveFilesystem(int(destination.Fd()), "destination"); err != nil {
+			return ManagedTransferResult{}, err
 		}
 	}
 
 	base := filepath.Base(sourceLocation.Canonical)
 	if err := ValidatePathComponent(base); err != nil {
 		return ManagedTransferResult{}, err
+	}
+	if move && base != sourceParentBase {
+		return ManagedTransferResult{}, fmt.Errorf("%w: pinned source parent basename changed", ErrUnsafePath)
 	}
 	requestedTarget := filepath.Join(destinationLocation.Canonical, base)
 	if err := m.rejectConfiguredRootCanonicalAtOrBelow(requestedTarget); err != nil {
@@ -151,7 +172,7 @@ func (m *ManagedRoots) transferInto(sourcePath, destinationDirectory string, sty
 			if err := m.validateManagedAtomicMoveTree(source, &sourceStat, sourceMountID, 0, &budget); err != nil {
 				return ManagedTransferResult{}, err
 			}
-			result, completed, renameErr := m.renameManagedSourceNoReplace(sourceRoot, sourceLocation, &sourceStat, int(destination.Fd()), destinationLocation, base, style)
+			result, completed, renameErr := m.renameManagedSourceNoReplace(sourceParentFD, sourceParentBase, source, sourceLocation, &sourceStat, int(destination.Fd()), destinationLocation, base, style)
 			if !completed && errors.Is(renameErr, unix.EXDEV) {
 				return ManagedTransferResult{}, ErrManagedDirectoryMoveRequiresAtomicRename
 			}
@@ -160,30 +181,24 @@ func (m *ManagedRoots) transferInto(sourcePath, destinationDirectory string, sty
 	}
 
 	if move && style != ManagedConflictReplace {
-		result, completed, renameErr := m.renameManagedSourceNoReplace(sourceRoot, sourceLocation, &sourceStat, int(destination.Fd()), destinationLocation, base, style)
+		result, completed, renameErr := m.renameManagedSourceNoReplace(sourceParentFD, sourceParentBase, source, sourceLocation, &sourceStat, int(destination.Fd()), destinationLocation, base, style)
 		if completed || renameErr != nil && !errors.Is(renameErr, unix.EXDEV) {
 			return result, renameErr
 		}
 	}
 
-	result, err := m.copyManagedTransfer(source, &sourceStat, int(destination.Fd()), destinationMountID, destinationLocation, base, style)
-	if err != nil || !move || !result.Changed {
-		return result, err
+	result, transferErr := m.copyManagedTransfer(source, &sourceStat, int(destination.Fd()), destinationMountID, destinationLocation, base, style)
+	if !move || !result.Changed {
+		return result, transferErr
 	}
 
-	// Copy-first move fallback. Only unlink the name if it still identifies the
-	// inode that was copied; a concurrent pathname replacement is left intact.
-	var sourceAfterCopy unix.Stat_t
-	if err := unix.Fstat(int(source.Fd()), &sourceAfterCopy); err != nil {
-		return result, fmt.Errorf("destination published but source revalidation failed: %w", err)
-	}
-	if !sameManagedTransferStat(&sourceStat, &sourceAfterCopy) {
-		return result, errors.New("destination published but source changed before cleanup")
-	}
-	if err := m.removeManagedTransferSource(sourceRoot, sourceLocation, &sourceStat); err != nil {
-		return result, fmt.Errorf("destination published but source cleanup failed: %w", err)
-	}
-	return result, nil
+	// Until Issue #17 provides a durable move ledger and crash-safe recovery,
+	// copy-first moves deliberately retain the original source. The destination
+	// has already been published. Always preserve the source-retained contract,
+	// while joining any publication/transaction error so its real durability
+	// metadata and errors.Is identity remain visible to callers.
+	retainedErr := managedChangedMutationError("copy-first managed move retained source", false, ErrManagedMoveSourceRetained)
+	return result, errors.Join(transferErr, retainedErr)
 }
 
 func validateManagedMoveMountBoundary(sourceParentFD, sourceFD int) error {
@@ -201,16 +216,10 @@ func validateManagedMoveMountBoundary(sourceParentFD, sourceFD int) error {
 	return nil
 }
 
-func (m *ManagedRoots) renameManagedSourceNoReplace(sourceRoot *managedRoot, sourceLocation ManagedLocation, sourceStat *unix.Stat_t, destinationFD int, destinationLocation ManagedLocation, base string, style ManagedConflictStyle) (ManagedTransferResult, bool, error) {
-	sourceParentFD, sourceBase, err := openManagedParent(sourceRoot, sourceLocation)
-	if err != nil {
-		return ManagedTransferResult{}, true, err
+func (m *ManagedRoots) renameManagedSourceNoReplace(sourceParentFD int, sourceBase string, source *os.File, sourceLocation ManagedLocation, sourceStat *unix.Stat_t, destinationFD int, destinationLocation ManagedLocation, base string, style ManagedConflictStyle) (ManagedTransferResult, bool, error) {
+	if sourceParentFD < 0 || destinationFD < 0 || source == nil || sourceStat == nil || sourceBase == "" {
+		return ManagedTransferResult{}, true, fmt.Errorf("%w: managed direct move descriptors are incomplete", ErrUnsafePath)
 	}
-	defer unix.Close(sourceParentFD)
-	if err := verifyManagedNameIdentity(sourceParentFD, sourceBase, sourceStat); err != nil {
-		return ManagedTransferResult{}, true, err
-	}
-
 	limit := 1
 	if style == ManagedConflictRename {
 		limit = maxManagedRenameCandidates
@@ -224,15 +233,51 @@ func (m *ManagedRoots) renameManagedSourceNoReplace(sourceRoot *managedRoot, sou
 		if managedPathsOverlap(sourceLocation.Canonical, target) {
 			return ManagedTransferResult{}, true, fmt.Errorf("%w: source and destination overlap", ErrUnsafePath)
 		}
-		if err := verifyManagedNameIdentity(sourceParentFD, sourceBase, sourceStat); err != nil {
+		var sourceBeforeRename unix.Stat_t
+		if err := unix.Fstat(int(source.Fd()), &sourceBeforeRename); err != nil {
 			return ManagedTransferResult{}, true, err
+		}
+		if !sameManagedTransferStat(sourceStat, &sourceBeforeRename) {
+			return ManagedTransferResult{}, true, fmt.Errorf("%w: managed direct move source changed before rename", ErrUnsafePath)
+		}
+		if err := verifyManagedNameIdentity(sourceParentFD, sourceBase, &sourceBeforeRename); err != nil {
+			return ManagedTransferResult{}, true, err
+		}
+		if m.moveBeforeDirectRename != nil {
+			if err := m.moveBeforeDirectRename(); err != nil {
+				return ManagedTransferResult{}, true, err
+			}
 		}
 		renameErr := unix.Renameat2(sourceParentFD, sourceBase, destinationFD, candidate, unix.RENAME_NOREPLACE)
 		if renameErr == nil {
 			result := ManagedTransferResult{Destination: target, Changed: true}
-			destinationSyncErr := m.syncManagedDirectory(destinationFD, "sync moved managed destination parent", true)
-			sourceSyncErr := m.syncManagedDirectory(sourceParentFD, "sync moved managed source parent", true)
-			return result, true, errors.Join(destinationSyncErr, sourceSyncErr)
+			var sourceAfterRename unix.Stat_t
+			if err := unix.Fstat(int(source.Fd()), &sourceAfterRename); err != nil {
+				return result, true, managedChangedMutationError("managed direct move published but pinned source revalidation failed", true, err)
+			}
+			if !sameManagedExchangeStat(&sourceBeforeRename, &sourceAfterRename) {
+				return result, true, managedChangedMutationError("managed direct move published but source changed during rename", true, ErrUnsafePath)
+			}
+			if err := verifyManagedNameIdentity(destinationFD, candidate, &sourceAfterRename); err != nil {
+				return result, true, managedChangedMutationError("managed direct move destination does not identify pinned source", true, err)
+			}
+			if err := m.syncManagedDirectory(destinationFD, "sync moved managed destination parent", true); err != nil {
+				return result, true, err
+			}
+			if err := m.syncManagedDirectory(sourceParentFD, "sync moved managed source parent", true); err != nil {
+				return result, true, err
+			}
+			var sourceAfterSync unix.Stat_t
+			if err := unix.Fstat(int(source.Fd()), &sourceAfterSync); err != nil {
+				return result, true, managedChangedMutationError("managed direct move synced but pinned source revalidation failed", false, err)
+			}
+			if !sameManagedTransferStat(&sourceAfterRename, &sourceAfterSync) {
+				return result, true, managedChangedMutationError("managed direct move source changed during sync", false, ErrUnsafePath)
+			}
+			if err := verifyManagedNameIdentity(destinationFD, candidate, &sourceAfterSync); err != nil {
+				return result, true, managedChangedMutationError("managed direct move destination changed during sync", false, err)
+			}
+			return result, true, nil
 		}
 		if errors.Is(renameErr, unix.EXDEV) {
 			return ManagedTransferResult{}, false, renameErr
@@ -255,14 +300,36 @@ func (m *ManagedRoots) copyManagedTransfer(source *os.File, sourceStat *unix.Sta
 	}
 	cleanupAllowed := true
 	entryPresent := false
+	stagingSynced := false
 	defer func() {
-		if cleanupAllowed {
-			resultErr = errors.Join(resultErr, m.cleanupManagedTransferTransaction(destinationFD, destinationMountID, transactionName, transaction, entryPresent))
+		if !cleanupAllowed {
+			retainedErr := errors.Join(resultErr, transaction.Close())
+			missingRecordedCause := retainedErr == nil
+			if retainedErr == nil {
+				retainedErr = errors.New("managed transfer transaction retained without a recorded cause")
+			}
+			retainedErr = fmt.Errorf("private managed transfer transaction %q retained: %w", transactionName, retainedErr)
+			durabilityUnknown := ManagedMutationDurabilityUnknown(retainedErr)
+			if !ManagedMutationChanged(retainedErr) {
+				durabilityUnknown = durabilityUnknown || (entryPresent && !stagingSynced) || missingRecordedCause
+			}
+			resultErr = managedChangedMutationError(
+				"managed transfer transaction retained after ambiguous outcome",
+				durabilityUnknown,
+				retainedErr,
+			)
+			return
 		}
-		resultErr = errors.Join(resultErr, transaction.Close())
-		if !cleanupAllowed && resultErr != nil {
-			resultErr = fmt.Errorf("private managed transfer transaction %q retained: %w", transactionName, resultErr)
+		cleanupErr := m.cleanupManagedTransferTransaction(destinationFD, destinationMountID, transactionName, transaction, entryPresent)
+		if cleanupErr != nil {
+			durabilityUnknown := ManagedMutationDurabilityUnknown(cleanupErr) || (entryPresent && !stagingSynced)
+			cleanupErr = managedChangedMutationError(
+				"managed transfer transaction cleanup incomplete",
+				durabilityUnknown,
+				cleanupErr,
+			)
 		}
+		resultErr = errors.Join(resultErr, cleanupErr, transaction.Close())
 	}()
 	if err := m.syncManagedDirectory(destinationFD, "sync created managed transfer transaction", true); err != nil {
 		cleanupAllowed = false
@@ -280,10 +347,16 @@ func (m *ManagedRoots) copyManagedTransfer(source *os.File, sourceStat *unix.Sta
 	if err := unix.Fstatat(int(transaction.Fd()), transactionEntry, &stagingExpected, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		return ManagedTransferResult{}, err
 	}
+	if m.transactionBeforeStageSync != nil {
+		if err := m.transactionBeforeStageSync(); err != nil {
+			return ManagedTransferResult{}, err
+		}
+	}
 	if err := m.syncManagedDirectory(int(transaction.Fd()), "sync staged managed transfer transaction", true); err != nil {
 		cleanupAllowed = false
 		return ManagedTransferResult{}, err
 	}
+	stagingSynced = true
 	result, cleanupAllowed, entryPresent, err = m.publishManagedTransaction(destinationFD, destinationMountID, transactionName, transaction, destinationLocation, base, style, &stagingExpected)
 	if err != nil {
 		return result, err
@@ -774,18 +847,19 @@ func (m *ManagedRoots) publishManagedTransaction(destinationFD int, destinationM
 			result := ManagedTransferResult{Destination: target, Changed: true}
 			var publishedStat unix.Stat_t
 			if err := unix.Fstat(int(staging.Fd()), &publishedStat); err != nil {
-				return result, false, false, managedChangedMutationError("managed transfer published but staging descriptor revalidation failed", false, errors.Join(err, closeStaging()))
+				return result, false, false, managedChangedMutationError("managed transfer published but staging descriptor revalidation failed", true, errors.Join(err, closeStaging()))
 			}
 			if !sameManagedExchangeStat(&stagingBefore, &publishedStat) {
-				return result, false, false, managedChangedMutationError("managed transfer published but staging changed during rename", false, errors.Join(ErrUnsafePath, closeStaging()))
+				return result, false, false, managedChangedMutationError("managed transfer published but staging changed during rename", true, errors.Join(ErrUnsafePath, closeStaging()))
 			}
 			if err := verifyManagedNameIdentity(destinationFD, candidate, &publishedStat); err != nil {
-				return result, false, false, managedChangedMutationError("managed transfer destination does not identify pinned staging", false, errors.Join(err, closeStaging()))
+				return result, false, false, managedChangedMutationError("managed transfer destination does not identify pinned staging", true, errors.Join(err, closeStaging()))
 			}
-			destinationSyncErr := m.syncManagedDirectory(destinationFD, "sync published managed destination", true)
-			transactionSyncErr := m.syncManagedDirectory(int(transaction.Fd()), "sync published managed transaction", true)
-			if err := errors.Join(destinationSyncErr, transactionSyncErr); err != nil {
-				return result, false, false, errors.Join(err, closeStaging())
+			if err := m.syncManagedDirectory(destinationFD, "sync published managed destination", true); err != nil {
+				return result, false, false, managedChangedMutationError("managed transfer destination publication sync failed", true, errors.Join(err, closeStaging()))
+			}
+			if err := m.syncManagedDirectory(int(transaction.Fd()), "sync published managed transaction", true); err != nil {
+				return result, false, false, managedChangedMutationError("managed transfer transaction publication sync failed", true, errors.Join(err, closeStaging()))
 			}
 			var publishedAfterSync unix.Stat_t
 			if err := unix.Fstat(int(staging.Fd()), &publishedAfterSync); err != nil {
@@ -802,8 +876,18 @@ func (m *ManagedRoots) publishManagedTransaction(destinationFD int, destinationM
 			}
 			return result, true, false, nil
 		}
+		filesystemEligibility := managedTransactionalFilesystemEligibility
+		if m.transferFilesystemEligibility != nil {
+			filesystemEligibility = m.transferFilesystemEligibility
+		}
+		_, filesystemAllowed, filesystemErr := filesystemEligibility(destinationFD)
+		if filesystemErr != nil || !filesystemAllowed {
+			failureResult, cleanupAllowed, publicationErr := classifyManagedNoReplacePublicationFailure(renameErr, filesystemAllowed, filesystemErr)
+			return failureResult, cleanupAllowed, true, errors.Join(publicationErr, closeStaging())
+		}
 		if !errors.Is(renameErr, unix.EEXIST) {
-			return ManagedTransferResult{}, true, true, errors.Join(classifyManagedResolutionError(renameErr), closeStaging())
+			failureResult, cleanupAllowed, publicationErr := classifyManagedNoReplacePublicationFailure(renameErr, filesystemAllowed, nil)
+			return failureResult, cleanupAllowed, true, errors.Join(publicationErr, closeStaging())
 		}
 		switch style {
 		case ManagedConflictSkip:
@@ -867,28 +951,29 @@ func (m *ManagedRoots) publishManagedTransaction(destinationFD int, destinationM
 			result := ManagedTransferResult{Destination: target, Changed: true}
 			var publishedStat unix.Stat_t
 			if err := unix.Fstat(int(staging.Fd()), &publishedStat); err != nil {
-				return result, false, true, managedChangedMutationError("replacement published but staging descriptor revalidation failed", false, errors.Join(err, closePinned()))
+				return result, false, true, managedChangedMutationError("replacement published but staging descriptor revalidation failed", true, errors.Join(err, closePinned()))
 			}
 			if !sameManagedExchangeStat(&stagingBefore, &publishedStat) {
-				return result, false, true, managedChangedMutationError("replacement published but staging changed during exchange", false, errors.Join(ErrUnsafePath, closePinned()))
+				return result, false, true, managedChangedMutationError("replacement published but staging changed during exchange", true, errors.Join(ErrUnsafePath, closePinned()))
 			}
 			if err := verifyManagedNameIdentity(destinationFD, candidate, &publishedStat); err != nil {
-				return result, false, true, managedChangedMutationError("replacement destination does not identify pinned staging", false, errors.Join(err, closePinned()))
+				return result, false, true, managedChangedMutationError("replacement destination does not identify pinned staging", true, errors.Join(err, closePinned()))
 			}
 			var exchangedStat unix.Stat_t
 			if err := unix.Fstat(int(replaced.Fd()), &exchangedStat); err != nil {
-				return result, false, true, managedChangedMutationError("replacement published but old target descriptor revalidation failed", false, errors.Join(err, closePinned()))
+				return result, false, true, managedChangedMutationError("replacement published but old target descriptor revalidation failed", true, errors.Join(err, closePinned()))
 			}
 			if !sameManagedExchangeStat(&exchangeBefore, &exchangedStat) {
-				return result, false, true, managedChangedMutationError("replacement published but old target changed during exchange", false, errors.Join(ErrUnsafePath, closePinned()))
+				return result, false, true, managedChangedMutationError("replacement published but old target changed during exchange", true, errors.Join(ErrUnsafePath, closePinned()))
 			}
 			if err := verifyManagedNameIdentity(int(transaction.Fd()), transactionEntry, &exchangedStat); err != nil {
-				return result, false, true, managedChangedMutationError("private transaction does not identify exchanged old target", false, errors.Join(err, closePinned()))
+				return result, false, true, managedChangedMutationError("private transaction does not identify exchanged old target", true, errors.Join(err, closePinned()))
 			}
-			destinationSyncErr := m.syncManagedDirectory(destinationFD, "sync exchanged managed destination", true)
-			transactionSyncErr := m.syncManagedDirectory(int(transaction.Fd()), "sync exchanged managed transaction", true)
-			if err := errors.Join(destinationSyncErr, transactionSyncErr); err != nil {
-				return result, false, true, errors.Join(err, closePinned())
+			if err := m.syncManagedDirectory(destinationFD, "sync exchanged managed destination", true); err != nil {
+				return result, false, true, managedChangedMutationError("managed replacement destination sync failed", true, errors.Join(err, closePinned()))
+			}
+			if err := m.syncManagedDirectory(int(transaction.Fd()), "sync exchanged managed transaction", true); err != nil {
+				return result, false, true, managedChangedMutationError("managed replacement transaction sync failed", true, errors.Join(err, closePinned()))
 			}
 			if m.replaceBeforeCleanup != nil {
 				if err := m.replaceBeforeCleanup(); err != nil {
@@ -969,23 +1054,30 @@ func createManagedTransferTransaction(parentFD int, parentMountID uint64) (*os.F
 	if err := unix.Mkdirat(parentFD, name, 0o700); err != nil {
 		return nil, "", classifyManagedResolutionError(err)
 	}
+	retained := func(operation string, err error) error {
+		return managedChangedMutationError(
+			operation,
+			true,
+			fmt.Errorf("private managed transfer transaction %q retained: %w", name, err),
+		)
+	}
 	fd, err := unix.Openat2(parentFD, name, &unix.OpenHow{
 		Flags:   unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC | unix.O_NOFOLLOW | unix.O_NONBLOCK,
 		Resolve: managedResolvePolicy,
 	})
 	if err != nil {
-		return nil, name, fmt.Errorf("private managed transfer transaction %q retained after open failure: %w", name, classifyManagedResolutionError(err))
+		return nil, name, retained("open newly created managed transfer transaction", classifyManagedResolutionError(err))
 	}
 	transaction := os.NewFile(uintptr(fd), name)
 	if transaction == nil {
 		unix.Close(fd)
-		return nil, name, fmt.Errorf("private managed transfer transaction %q retained after descriptor conversion failure", name)
+		return nil, name, retained("convert newly created managed transfer transaction descriptor", errors.New("descriptor conversion failed"))
 	}
 	if err := unix.Fchmod(fd, 0o700); err != nil {
-		return nil, name, fmt.Errorf("private managed transfer transaction %q retained after chmod failure: %w", name, errors.Join(err, transaction.Close()))
+		return nil, name, retained("chmod newly created managed transfer transaction", errors.Join(err, transaction.Close()))
 	}
 	if err := validateManagedTransferTransaction(parentFD, parentMountID, name, transaction); err != nil {
-		return nil, name, fmt.Errorf("private managed transfer transaction %q retained after validation failure: %w", name, errors.Join(err, transaction.Close()))
+		return nil, name, retained("validate newly created managed transfer transaction", errors.Join(err, transaction.Close()))
 	}
 	return transaction, name, nil
 }
@@ -1032,17 +1124,55 @@ func validateManagedTransferTransactionStat(stat *unix.Stat_t, effectiveUID uint
 }
 
 func validateManagedReplaceFilesystem(fd int) error {
-	var stat unix.Statfs_t
-	if err := unix.Fstatfs(fd, &stat); err != nil {
+	magic, allowed, err := managedTransactionalFilesystemEligibility(fd)
+	if err != nil {
 		return err
 	}
-	if !managedReplaceFilesystemCertified(int64(stat.Type)) {
-		return fmt.Errorf("%w: replace requires a certified local filesystem; filesystem type %#x is not certified", ErrUnsafePath, uint32(stat.Type))
+	if !allowed {
+		return fmt.Errorf("%w: replace requires an allowlisted local filesystem; filesystem type %#x is not allowlisted", ErrUnsafePath, uint32(magic))
 	}
 	return nil
 }
 
-func managedReplaceFilesystemCertified(magic int64) bool {
+func validateManagedMoveFilesystem(fd int, role string) error {
+	magic, allowed, err := managedTransactionalFilesystemEligibility(fd)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return fmt.Errorf("%w: move requires an allowlisted local %s filesystem; filesystem type %#x is not allowlisted", ErrUnsafePath, role, uint32(magic))
+	}
+	return nil
+}
+
+func managedTransactionalFilesystemEligibility(fd int) (int64, bool, error) {
+	var stat unix.Statfs_t
+	if err := unix.Fstatfs(fd, &stat); err != nil {
+		return 0, false, err
+	}
+	magic := int64(stat.Type)
+	return magic, managedTransactionalFilesystemAllowed(magic), nil
+}
+
+func classifyManagedNoReplacePublicationFailure(renameErr error, filesystemAllowed bool, filesystemErr error) (ManagedTransferResult, bool, error) {
+	classifiedRenameErr := classifyManagedResolutionError(renameErr)
+	if filesystemErr == nil && filesystemAllowed {
+		return ManagedTransferResult{}, true, classifiedRenameErr
+	}
+	var eligibilityErr error
+	if filesystemErr != nil {
+		eligibilityErr = fmt.Errorf("destination filesystem eligibility could not be proven after rename failure: %w", filesystemErr)
+	} else {
+		eligibilityErr = fmt.Errorf("%w: destination filesystem is not allowlisted for deterministic rename failure handling", ErrUnsafePath)
+	}
+	return ManagedTransferResult{}, false, managedChangedMutationError(
+		"managed transfer publication outcome is ambiguous",
+		true,
+		errors.Join(classifiedRenameErr, eligibilityErr),
+	)
+}
+
+func managedTransactionalFilesystemAllowed(magic int64) bool {
 	switch uint32(magic) {
 	case uint32(unix.EXT4_SUPER_MAGIC), // Shared by ext2, ext3, and ext4.
 		uint32(unix.XFS_SUPER_MAGIC),
@@ -1094,6 +1224,11 @@ func (m *ManagedRoots) cleanupManagedTransferTransaction(parentFD int, parentMou
 	if err := validateManagedTransferTransaction(parentFD, parentMountID, name, transaction); err != nil {
 		return fmt.Errorf("private managed transfer transaction %q retained: %w", name, err)
 	}
+	if m.transactionBeforeCleanup != nil {
+		if err := m.transactionBeforeCleanup(); err != nil {
+			return fmt.Errorf("private managed transfer transaction %q retained before cleanup: %w", name, err)
+		}
+	}
 	if entryPresent {
 		cleanupBudget := int64(0)
 		if err := m.removeManagedEntryAt(int(transaction.Fd()), "entry", parentMountID, 0, &cleanupBudget); err != nil {
@@ -1110,16 +1245,24 @@ func (m *ManagedRoots) cleanupManagedTransferTransaction(parentFD int, parentMou
 	// make cleanup delete a data-bearing replacement. A same-UID writer could
 	// first unlink the original empty directory and then substitute another empty
 	// directory, making that substitution undetectable by the pinned Nlink check.
-	// This trusted-host residual is tracked in follow-up issues #7 and #17.
+	// Issue #7 tracks this trusted-host race. Issue #17 tracks durable transaction
+	// ledger/recovery; until that exists, any transaction retained after an
+	// ambiguous namespace outcome is manual-recovery evidence and is not
+	// auto-cleaned.
 	if err := unix.Unlinkat(parentFD, name, unix.AT_REMOVEDIR); err != nil {
 		return fmt.Errorf("private managed transfer transaction %q retained after rmdir failure: %w", name, err)
 	}
+	if m.transactionAfterRmdir != nil {
+		if err := m.transactionAfterRmdir(); err != nil {
+			return managedChangedMutationError("managed transfer transaction removed but post-rmdir interlock failed", true, err)
+		}
+	}
 	var removed unix.Stat_t
 	if err := unix.Fstat(int(transaction.Fd()), &removed); err != nil {
-		return err
+		return managedChangedMutationError("managed transfer transaction removed but descriptor revalidation failed", true, err)
 	}
 	if removed.Nlink != 0 {
-		return fmt.Errorf("%w: managed transfer transaction removal did not unlink the pinned directory", ErrUnsafePath)
+		return managedChangedMutationError("managed transfer transaction namespace changed but pinned directory remains linked", true, fmt.Errorf("%w: managed transfer transaction removal did not unlink the pinned directory", ErrUnsafePath))
 	}
 	return m.syncManagedDirectory(parentFD, "sync removed managed transfer transaction", true)
 }
@@ -1245,23 +1388,6 @@ func validateManagedRemovableEntryAt(parentFD int, name string, parentMountID ui
 	}
 }
 
-func (m *ManagedRoots) removeManagedTransferSource(root *managedRoot, location ManagedLocation, sourceStat *unix.Stat_t) error {
-	parentFD, base, err := openManagedParent(root, location)
-	if err != nil {
-		return err
-	}
-	defer unix.Close(parentFD)
-	if err := verifyManagedNameIdentity(parentFD, base, sourceStat); err != nil {
-		return err
-	}
-	parentMountID, err := managedMountIDAt(parentFD, "", unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
-	if err != nil {
-		return err
-	}
-	budget := int64(0)
-	return m.removeManagedEntryAt(parentFD, base, parentMountID, 0, &budget)
-}
-
 func verifyManagedNameIdentity(parentFD int, name string, expected *unix.Stat_t) error {
 	var actual unix.Stat_t
 	if err := unix.Fstatat(parentFD, name, &actual, unix.AT_SYMLINK_NOFOLLOW); err != nil {
@@ -1288,10 +1414,10 @@ func sameManagedTransferStat(before, after *unix.Stat_t) bool {
 		before.Ctim == after.Ctim
 }
 
-// sameManagedExchangeStat permits only the inode ctime transition caused by
-// renameat2(RENAME_EXCHANGE). The old target remains pinned by an open
-// descriptor across the syscall; every other identity and content signal must
-// remain unchanged before its hidden name can be removed.
+// sameManagedExchangeStat permits only the inode ctime transition caused by a
+// descriptor-relative namespace rename or exchange. The inode remains pinned
+// by an open descriptor across the syscall; every other identity and content
+// signal must remain unchanged before its private name can be removed.
 func sameManagedExchangeStat(before, after *unix.Stat_t) bool {
 	return before.Dev == after.Dev &&
 		before.Ino == after.Ino &&
