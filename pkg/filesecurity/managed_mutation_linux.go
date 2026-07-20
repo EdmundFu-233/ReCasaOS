@@ -31,9 +31,14 @@ func (m *ManagedRoots) AcquireMutation() (func(), error) {
 		m.mutationMu.Unlock()
 		return nil, fs.ErrClosed
 	}
+	// The generation is even while quiescent and odd while a serialized
+	// mutation is active. Inventory snapshots can therefore detect an operation
+	// that began before their first sample and remains in flight at the end.
+	m.mutationGeneration.Add(1)
 	var once sync.Once
 	return func() {
 		once.Do(func() {
+			m.mutationGeneration.Add(1)
 			m.mutationMu.Unlock()
 		})
 	}, nil

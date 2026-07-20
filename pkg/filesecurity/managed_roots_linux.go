@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 )
@@ -32,6 +33,15 @@ type managedRoot struct {
 	file *os.File
 }
 
+// managedRootDescriptor is a descriptor view of a pinned management root.
+// Existing operations borrow their descriptors; inventory snapshots own and
+// close duplicated descriptors so potentially blocking filesystem operations
+// never need to hold ManagedRoots locks.
+type managedRootDescriptor struct {
+	path string
+	fd   int
+}
+
 // ManagedRoots pins each explicitly authorized management root to a directory
 // descriptor. Client paths are resolved beneath those descriptors with
 // openat2, so validation and use cannot be separated by a symlink swap.
@@ -41,6 +51,7 @@ type managedRoot struct {
 // core private-management use case. Symlinks and magic links remain forbidden.
 type ManagedRoots struct {
 	mutationMu                    sync.Mutex
+	mutationGeneration            atomic.Uint64 // even when quiescent; odd while mutationMu is leased
 	mu                            sync.RWMutex
 	roots                         []managedRoot
 	closed                        bool
@@ -53,6 +64,8 @@ type ManagedRoots struct {
 	transactionBeforeStageSync    func() error
 	transactionBeforeCleanup      func() error
 	transactionAfterRmdir         func() error
+	inventoryAfterRootSnapshot    func() error
+	inventoryAfterOpen            func(int, string) error
 	transferFilesystemEligibility func(int) (int64, bool, error)
 	rewriteBeforePublish          func() error
 }
@@ -152,7 +165,11 @@ func (m *ManagedRoots) Close() error {
 		return nil
 	}
 	m.mutationMu.Lock()
-	defer m.mutationMu.Unlock()
+	m.mutationGeneration.Add(1)
+	defer func() {
+		m.mutationGeneration.Add(1)
+		m.mutationMu.Unlock()
+	}()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -1031,7 +1048,17 @@ func (m *ManagedRoots) open(absolutePath string, flags int, permission fs.FileMo
 }
 
 func openManagedAt(root *managedRoot, location ManagedLocation, flags int, permission fs.FileMode) (*os.File, error) {
-	fd, err := unix.Openat2(int(root.file.Fd()), location.Relative, &unix.OpenHow{
+	if root == nil || root.file == nil {
+		return nil, ErrUnsafePath
+	}
+	return openManagedAtFD(int(root.file.Fd()), location, flags, permission)
+}
+
+func openManagedAtFD(rootFD int, location ManagedLocation, flags int, permission fs.FileMode) (*os.File, error) {
+	if rootFD < 0 {
+		return nil, ErrUnsafePath
+	}
+	fd, err := unix.Openat2(rootFD, location.Relative, &unix.OpenHow{
 		Flags:   uint64(flags | unix.O_CLOEXEC | unix.O_NOFOLLOW),
 		Mode:    uint64(permission.Perm()),
 		Resolve: managedResolvePolicy,
