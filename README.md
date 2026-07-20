@@ -60,6 +60,12 @@ tombstone for stale-route cleanup and is never the portal upstream. A
 particular host is not public-ready until the guide's deployment, restore,
 scanning, and independent-review gates pass.
 
+The portal's large-file browser stream is still a candidate tracked in
+[Issue #20](https://github.com/EdmundFu-233/ReCasaOS/issues/20). Its token is
+current-page-memory-only and header-authenticated, with a 32 MiB bounded
+fallback, but stable Chromium/Firefox/WebKit HTTPS download, memory, retry,
+Range, cancellation, and filename tests remain release gates.
+
 Never expose Samba, SSH, daemon ports, debug/API documentation, setup routes,
 privileged v1/v2/v3 APIs, the dedicated portal listener, or root/Gateway
 listeners directly. Keep the management Gateway on a firewalled private/VPN

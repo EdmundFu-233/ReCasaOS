@@ -419,25 +419,25 @@ func TestPinnedRootDescriptorSurvivesPathReplacement(t *testing.T) {
 	}
 }
 
-func TestPortalAssetsUseStrictCSPAndSessionStorage(t *testing.T) {
+func TestPortalAssetsUseStrictCSPAndPageMemory(t *testing.T) {
 	fixture := newPortalFixture(t, 0)
 	html := serve(fixture.portal, httptest.NewRequest(http.MethodGet, BasePath+"/", nil))
 	if html.Code != http.StatusOK || strings.Contains(html.Body.String(), testToken) {
 		t.Fatalf("HTML response is unsafe: %d %s", html.Code, html.Body.String())
 	}
 	csp := html.Header().Get("Content-Security-Policy")
-	if !strings.Contains(csp, "default-src 'none'") || !strings.Contains(csp, "frame-ancestors 'none'") || strings.Contains(csp, "unsafe-inline") {
+	if !strings.Contains(csp, "default-src 'none'") || !strings.Contains(csp, "frame-ancestors 'none'") || !strings.Contains(csp, "worker-src 'self'") || strings.Contains(csp, "unsafe-inline") {
 		t.Fatalf("unexpected CSP: %q", csp)
 	}
 	javascript := serve(fixture.portal, httptest.NewRequest(http.MethodGet, BasePath+"/app.js", nil))
-	if !strings.Contains(javascript.Body.String(), "sessionStorage") || strings.Contains(javascript.Body.String(), "localStorage") {
-		t.Fatal("client token is not scoped to sessionStorage")
+	if !strings.Contains(javascript.Body.String(), "let accessToken=''") || strings.Contains(javascript.Body.String(), "sessionStorage") || strings.Contains(javascript.Body.String(), "localStorage") {
+		t.Fatal("client token is not confined to ephemeral page memory")
 	}
 }
 
 func TestMutatingMethodsAreRejected(t *testing.T) {
 	fixture := newPortalFixture(t, 0)
-	for _, endpoint := range []string{BasePath + "/api/list", BasePath + "/api/file?path=x", BasePath + "/"} {
+	for _, endpoint := range []string{BasePath + "/api/list", BasePath + "/api/file?path=x", BasePath + "/", BasePath + "/download-worker.js"} {
 		response := serve(fixture.portal, authorizedRequest(t, http.MethodPost, endpoint))
 		if response.Code != http.StatusMethodNotAllowed {
 			t.Errorf("POST %s returned %d, want 405", endpoint, response.Code)
