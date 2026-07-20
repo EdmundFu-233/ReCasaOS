@@ -13,6 +13,13 @@ The supplied Caddy and Nginx examples use a positive route allowlist: they
 proxy `/public-files` and `/public-files/*`, then return 404 for everything
 else. Do not replace that final deny with a catch-all proxy.
 
+This guide is a repository deployment baseline, not evidence of a live public
+deployment. The repository has not verified any real public hostname, DNS
+record, certificate, firewall policy, running reverse proxy, external port
+scan, or Internet acceptance test. The `.invalid` names and documentation IPs
+in the examples are placeholders. A specific host remains unverified until an
+operator completes and records every applicable acceptance test below.
+
 The portal is deliberately limited:
 
 - read-only directory listing and regular-file download;
@@ -26,14 +33,37 @@ The portal is deliberately limited:
 - bounded directory listings, strict browser CSP, no-store responses, and no
   external browser assets.
 
+The dedicated application server treats 30 seconds without a successful file
+write as a stalled download. A cumulative budget also requires at least 64 KiB
+per second after a 30-second grace period. Each bounded file-body write can
+refresh the idle deadline, so this is not an absolute total-transfer cutoff;
+clients that keep acceptable progress may continue for longer than one hour.
+These limits protect the finite download slots and do not replace the edge
+connection/rate controls or target-host cancellation tests below.
+
 There is intentionally no weaker fallback. Enabling the portal on a kernel or
-seccomp profile without the required `openat2` policy makes startup fail.
+seccomp profile without the required `openat2` policy makes startup fail. A
+real procfs mounted at `/proc` is also required: token and download files are
+first pinned with `O_PATH`, then reopened only through the internally generated
+`/proc/self/fd/<fd>` path and revalidated. The required token read probes this
+mechanism during portal initialization, so an unavailable procfd mechanism
+also fails startup.
 
 ## 1. Prepare the share and token
 
 Use a dedicated directory containing only files approved for public download.
 Do not point it at a home directory, `/DATA`, an application-data tree, backup
 root, secrets directory, or a writable upload staging area.
+
+Use a reviewed local filesystem for this root. FUSE, NFS, CIFS/SMB and other
+potentially blocking network or userspace filesystems are not public-ready:
+socket deadlines cannot interrupt a kernel filesystem read that never returns.
+Such a syscall can retain its in-process download slot until the syscall
+returns; the progress budget only bounds response writes.
+Fail-closed filesystem isolation is tracked separately in
+[ReCasaOS issue #22](https://github.com/EdmundFu-233/ReCasaOS/issues/22);
+until it is implemented and validated, keep those filesystem types outside the
+portal root.
 
 Example (replace the service account if ReCasaOS does not run as root):
 
@@ -110,6 +140,20 @@ Before enabling either:
 8. Keep the edge proxy on a currently supported, fully patched release. The
    Caddy minimum is a security boundary, not permission to defer later patches.
 
+Keep Caddy's `flush_interval` unset as the supplied example does. Caddy's
+default behavior partially buffers responses and allows a downstream client
+disconnect to cancel the loopback upstream request. A negative value such as
+`flush_interval -1` disables that buffering but also keeps the upstream request
+running after the client has gone away; do not reintroduce it for downloads.
+
+In the Nginx example, `proxy_read_timeout 3600s` is an upstream-read idle
+timeout: it applies between two successive read operations, not to the total
+response duration. A continuously progressing download does not expire merely
+because its total duration exceeds one hour, although application and other
+edge deadlines still apply. The example also leaves `proxy_ignore_client_abort`
+at its default `off`, so Nginx does not intentionally keep the loopback
+upstream request alive after the downstream client disconnects.
+
 The Nginx example includes per-client request and connection limits. Stock
 Caddy has no equivalent request-rate limiter in the supplied example; a public
 Caddy deployment therefore requires a separate, reviewed rate-limiting
@@ -147,13 +191,15 @@ token in the URL. Also verify:
 | Authentication | Missing, malformed, duplicate, wrong, query-string, and rotated tokens fail without revealing why. |
 | Path confinement | Absolute/parent/encoded traversal, hidden names, symlinks, hardlinks, mount points, devices, pipes, and sockets cannot be listed or downloaded. |
 | Browser boundary | CSP has no inline/eval allowance; token remains in `sessionStorage`; hostile framing/origin cannot read responses. |
-| Response handling | GET, HEAD, and ranges work; private files return `no-store`, `nosniff`, and attachment headers. |
+| Response handling | GET, HEAD, and one byte range work, including offsets above 4 GiB; multi-range work is rejected; 401/404/416/503 and successful private-file responses retain `no-store` and `nosniff`. A progressing transfer can cross the base write timeout, while idle and below-budget clients are terminated. |
+| Client cancellation | After a large response starts, abort the client and verify that the chosen edge promptly closes its loopback upstream request and releases portal download capacity. Test both HTTP/1.1 and HTTP/2 at the public edge when both are enabled. |
 | Resource bounds | Oversized directory and request-body tests fail; slow clients do not exhaust all edge connections. Nginx rate/connection limits or the separately reviewed Caddy-fronting limiter are exercised. |
 | Logs | No bearer token, query, private host path, file content, cookie, or personal data appears in edge/application logs. |
 | Backups | Share and configuration can be restored to an isolated host with recorded checksums and acceptable RPO/RTO. |
 
-Any failed row blocks public DNS/exposure. Retest after every routing, auth,
-kernel, proxy, installer, or component change.
+Any failed row blocks public DNS/exposure. Passing repository static tests does
+not satisfy this target-host matrix. Retest after every routing, auth, kernel,
+proxy, installer, or component change.
 
 ## Operational limits
 

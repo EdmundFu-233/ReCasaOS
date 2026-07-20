@@ -18,6 +18,13 @@ import (
 
 const resolveUnderRoot = unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_XDEV
 
+var (
+	errPinnedObjectNotRegular = errors.New("pinned object is not a single-link regular file")
+	errPinnedIdentityChanged  = errors.New("pinned regular file identity changed during reopen")
+)
+
+type pinnedRegularReopener func(int) (int, error)
+
 type secureRoot struct {
 	file *os.File
 }
@@ -63,32 +70,34 @@ func openSecureRoot(absolutePath string) (*secureRoot, error) {
 }
 
 func readTokenFileSecure(absolutePath string) ([]byte, error) {
+	return readTokenFileSecureWith(absolutePath, reopenPinnedRegular)
+}
+
+func readTokenFileSecureWith(absolutePath string, reopen pinnedRegularReopener) ([]byte, error) {
 	rootFD, err := unix.Open("/", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, ErrUnsupported
 	}
 	defer unix.Close(rootFD)
 
-	fd, err := unix.Openat2(rootFD, strings.TrimPrefix(absolutePath, "/"), &unix.OpenHow{
-		Flags:   uint64(unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW | unix.O_NONBLOCK),
-		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_SYMLINKS,
-	})
+	fd, stat, err := openPinnedRegular(func() (int, error) {
+		return unix.Openat2(rootFD, strings.TrimPrefix(absolutePath, "/"), &unix.OpenHow{
+			Flags:   uint64(unix.O_PATH | unix.O_CLOEXEC | unix.O_NOFOLLOW),
+			Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_SYMLINKS,
+		})
+	}, reopen)
 	if err != nil {
 		if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EINVAL) {
 			return nil, ErrUnsupported
+		}
+		if errors.Is(err, errPinnedObjectNotRegular) || errors.Is(err, errPinnedIdentityChanged) {
+			return nil, errors.New("token file must be a stable single-link regular file")
 		}
 		return nil, errors.New("cannot securely open token file")
 	}
 	file := os.NewFile(uintptr(fd), "public-file-token")
 	defer file.Close()
 
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil {
-		return nil, errors.New("cannot inspect token file")
-	}
-	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 {
-		return nil, errors.New("token file must be a single-link regular file")
-	}
 	if stat.Uid != uint32(os.Geteuid()) {
 		return nil, errors.New("token file must be owned by the service user")
 	}
@@ -205,14 +214,18 @@ func (r *secureRoot) list(relative string, maxEntries int) ([]Entry, error) {
 }
 
 func (r *secureRoot) openRegular(relative string) (*os.File, fileInfo, error) {
-	fd, err := r.open(relative, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK)
+	return r.openRegularWith(relative, reopenPinnedRegular)
+}
+
+func (r *secureRoot) openRegularWith(relative string, reopen pinnedRegularReopener) (*os.File, fileInfo, error) {
+	fd, _, err := openPinnedRegular(func() (int, error) {
+		return r.open(relative, unix.O_PATH|unix.O_CLOEXEC|unix.O_NOFOLLOW)
+	}, reopen)
 	if err != nil {
+		if errors.Is(err, errPinnedObjectNotRegular) || errors.Is(err, errPinnedIdentityChanged) {
+			return nil, nil, unix.EPERM
+		}
 		return nil, nil, err
-	}
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 {
-		unix.Close(fd)
-		return nil, nil, unix.EPERM
 	}
 	file := os.NewFile(uintptr(fd), "public-file")
 	info, err := file.Stat()
@@ -225,6 +238,68 @@ func (r *secureRoot) openRegular(relative string) (*os.File, fileInfo, error) {
 		return nil, nil, unix.EPERM
 	}
 	return file, info, nil
+}
+
+// openPinnedRegular first fixes the name to an O_PATH descriptor, validates
+// that descriptor without invoking the target's data-open operation, and only
+// then reopens that exact descriptor for reading. The procfd path is generated
+// exclusively from a live descriptor; callers must never substitute a
+// user-controlled pathname or fall back to opening the original pathname.
+func openPinnedRegular(pin func() (int, error), reopen pinnedRegularReopener) (int, unix.Stat_t, error) {
+	var zero unix.Stat_t
+	pinnedFD, err := pin()
+	if err != nil {
+		return -1, zero, err
+	}
+	defer unix.Close(pinnedFD)
+
+	var before unix.Stat_t
+	if err := unix.Fstat(pinnedFD, &before); err != nil {
+		return -1, zero, fmt.Errorf("inspect pinned file: %w", err)
+	}
+	if !isSingleLinkRegular(&before) {
+		return -1, zero, errPinnedObjectNotRegular
+	}
+	if reopen == nil {
+		return -1, zero, errors.New("pinned regular file reopener is unavailable")
+	}
+
+	dataFD, err := reopen(pinnedFD)
+	if err != nil {
+		return -1, zero, fmt.Errorf("reopen pinned regular file: %w", err)
+	}
+	closeData := true
+	defer func() {
+		if closeData {
+			_ = unix.Close(dataFD)
+		}
+	}()
+
+	var after unix.Stat_t
+	if err := unix.Fstat(dataFD, &after); err != nil {
+		return -1, zero, fmt.Errorf("inspect reopened regular file: %w", err)
+	}
+	if !isSingleLinkRegular(&after) {
+		return -1, zero, errPinnedObjectNotRegular
+	}
+	if before.Dev != after.Dev || before.Ino != after.Ino {
+		return -1, zero, errPinnedIdentityChanged
+	}
+
+	closeData = false
+	return dataFD, after, nil
+}
+
+func reopenPinnedRegular(pinnedFD int) (int, error) {
+	return unix.Open(
+		fmt.Sprintf("/proc/self/fd/%d", pinnedFD),
+		unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NONBLOCK,
+		0,
+	)
+}
+
+func isSingleLinkRegular(stat *unix.Stat_t) bool {
+	return stat != nil && stat.Mode&unix.S_IFMT == unix.S_IFREG && stat.Nlink == 1
 }
 
 func isHiddenFilesystemError(err error) bool {

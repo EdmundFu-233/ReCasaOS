@@ -52,7 +52,10 @@ https://recasaos.example.invalid {
 			header_up X-Real-IP {remote_host}
 			header_up X-Forwarded-For {remote_host}
 			header_up X-Forwarded-Proto https
-			flush_interval -1
+
+			# Keep Caddy's default response buffering and cancellation behavior.
+			# A negative flush_interval keeps the upstream request running after
+			# a client disconnects; leaving it unset lets cancellation propagate.
 
 			transport http {
 				dial_timeout 5s
