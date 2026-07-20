@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"strconv"
 	"strings"
@@ -14,44 +15,41 @@ import (
 )
 
 const (
-	maxManagedTransferInventoryEntries    = 4_096
-	maxManagedTransferInventoryCandidates = 128
+	maxManagedTransferInventoryEntries     = 4_096
+	maxManagedTransferInventoryCandidates  = 128
+	managedTransferInventoryDirectoryFlags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NONBLOCK | unix.O_NOATIME
 )
 
 // InventoryManagedTransferTransactions performs a bounded, single-directory,
 // read-only observation below the startup-pinned management roots. It never
-// recursively scans, changes metadata, synchronizes, renames, or removes an
-// entry. A returned item is therefore evidence for operator review only.
+// recursively scans or intentionally changes content, namespace, permissions,
+// or durability state. Directory descriptors require O_NOATIME and fail closed
+// rather than falling back. A returned item is evidence for review only.
 func (m *ManagedRoots) InventoryManagedTransferTransactions(parentPath string) (ManagedTransferInventoryResult, error) {
 	result := ManagedTransferInventoryResult{
 		Parent:   parentPath,
 		Items:    make([]ManagedTransferInventoryItem, 0),
 		Complete: true,
 	}
-	release, err := m.AcquireMutation()
+	rootDescriptors, selectedRoot, location, baselineGeneration, err := m.snapshotManagedTransferInventoryRoots(parentPath)
 	if err != nil {
 		return result, err
 	}
-	defer release()
-
-	root, location, err := m.resolveLocked(parentPath)
-	if err != nil {
-		return result, err
-	}
+	defer closeManagedTransferInventoryRoots(rootDescriptors)
 	result.Parent = location.Canonical
-	parent, err := openManagedAt(root, location, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NONBLOCK, 0)
+	if m.inventoryAfterRootSnapshot != nil {
+		if err := m.inventoryAfterRootSnapshot(); err != nil {
+			return result, err
+		}
+	}
+	parent, err := openManagedAtFD(rootDescriptors[selectedRoot].fd, location, managedTransferInventoryDirectoryFlags, 0)
 	if err != nil {
 		return result, err
 	}
 	defer parent.Close()
-	if err := m.validateManagedDestinationFD(root, int(parent.Fd()), location); err != nil {
+	if err := validateManagedDestinationDescriptors(rootDescriptors, selectedRoot, int(parent.Fd()), location); err != nil {
 		return result, err
 	}
-	rootFD, err := unix.FcntlInt(root.file.Fd(), unix.F_DUPFD_CLOEXEC, 0)
-	if err != nil {
-		return result, err
-	}
-	defer unix.Close(rootFD)
 	var parentBefore unix.Stat_t
 	if err := unix.Fstat(int(parent.Fd()), &parentBefore); err != nil {
 		return result, err
@@ -60,13 +58,6 @@ func (m *ManagedRoots) InventoryManagedTransferTransactions(parentPath string) (
 	if err != nil {
 		return result, err
 	}
-	baselineGeneration := m.mutationGeneration.Load()
-	// Do not hold the global mutation lease while a user-selected mount is
-	// enumerated. A stalled remote/FUSE syscall must not freeze all managed
-	// writes or Close. Descriptor/name checks and the mutation generation make
-	// any concurrent change an incomplete or unverified observation.
-	release()
-
 	scanComplete := false
 	for {
 		entries, readErr := parent.ReadDir(256)
@@ -98,13 +89,74 @@ func (m *ManagedRoots) InventoryManagedTransferTransactions(parentPath string) (
 			break
 		}
 	}
-	if !revalidateManagedTransferInventoryParent(rootFD, location.Relative, parent, &parentBefore, parentMountID) {
+	if !revalidateManagedTransferInventoryParent(rootDescriptors[selectedRoot].fd, location.Relative, parent, &parentBefore, parentMountID) {
 		markManagedTransferInventoryIncomplete(&result, false, ManagedTransferFindingParentIdentityChanged)
 	}
-	if m.mutationGeneration.Load() != baselineGeneration {
+	currentGeneration := m.mutationGeneration.Load()
+	if baselineGeneration&1 != 0 || currentGeneration != baselineGeneration || currentGeneration&1 != 0 {
 		markManagedTransferInventoryIncomplete(&result, false, ManagedTransferFindingConcurrentMutation)
 	}
 	return result, nil
+}
+
+// snapshotManagedTransferInventoryRoots duplicates only the startup-pinned
+// O_PATH descriptors while holding m.mu. Every operation that can touch a
+// user-selected mount happens after the lock is released, so a stalled
+// remote/FUSE mount cannot freeze unrelated mutations or ManagedRoots.Close.
+func (m *ManagedRoots) snapshotManagedTransferInventoryRoots(parentPath string) ([]managedRootDescriptor, int, ManagedLocation, uint64, error) {
+	if m == nil {
+		return nil, -1, ManagedLocation{}, 0, ErrManagedPathOutsideRoots
+	}
+	m.mu.RLock()
+	if m.closed {
+		m.mu.RUnlock()
+		return nil, -1, ManagedLocation{}, 0, fs.ErrClosed
+	}
+	rootDescriptors := make([]managedRootDescriptor, 0, len(m.roots))
+	for index := range m.roots {
+		fd, duplicateErr := unix.FcntlInt(m.roots[index].file.Fd(), unix.F_DUPFD_CLOEXEC, 0)
+		if duplicateErr != nil {
+			m.mu.RUnlock()
+			closeManagedTransferInventoryRoots(rootDescriptors)
+			return nil, -1, ManagedLocation{}, 0, duplicateErr
+		}
+		rootDescriptors = append(rootDescriptors, managedRootDescriptor{path: m.roots[index].path, fd: fd})
+	}
+	// Sample before releasing m.mu. Close cannot complete between the descriptor
+	// snapshot and this sample; an already active mutation has an odd value.
+	baselineGeneration := m.mutationGeneration.Load()
+	m.mu.RUnlock()
+
+	paths := make([]string, len(rootDescriptors))
+	for index := range rootDescriptors {
+		paths[index] = rootDescriptors[index].path
+	}
+	location, err := MatchManagementPath(paths, parentPath)
+	if err != nil {
+		closeManagedTransferInventoryRoots(rootDescriptors)
+		return nil, -1, ManagedLocation{}, 0, err
+	}
+	selectedRoot := -1
+	for index := range rootDescriptors {
+		if rootDescriptors[index].path == location.Root {
+			selectedRoot = index
+			break
+		}
+	}
+	if selectedRoot < 0 {
+		closeManagedTransferInventoryRoots(rootDescriptors)
+		return nil, -1, ManagedLocation{}, 0, ErrManagedPathOutsideRoots
+	}
+	return rootDescriptors, selectedRoot, location, baselineGeneration, nil
+}
+
+func closeManagedTransferInventoryRoots(roots []managedRootDescriptor) {
+	for index := range roots {
+		if roots[index].fd >= 0 {
+			_ = unix.Close(roots[index].fd)
+			roots[index].fd = -1
+		}
+	}
 }
 
 func markManagedTransferInventoryIncomplete(result *ManagedTransferInventoryResult, truncated bool, finding string) {
@@ -146,7 +198,7 @@ func (m *ManagedRoots) inspectManagedTransferTransaction(parentFD int, parentMou
 		RecoveryRole:  ManagedTransferRecoveryRoleUnknown,
 	}
 	transactionFD, err := unix.Openat2(parentFD, name, &unix.OpenHow{
-		Flags:   unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC | unix.O_NOFOLLOW | unix.O_NONBLOCK,
+		Flags:   managedTransferInventoryDirectoryFlags | unix.O_CLOEXEC | unix.O_NOFOLLOW,
 		Resolve: managedResolvePolicy,
 	})
 	if err != nil {
@@ -283,7 +335,7 @@ func revalidateManagedTransferInventoryParent(rootFD int, relative string, paren
 		return false
 	}
 	reopenedFD, err := unix.Openat2(rootFD, relative, &unix.OpenHow{
-		Flags:   unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC | unix.O_NOFOLLOW | unix.O_NONBLOCK,
+		Flags:   unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC | unix.O_NOFOLLOW,
 		Resolve: managedResolvePolicy,
 	})
 	if err != nil {

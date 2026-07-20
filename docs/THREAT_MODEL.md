@@ -114,9 +114,13 @@ on a proven allowlisted local filesystem is `EEXIST` handled as the explicit
 conflict policy.
 An authenticated management endpoint can now inventory exact-format retained
 transactions under one explicitly selected parent. The observation is bounded,
-single-level, descriptor-relative, no-follow, and strictly read-only. It reports
-only `empty_unclassified`, `entry_present_unclassified`, or `unverified`, with
-the recovery role always `unknown`; it never reports an entry as safe to delete.
+single-level, descriptor-relative, and no-follow. It never intentionally changes
+content, namespace, permissions, or durability state. Directory enumeration
+requires `O_NOATIME` and fails closed instead of retrying without it; a remote
+filesystem server can still maintain access metadata outside the process's
+control. It reports only `empty_unclassified`, `entry_present_unclassified`, or
+`unverified`, with the recovery role always `unknown`; it never reports an entry
+as safe to delete.
 Non-standard names created by an external rename cannot be discovered without a
 durable ledger, and incomplete or truncated observations remain manual-review
 evidence. Startup reconciliation, role classification, filesystem capability

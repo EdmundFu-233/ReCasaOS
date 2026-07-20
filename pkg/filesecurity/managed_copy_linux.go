@@ -596,7 +596,29 @@ func (m *ManagedRoots) validateManagedDestinationFD(selectedRoot *managedRoot, d
 	if selectedRoot == nil || location.Root != selectedRoot.path {
 		return fmt.Errorf("%w: destination root selection changed", ErrUnsafePath)
 	}
-	withinSelected, err := managedDescriptorIsAncestorOrSame(int(selectedRoot.file.Fd()), destinationFD)
+	rootDescriptors := make([]managedRootDescriptor, len(m.roots))
+	selectedIndex := -1
+	for index := range m.roots {
+		rootDescriptors[index] = managedRootDescriptor{
+			path: m.roots[index].path,
+			fd:   int(m.roots[index].file.Fd()),
+		}
+		if &m.roots[index] == selectedRoot {
+			selectedIndex = index
+		}
+	}
+	return validateManagedDestinationDescriptors(rootDescriptors, selectedIndex, destinationFD, location)
+}
+
+// validateManagedDestinationDescriptors is the descriptor-only form of the
+// configured-root topology check. Callers must keep every supplied descriptor
+// open for the duration of the call.
+func validateManagedDestinationDescriptors(roots []managedRootDescriptor, selectedIndex, destinationFD int, location ManagedLocation) error {
+	if selectedIndex < 0 || selectedIndex >= len(roots) || location.Root != roots[selectedIndex].path {
+		return fmt.Errorf("%w: destination root selection changed", ErrUnsafePath)
+	}
+	selectedRoot := roots[selectedIndex]
+	withinSelected, err := managedDescriptorIsAncestorOrSame(selectedRoot.fd, destinationFD)
 	if err != nil {
 		return err
 	}
@@ -611,13 +633,13 @@ func (m *ManagedRoots) validateManagedDestinationFD(selectedRoot *managedRoot, d
 	if err != nil {
 		return err
 	}
-	selectedMountID, err := managedMountIDAt(int(selectedRoot.file.Fd()), "", unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
+	selectedMountID, err := managedMountIDAt(selectedRoot.fd, "", unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
 	if err != nil {
 		return err
 	}
-	for i := range m.roots {
-		other := &m.roots[i]
-		if other == selectedRoot {
+	for index := range roots {
+		other := roots[index]
+		if index == selectedIndex {
 			continue
 		}
 		// A more-specific configured root is legitimately nested beneath a
@@ -628,13 +650,13 @@ func (m *ManagedRoots) validateManagedDestinationFD(selectedRoot *managedRoot, d
 			continue
 		}
 		var otherStat unix.Stat_t
-		if err := unix.Fstat(int(other.file.Fd()), &otherStat); err != nil {
+		if err := unix.Fstat(other.fd, &otherStat); err != nil {
 			return err
 		}
 		if managedStatSameObject(&destinationStat, &otherStat) {
 			return fmt.Errorf("%w: destination descriptor aliases configured root %q", ErrUnsafePath, other.path)
 		}
-		insideOther, err := managedDescriptorIsAncestorOrSame(int(other.file.Fd()), destinationFD)
+		insideOther, err := managedDescriptorIsAncestorOrSame(other.fd, destinationFD)
 		if err != nil {
 			return err
 		}

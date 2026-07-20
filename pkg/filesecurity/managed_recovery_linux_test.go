@@ -251,6 +251,230 @@ func TestManagedTransferInventoryDoesNotHoldMutationLeaseWhileScanning(t *testin
 	}
 }
 
+func TestManagedTransferInventoryDoesNotBlockCloseAfterRootSnapshot(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "destination")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	roots := openManagedRecoveryTestRoots(t, root)
+	entered := make(chan struct{})
+	resume := make(chan struct{})
+	roots.inventoryAfterRootSnapshot = func() error {
+		close(entered)
+		<-resume
+		return nil
+	}
+	type inventoryOutcome struct {
+		result ManagedTransferInventoryResult
+		err    error
+	}
+	outcome := make(chan inventoryOutcome, 1)
+	go func() {
+		result, inventoryErr := roots.InventoryManagedTransferTransactions(parent)
+		outcome <- inventoryOutcome{result: result, err: inventoryErr}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		close(resume)
+		t.Fatal("inventory did not finish its root snapshot")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- roots.Close() }()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			close(resume)
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		close(resume)
+		t.Fatal("inventory held a ManagedRoots lock after duplicating root descriptors")
+	}
+	close(resume)
+	completed := <-outcome
+	if completed.err != nil {
+		t.Fatal(completed.err)
+	}
+	if completed.result.Complete || !managedRecoveryHasFinding(completed.result, ManagedTransferFindingConcurrentMutation) {
+		t.Fatalf("close-overlap inventory = %+v", completed.result)
+	}
+}
+
+func TestManagedTransferInventoryDoesNotWaitForActiveMutationLease(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "destination")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	roots := openManagedRecoveryTestRoots(t, root)
+	release, err := roots.AcquireMutation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	type inventoryOutcome struct {
+		result ManagedTransferInventoryResult
+		err    error
+	}
+	outcome := make(chan inventoryOutcome, 1)
+	go func() {
+		result, inventoryErr := roots.InventoryManagedTransferTransactions(parent)
+		outcome <- inventoryOutcome{result: result, err: inventoryErr}
+	}()
+	select {
+	case completed := <-outcome:
+		if completed.err != nil {
+			t.Fatal(completed.err)
+		}
+		if completed.result.Complete || !managedRecoveryHasFinding(completed.result, ManagedTransferFindingConcurrentMutation) {
+			t.Fatalf("active mutation inventory = %+v", completed.result)
+		}
+	case <-time.After(2 * time.Second):
+		release()
+		t.Fatal("inventory waited for the global mutation lease while pinning its parent")
+	}
+}
+
+func TestManagedMutationGenerationIsOddOnlyWhileLeaseIsActive(t *testing.T) {
+	root := t.TempDir()
+	roots := openManagedRecoveryTestRoots(t, root)
+	before := roots.mutationGeneration.Load()
+	if before&1 != 0 {
+		t.Fatalf("initial mutation generation = %d", before)
+	}
+	release, err := roots.AcquireMutation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	during := roots.mutationGeneration.Load()
+	if during != before+1 || during&1 == 0 {
+		release()
+		t.Fatalf("active mutation generation = %d, before = %d", during, before)
+	}
+	release()
+	after := roots.mutationGeneration.Load()
+	if after != before+2 || after&1 != 0 {
+		t.Fatalf("released mutation generation = %d, before = %d", after, before)
+	}
+	release()
+	if repeated := roots.mutationGeneration.Load(); repeated != after {
+		t.Fatalf("repeated release changed generation: before=%d after=%d", after, repeated)
+	}
+	if err := roots.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if closed := roots.mutationGeneration.Load(); closed != after+2 || closed&1 != 0 {
+		t.Fatalf("closed mutation generation = %d, released = %d", closed, after)
+	}
+}
+
+func TestManagedTransferInventoryRootSnapshotSurvivesManagedRootsClose(t *testing.T) {
+	firstRoot := t.TempDir()
+	secondRoot := t.TempDir()
+	parent := filepath.Join(secondRoot, "destination")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := OpenManagementFileRoots([]string{firstRoot, secondRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptors, selected, location, _, err := roots.snapshotManagedTransferInventoryRoots(parent)
+	if err != nil {
+		_ = roots.Close()
+		t.Fatal(err)
+	}
+	defer closeManagedTransferInventoryRoots(descriptors)
+	if len(descriptors) != 2 || selected < 0 || selected >= len(descriptors) {
+		_ = roots.Close()
+		t.Fatalf("root snapshot = %+v, selected=%d", descriptors, selected)
+	}
+	if err := roots.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for index := range descriptors {
+		var stat unix.Stat_t
+		if err := unix.Fstat(descriptors[index].fd, &stat); err != nil {
+			t.Fatalf("duplicated root %d did not survive Close: %v", index, err)
+		}
+	}
+	opened, err := openManagedAtFD(descriptors[selected].fd, location, unix.O_PATH|unix.O_DIRECTORY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	if err := validateManagedDestinationDescriptors(descriptors, selected, int(opened.Fd()), location); err != nil {
+		t.Fatalf("snapshot topology validation failed: %v", err)
+	}
+	if err := validateManagedDestinationDescriptors(descriptors, -1, int(opened.Fd()), location); !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("invalid selected root error = %v", err)
+	}
+}
+
+func TestManagedTransferInventoryRequiresNoAtimeDirectoryDescriptors(t *testing.T) {
+	if managedTransferInventoryDirectoryFlags&unix.O_NOATIME == 0 {
+		t.Fatal("inventory directory reads can update forensic access times")
+	}
+}
+
+func TestManagedTransferInventoryPreservesLocalDirectoryAccessTimes(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "destination")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var filesystem unix.Statfs_t
+	if err := unix.Statfs(parent, &filesystem); err != nil {
+		t.Fatal(err)
+	}
+	switch uint32(filesystem.Type) {
+	case uint32(unix.NFS_SUPER_MAGIC), uint32(unix.CIFS_SUPER_MAGIC), uint32(unix.SMB_SUPER_MAGIC), uint32(unix.SMB2_SUPER_MAGIC), uint32(unix.FUSE_SUPER_MAGIC):
+		t.Skip("remote or userspace filesystem controls access-time semantics")
+	}
+	if filesystem.Flags&(unix.ST_NOATIME|unix.ST_NODIRATIME) != 0 {
+		t.Skip("mount options already suppress directory access-time updates")
+	}
+	transaction := filepath.Join(parent, managedRecoveryTestName(45))
+	if err := os.Mkdir(transaction, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-72 * time.Hour).Truncate(time.Second)
+	for _, path := range []string{parent, transaction} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	beforeParent := managedRecoveryAccessTime(t, parent)
+	beforeTransaction := managedRecoveryAccessTime(t, transaction)
+
+	roots := openManagedRecoveryTestRoots(t, root)
+	result, err := roots.InventoryManagedTransferTransactions(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Complete || len(result.Items) != 1 {
+		t.Fatalf("inventory = %+v", result)
+	}
+	if after := managedRecoveryAccessTime(t, parent); after != beforeParent {
+		t.Fatalf("parent access time changed: before=%+v after=%+v", beforeParent, after)
+	}
+	if after := managedRecoveryAccessTime(t, transaction); after != beforeTransaction {
+		t.Fatalf("transaction access time changed: before=%+v after=%+v", beforeTransaction, after)
+	}
+}
+
+func managedRecoveryAccessTime(t *testing.T, path string) unix.Timespec {
+	t.Helper()
+	var stat unix.Stat_t
+	if err := unix.Stat(path, &stat); err != nil {
+		t.Fatal(err)
+	}
+	return stat.Atim
+}
+
 func TestManagedTransferInventoryReportsCandidateLimitWithoutClaimingCompleteness(t *testing.T) {
 	root := t.TempDir()
 	parent := filepath.Join(root, "destination")
@@ -265,9 +489,17 @@ func TestManagedTransferInventoryReportsCandidateLimitWithoutClaimingCompletenes
 
 	roots := openManagedRecoveryTestRoots(t, root)
 	var generationOnce sync.Once
+	var mutationErr error
 	roots.inventoryAfterOpen = func(int, string) error {
-		generationOnce.Do(func() { roots.mutationGeneration.Add(1) })
-		return nil
+		generationOnce.Do(func() {
+			release, err := roots.AcquireMutation()
+			if err != nil {
+				mutationErr = err
+				return
+			}
+			release()
+		})
+		return mutationErr
 	}
 	result, err := roots.InventoryManagedTransferTransactions(parent)
 	if err != nil {

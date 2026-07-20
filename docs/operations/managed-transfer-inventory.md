@@ -24,6 +24,23 @@ The request accepts exactly one canonical absolute parent below
 children and only names matching `.recasaos-transfer-` followed by 32 lowercase
 hexadecimal characters. It does not recursively scan a root or mount.
 
+The service opens every directory it enumerates with Linux `O_NOATIME` and does
+not retry without that flag. If the service lacks the ownership or capability
+required for `O_NOATIME`, opening the selected parent fails with the generic
+unavailable response; failure on a candidate produces `unverified` with
+`candidate_open_failed`. This prevents local Linux access-time updates under the
+tested filesystems, but a remote filesystem server may still maintain access
+metadata outside ReCasaOS's control. The endpoint never intentionally changes
+content, namespace, permissions, or durability state; its response is not a
+general metadata-neutral or forensic chain-of-custody proof.
+
+Before touching the selected path, inventory duplicates all configured root
+descriptors under a short in-memory lock. It does not hold the global managed
+mutation lock, or the root-state lock, across path resolution, topology checks,
+directory reads, or descriptor cleanup. An overlapping in-process managed
+mutation or root close adds `concurrent_mutation` and makes the snapshot
+incomplete; arbitrary external writers remain a trusted-host residual.
+
 Each item has one of these observed shapes:
 
 - `empty_unclassified`: a descriptor-bound, service-owned mode-0700 directory

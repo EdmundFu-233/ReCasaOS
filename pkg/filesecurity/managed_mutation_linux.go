@@ -31,13 +31,14 @@ func (m *ManagedRoots) AcquireMutation() (func(), error) {
 		m.mutationMu.Unlock()
 		return nil, fs.ErrClosed
 	}
-	// Inventory snapshots sample this generation after pinning their parent.
-	// Increment on acquisition so an operation that remains in flight at the
-	// end of an inventory cannot be mistaken for a quiescent interval.
+	// The generation is even while quiescent and odd while a serialized
+	// mutation is active. Inventory snapshots can therefore detect an operation
+	// that began before their first sample and remains in flight at the end.
 	m.mutationGeneration.Add(1)
 	var once sync.Once
 	return func() {
 		once.Do(func() {
+			m.mutationGeneration.Add(1)
 			m.mutationMu.Unlock()
 		})
 	}, nil
