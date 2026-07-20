@@ -151,14 +151,7 @@ func main() {
 			panic(err)
 		}
 		publicListener = netutil.LimitListener(publicListener, 96)
-		publicServer := &http.Server{
-			Handler:           publicFilePortal,
-			ReadHeaderTimeout: 5 * time.Second,
-			ReadTimeout:       15 * time.Second,
-			WriteTimeout:      time.Hour,
-			IdleTimeout:       30 * time.Second,
-			MaxHeaderBytes:    32 << 10,
-		}
+		publicServer := publicfiles.NewHTTPServer(publicFilePortal)
 		defer publicServer.Close()
 		go func() {
 			if err := publicServer.Serve(publicListener); err != nil && err != http.ErrServerClosed {

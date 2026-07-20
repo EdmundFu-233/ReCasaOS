@@ -163,6 +163,7 @@ func (p *Portal) Close() error {
 }
 
 func (p *Portal) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w = &securityResponseWriter{ResponseWriter: w}
 	setSecurityHeaders(w.Header())
 
 	switch r.URL.Path {
@@ -186,6 +187,27 @@ func (p *Portal) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, r, http.StatusNotFound, "not found")
 	}
+}
+
+// securityResponseWriter reapplies the portal policy at the actual header
+// commit boundary. This is required because helpers such as http.ServeContent
+// may delete caching headers while constructing an error response.
+type securityResponseWriter struct {
+	http.ResponseWriter
+}
+
+func (w *securityResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func (w *securityResponseWriter) WriteHeader(status int) {
+	setSecurityHeaders(w.Header())
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *securityResponseWriter) Write(payload []byte) (int, error) {
+	setSecurityHeaders(w.Header())
+	return w.ResponseWriter.Write(payload)
 }
 
 func setSecurityHeaders(header http.Header) {
@@ -301,6 +323,14 @@ func (p *Portal) serveFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
+	// Multi-range work is intentionally rejected even when If-Range might make
+	// the standard library ignore it. The public boundary supports one bounded
+	// byte range only and does not construct multipart responses.
+	if ranges := r.Header.Values("Range"); len(ranges) > 1 || (len(ranges) == 1 && strings.Contains(ranges[0], ",")) {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", info.Size()))
+		writeError(w, r, http.StatusRequestedRangeNotSatisfiable, "multiple ranges are not supported")
+		return
+	}
 
 	filename := pathpkg.Base(relativePath)
 	disposition := mime.FormatMediaType("attachment", map[string]string{"filename": filename})
