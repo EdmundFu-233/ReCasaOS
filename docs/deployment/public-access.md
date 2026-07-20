@@ -33,6 +33,58 @@ The portal is deliberately limited:
 - bounded directory listings, strict browser CSP, no-store responses, and no
   external browser assets.
 
+### Browser download boundary (candidate)
+
+The portal never persists its bearer token. The token exists only in the
+current page's JavaScript memory and is forgotten on logout, page exit, or
+reload; it is not written to cookies, URLs, history, `sessionStorage`,
+`localStorage`, IndexedDB, or the Cache API.
+
+For a large file, a scoped Service Worker first records a 192-bit random,
+single-use correlation nonce bound to the exact portal client, relative path,
+and same-origin file URL for at most 10 seconds. The page then starts an
+ordinary top-level navigation whose fragment contains that non-secret nonce.
+The worker consumes the reservation atomically, challenges only the original
+portal page over a `MessageChannel`, receives the bearer once, removes the
+fragment, and makes one clean same-origin file request with the bearer in the
+`Authorization` header. Redirects fail, credentials are omitted, and the
+worker requires the exact clean URL, 200/206 status, attachment disposition,
+octet-stream type, `no-store`, `nosniff`, and byte-range policy before returning
+the upstream streaming response without calling `blob()`, `arrayBuffer()`,
+cloning, or teeing the body. A restart loses all transient reservations and
+therefore fails closed. Cancellation before response handoff aborts the worker
+fetch; browser download cancellation after handoff must still be verified end
+to end. If the controlled top-level request reaches the server without
+Worker-added authorization, its browser-generated navigation metadata selects
+an empty 204 response, so access remains denied without replacing the portal
+document; ordinary API clients still receive 401.
+
+This uses a top-level attachment navigation because the HTML navigation model
+keeps the existing document when an attachment is handed to the download
+manager, while `frame-ancestors 'none'` deliberately blocks an iframe before
+the attachment branch. It does not depend on Service Worker interception of an
+`<a download>` request or on a navigation `clientId`. See the
+[HTML navigation algorithm](https://html.spec.whatwg.org/multipage/browsing-the-web.html#attempting-to-populate-the-history-entry's-document),
+the [Service Worker fetch-event tests](https://github.com/web-platform-tests/wpt/blob/master/service-workers/service-worker/fetch-event.https.html),
+and the [streaming-response tests](https://github.com/web-platform-tests/wpt/blob/master/service-workers/service-worker/fetch-event-respond-with-readable-stream.https.html).
+
+If that protocol is unavailable before navigation begins, the page permits one
+fallback download at a time only when both listing metadata and the response's
+mandatory `Content-Length` are safe integers no greater than 32 MiB. It counts
+every `ReadableStream` chunk and aborts on an overrun, mismatch, missing body,
+or early EOF before constructing a Blob. The 32 MiB figure is a payload cap,
+not a promise of 32 MiB peak heap use: chunk storage and Blob construction can
+temporarily require roughly two copies plus browser overhead.
+
+This is a candidate implementation for
+[Issue #20](https://github.com/EdmundFu-233/ReCasaOS/issues/20), not evidence of
+cross-browser readiness. Stable Chromium, Firefox, and WebKit still require
+real HTTPS tests covering saved-file contents and names, large/slow-transfer
+memory, two tabs, nonce replay, Worker restart, logout, token rotation,
+redirects, initial Range, transparent retry/resume, and cancellation. The
+current nonce is deliberately one-shot, so a later automatic retry with the
+same URL fails closed rather than silently reusing authorization.
+
 The dedicated application server treats 30 seconds without a successful file
 write as a stalled download. A cumulative budget also requires at least 64 KiB
 per second after a 30-second grace period. Each bounded file-body write can
@@ -190,7 +242,7 @@ token in the URL. Also verify:
 | TLS | Trusted chain and hostname; TLS 1.2/1.3; renewal tested and monitored. |
 | Authentication | Missing, malformed, duplicate, wrong, query-string, and rotated tokens fail without revealing why. |
 | Path confinement | Absolute/parent/encoded traversal, hidden names, symlinks, hardlinks, mount points, devices, pipes, and sockets cannot be listed or downloaded. |
-| Browser boundary | CSP has no inline/eval allowance; token remains in `sessionStorage`; hostile framing/origin cannot read responses. |
+| Browser boundary | CSP has no inline/eval allowance; the bearer exists only in current-page memory and never appears in a URL, Referer, history, cookie, Cache API, Web Storage, IndexedDB, or log. In stable Chromium, Firefox, and WebKit over real HTTPS, verify a large download starts without full-body buffering and preserves bytes/filename; replay, another tab, Worker restart, logout, rotation, redirect, and malformed messages fail closed. Record memory measurements and initial Range, retry/resume, and cancellation results. |
 | Response handling | GET, HEAD, and one byte range work, including offsets above 4 GiB; multi-range work is rejected; 401/404/416/503 and successful private-file responses retain `no-store` and `nosniff`. A progressing transfer can cross the base write timeout, while idle and below-budget clients are terminated. |
 | Client cancellation | After a large response starts, abort the client and verify that the chosen edge promptly closes its loopback upstream request and releases portal download capacity. Test both HTTP/1.1 and HTTP/2 at the public edge when both are enabled. |
 | Resource bounds | Oversized directory and request-body tests fail; slow clients do not exhaust all edge connections. Nginx rate/connection limits or the separately reviewed Caddy-fronting limiter are exercised. |
@@ -205,10 +257,12 @@ proxy, installer, or component change.
 
 The bearer token is a shared capability, not per-person authorization or MFA.
 Use a separate portal/root/token per trust group, rotate tokens regularly, and
-remove access immediately when a recipient leaves. The UI downloads through
-browser memory to keep credentials out of URLs; very large files may be better
-served by a separately reviewed streaming client that can set an Authorization
-header.
+remove access immediately when a recipient leaves. Rotation blocks new
+requests but cannot retract bytes already handed to a browser download manager.
+The native browser-stream candidate keeps the bearer header-only; unsupported
+browsers are limited to the bounded 32 MiB fallback. Until Issue #20's browser
+matrix passes, use a separately reviewed streaming client that can set an
+Authorization header for large files.
 
 For upload, sharing links, expiry, audit identities, per-user policy, previews,
 or remote administration, use a separately isolated and independently tested

@@ -178,6 +178,9 @@ func (p *Portal) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.serveAsset(w, r, "text/html; charset=utf-8", portalHTML)
 	case BasePath + "/app.js":
 		p.serveAsset(w, r, "text/javascript; charset=utf-8", portalJavaScript)
+	case BasePath + "/download-worker.js":
+		w.Header().Set("Service-Worker-Allowed", BasePath+"/")
+		p.serveAsset(w, r, "text/javascript; charset=utf-8", downloadWorkerJavaScript)
 	case BasePath + "/style.css":
 		p.serveAsset(w, r, "text/css; charset=utf-8", portalCSS)
 	case BasePath + "/api/list":
@@ -212,7 +215,7 @@ func (w *securityResponseWriter) Write(payload []byte) (int, error) {
 
 func setSecurityHeaders(header http.Header) {
 	header.Set("Cache-Control", "no-store")
-	header.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+	header.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; worker-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
 	header.Set("Cross-Origin-Opener-Policy", "same-origin")
 	header.Set("Cross-Origin-Resource-Policy", "same-origin")
 	header.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
@@ -290,6 +293,16 @@ func (p *Portal) serveFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !p.authorized(r) {
+		// A controlled top-level download navigation normally receives its
+		// Authorization header from the scoped Service Worker. If that Worker is
+		// replaced or bypassed after the page has prepared the navigation, keep
+		// the existing portal document in place instead of rendering an error
+		// document. Sec-Fetch-* is only a UX/fail-closed signal here; it never
+		// grants access and non-navigation clients retain the normal 401.
+		if r.Method == http.MethodGet && r.Header.Get("Sec-Fetch-Mode") == "navigate" && r.Header.Get("Sec-Fetch-Dest") == "document" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		w.Header().Set("WWW-Authenticate", `Bearer realm="ReCasaOS public files"`)
 		writeError(w, r, http.StatusUnauthorized, "authorization required")
 		return
@@ -333,11 +346,7 @@ func (p *Portal) serveFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	filename := pathpkg.Base(relativePath)
-	disposition := mime.FormatMediaType("attachment", map[string]string{"filename": filename})
-	if disposition == "" {
-		disposition = "attachment"
-	}
-	w.Header().Set("Content-Disposition", disposition)
+	w.Header().Set("Content-Disposition", formatDownloadContentDisposition(filename))
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Accept-Ranges", "bytes")
 	http.ServeContent(w, r, filename, info.ModTime(), file)
@@ -387,11 +396,22 @@ func isSafeVisibleName(value string) bool {
 		return false
 	}
 	for _, character := range value {
-		if unicode.IsControl(character) {
+		if unicode.IsControl(character) || unicode.Is(unicode.Cf, character) {
 			return false
 		}
 	}
 	return true
+}
+
+func formatDownloadContentDisposition(filename string) string {
+	if !isSafeVisibleName(filename) {
+		return "attachment"
+	}
+	disposition := mime.FormatMediaType("attachment", map[string]string{"filename": filename})
+	if disposition == "" {
+		return "attachment"
+	}
+	return disposition
 }
 
 func (p *Portal) authorized(r *http.Request) bool {

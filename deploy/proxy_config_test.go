@@ -49,6 +49,20 @@ func TestCaddyConfigPreservesClientCancellation(t *testing.T) {
 	}
 }
 
+func TestPublicPortalProxyCSPAllowsOnlyRequiredWorkerSource(t *testing.T) {
+	for _, path := range []string{"deploy/caddy/Caddyfile.example", "deploy/nginx/recasaos.conf.example"} {
+		config := repositoryFile(t, path)
+		for _, required := range []string{"default-src 'none'", "worker-src 'self'", "frame-ancestors 'none'"} {
+			if !strings.Contains(config, required) {
+				t.Errorf("%s CSP is missing %q", path, required)
+			}
+		}
+		if strings.Contains(config, "unsafe-inline") || strings.Contains(config, "unsafe-eval") {
+			t.Errorf("%s CSP contains an unsafe script allowance", path)
+		}
+	}
+}
+
 func TestDeploymentGuideStatesProxyTimeoutAndVerificationBoundaries(t *testing.T) {
 	guide := normalizedText(repositoryFile(t, "docs/deployment/public-access.md"))
 	for _, required := range []string{
