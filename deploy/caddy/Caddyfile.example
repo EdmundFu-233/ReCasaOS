@@ -2,8 +2,8 @@
 #
 # REQUIRED before use:
 #   1. Replace recasaos.example.invalid and both documentation IPs.
-#   2. Set RECASAOS_PUBLIC_FILE_LISTEN=127.0.0.1:39777. The portal listener
-#      accepts a literal loopback address only.
+#   2. Install and validate recasaos-public-files.socket. It binds only the
+#      reviewed literal loopback address 127.0.0.1:39777.
 #   3. Keep the management Gateway on a private, firewalled, non-public port.
 #      It is not this edge's upstream.
 #   4. Enable and configure the portal as documented in
@@ -16,10 +16,21 @@
 # reviewed rate-limiting edge/WAF in front before public deployment.
 {
 	auto_https disable_redirects
+
+	# Runtime errors can attach request.uri, including its query string. Filter
+	# the default runtime logger here; a site-level log directive would affect
+	# access logs only.
+	log {
+		format filter {
+			request>uri delete
+		}
+	}
 }
 http://recasaos.example.invalid {
 	bind 203.0.113.10 [2001:db8::10]
-	redir https://recasaos.example.invalid{uri} 308
+	# Do not copy a file-selection query from plaintext HTTP into the redirect.
+	# A mistyped HTTP download URL lands on the HTTPS portal root instead.
+	redir https://recasaos.example.invalid/public-files/ 308
 }
 
 https://recasaos.example.invalid {

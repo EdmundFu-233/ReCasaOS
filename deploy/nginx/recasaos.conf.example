@@ -2,8 +2,8 @@
 # REQUIRED before use:
 #   1. Replace recasaos.example.invalid and the documentation IPs.
 #   2. Replace the certificate paths.
-#   3. Set RECASAOS_PUBLIC_FILE_LISTEN=127.0.0.1:39777. The portal listener
-#      accepts a literal loopback address only.
+#   3. Install and validate recasaos-public-files.socket. It binds only the
+#      reviewed literal loopback address 127.0.0.1:39777.
 #   4. Keep the management Gateway on a private, firewalled, non-public port.
 #      It is not this edge's upstream.
 #   5. Enable the read-only portal as documented in
@@ -31,8 +31,14 @@ server {
     listen [2001:db8::10]:80;
     server_name recasaos.example.invalid;
     access_log /var/log/nginx/recasaos_access.log recasaos_no_query;
+    # Nginx error entries can contain the full request URI. This dedicated
+    # public edge fails closed; use the query-free access log and out-of-band
+    # health/metrics for diagnostics.
+    error_log /dev/null;
 
-    return 308 https://recasaos.example.invalid$request_uri;
+    # Do not copy a file-selection query from plaintext HTTP into the redirect.
+    # A mistyped HTTP download URL lands on the HTTPS portal root instead.
+    return 308 https://recasaos.example.invalid/public-files/;
 }
 
 server {
@@ -43,7 +49,10 @@ server {
 
     server_tokens off;
     access_log /var/log/nginx/recasaos_access.log recasaos_no_query;
-    error_log /var/log/nginx/recasaos_error.log warn;
+    # Nginx error entries can contain the full request URI. This dedicated
+    # public edge fails closed; use the query-free access log and out-of-band
+    # health/metrics for diagnostics.
+    error_log /dev/null;
 
     ssl_certificate /etc/letsencrypt/live/recasaos.example.invalid/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/recasaos.example.invalid/privkey.pem;

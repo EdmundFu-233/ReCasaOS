@@ -30,14 +30,3 @@ func TestValidateListenAddressRequiresLiteralLoopback(t *testing.T) {
 		})
 	}
 }
-
-func TestListenAddressFromEnvDefaultsAndRejectsUnsafeOverride(t *testing.T) {
-	t.Setenv(ListenAddressEnv, "")
-	if got, err := ListenAddressFromEnv(); err != nil || got != DefaultListenAddress {
-		t.Fatalf("default listen address = (%q, %v)", got, err)
-	}
-	t.Setenv(ListenAddressEnv, ":39777")
-	if _, err := ListenAddressFromEnv(); err == nil {
-		t.Fatal("wildcard listener was accepted")
-	}
-}

@@ -31,9 +31,10 @@ The first hardening milestone includes:
   checks;
 - access/refresh JWT issuer separation and protected debug routes;
 - bounded, traversal-resistant multipart uploads and safer streaming downloads;
-- an opt-in, read-only `/public-files` portal confined with Linux `openat2`, a
-  server-owned root, and a header-only bearer whose server-side configuration
-  contains only a versioned SHA-256 verifier;
+- an opt-in, read-only `/public-files` portal confined with Linux `openat2`,
+  served by a separate non-root, systemd-activated process with an isolated
+  network and root filesystem, and authenticated by a header-only bearer whose
+  server-side configuration contains only a versioned SHA-256 verifier;
 - bounded root file/SSH WebSockets, verified local SSH host keys, one-use SSH
   login tickets, and removal of an SSH infinite retry path;
 - capability-bound outbound fetches with exact endpoint allowlists and
@@ -53,16 +54,21 @@ See [the threat model](docs/THREAT_MODEL.md) for the remaining blockers and
 
 The full administrative dashboard is **not ready for unrestricted Internet
 exposure**. Keep it on a private management network or mesh VPN. ReCasaOS now
-has a separate read-only public file portal on a dedicated literal-loopback
-listener (default `127.0.0.1:39777`). The examples in [the public-access
-guide](docs/deployment/public-access.md) proxy only that listener and positive
-route allowlist. Gateway's `/public-files` registration is an intentional 404
-tombstone for stale-route cleanup and is never the portal upstream. A
-particular host is not public-ready until the guide's deployment, restore,
-scanning, and independent-review gates pass. Verifier-only credentials do not
-change that status: [Issue #25](https://github.com/EdmundFu-233/ReCasaOS/issues/25)
-still requires the Internet-facing listener and potentially blocking filesystem
-work to be isolated from the privileged management daemon.
+has a separate read-only public file binary. A systemd socket owns the dedicated
+literal-loopback listener (default `127.0.0.1:39777`) and passes it to a
+non-root service whose network and filesystem views are isolated from the
+privileged CasaOS daemon. The socket is not automatically enabled. The examples
+in [the public-access guide](docs/deployment/public-access.md) proxy only that
+listener and positive route allowlist. Gateway's `/public-files` registration
+is an intentional 404 tombstone for stale-route cleanup and is never the portal
+upstream.
+
+A particular host is not public-ready until the guide's deployment, restore,
+scanning, and independent-review gates pass. The first process split prevents a
+portal crash or restart from stopping the management daemon, but the portal
+service still performs potentially blocking filesystem calls in its long-lived
+process. [Issue #25](https://github.com/EdmundFu-233/ReCasaOS/issues/25) remains
+open for the killable worker and hung-storage acceptance boundary.
 
 The portal's large-file browser stream is still a candidate tracked in
 [Issue #20](https://github.com/EdmundFu-233/ReCasaOS/issues/20). Its client does
@@ -76,11 +82,12 @@ The portal also verifies the already-pinned root descriptor's Linux mount ID
 and filesystem type before it becomes available. Only ext2/3/4, XFS, Btrfs,
 tmpfs, and F2FS are allowlisted; FUSE, network filesystems, overlayfs, ZFS, and
 unknown or unverified types fail startup. There is no unrestricted fallback.
-This keeps unsupported roots out of the in-process download-slot boundary; it
-does not certify the health or locality of an allowlisted filesystem's block
-device. [Issue #22](https://github.com/EdmundFu-233/ReCasaOS/issues/22) remains
-open until the compatibility and blocking-I/O boundary is independently
-verified. Process isolation from the privileged daemon is tracked in
+This keeps unsupported roots out of the isolated service's download-slot
+boundary; it does not certify the health or locality of an allowlisted
+filesystem's block device.
+[Issue #22](https://github.com/EdmundFu-233/ReCasaOS/issues/22) remains open
+until the compatibility and blocking-I/O boundary is independently verified.
+Killable filesystem workers and bounded hung-I/O containment remain tracked in
 [Issue #25](https://github.com/EdmundFu-233/ReCasaOS/issues/25).
 
 The supported credential candidate is verifier-only. Generate the 47-character
@@ -88,11 +95,12 @@ The supported credential candidate is verifier-only. Generate the 47-character
 keep its durable copy only in a password manager, and provision only the strict
 versioned SHA-256 verifier as host credential material. Authorized HTTPS
 requests still carry the bearer transiently to the edge and portal process. The
-host reads the verifier through `RECASAOS_PUBLIC_FILE_VERIFIER_FILE`; when the
-portal is enabled, any non-empty legacy `RECASAOS_PUBLIC_FILE_TOKEN_FILE` value
-fails startup, including when the new setting is also present.
-[Issue #26](https://github.com/EdmundFu-233/ReCasaOS/issues/26)
-remains open until migration, bind-alias, and rotation evidence is reviewed.
+standalone service receives the verifier through systemd `LoadCredential=` and
+a strict CLI path; it has no environment-variable configuration fallback.
+Every non-empty legacy `RECASAOS_PUBLIC_FILE_*` setting fails startup so an old
+root-daemon drop-in cannot silently influence the new boundary. Verifier
+format, bind-alias, rotation, and rollback hardening was completed and reviewed
+in [Issue #26](https://github.com/EdmundFu-233/ReCasaOS/issues/26).
 
 Never expose Samba, SSH, daemon ports, debug/API documentation, setup routes,
 privileged v1/v2/v3 APIs, the dedicated portal listener, or root/Gateway
@@ -117,7 +125,8 @@ for CasaOS storage compatibility, but recursive deletion refuses to cross a
 mount boundary. Treat the host mount namespace and `CAP_SYS_ADMIN` as trusted
 operator controls. Keep the administrative API private/VPN-only even when its
 paths are confined; `RECASAOS_MANAGEMENT_FILE_ROOTS` is not a public sharing
-configuration and is separate from `RECASAOS_PUBLIC_FILE_ROOT`.
+configuration and is separate from the isolated portal share at
+`/srv/recasaos-public`.
 
 Retained `.recasaos-transfer-*` directories are recovery evidence, not ordinary
 temporary files. The [managed transfer inventory guide](docs/operations/managed-transfer-inventory.md)
