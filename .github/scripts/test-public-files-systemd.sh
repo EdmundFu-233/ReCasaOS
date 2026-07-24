@@ -965,7 +965,8 @@ printf 'Authorization: Bearer %s\n' "$test_bearer" |
   curl -q -sS -H @- \
     'http://127.0.0.1:39777/public-files/api/file?path=report.txt' \
     -o "$response_file"
-cmp "$share/report.txt" "$response_file" ||
+printf '%s\n' 'systemd isolation fixture' |
+  cmp - "$response_file" ||
   fail "downloaded bytes differ from the approved file"
 
 for blocked_file in \
