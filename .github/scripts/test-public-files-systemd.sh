@@ -813,9 +813,9 @@ sudo awk -v uid="$service_uid" -v gid="$service_gid" '
 ' "/proc/$portal_pid/status" ||
   fail "runtime UID/GID/capability/seccomp invariants are not satisfied"
 
-root_net_ns="$(stat -Lc %i /proc/1/ns/net)"
+root_net_ns="$(sudo stat -Lc %i /proc/1/ns/net)"
 portal_net_ns="$(sudo stat -Lc %i "/proc/$portal_pid/ns/net")"
-root_mount_ns="$(stat -Lc %i /proc/1/ns/mnt)"
+root_mount_ns="$(sudo stat -Lc %i /proc/1/ns/mnt)"
 portal_mount_ns="$(sudo stat -Lc %i "/proc/$portal_pid/ns/mnt")"
 [[ "$portal_net_ns" != "$root_net_ns" ]] ||
   fail "service still shares PID 1's network namespace"
