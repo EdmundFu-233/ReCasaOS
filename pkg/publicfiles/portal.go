@@ -25,21 +25,21 @@ const (
 
 	DefaultMaxDirectoryEntries = 1_000
 	DefaultMaxActiveDownloads  = 64
-	maxBearerTokenBytes        = 4_096
 )
 
 var (
-	ErrDisabled    = errors.New("public file portal is disabled")
-	ErrUnsupported = errors.New("public file portal requires Linux openat2 and statx mount-ID support")
-	errEntryLimit  = errors.New("directory entry limit exceeded")
+	ErrDisabled              = errors.New("public file portal is disabled")
+	ErrUnsupported           = errors.New("public file portal requires Linux openat2 and statx mount-ID support")
+	ErrLegacyRawBearerConfig = errors.New("RECASAOS_PUBLIC_FILE_TOKEN_FILE is forbidden; configure only a verifier file")
+	errEntryLimit            = errors.New("directory entry limit exceeded")
 )
 
 // Config contains the complete public-file security boundary. Root and
-// TokenFile must be absolute paths. The token is intentionally loaded from a
-// protected file instead of an environment variable.
+// VerifierFile must be absolute paths. The host loads only a SHA-256 verifier;
+// the raw bearer must never be written to the portal host.
 type Config struct {
 	Root         string
-	TokenFile    string
+	VerifierFile string
 	MaxEntries   int
 	MaxDownloads int
 }
@@ -55,10 +55,10 @@ type Entry struct {
 
 // Portal is a read-only http.Handler rooted at a directory descriptor.
 type Portal struct {
-	root          *secureRoot
-	tokenDigest   [sha256.Size]byte
-	maxEntries    int
-	downloadSlots chan struct{}
+	root           *secureRoot
+	bearerVerifier [sha256.Size]byte
+	maxEntries     int
+	downloadSlots  chan struct{}
 }
 
 // NewFromEnv creates a portal only when RECASAOS_PUBLIC_FILE_ENABLED is
@@ -68,15 +68,18 @@ func NewFromEnv() (*Portal, error) {
 	if os.Getenv("RECASAOS_PUBLIC_FILE_ENABLED") != "1" {
 		return nil, ErrDisabled
 	}
+	if os.Getenv("RECASAOS_PUBLIC_FILE_TOKEN_FILE") != "" {
+		return nil, ErrLegacyRawBearerConfig
+	}
 
 	return New(Config{
-		Root:      os.Getenv("RECASAOS_PUBLIC_FILE_ROOT"),
-		TokenFile: os.Getenv("RECASAOS_PUBLIC_FILE_TOKEN_FILE"),
+		Root:         os.Getenv("RECASAOS_PUBLIC_FILE_ROOT"),
+		VerifierFile: os.Getenv("RECASAOS_PUBLIC_FILE_VERIFIER_FILE"),
 	})
 }
 
 // New validates the configured paths, securely opens the root directory and
-// loads the bearer token. It does not provide a non-openat2 or unrestricted
+// loads the bearer verifier. It does not provide a non-openat2 or unrestricted
 // filesystem fallback because weaker path and root checks would reintroduce
 // symlink, TOCTOU, and blocking-network-filesystem risks.
 func New(config Config) (*Portal, error) {
@@ -84,12 +87,9 @@ func New(config Config) (*Portal, error) {
 	if err != nil {
 		return nil, fmt.Errorf("public file root is invalid: %w", err)
 	}
-	tokenPath, err := validateAbsoluteConfigPath(config.TokenFile, true)
+	verifierPath, err := validateAbsoluteConfigPath(config.VerifierFile, true)
 	if err != nil {
-		return nil, fmt.Errorf("public file token file is invalid: %w", err)
-	}
-	if pathContains(rootPath, tokenPath) {
-		return nil, errors.New("public file token file must be outside the shared root")
+		return nil, fmt.Errorf("public file verifier file is invalid: %w", err)
 	}
 
 	maxEntries := config.MaxEntries
@@ -107,13 +107,9 @@ func New(config Config) (*Portal, error) {
 		return nil, fmt.Errorf("public file download limit must be between 1 and %d", DefaultMaxActiveDownloads)
 	}
 
-	token, err := readTokenFileSecure(tokenPath)
+	bearerVerifier, err := readVerifierFileSecure(verifierPath)
 	if err != nil {
-		return nil, fmt.Errorf("public file token file is unsafe: %w", err)
-	}
-	tokenDigest := sha256.Sum256(token)
-	for index := range token {
-		token[index] = 0
+		return nil, fmt.Errorf("public file verifier file is unsafe: %w", err)
 	}
 	root, err := openSecureRoot(rootPath)
 	if err != nil {
@@ -121,10 +117,10 @@ func New(config Config) (*Portal, error) {
 	}
 
 	return &Portal{
-		root:          root,
-		tokenDigest:   tokenDigest,
-		maxEntries:    maxEntries,
-		downloadSlots: make(chan struct{}, maxDownloads),
+		root:           root,
+		bearerVerifier: bearerVerifier,
+		maxEntries:     maxEntries,
+		downloadSlots:  make(chan struct{}, maxDownloads),
 	}, nil
 }
 
@@ -143,14 +139,6 @@ func validateAbsoluteConfigPath(value string, allowFile bool) (string, error) {
 		return "", errors.New("the filesystem root cannot be shared")
 	}
 	return clean, nil
-}
-
-func pathContains(root, candidate string) bool {
-	relative, err := filepath.Rel(root, candidate)
-	if err != nil {
-		return false
-	}
-	return relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))
 }
 
 // Close releases the pinned root directory descriptor. Call it only after the
@@ -415,16 +403,18 @@ func formatDownloadContentDisposition(filename string) string {
 }
 
 func (p *Portal) authorized(r *http.Request) bool {
-	candidate := []byte(nil)
+	candidate := ""
 	values := r.Header.Values("Authorization")
 	if len(values) == 1 {
 		parts := strings.SplitN(values[0], " ", 2)
-		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") && len(parts[1]) <= maxBearerTokenBytes && !strings.ContainsAny(parts[1], " \t\r\n") {
-			candidate = []byte(parts[1])
+		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+			candidate = parts[1]
 		}
 	}
-	candidateDigest := sha256.Sum256(candidate)
-	return subtle.ConstantTimeCompare(candidateDigest[:], p.tokenDigest[:]) == 1
+	candidateDigest := digestPublicBearer(candidate)
+	digestMatches := subtle.ConstantTimeCompare(candidateDigest[:], p.bearerVerifier[:])
+	candidateIsValid := validPublicBearer(candidate)
+	return digestMatches == 1 && candidateIsValid
 }
 
 func writeJSON(w http.ResponseWriter, r *http.Request, status int, value any) {

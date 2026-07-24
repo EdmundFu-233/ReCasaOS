@@ -3,6 +3,8 @@
 package publicfiles
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -16,12 +18,20 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const testToken = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_"
+var testToken = testPublicBearer(11)
 
 type portalFixture struct {
-	portal    *Portal
-	root      string
-	tokenFile string
+	portal       *Portal
+	root         string
+	verifierFile string
+}
+
+func writeTestVerifierFile(t *testing.T, path, bearer string, mode os.FileMode) {
+	t.Helper()
+	serialized := serializeTestPublicVerifier(digestPublicBearer(bearer))
+	if err := os.WriteFile(path, serialized, mode); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func newPortalFixture(t *testing.T, maxEntries int) portalFixture {
@@ -31,23 +41,26 @@ func newPortalFixture(t *testing.T, maxEntries int) portalFixture {
 	if err := os.Mkdir(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	tokenFile := filepath.Join(base, "access-token")
-	if err := os.WriteFile(tokenFile, []byte(testToken+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	portal, err := New(Config{Root: root, TokenFile: tokenFile, MaxEntries: maxEntries})
+	verifierFile := filepath.Join(base, "bearer-verifier")
+	writeTestVerifierFile(t, verifierFile, testToken, 0o600)
+	portal, err := New(Config{Root: root, VerifierFile: verifierFile, MaxEntries: maxEntries})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = portal.Close() })
-	return portalFixture{portal: portal, root: root, tokenFile: tokenFile}
+	return portalFixture{portal: portal, root: root, verifierFile: verifierFile}
+}
+
+func requestWithBearer(t *testing.T, method, endpoint, bearer string) *http.Request {
+	t.Helper()
+	request := httptest.NewRequest(method, endpoint, nil)
+	request.Header.Set("Authorization", "Bearer "+bearer)
+	return request
 }
 
 func authorizedRequest(t *testing.T, method, endpoint string) *http.Request {
 	t.Helper()
-	request := httptest.NewRequest(method, endpoint, nil)
-	request.Header.Set("Authorization", "Bearer "+testToken)
-	return request
+	return requestWithBearer(t, method, endpoint, testToken)
 }
 
 func serve(portal *Portal, request *http.Request) *httptest.ResponseRecorder {
@@ -59,6 +72,7 @@ func serve(portal *Portal, request *http.Request) *httptest.ResponseRecorder {
 func TestNewFromEnvIsExplicitlyDisabled(t *testing.T) {
 	t.Setenv("RECASAOS_PUBLIC_FILE_ENABLED", "")
 	t.Setenv("RECASAOS_PUBLIC_FILE_ROOT", "/should/not/be/read")
+	t.Setenv("RECASAOS_PUBLIC_FILE_VERIFIER_FILE", "/should/not/be/read")
 	t.Setenv("RECASAOS_PUBLIC_FILE_TOKEN_FILE", "/should/not/be/read")
 	portal, err := NewFromEnv()
 	if portal != nil || !errors.Is(err, ErrDisabled) {
@@ -69,6 +83,7 @@ func TestNewFromEnvIsExplicitlyDisabled(t *testing.T) {
 func TestNewFromEnvRequiresCompleteSafeConfiguration(t *testing.T) {
 	t.Setenv("RECASAOS_PUBLIC_FILE_ENABLED", "1")
 	t.Setenv("RECASAOS_PUBLIC_FILE_ROOT", "")
+	t.Setenv("RECASAOS_PUBLIC_FILE_VERIFIER_FILE", "")
 	t.Setenv("RECASAOS_PUBLIC_FILE_TOKEN_FILE", "")
 	if portal, err := NewFromEnv(); portal != nil || err == nil {
 		t.Fatalf("enabled incomplete configuration must fail closed: (%v, %v)", portal, err)
@@ -81,13 +96,12 @@ func TestNewFromEnvEnablesOnlyWithExplicitSafeConfiguration(t *testing.T) {
 	if err := os.Mkdir(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	tokenFile := filepath.Join(base, "token")
-	if err := os.WriteFile(tokenFile, []byte(testToken), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	verifierFile := filepath.Join(base, "verifier")
+	writeTestVerifierFile(t, verifierFile, testToken, 0o600)
 	t.Setenv("RECASAOS_PUBLIC_FILE_ENABLED", "1")
 	t.Setenv("RECASAOS_PUBLIC_FILE_ROOT", root)
-	t.Setenv("RECASAOS_PUBLIC_FILE_TOKEN_FILE", tokenFile)
+	t.Setenv("RECASAOS_PUBLIC_FILE_VERIFIER_FILE", verifierFile)
+	t.Setenv("RECASAOS_PUBLIC_FILE_TOKEN_FILE", "")
 	portal, err := NewFromEnv()
 	if err != nil {
 		t.Fatal(err)
@@ -100,46 +114,60 @@ func TestNewFromEnvEnablesOnlyWithExplicitSafeConfiguration(t *testing.T) {
 	}
 }
 
-func TestNewRejectsUnsafeRootsAndTokenFiles(t *testing.T) {
+func TestNewFromEnvRejectsNonEmptyLegacyRawBearerSetting(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "shared")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	verifierFile := filepath.Join(base, "verifier")
+	writeTestVerifierFile(t, verifierFile, testToken, 0o600)
+
+	for _, test := range []struct {
+		name         string
+		legacyValue  string
+		verifierFile string
+	}{
+		{name: "legacy setting only", legacyValue: "/legacy/raw-bearer"},
+		{name: "legacy and valid verifier together", legacyValue: "/legacy/raw-bearer", verifierFile: verifierFile},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("RECASAOS_PUBLIC_FILE_ENABLED", "1")
+			t.Setenv("RECASAOS_PUBLIC_FILE_ROOT", root)
+			t.Setenv("RECASAOS_PUBLIC_FILE_TOKEN_FILE", test.legacyValue)
+			t.Setenv("RECASAOS_PUBLIC_FILE_VERIFIER_FILE", test.verifierFile)
+			portal, err := NewFromEnv()
+			if portal != nil || !errors.Is(err, ErrLegacyRawBearerConfig) {
+				t.Fatalf("NewFromEnv() = (%v, %v), want legacy raw-bearer error", portal, err)
+			}
+		})
+	}
+}
+
+func TestNewRejectsUnsafeRootsAndVerifierFiles(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "root")
 	if err := os.Mkdir(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	token := filepath.Join(base, "token")
-	if err := os.WriteFile(token, []byte(testToken), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	verifier := filepath.Join(base, "verifier")
+	writeTestVerifierFile(t, verifier, testToken, 0o600)
 
 	tests := []struct {
-		name      string
-		root      string
-		tokenFile string
-		prepare   func(t *testing.T) string
+		name         string
+		root         string
+		verifierFile string
+		prepare      func(t *testing.T) string
 	}{
-		{name: "filesystem root", root: "/", tokenFile: token},
-		{name: "relative root", root: "relative", tokenFile: token},
+		{name: "filesystem root", root: "/", verifierFile: verifier},
+		{name: "relative root", root: "relative", verifierFile: verifier},
 		{
-			name:      "token within root",
-			root:      root,
-			tokenFile: filepath.Join(root, "token"),
+			name:         "group-readable verifier",
+			root:         root,
+			verifierFile: filepath.Join(base, "group-verifier"),
 			prepare: func(t *testing.T) string {
-				path := filepath.Join(root, "token")
-				if err := os.WriteFile(path, []byte(testToken), 0o600); err != nil {
-					t.Fatal(err)
-				}
-				return path
-			},
-		},
-		{
-			name:      "group-readable token",
-			root:      root,
-			tokenFile: filepath.Join(base, "group-token"),
-			prepare: func(t *testing.T) string {
-				path := filepath.Join(base, "group-token")
-				if err := os.WriteFile(path, []byte(testToken), 0o640); err != nil {
-					t.Fatal(err)
-				}
+				path := filepath.Join(base, "group-verifier")
+				writeTestVerifierFile(t, path, testToken, 0o640)
 				if err := os.Chmod(path, 0o640); err != nil {
 					t.Fatal(err)
 				}
@@ -147,11 +175,11 @@ func TestNewRejectsUnsafeRootsAndTokenFiles(t *testing.T) {
 			},
 		},
 		{
-			name:      "weak token",
-			root:      root,
-			tokenFile: filepath.Join(base, "weak-token"),
+			name:         "malformed verifier",
+			root:         root,
+			verifierFile: filepath.Join(base, "malformed-verifier"),
 			prepare: func(t *testing.T) string {
-				path := filepath.Join(base, "weak-token")
+				path := filepath.Join(base, "malformed-verifier")
 				if err := os.WriteFile(path, []byte(strings.Repeat("x", 64)), 0o600); err != nil {
 					t.Fatal(err)
 				}
@@ -159,21 +187,21 @@ func TestNewRejectsUnsafeRootsAndTokenFiles(t *testing.T) {
 			},
 		},
 		{
-			name:      "token symlink",
-			root:      root,
-			tokenFile: filepath.Join(base, "token-link"),
+			name:         "verifier symlink",
+			root:         root,
+			verifierFile: filepath.Join(base, "verifier-link"),
 			prepare: func(t *testing.T) string {
-				path := filepath.Join(base, "token-link")
-				if err := os.Symlink(token, path); err != nil {
+				path := filepath.Join(base, "verifier-link")
+				if err := os.Symlink(verifier, path); err != nil {
 					t.Fatal(err)
 				}
 				return path
 			},
 		},
 		{
-			name:      "root symlink",
-			root:      filepath.Join(base, "root-link"),
-			tokenFile: token,
+			name:         "root symlink",
+			root:         filepath.Join(base, "root-link"),
+			verifierFile: verifier,
 			prepare: func(t *testing.T) string {
 				path := filepath.Join(base, "root-link")
 				if err := os.Symlink(root, path); err != nil {
@@ -188,13 +216,13 @@ func TestNewRejectsUnsafeRootsAndTokenFiles(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if test.prepare != nil {
 				prepared := test.prepare(t)
-				if strings.Contains(test.name, "root") && test.name != "token within root" {
+				if strings.Contains(test.name, "root") {
 					test.root = prepared
 				} else {
-					test.tokenFile = prepared
+					test.verifierFile = prepared
 				}
 			}
-			portal, err := New(Config{Root: test.root, TokenFile: test.tokenFile})
+			portal, err := New(Config{Root: test.root, VerifierFile: test.verifierFile})
 			if portal != nil {
 				portal.Close()
 				t.Fatal("unsafe configuration unexpectedly created a portal")
@@ -234,6 +262,129 @@ func TestAuthorizationUsesHeaderOnly(t *testing.T) {
 	request = authorizedRequest(t, http.MethodGet, BasePath+"/api/list?token=ignored")
 	if response := serve(fixture.portal, request); response.Code != http.StatusBadRequest {
 		t.Fatalf("credential query with valid header returned %d, want 400", response.Code)
+	}
+}
+
+func TestVerifierMaterialCannotAuthenticate(t *testing.T) {
+	fixture := newPortalFixture(t, 0)
+	if err := os.WriteFile(filepath.Join(fixture.root, "secret"), []byte("protected-content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	verifier := digestPublicBearer(testToken)
+	candidates := []string{
+		string(serializeTestPublicVerifier(verifier)),
+		hex.EncodeToString(verifier[:]),
+		base64.RawURLEncoding.EncodeToString(verifier[:]),
+		publicBearerPrefix + base64.RawURLEncoding.EncodeToString(verifier[:]),
+	}
+	endpoints := []string{
+		BasePath + "/api/list",
+		BasePath + "/api/file?path=secret",
+	}
+
+	for _, candidate := range candidates {
+		for _, endpoint := range endpoints {
+			response := serve(fixture.portal, requestWithBearer(t, http.MethodGet, endpoint, candidate))
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf("verifier-derived candidate at %s returned %d, want 401", endpoint, response.Code)
+			}
+			if got := response.Header().Get("WWW-Authenticate"); got != `Bearer realm="ReCasaOS public files"` {
+				t.Fatalf("WWW-Authenticate = %q, want public-files bearer realm", got)
+			}
+			if got := response.Header().Get("Cache-Control"); got != "no-store" {
+				t.Fatalf("Cache-Control = %q, want no-store", got)
+			}
+			if got := response.Body.String(); got != `{"error":"authorization required"}` {
+				t.Fatalf("authentication body = %q, want generic error", got)
+			}
+			for _, protected := range []string{candidate, testToken, fixture.root, "protected-content"} {
+				if protected != "" && strings.Contains(response.Body.String(), protected) {
+					t.Fatal("authentication failure reflected credential, host path, or file content")
+				}
+			}
+		}
+	}
+
+	if response := serve(fixture.portal, authorizedRequest(t, http.MethodGet, BasePath+"/api/list")); response.Code != http.StatusOK {
+		t.Fatalf("real bearer returned %d after verifier probes, want 200", response.Code)
+	}
+}
+
+func TestVerifierRotationRequiresRestartAndRollsBack(t *testing.T) {
+	fixture := newPortalFixture(t, 0)
+	newBearer := testPublicBearer(77)
+	replaceVerifier := func(name, bearer string) {
+		t.Helper()
+		replacement := filepath.Join(filepath.Dir(fixture.verifierFile), name)
+		writeTestVerifierFile(t, replacement, bearer, 0o600)
+		if err := os.Rename(replacement, fixture.verifierFile); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if response := serve(fixture.portal, authorizedRequest(t, http.MethodGet, BasePath+"/api/list")); response.Code != http.StatusOK {
+		t.Fatalf("old bearer before rotation returned %d, want 200", response.Code)
+	}
+	if response := serve(fixture.portal, requestWithBearer(t, http.MethodGet, BasePath+"/api/list", newBearer)); response.Code != http.StatusUnauthorized {
+		t.Fatalf("new bearer before rotation returned %d, want 401", response.Code)
+	}
+
+	replaceVerifier("verifier.next", newBearer)
+	serialized, err := os.ReadFile(fixture.verifierFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(serialized) != string(serializeTestPublicVerifier(digestPublicBearer(newBearer))) ||
+		strings.Contains(string(serialized), testToken) ||
+		strings.Contains(string(serialized), newBearer) {
+		t.Fatal("rotated verifier file did not contain only the expected serialized digest")
+	}
+	rotated, err := New(Config{Root: fixture.root, VerifierFile: fixture.verifierFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rotated.Close() })
+	if response := serve(rotated, authorizedRequest(t, http.MethodGet, BasePath+"/api/list")); response.Code != http.StatusUnauthorized {
+		t.Fatalf("old bearer after controlled restart returned %d, want 401", response.Code)
+	}
+	if response := serve(rotated, requestWithBearer(t, http.MethodGet, BasePath+"/api/list", newBearer)); response.Code != http.StatusOK {
+		t.Fatalf("new bearer after controlled restart returned %d, want 200", response.Code)
+	}
+	if response := serve(fixture.portal, authorizedRequest(t, http.MethodGet, BasePath+"/api/list")); response.Code != http.StatusOK {
+		t.Fatalf("existing process did not retain its pinned in-memory verifier: %d", response.Code)
+	}
+	if response := serve(fixture.portal, requestWithBearer(t, http.MethodGet, BasePath+"/api/list", newBearer)); response.Code != http.StatusUnauthorized {
+		t.Fatalf("existing process accepted new bearer before restart: %d", response.Code)
+	}
+
+	invalid := filepath.Join(filepath.Dir(fixture.verifierFile), "verifier.invalid")
+	if err := os.WriteFile(invalid, []byte("invalid\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(invalid, fixture.verifierFile); err != nil {
+		t.Fatal(err)
+	}
+	if portal, err := New(Config{Root: fixture.root, VerifierFile: fixture.verifierFile}); portal != nil || err == nil {
+		if portal != nil {
+			_ = portal.Close()
+		}
+		t.Fatalf("restart with invalid verifier = (%v, %v), want fail closed", portal, err)
+	}
+	if response := serve(rotated, requestWithBearer(t, http.MethodGet, BasePath+"/api/list", newBearer)); response.Code != http.StatusOK {
+		t.Fatalf("running portal stopped using its pinned verifier after invalid publication: %d", response.Code)
+	}
+
+	replaceVerifier("verifier.rollback", testToken)
+	rolledBack, err := New(Config{Root: fixture.root, VerifierFile: fixture.verifierFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rolledBack.Close() })
+	if response := serve(rolledBack, authorizedRequest(t, http.MethodGet, BasePath+"/api/list")); response.Code != http.StatusOK {
+		t.Fatalf("old bearer after rollback returned %d, want 200", response.Code)
+	}
+	if response := serve(rolledBack, requestWithBearer(t, http.MethodGet, BasePath+"/api/list", newBearer)); response.Code != http.StatusUnauthorized {
+		t.Fatalf("new bearer after rollback returned %d, want 401", response.Code)
 	}
 }
 

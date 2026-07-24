@@ -1,0 +1,28 @@
+# Install as:
+#   /etc/systemd/system/casaos.service.d/recasaos-public-files-verifier.conf
+#
+# This is a verifier-only migration example for the current candidate. It does
+# not isolate the Internet-facing listener from the privileged management
+# daemon. Issue #25 remains a production public-readiness blocker.
+# Requires systemd 247 or newer for LoadCredential= and the %d credential
+# directory specifier. Verify the installed unit before restarting CasaOS.
+#
+# The source file must be exactly 100 bytes:
+#   recasaos-public-verifier-v1:sha256:<64 lowercase hexadecimal characters><LF>
+#
+# Generate the raw rc1_ bearer only on an independent administrator workstation,
+# retain it only in a password manager, and transfer only this verifier file to
+# the ReCasaOS host.
+#
+# Remove RECASAOS_PUBLIC_FILE_TOKEN_FILE from every old drop-in. Any non-empty
+# value is a rejected legacy configuration when the portal is enabled, even
+# when the verifier variable below is also present.
+
+[Service]
+LoadCredential=recasaos-public-file-verifier:/etc/recasaos/public-file.verifier
+Environment=RECASAOS_PUBLIC_FILE_ENABLED=1
+Environment=RECASAOS_PUBLIC_FILE_ROOT=/srv/recasaos-public
+Environment=RECASAOS_PUBLIC_FILE_VERIFIER_FILE=%d/recasaos-public-file-verifier
+Environment=RECASAOS_PUBLIC_FILE_LISTEN=127.0.0.1:39777
+Environment=RECASAOS_TRUST_LOOPBACK_AUTH_BYPASS=0
+LimitCORE=0

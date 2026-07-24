@@ -3,6 +3,7 @@
 package publicfiles
 
 import (
+	"crypto/sha256"
 	"os"
 )
 
@@ -12,8 +13,8 @@ func openSecureRoot(string) (*secureRoot, error) {
 	return nil, ErrUnsupported
 }
 
-func readTokenFileSecure(string) ([]byte, error) {
-	return nil, ErrUnsupported
+func readVerifierFileSecure(string) ([sha256.Size]byte, error) {
+	return [sha256.Size]byte{}, ErrUnsupported
 }
 
 func (r *secureRoot) close() error {

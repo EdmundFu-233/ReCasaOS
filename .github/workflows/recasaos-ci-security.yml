@@ -209,7 +209,7 @@ jobs:
               RECASAOS_PRIVILEGED_MOUNT_TEST=1 \
               "$RUNNER_TEMP/recasaos-publicfiles.test" \
                 -test.count=1 \
-                -test.run '^(TestPinnedPublicRootSurvivesBindMountReplacement|TestPublicRootRejectsNestedBindMount|TestPublicRootAcceptsTmpfsInIsolatedNamespace|TestPublicRootAllowlistedFilesystemCompatibilityMatrix)$' \
+                -test.run '^(TestPublicVerifierBindAliasDisclosureCannotAuthenticate|TestPinnedPublicRootSurvivesBindMountReplacement|TestPublicRootRejectsNestedBindMount|TestPublicRootAcceptsTmpfsInIsolatedNamespace|TestPublicRootAllowlistedFilesystemCompatibilityMatrix)$' \
                 -test.timeout=9m \
                 -test.v
 

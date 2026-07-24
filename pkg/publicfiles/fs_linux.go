@@ -3,9 +3,7 @@
 package publicfiles
 
 import (
-	"bytes"
-	"encoding/base64"
-	"encoding/hex"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +24,18 @@ var (
 )
 
 type pinnedRegularReopener func(int) (int, error)
+
+type pinnedRegularValidationError struct {
+	err error
+}
+
+func (e *pinnedRegularValidationError) Error() string {
+	return e.err.Error()
+}
+
+func (e *pinnedRegularValidationError) Unwrap() error {
+	return e.err
+}
 
 type rootFilesystemIdentity struct {
 	mountID uint64
@@ -163,81 +173,144 @@ func publicRootFilesystemName(magic int64) (string, bool) {
 	}
 }
 
-func readTokenFileSecure(absolutePath string) ([]byte, error) {
-	return readTokenFileSecureWith(absolutePath, reopenPinnedRegular)
+func readVerifierFileSecure(absolutePath string) ([sha256.Size]byte, error) {
+	return readVerifierFileSecureWith(absolutePath, reopenPinnedRegular)
 }
 
-func readTokenFileSecureWith(absolutePath string, reopen pinnedRegularReopener) ([]byte, error) {
+func readVerifierFileSecureWith(absolutePath string, reopen pinnedRegularReopener) ([sha256.Size]byte, error) {
+	var zero [sha256.Size]byte
 	rootFD, err := unix.Open("/", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, ErrUnsupported
+		return zero, ErrUnsupported
 	}
 	defer unix.Close(rootFD)
 
-	fd, stat, err := openPinnedRegular(func() (int, error) {
-		return unix.Openat2(rootFD, strings.TrimPrefix(absolutePath, "/"), &unix.OpenHow{
+	relative := strings.TrimPrefix(absolutePath, "/")
+	if err := validateVerifierParentDirectory(rootFD, path.Dir(relative)); err != nil {
+		return zero, err
+	}
+
+	fd, stat, err := openPinnedRegularValidated(func() (int, error) {
+		return unix.Openat2(rootFD, relative, &unix.OpenHow{
 			Flags:   uint64(unix.O_PATH | unix.O_CLOEXEC | unix.O_NOFOLLOW),
 			Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_SYMLINKS,
 		})
-	}, reopen)
+	}, validateVerifierFileStat, reopen)
 	if err != nil {
 		if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EINVAL) {
-			return nil, ErrUnsupported
+			return zero, ErrUnsupported
 		}
 		if errors.Is(err, errPinnedObjectNotRegular) || errors.Is(err, errPinnedIdentityChanged) {
-			return nil, errors.New("token file must be a stable single-link regular file")
+			return zero, errors.New("verifier file must be a stable single-link regular file")
 		}
-		return nil, errors.New("cannot securely open token file")
+		var validationErr *pinnedRegularValidationError
+		if errors.As(err, &validationErr) {
+			return zero, validationErr.err
+		}
+		return zero, errors.New("cannot securely open verifier file")
 	}
-	file := os.NewFile(uintptr(fd), "public-file-token")
+	file := os.NewFile(uintptr(fd), "public-file-verifier")
 	defer file.Close()
 
-	if stat.Uid != uint32(os.Geteuid()) {
-		return nil, errors.New("token file must be owned by the service user")
+	encoded, err := io.ReadAll(io.LimitReader(file, int64(publicVerifierFileMaxBytes+1)))
+	if err != nil {
+		return zero, errors.New("cannot read verifier file")
 	}
-	if stat.Mode&0o177 != 0 {
-		return nil, errors.New("token file must be non-executable and inaccessible by group or other users")
+	verifier, err := parsePublicVerifier(encoded)
+	for index := range encoded {
+		encoded[index] = 0
+	}
+	if err != nil {
+		return zero, err
 	}
 
-	token, err := io.ReadAll(io.LimitReader(file, maxBearerTokenBytes+2))
-	if err != nil {
-		return nil, errors.New("cannot read token file")
+	var afterRead unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &afterRead); err != nil {
+		return zero, errors.New("cannot revalidate verifier file after reading")
 	}
-	token = bytes.TrimSuffix(token, []byte("\n"))
-	token = bytes.TrimSuffix(token, []byte("\r"))
-	if len(token) > maxBearerTokenBytes || !decodesToStrongToken(token) {
-		return nil, fmt.Errorf("token must be base64 or hex encoding of at least 32 random bytes (maximum %d encoded bytes)", maxBearerTokenBytes)
+	if !sameStableRegularFile(&stat, &afterRead) ||
+		stat.Size != afterRead.Size ||
+		stat.Mtim != afterRead.Mtim ||
+		stat.Ctim != afterRead.Ctim {
+		return zero, errors.New("verifier file changed while it was being read")
 	}
-	distinct := make(map[byte]struct{}, 32)
-	for _, value := range token {
-		if value < 0x21 || value > 0x7e {
-			return nil, errors.New("token must use visible ASCII without whitespace")
-		}
-		distinct[value] = struct{}{}
+	if err := validateVerifierFileStat(&afterRead); err != nil {
+		return zero, err
 	}
-	if len(distinct) < 12 {
-		return nil, errors.New("token does not appear to contain enough randomness")
+	if err := revalidateVerifierPath(rootFD, relative, &afterRead); err != nil {
+		return zero, err
 	}
-	return token, nil
+	return verifier, nil
 }
 
-func decodesToStrongToken(token []byte) bool {
-	value := string(token)
-	if decoded, err := hex.DecodeString(value); err == nil && len(decoded) >= 32 {
-		return true
-	}
-	encodings := []*base64.Encoding{
-		base64.StdEncoding,
-		base64.RawStdEncoding,
-		base64.URLEncoding,
-		base64.RawURLEncoding,
-	}
-	for _, encoding := range encodings {
-		if decoded, err := encoding.DecodeString(value); err == nil && len(decoded) >= 32 {
-			return true
+func validateVerifierParentDirectory(rootFD int, relativeParent string) error {
+	fd, err := unix.Openat2(rootFD, relativeParent, &unix.OpenHow{
+		Flags:   uint64(unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC | unix.O_NOFOLLOW),
+		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_SYMLINKS,
+	})
+	if err != nil {
+		if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EINVAL) {
+			return ErrUnsupported
 		}
+		return errors.New("cannot securely open verifier parent directory")
 	}
-	return false
+	defer unix.Close(fd)
+
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return errors.New("verifier parent must be a directory")
+	}
+	effectiveUID := uint32(os.Geteuid())
+	if stat.Uid != 0 && stat.Uid != effectiveUID {
+		return errors.New("verifier parent directory must be owned by root or the service user")
+	}
+	if stat.Mode&0o022 != 0 {
+		return errors.New("verifier parent directory must not be writable by group or other users")
+	}
+	return nil
+}
+
+func validateVerifierFileStat(stat *unix.Stat_t) error {
+	if !isSingleLinkRegular(stat) {
+		return errors.New("verifier file must be a stable single-link regular file")
+	}
+	if stat.Uid != uint32(os.Geteuid()) {
+		return errors.New("verifier file must be owned by the service user")
+	}
+	permissions := stat.Mode & 0o7777
+	if permissions != 0o400 && permissions != 0o600 {
+		return errors.New("verifier file permissions must be exactly 0400 or 0600")
+	}
+	return nil
+}
+
+func sameStableRegularFile(first, second *unix.Stat_t) bool {
+	return isSingleLinkRegular(first) &&
+		isSingleLinkRegular(second) &&
+		first.Dev == second.Dev &&
+		first.Ino == second.Ino
+}
+
+func revalidateVerifierPath(rootFD int, relative string, expected *unix.Stat_t) error {
+	fd, err := unix.Openat2(rootFD, relative, &unix.OpenHow{
+		Flags:   uint64(unix.O_PATH | unix.O_CLOEXEC | unix.O_NOFOLLOW),
+		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_SYMLINKS,
+	})
+	if err != nil {
+		return errors.New("verifier path changed while it was being read")
+	}
+	defer unix.Close(fd)
+
+	var current unix.Stat_t
+	if err := unix.Fstat(fd, &current); err != nil ||
+		!sameStableRegularFile(expected, &current) ||
+		expected.Size != current.Size ||
+		expected.Mtim != current.Mtim ||
+		expected.Ctim != current.Ctim ||
+		validateVerifierFileStat(&current) != nil {
+		return errors.New("verifier path changed while it was being read")
+	}
+	return nil
 }
 
 func (r *secureRoot) close() error {
@@ -375,6 +448,14 @@ func (r *secureRoot) openRegularWith(relative string, reopen pinnedRegularReopen
 // exclusively from a live descriptor; callers must never substitute a
 // user-controlled pathname or fall back to opening the original pathname.
 func openPinnedRegular(pin func() (int, error), reopen pinnedRegularReopener) (int, unix.Stat_t, error) {
+	return openPinnedRegularValidated(pin, nil, reopen)
+}
+
+func openPinnedRegularValidated(
+	pin func() (int, error),
+	validate func(*unix.Stat_t) error,
+	reopen pinnedRegularReopener,
+) (int, unix.Stat_t, error) {
 	var zero unix.Stat_t
 	pinnedFD, err := pin()
 	if err != nil {
@@ -388,6 +469,11 @@ func openPinnedRegular(pin func() (int, error), reopen pinnedRegularReopener) (i
 	}
 	if !isSingleLinkRegular(&before) {
 		return -1, zero, errPinnedObjectNotRegular
+	}
+	if validate != nil {
+		if err := validate(&before); err != nil {
+			return -1, zero, &pinnedRegularValidationError{err: err}
+		}
 	}
 	if reopen == nil {
 		return -1, zero, errors.New("pinned regular file reopener is unavailable")
@@ -413,6 +499,11 @@ func openPinnedRegular(pin func() (int, error), reopen pinnedRegularReopener) (i
 	}
 	if before.Dev != after.Dev || before.Ino != after.Ino {
 		return -1, zero, errPinnedIdentityChanged
+	}
+	if validate != nil {
+		if err := validate(&after); err != nil {
+			return -1, zero, &pinnedRegularValidationError{err: err}
+		}
 	}
 
 	closeData = false
