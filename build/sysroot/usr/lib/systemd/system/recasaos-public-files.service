@@ -1,7 +1,8 @@
 [Unit]
 Description=ReCasaOS isolated public-file portal
 ConditionPathIsDirectory=/srv/recasaos-public
-ConditionPathIsRegular=/etc/recasaos/public-file.verifier
+ConditionFileNotEmpty=/etc/recasaos/public-file.verifier
+ConditionPathIsSymbolicLink=!/etc/recasaos/public-file.verifier
 StartLimitIntervalSec=2min
 StartLimitBurst=5
 
@@ -72,8 +73,6 @@ LimitCORE=0
 LimitNOFILE=512
 TasksMax=128
 MemoryMax=256M
-# MemoryLimit is the cgroup-v1 fallback; MemoryMax takes precedence on cgroup v2.
-MemoryLimit=256M
 MemorySwapMax=0
 CPUQuota=100%
 TimeoutStartSec=15s

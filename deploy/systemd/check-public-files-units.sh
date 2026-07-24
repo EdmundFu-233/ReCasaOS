@@ -8,10 +8,18 @@ socket="${unit_dir}/recasaos-public-files.socket"
 sysusers="${repo_root}/build/sysroot/usr/lib/sysusers.d/recasaos-public-files.conf"
 tmpfiles="${repo_root}/build/sysroot/usr/lib/tmpfiles.d/recasaos-public-files.conf"
 retired="${repo_root}/deploy/systemd/recasaos-public-files-verifier.conf.example"
+semantic_verifier="${repo_root}/deploy/systemd/verify-public-files-units.sh"
 
 fail() {
   printf '%s\n' "public-files unit check: $*" >&2
   exit 1
+}
+
+reject_line_continuations() {
+  file=$1
+  if LC_ALL=C grep -n '\\[[:space:]]*$' "$file" >/dev/null 2>&1; then
+    fail "line continuations are forbidden in reviewed configuration: $file"
+  fi
 }
 
 active_lines() {
@@ -152,16 +160,24 @@ reject_active_pattern() {
   fi
 }
 
-for required in "$service" "$socket" "$sysusers" "$tmpfiles" "$retired"; do
+for required in \
+  "$service" "$socket" "$sysusers" "$tmpfiles" "$retired" "$semantic_verifier"
+do
   test -f "$required" || fail "missing $required"
   test ! -L "$required" || fail "candidate payload is a symlink: $required"
+done
+test -x "$semantic_verifier" ||
+  fail "semantic verifier is not executable: $semantic_verifier"
+for reviewed_config in "$service" "$socket" "$sysusers" "$tmpfiles"; do
+  reject_line_continuations "$reviewed_config"
 done
 
 require_exact_sectioned_active_lines "$service" \
   '[Unit]' \
   'Description=ReCasaOS isolated public-file portal' \
   'ConditionPathIsDirectory=/srv/recasaos-public' \
-  'ConditionPathIsRegular=/etc/recasaos/public-file.verifier' \
+  'ConditionFileNotEmpty=/etc/recasaos/public-file.verifier' \
+  'ConditionPathIsSymbolicLink=!/etc/recasaos/public-file.verifier' \
   'StartLimitIntervalSec=2min' \
   'StartLimitBurst=5' \
   '[Service]' \
@@ -211,7 +227,6 @@ require_exact_sectioned_active_lines "$service" \
   'LimitNOFILE=512' \
   'TasksMax=128' \
   'MemoryMax=256M' \
-  'MemoryLimit=256M' \
   'MemorySwapMax=0' \
   'CPUQuota=100%' \
   'TimeoutStartSec=15s' \
@@ -226,7 +241,8 @@ require_exact_sectioned_active_lines "$socket" \
   '[Unit]' \
   'Description=ReCasaOS public-file portal socket' \
   'ConditionPathIsDirectory=/srv/recasaos-public' \
-  'ConditionPathIsRegular=/etc/recasaos/public-file.verifier' \
+  'ConditionFileNotEmpty=/etc/recasaos/public-file.verifier' \
+  'ConditionPathIsSymbolicLink=!/etc/recasaos/public-file.verifier' \
   '[Socket]' \
   'ListenStream=127.0.0.1:39777' \
   'Accept=no' \
@@ -542,9 +558,9 @@ fi
 if test "${RECASAOS_SYSTEMD_VERIFY:-0}" = 1; then
   command -v systemd-analyze >/dev/null 2>&1 ||
     fail 'RECASAOS_SYSTEMD_VERIFY=1 but systemd-analyze is unavailable'
-  # Run this mode only after the static user and jailed executable have been
-  # provisioned; systemd-analyze also validates those external prerequisites.
-  systemd-analyze verify "$socket" "$service"
+  test "${RECASAOS_SYSTEMD_LIVE_VERIFY:-0}" = 1 ||
+    fail 'RECASAOS_SYSTEMD_VERIFY=1 requires RECASAOS_SYSTEMD_LIVE_VERIFY=1'
+  "$semantic_verifier" "$live_service" "$live_socket" "$live_binary"
 fi
 
 printf '%s\n' 'public-files unit check: passed'

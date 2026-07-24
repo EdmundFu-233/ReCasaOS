@@ -35,6 +35,9 @@ copy_fixture() {
   install -m 0644 \
     "$repo_root/deploy/systemd/recasaos-public-files-verifier.conf.example" \
     "$fixture/deploy/systemd/recasaos-public-files-verifier.conf.example"
+  install -m 0755 \
+    "$repo_root/deploy/systemd/verify-public-files-units.sh" \
+    "$fixture/deploy/systemd/verify-public-files-units.sh"
 }
 
 expect_rejected() {
@@ -44,12 +47,14 @@ expect_rejected() {
   local socket
   local sysusers
   local tmpfiles
+  local semantic_verifier
 
   copy_fixture "$fixture"
   service="$fixture/build/sysroot/usr/lib/systemd/system/recasaos-public-files.service"
   socket="$fixture/build/sysroot/usr/lib/systemd/system/recasaos-public-files.socket"
   sysusers="$fixture/build/sysroot/usr/lib/sysusers.d/recasaos-public-files.conf"
   tmpfiles="$fixture/build/sysroot/usr/lib/tmpfiles.d/recasaos-public-files.conf"
+  semantic_verifier="$fixture/deploy/systemd/verify-public-files-units.sh"
 
   case "$name" in
     duplicate-root)
@@ -107,6 +112,31 @@ expect_rejected() {
       ' "$service" >"$service.next"
       mv -f -- "$service.next" "$service"
       ;;
+    unsupported-regular-file-condition)
+      sed \
+        's|ConditionFileNotEmpty=/etc/recasaos/public-file.verifier|ConditionPathIsRegular=/etc/recasaos/public-file.verifier|' \
+        "$service" >"$service.next"
+      mv -f -- "$service.next" "$service"
+      ;;
+    missing-semantic-verifier)
+      rm -f -- "$semantic_verifier"
+      ;;
+    linked-semantic-verifier)
+      rm -f -- "$semantic_verifier"
+      ln -s -- recasaos-public-files-verifier.conf.example "$semantic_verifier"
+      ;;
+    nonexecutable-semantic-verifier)
+      chmod 0644 "$semantic_verifier"
+      ;;
+    comment-continuation)
+      awk '
+        $0 == "CapabilityBoundingSet=" {
+          print "# systemd would swallow the next physical line \\"
+        }
+        { print }
+      ' "$service" >"$service.next"
+      mv -f -- "$service.next" "$service"
+      ;;
     *)
       fail "unknown negative fixture: $name"
       ;;
@@ -127,5 +157,10 @@ expect_rejected extra-tmpfiles-path
 expect_rejected candidate-symlink
 expect_rejected wrong-socket-section
 expect_rejected swapped-syscall-filter-order
+expect_rejected unsupported-regular-file-condition
+expect_rejected missing-semantic-verifier
+expect_rejected linked-semantic-verifier
+expect_rejected nonexecutable-semantic-verifier
+expect_rejected comment-continuation
 
 printf '%s\n' 'public-files unit checker negative tests: passed'

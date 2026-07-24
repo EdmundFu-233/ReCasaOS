@@ -27,6 +27,14 @@ func TestValidateServiceRuntimeStatusAcceptsReviewedBoundary(t *testing.T) {
 	}
 }
 
+func TestValidateRuntimeIDsAcceptsFullUint32Range(t *testing.T) {
+	const highRuntimeID uint64 = (1 << 32) - 2
+	const encoded = "4294967294 4294967294 4294967294 4294967294"
+	if err := validateRuntimeIDs("Uid", encoded, highRuntimeID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestValidateServiceRuntimeStatusRejectsWeakenedProcess(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -38,6 +46,11 @@ func TestValidateServiceRuntimeStatusRejectsWeakenedProcess(t *testing.T) {
 		{name: "root gid", status: strings.Replace(safeServiceRuntimeStatus, "Gid:\t62001\t62001\t62001\t62001", "Gid:\t0\t0\t0\t0", 1), uid: 62001, gid: 0},
 		{name: "saved uid differs", status: strings.Replace(safeServiceRuntimeStatus, "Uid:\t62001\t62001\t62001\t62001", "Uid:\t62001\t62001\t0\t62001", 1), uid: 62001, gid: 62001},
 		{name: "supplementary group", status: strings.Replace(safeServiceRuntimeStatus, "Groups:\t62001", "Groups:\t62001 44", 1), uid: 62001, gid: 62001},
+		{name: "high uid", status: strings.Replace(safeServiceRuntimeStatus, "Uid:\t62001\t62001\t62001\t62001", "Uid:\t4294967294\t4294967294\t4294967294\t4294967294", 1), uid: 62001, gid: 62001},
+		{name: "high gid", status: strings.Replace(safeServiceRuntimeStatus, "Gid:\t62001\t62001\t62001\t62001", "Gid:\t4294967294\t4294967294\t4294967294\t4294967294", 1), uid: 62001, gid: 62001},
+		{name: "high supplementary group", status: strings.Replace(safeServiceRuntimeStatus, "Groups:\t62001", "Groups:\t4294967294", 1), uid: 62001, gid: 62001},
+		{name: "overflowing uid", status: strings.Replace(safeServiceRuntimeStatus, "Uid:\t62001\t62001\t62001\t62001", "Uid:\t4294967296\t4294967296\t4294967296\t4294967296", 1), uid: 62001, gid: 62001},
+		{name: "negative supplementary group", status: strings.Replace(safeServiceRuntimeStatus, "Groups:\t62001", "Groups:\t-1", 1), uid: 62001, gid: 62001},
 		{name: "broad umask", status: strings.Replace(safeServiceRuntimeStatus, "Umask:\t0077", "Umask:\t0022", 1), uid: 62001, gid: 62001},
 		{name: "effective capability", status: strings.Replace(safeServiceRuntimeStatus, "CapEff:\t0000000000000000", "CapEff:\t0000000000000001", 1), uid: 62001, gid: 62001},
 		{name: "bounding capability", status: strings.Replace(safeServiceRuntimeStatus, "CapBnd:\t0000000000000000", "CapBnd:\t00000000a80425fb", 1), uid: 62001, gid: 62001},

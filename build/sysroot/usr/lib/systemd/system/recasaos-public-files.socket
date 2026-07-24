@@ -1,7 +1,8 @@
 [Unit]
 Description=ReCasaOS public-file portal socket
 ConditionPathIsDirectory=/srv/recasaos-public
-ConditionPathIsRegular=/etc/recasaos/public-file.verifier
+ConditionFileNotEmpty=/etc/recasaos/public-file.verifier
+ConditionPathIsSymbolicLink=!/etc/recasaos/public-file.verifier
 
 [Socket]
 ListenStream=127.0.0.1:39777

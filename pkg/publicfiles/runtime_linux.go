@@ -58,6 +58,8 @@ func validateServiceRuntimeStatus(status []byte, effectiveUID, effectiveGID int)
 	if effectiveGID <= 0 {
 		return errors.New("service must not run with the root group")
 	}
+	effectiveUIDValue := uint64(effectiveUID)
+	effectiveGIDValue := uint64(effectiveGID)
 
 	required := map[string]bool{
 		"Uid":        true,
@@ -89,15 +91,15 @@ func validateServiceRuntimeStatus(status []byte, effectiveUID, effectiveGID int)
 		}
 	}
 
-	if err := validateRuntimeIDs("Uid", fields["Uid"], effectiveUID); err != nil {
+	if err := validateRuntimeIDs("Uid", fields["Uid"], effectiveUIDValue); err != nil {
 		return err
 	}
-	if err := validateRuntimeIDs("Gid", fields["Gid"], effectiveGID); err != nil {
+	if err := validateRuntimeIDs("Gid", fields["Gid"], effectiveGIDValue); err != nil {
 		return err
 	}
 	for _, group := range strings.Fields(fields["Groups"]) {
 		value, err := strconv.ParseUint(group, 10, 32)
-		if err != nil || int(value) != effectiveGID {
+		if err != nil || value != effectiveGIDValue {
 			return errors.New("service has an unexpected supplementary group")
 		}
 	}
@@ -120,14 +122,14 @@ func validateServiceRuntimeStatus(status []byte, effectiveUID, effectiveGID int)
 	return nil
 }
 
-func validateRuntimeIDs(name, encoded string, expected int) error {
+func validateRuntimeIDs(name, encoded string, expected uint64) error {
 	values := strings.Fields(encoded)
 	if len(values) != 4 {
 		return fmt.Errorf("%s must contain four identities", name)
 	}
 	for _, value := range values {
 		parsed, err := strconv.ParseUint(value, 10, 32)
-		if err != nil || int(parsed) != expected {
+		if err != nil || parsed != expected {
 			return fmt.Errorf("%s identities must all match the effective identity", name)
 		}
 	}

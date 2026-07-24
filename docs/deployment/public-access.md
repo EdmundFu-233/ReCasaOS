@@ -268,7 +268,13 @@ The standalone service requires Linux 5.8 or newer and systemd 247 or newer.
 `LoadCredential=` is available at that systemd baseline. The packaged unit
 intentionally uses `${CREDENTIALS_DIRECTORY}` in `ExecStart`; the shorter `%d`
 credential-directory specifier was added later and must not be substituted
-while systemd 247 remains supported.
+while systemd 247 remains supported. The staging checker accommodates
+`systemd-analyze`'s host-path executable check with a disposable unit copy; the
+production `ExecStart` remains byte-locked and the live activation gate proves
+the executable inside `RootDirectory=`. Both the service and socket require a
+non-empty verifier and independently reject a verifier-path symlink before
+activation, so an unsafe verifier state cannot leave the loopback listener
+bound.
 
 Check the actual target before installing anything:
 

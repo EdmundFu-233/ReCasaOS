@@ -54,6 +54,9 @@ jobs:
       - name: Exercise public-file unit checker negative cases
         run: .github/scripts/test-public-files-unit-checker.sh
 
+      - name: Exercise public-file semantic verifier negative cases
+        run: .github/scripts/test-public-files-semantic-verifier.sh
+
       - name: Cross-compile isolated public-file service
         run: .github/scripts/check-public-files-builds.sh
 

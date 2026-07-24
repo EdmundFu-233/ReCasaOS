@@ -417,6 +417,49 @@ require_unit_property() {
     fail "$unit property $property is $actual, want $expected"
 }
 
+socket_is_inactive_and_unbound() {
+  if sudo systemctl is-active --quiet "$socket_unit"; then
+    return 1
+  fi
+  [[ "$(
+    sudo ss -H -ltn |
+      awk '$4 == "127.0.0.1:39777" { count++ } END { print count + 0 }'
+  )" == 0 ]]
+}
+
+assert_unsafe_verifier_skips_units() {
+  local description=$1
+  local unit
+  local condition_result
+  local active_state
+  local main_pid
+
+  sudo systemctl reset-failed "$service_unit" "$socket_unit"
+  for unit in "$service_unit" "$socket_unit"; do
+    sudo systemctl start "$unit" ||
+      fail "$description did not skip $unit cleanly"
+    condition_result="$(
+      sudo systemctl show --property=ConditionResult --value "$unit"
+    )"
+    active_state="$(
+      sudo systemctl show --property=ActiveState --value "$unit"
+    )"
+    [[ "$condition_result" == no ]] ||
+      fail "$description left $unit ConditionResult=$condition_result"
+    [[ "$active_state" == inactive ]] ||
+      fail "$description left $unit ActiveState=$active_state"
+    if sudo systemctl is-failed --quiet "$unit"; then
+      fail "$description moved $unit into the failed state"
+    fi
+  done
+  main_pid="$(
+    sudo systemctl show --property=MainPID --value "$service_unit"
+  )"
+  [[ "$main_pid" == 0 ]] ||
+    fail "$description started a service process: $main_pid"
+  wait_until "$description listener check" socket_is_inactive_and_unbound
+}
+
 page_is_ready() {
   [[ "$(
     curl -q -sS --max-time 1 -o /dev/null -w '%{http_code}' \
@@ -515,9 +558,9 @@ sudo install -d -o root -g root -m 0755 "$override_dir"
 printf '%s\n' \
   '[Unit]' \
   'ConditionPathIsDirectory=' \
-  'ConditionPathIsRegular=' \
   "ConditionPathIsDirectory=$share" \
-  "ConditionPathIsRegular=$verifier" \
+  "ConditionFileNotEmpty=$verifier" \
+  "ConditionPathIsSymbolicLink=!$verifier" \
   'StartLimitIntervalSec=15s' \
   'StartLimitBurst=3' \
   '' \
@@ -534,14 +577,20 @@ sudo install -d -o root -g root -m 0755 "$socket_override_dir"
 printf '%s\n' \
   '[Unit]' \
   'ConditionPathIsDirectory=' \
-  'ConditionPathIsRegular=' \
   "ConditionPathIsDirectory=$share" \
-  "ConditionPathIsRegular=$verifier" |
+  "ConditionFileNotEmpty=$verifier" \
+  "ConditionPathIsSymbolicLink=!$verifier" |
   sudo tee "$socket_override_path" >/dev/null
 sudo chmod 0644 "$socket_override_path"
 
 sudo systemctl daemon-reload
-sudo systemd-analyze verify "$socket_unit" "$service_unit"
+
+"$repo_root/deploy/systemd/verify-public-files-units.sh" \
+  "$service_path" \
+  "$socket_path" \
+  "$workspace/recasaos-public-files" \
+  "$override_path" \
+  "$socket_override_path"
 require_unit_property "$service_unit" User recasaos-public
 require_unit_property "$service_unit" Group recasaos-public
 require_unit_property "$service_unit" RootDirectory "$rootfs"
@@ -576,6 +625,27 @@ socket_drop_ins="$(
   fail "systemd loaded unexpected service drop-ins: $service_drop_ins"
 [[ "$socket_drop_ins" == "$socket_override_path" ]] ||
   fail "systemd loaded unexpected socket drop-ins: $socket_drop_ins"
+
+# The socket must not bind when the verifier is empty, the wrong type, or a
+# symlink. ConditionFileNotEmpty follows symlinks, so the explicit negated
+# ConditionPathIsSymbolicLink check is independently required.
+sudo rm -f -- "$verifier"
+assert_unsafe_verifier_skips_units "missing verifier"
+
+sudo install -o root -g root -m 0600 "$good_verifier" "$verifier"
+sudo truncate -s 0 "$verifier"
+assert_unsafe_verifier_skips_units "empty verifier"
+
+sudo rm -f -- "$verifier"
+sudo install -d -o root -g root -m 0700 "$verifier"
+assert_unsafe_verifier_skips_units "directory verifier"
+
+sudo rmdir -- "$verifier"
+sudo ln -s -- "$good_verifier" "$verifier"
+assert_unsafe_verifier_skips_units "symlink verifier"
+
+sudo rm -f -- "$verifier"
+sudo install -o root -g root -m 0600 "$good_verifier" "$verifier"
 
 sudo install -d -o "$runner_uid" -g "$runner_gid" -m 0755 "$management_dir"
 printf 'management sentinel\n' >"$management_dir/health.txt"
