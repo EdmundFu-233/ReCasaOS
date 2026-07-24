@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -99,7 +100,35 @@ func validateLoopDeviceOutput(output []byte) (string, error) {
 	return device, nil
 }
 
-func detachLoopDevicesForImage(t *testing.T, losetupTool, imagePath string) {
+func settleLoopDeviceRemoval(t *testing.T, udevadmTool string) {
+	t.Helper()
+	output, err := exec.Command(udevadmTool, "settle", "--timeout=5").CombinedOutput()
+	if err != nil {
+		t.Errorf("wait for loop-device removal events: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+}
+
+func waitForLoopImageDetach(t *testing.T, losetupTool, imagePath string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		remaining, err := exec.Command(losetupTool, "--associated", imagePath).CombinedOutput()
+		if err != nil {
+			t.Errorf("verify loop cleanup for %q: %v: %s", imagePath, err, strings.TrimSpace(string(remaining)))
+			return
+		}
+		if strings.TrimSpace(string(remaining)) == "" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("loop device remained associated after bounded teardown wait: %s", strings.TrimSpace(string(remaining)))
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func detachLoopDevicesForImage(t *testing.T, losetupTool, udevadmTool, imagePath string) {
 	t.Helper()
 	output, err := exec.Command(losetupTool, "--associated", imagePath).CombinedOutput()
 	if err != nil {
@@ -125,9 +154,11 @@ func detachLoopDevicesForImage(t *testing.T, losetupTool, imagePath string) {
 			t.Errorf("detach associated loop device %q: %v: %s", validated, detachErr, strings.TrimSpace(string(detachOutput)))
 		}
 	}
+	settleLoopDeviceRemoval(t, udevadmTool)
+	waitForLoopImageDetach(t, losetupTool, imagePath)
 }
 
-func cleanupLoopMountedFilesystem(t *testing.T, losetupTool, imagePath, mountPoint, loopDevice string, mounted bool) {
+func cleanupLoopMountedFilesystem(t *testing.T, losetupTool, udevadmTool, imagePath, mountPoint, loopDevice string, mounted bool) {
 	t.Helper()
 	if mounted {
 		if err := unix.Unmount(mountPoint, 0); err != nil {
@@ -140,7 +171,7 @@ func cleanupLoopMountedFilesystem(t *testing.T, losetupTool, imagePath, mountPoi
 	}
 
 	if loopDevice == "" {
-		detachLoopDevicesForImage(t, losetupTool, imagePath)
+		detachLoopDevicesForImage(t, losetupTool, udevadmTool, imagePath)
 		return
 	}
 
@@ -149,12 +180,8 @@ func cleanupLoopMountedFilesystem(t *testing.T, losetupTool, imagePath, mountPoi
 		t.Errorf("detach exact loop device %q: %v: %s", loopDevice, detachErr, strings.TrimSpace(string(detachOutput)))
 		return
 	}
-	remaining, listErr := exec.Command(losetupTool, "--associated", imagePath).CombinedOutput()
-	if listErr != nil {
-		t.Errorf("verify loop cleanup for %q: %v: %s", imagePath, listErr, strings.TrimSpace(string(remaining)))
-	} else if strings.TrimSpace(string(remaining)) != "" {
-		t.Errorf("loop device remained associated after detaching %q: %s", loopDevice, strings.TrimSpace(string(remaining)))
-	}
+	settleLoopDeviceRemoval(t, udevadmTool)
+	waitForLoopImageDetach(t, losetupTool, imagePath)
 }
 
 func TestPinnedPublicRootSurvivesBindMountReplacement(t *testing.T) {
@@ -316,6 +343,7 @@ func TestPublicRootAllowlistedFilesystemCompatibilityMatrix(t *testing.T) {
 	requireIsolatedPublicMountTest(t)
 
 	losetupTool := requirePublicFilesystemTool(t, "losetup")
+	udevadmTool := requirePublicFilesystemTool(t, "udevadm")
 	testContent := []byte("ReCasaOS allowlisted filesystem compatibility\n")
 	tests := []struct {
 		name       string
@@ -379,7 +407,7 @@ func TestPublicRootAllowlistedFilesystemCompatibilityMatrix(t *testing.T) {
 			loopDevice := ""
 			mounted := false
 			t.Cleanup(func() {
-				cleanupLoopMountedFilesystem(t, losetupTool, imagePath, mountPoint, loopDevice, mounted)
+				cleanupLoopMountedFilesystem(t, losetupTool, udevadmTool, imagePath, mountPoint, loopDevice, mounted)
 			})
 			loopOutput, loopErr := exec.Command(losetupTool, "--find", "--show", imagePath).CombinedOutput()
 			if loopErr != nil {

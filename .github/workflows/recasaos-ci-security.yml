@@ -154,9 +154,10 @@ jobs:
               kmod \
               "linux-modules-extra-$(uname -r)" \
               mount \
+              udev \
               util-linux \
               xfsprogs
-          for tool in losetup mkfs.btrfs mkfs.ext4 mkfs.f2fs mkfs.xfs mount umount; do
+          for tool in losetup mkfs.btrfs mkfs.ext4 mkfs.f2fs mkfs.xfs mount udevadm umount; do
             if ! command -v "$tool" >/dev/null; then
               printf 'required privileged filesystem test tool is unavailable: %s\n' "$tool" >&2
               exit 1
