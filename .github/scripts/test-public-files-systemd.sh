@@ -434,7 +434,6 @@ assert_unsafe_verifier_skips_units() {
   local active_state
   local main_pid
 
-  sudo systemctl reset-failed "$service_unit" "$socket_unit"
   for unit in "$service_unit" "$socket_unit"; do
     sudo systemctl start "$unit" ||
       fail "$description did not skip $unit cleanly"
