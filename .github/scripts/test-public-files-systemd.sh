@@ -405,6 +405,25 @@ wait_until() {
     fi
     sleep 0.1
   done
+  if [[ "$description" == "public portal activation" ]]; then
+    printf '%s\n' 'public-files activation diagnostics:' >&2
+    sudo systemctl show \
+      --property=LoadState \
+      --property=ActiveState \
+      --property=SubState \
+      --property=Result \
+      --property=ConditionResult \
+      --property=MainPID \
+      --property=ExecMainCode \
+      --property=ExecMainStatus \
+      --property=NRestarts \
+      "$socket_unit" "$service_unit" >&2 || true
+    sudo systemctl status --no-pager --full \
+      "$socket_unit" "$service_unit" >&2 || true
+    sudo journalctl --no-pager --output=short-monotonic --lines=120 \
+      --unit="$socket_unit" --unit="$service_unit" >&2 || true
+    sudo ss -H -ltnp 'sport = :39777' >&2 || true
+  fi
   fail "timed out waiting for ${description}"
 }
 
