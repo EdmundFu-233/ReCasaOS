@@ -9,7 +9,7 @@ require (
 	github.com/IceWhaleTech/CasaOS-Common v0.4.11-alpha4
 	github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf
 	github.com/deckarep/golang-set/v2 v2.3.0
-	github.com/getkin/kin-openapi v0.142.0
+	github.com/getkin/kin-openapi v0.144.0
 	github.com/glebarez/sqlite v1.8.0
 	github.com/go-ini/ini v1.67.0
 	github.com/go-resty/resty/v2 v2.7.0
