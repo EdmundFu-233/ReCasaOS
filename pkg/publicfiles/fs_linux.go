@@ -195,21 +195,25 @@ func readVerifierFileSecureWith(absolutePath string, reopen pinnedRegularReopene
 			Flags:   uint64(unix.O_PATH | unix.O_CLOEXEC | unix.O_NOFOLLOW),
 			Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_SYMLINKS,
 		})
-	}, validateVerifierFileStat, reopen)
+	}, validateVerifierFileCandidate, validateVerifierFileDescriptor, reopen)
 	if err != nil {
+		var validationErr *pinnedRegularValidationError
+		if errors.As(err, &validationErr) {
+			return zero, validationErr.err
+		}
 		if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EINVAL) {
 			return zero, ErrUnsupported
 		}
 		if errors.Is(err, errPinnedObjectNotRegular) || errors.Is(err, errPinnedIdentityChanged) {
 			return zero, errors.New("verifier file must be a stable single-link regular file")
 		}
-		var validationErr *pinnedRegularValidationError
-		if errors.As(err, &validationErr) {
-			return zero, validationErr.err
-		}
 		return zero, errors.New("cannot securely open verifier file")
 	}
 	file := os.NewFile(uintptr(fd), "public-file-verifier")
+	if file == nil {
+		_ = unix.Close(fd)
+		return zero, errors.New("cannot securely open verifier file")
+	}
 	defer file.Close()
 
 	encoded, err := io.ReadAll(io.LimitReader(file, int64(publicVerifierFileMaxBytes+1)))
@@ -228,16 +232,13 @@ func readVerifierFileSecureWith(absolutePath string, reopen pinnedRegularReopene
 	if err := unix.Fstat(int(file.Fd()), &afterRead); err != nil {
 		return zero, errors.New("cannot revalidate verifier file after reading")
 	}
-	if !sameStableRegularFile(&stat, &afterRead) ||
-		stat.Size != afterRead.Size ||
-		stat.Mtim != afterRead.Mtim ||
-		stat.Ctim != afterRead.Ctim {
+	if !sameVerifierFileMetadata(&stat, &afterRead) {
 		return zero, errors.New("verifier file changed while it was being read")
 	}
-	if err := validateVerifierFileStat(&afterRead); err != nil {
+	if err := validateVerifierFileDescriptor(int(file.Fd()), &afterRead); err != nil {
 		return zero, err
 	}
-	if err := revalidateVerifierPath(rootFD, relative, &afterRead); err != nil {
+	if err := revalidateVerifierPath(rootFD, relative, &afterRead, reopen); err != nil {
 		return zero, err
 	}
 	return verifier, nil
@@ -270,20 +271,6 @@ func validateVerifierParentDirectory(rootFD int, relativeParent string) error {
 	return nil
 }
 
-func validateVerifierFileStat(stat *unix.Stat_t) error {
-	if !isSingleLinkRegular(stat) {
-		return errors.New("verifier file must be a stable single-link regular file")
-	}
-	if stat.Uid != uint32(os.Geteuid()) {
-		return errors.New("verifier file must be owned by the service user")
-	}
-	permissions := stat.Mode & 0o7777
-	if permissions != 0o400 && permissions != 0o600 {
-		return errors.New("verifier file permissions must be exactly 0400 or 0600")
-	}
-	return nil
-}
-
 func sameStableRegularFile(first, second *unix.Stat_t) bool {
 	return isSingleLinkRegular(first) &&
 		isSingleLinkRegular(second) &&
@@ -291,7 +278,12 @@ func sameStableRegularFile(first, second *unix.Stat_t) bool {
 		first.Ino == second.Ino
 }
 
-func revalidateVerifierPath(rootFD int, relative string, expected *unix.Stat_t) error {
+func revalidateVerifierPath(
+	rootFD int,
+	relative string,
+	expected *unix.Stat_t,
+	reopen pinnedRegularReopener,
+) error {
 	fd, err := unix.Openat2(rootFD, relative, &unix.OpenHow{
 		Flags:   uint64(unix.O_PATH | unix.O_CLOEXEC | unix.O_NOFOLLOW),
 		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_SYMLINKS,
@@ -303,12 +295,37 @@ func revalidateVerifierPath(rootFD int, relative string, expected *unix.Stat_t) 
 
 	var current unix.Stat_t
 	if err := unix.Fstat(fd, &current); err != nil ||
-		!sameStableRegularFile(expected, &current) ||
-		expected.Size != current.Size ||
-		expected.Mtim != current.Mtim ||
-		expected.Ctim != current.Ctim ||
-		validateVerifierFileStat(&current) != nil {
+		!sameVerifierFileMetadata(expected, &current) ||
+		validateVerifierFileCandidate(&current) != nil {
 		return errors.New("verifier path changed while it was being read")
+	}
+	if reopen == nil {
+		return errors.New("cannot securely revalidate verifier file through its final configured path")
+	}
+	dataFD, err := reopen(fd)
+	if err != nil {
+		if dataFD >= 0 && dataFD != fd {
+			_ = unix.Close(dataFD)
+		}
+		return errors.New("cannot securely reopen verifier file during final path validation")
+	}
+	if dataFD < 0 || dataFD == fd {
+		if dataFD >= 0 && dataFD != fd {
+			_ = unix.Close(dataFD)
+		}
+		return errors.New("cannot securely reopen verifier file during final path validation")
+	}
+	defer unix.Close(dataFD)
+
+	var reopened unix.Stat_t
+	if err := unix.Fstat(dataFD, &reopened); err != nil {
+		return errors.New("cannot inspect verifier file during final path validation")
+	}
+	if !sameVerifierFileMetadata(&current, &reopened) {
+		return errors.New("verifier path changed while it was being read")
+	}
+	if err := validateVerifierFileDescriptor(dataFD, &reopened); err != nil {
+		return err
 	}
 	return nil
 }
@@ -447,13 +464,18 @@ func (r *secureRoot) openRegularWith(relative string, reopen pinnedRegularReopen
 // then reopens that exact descriptor for reading. The procfd path is generated
 // exclusively from a live descriptor; callers must never substitute a
 // user-controlled pathname or fall back to opening the original pathname.
+// The reopen callback borrows the pinned descriptor synchronously and must not
+// close, retain, replace, or use it asynchronously. On success it transfers
+// ownership of a distinct data descriptor to this helper. The opened validator
+// borrows that data descriptor synchronously under the same restrictions.
 func openPinnedRegular(pin func() (int, error), reopen pinnedRegularReopener) (int, unix.Stat_t, error) {
-	return openPinnedRegularValidated(pin, nil, reopen)
+	return openPinnedRegularValidated(pin, nil, nil, reopen)
 }
 
 func openPinnedRegularValidated(
 	pin func() (int, error),
-	validate func(*unix.Stat_t) error,
+	validatePinned func(*unix.Stat_t) error,
+	validateOpened func(int, *unix.Stat_t) error,
 	reopen pinnedRegularReopener,
 ) (int, unix.Stat_t, error) {
 	var zero unix.Stat_t
@@ -470,8 +492,8 @@ func openPinnedRegularValidated(
 	if !isSingleLinkRegular(&before) {
 		return -1, zero, errPinnedObjectNotRegular
 	}
-	if validate != nil {
-		if err := validate(&before); err != nil {
+	if validatePinned != nil {
+		if err := validatePinned(&before); err != nil {
 			return -1, zero, &pinnedRegularValidationError{err: err}
 		}
 	}
@@ -481,7 +503,13 @@ func openPinnedRegularValidated(
 
 	dataFD, err := reopen(pinnedFD)
 	if err != nil {
+		if dataFD >= 0 && dataFD != pinnedFD {
+			_ = unix.Close(dataFD)
+		}
 		return -1, zero, fmt.Errorf("reopen pinned regular file: %w", err)
+	}
+	if dataFD < 0 || dataFD == pinnedFD {
+		return -1, zero, errors.New("pinned regular file reopener returned an invalid descriptor")
 	}
 	closeData := true
 	defer func() {
@@ -500,8 +528,20 @@ func openPinnedRegularValidated(
 	if before.Dev != after.Dev || before.Ino != after.Ino {
 		return -1, zero, errPinnedIdentityChanged
 	}
-	if validate != nil {
-		if err := validate(&after); err != nil {
+	// Verifier validators require one canonical metadata snapshot from the
+	// O_PATH pin through the readable reopen. Ordinary public-file opens keep
+	// their historical dev/inode identity rule because they pass no validators.
+	if validatePinned != nil &&
+		!sameVerifierFileMetadata(&before, &after) {
+		return -1, zero, errPinnedIdentityChanged
+	}
+	if validatePinned != nil {
+		if err := validatePinned(&after); err != nil {
+			return -1, zero, &pinnedRegularValidationError{err: err}
+		}
+	}
+	if validateOpened != nil {
+		if err := validateOpened(dataFD, &after); err != nil {
 			return -1, zero, &pinnedRegularValidationError{err: err}
 		}
 	}

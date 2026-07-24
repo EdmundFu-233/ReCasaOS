@@ -551,13 +551,38 @@ func TestVerifierRejectsUnsafePermissions(t *testing.T) {
 }
 
 func TestVerifierRejectsUnexpectedOwner(t *testing.T) {
+	unexpectedUID := uint32(os.Geteuid()) + 1
+	if unexpectedUID == 0 {
+		unexpectedUID = 1
+	}
 	stat := unix.Stat_t{
 		Mode:  unix.S_IFREG | 0o600,
 		Nlink: 1,
-		Uid:   uint32(os.Geteuid()) + 1,
+		Uid:   unexpectedUID,
 	}
-	if err := validateVerifierFileStat(&stat); err == nil || !strings.Contains(err.Error(), "owned by the service user") {
+	if err := validateVerifierFileMetadata(
+		&stat,
+		nil,
+		uint32(os.Geteuid()),
+	); err == nil || !strings.Contains(err.Error(), "owned by root or the service user") {
 		t.Fatalf("unexpected verifier owner returned %v", err)
+	}
+}
+
+func TestVerifierAcceptsPrivateRootOwnedCredential(t *testing.T) {
+	for _, mode := range []uint32{0o400, 0o600} {
+		stat := unix.Stat_t{
+			Mode:  unix.S_IFREG | mode,
+			Nlink: 1,
+			Uid:   0,
+		}
+		if err := validateVerifierFileMetadata(
+			&stat,
+			nil,
+			uint32(os.Geteuid()),
+		); err != nil {
+			t.Fatalf("private root-owned credential mode %04o was rejected: %v", mode, err)
+		}
 	}
 }
 
@@ -651,6 +676,86 @@ func TestVerifierFailsClosedWhenProcReopenIsUnavailable(t *testing.T) {
 	}
 }
 
+func TestVerifierReopensFinalConfiguredPath(t *testing.T) {
+	verifierPath := filepath.Join(t.TempDir(), "verifier")
+	expected := digestPublicBearer(testPublicBearer(13))
+	if err := os.WriteFile(
+		verifierPath,
+		serializeTestPublicVerifier(expected),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	var reopenedFDs []int
+	verifier, err := readVerifierFileSecureWith(
+		verifierPath,
+		func(pinnedFD int) (int, error) {
+			fd, reopenErr := reopenPinnedRegular(pinnedFD)
+			if fd >= 0 {
+				reopenedFDs = append(reopenedFDs, fd)
+			}
+			return fd, reopenErr
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verifier != expected {
+		t.Fatalf("reopened verifier = %x, want %x", verifier, expected)
+	}
+	if len(reopenedFDs) != 2 {
+		t.Fatalf("verifier used %d readable reopens, want initial and final", len(reopenedFDs))
+	}
+	for _, fd := range reopenedFDs {
+		var stat unix.Stat_t
+		if statErr := unix.Fstat(fd, &stat); !errors.Is(statErr, unix.EBADF) {
+			t.Fatalf("reopened verifier descriptor %d was not closed: %v", fd, statErr)
+		}
+	}
+}
+
+func TestVerifierFailsClosedWhenFinalPathReopenIsUnavailable(t *testing.T) {
+	verifierPath := filepath.Join(t.TempDir(), "verifier")
+	expected := digestPublicBearer(testPublicBearer(14))
+	if err := os.WriteFile(
+		verifierPath,
+		serializeTestPublicVerifier(expected),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := 0
+	initialDataFD := -1
+	verifier, err := readVerifierFileSecureWith(
+		verifierPath,
+		func(pinnedFD int) (int, error) {
+			calls++
+			if calls == 2 {
+				return -1, unix.ENOENT
+			}
+			fd, reopenErr := reopenPinnedRegular(pinnedFD)
+			initialDataFD = fd
+			return fd, reopenErr
+		},
+	)
+	if err == nil || verifier != ([sha256.Size]byte{}) ||
+		!strings.Contains(
+			err.Error(),
+			"cannot securely reopen verifier file during final path validation",
+		) {
+		t.Fatalf("unavailable final reopen returned verifier=%x err=%v", verifier, err)
+	}
+	if calls != 2 {
+		t.Fatalf("verifier used %d readable reopens, want initial and final", calls)
+	}
+	var stat unix.Stat_t
+	if statErr := unix.Fstat(initialDataFD, &stat); !errors.Is(statErr, unix.EBADF) {
+		t.Fatalf("initial verifier descriptor was not closed: %v", statErr)
+	}
+}
+
 func TestVerifierRejectsReopenedIdentityMismatch(t *testing.T) {
 	base := t.TempDir()
 	expectedPath := filepath.Join(base, "expected-verifier")
@@ -684,21 +789,38 @@ func TestVerifierRejectsReopenedIdentityMismatch(t *testing.T) {
 	}
 }
 
-func TestVerifierValidatesPermissionsOnReopenedDescriptor(t *testing.T) {
-	verifierPath := filepath.Join(t.TempDir(), "verifier")
-	expected := digestPublicBearer(testPublicBearer(6))
-	if err := os.WriteFile(verifierPath, serializeTestPublicVerifier(expected), 0o600); err != nil {
-		t.Fatal(err)
-	}
+func TestVerifierRejectsMetadataDriftAcrossReadableReopen(t *testing.T) {
+	for _, mode := range []os.FileMode{0o400, 0o640} {
+		t.Run(fmt.Sprintf("%04o", mode), func(t *testing.T) {
+			verifierPath := filepath.Join(t.TempDir(), "verifier")
+			expected := digestPublicBearer(testPublicBearer(15))
+			if err := os.WriteFile(
+				verifierPath,
+				serializeTestPublicVerifier(expected),
+				0o600,
+			); err != nil {
+				t.Fatal(err)
+			}
 
-	verifier, err := readVerifierFileSecureWith(verifierPath, func(pinnedFD int) (int, error) {
-		if err := os.Chmod(verifierPath, 0o640); err != nil {
-			return -1, err
-		}
-		return reopenPinnedRegular(pinnedFD)
-	})
-	if err == nil || verifier != ([sha256.Size]byte{}) || !strings.Contains(err.Error(), "permissions must be exactly 0400 or 0600") {
-		t.Fatalf("changed verifier permissions returned verifier=%x err=%v", verifier, err)
+			verifier, err := readVerifierFileSecureWith(
+				verifierPath,
+				func(pinnedFD int) (int, error) {
+					if chmodErr := os.Chmod(verifierPath, mode); chmodErr != nil {
+						return -1, chmodErr
+					}
+					return reopenPinnedRegular(pinnedFD)
+				},
+			)
+			if err == nil || verifier != ([sha256.Size]byte{}) ||
+				!strings.Contains(err.Error(), "stable single-link regular file") {
+				t.Fatalf(
+					"metadata drift to %04o returned verifier=%x err=%v",
+					mode,
+					verifier,
+					err,
+				)
+			}
+		})
 	}
 }
 

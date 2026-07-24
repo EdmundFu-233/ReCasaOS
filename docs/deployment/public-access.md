@@ -552,6 +552,18 @@ has an empty capability bounding set. It has no dependency on
 `casaos.service`. A portal startup failure, crash, restart limit, or controlled
 stop must leave the management daemon PID and health unchanged.
 
+On ACL-capable systems, systemd keeps the runtime credential owned by
+`root:root` and grants only the service UID named-user read access. Linux then
+reports mode `0440` because the group mode bits represent the ACL mask, not
+ordinary group access. The portal accepts only that exact five-entry ACL;
+ordinary group-readable `0440`, extra ACL principals, and writable ACL entries
+fail startup. The older read-only-store fallback remains a service-owned
+`0400` file without an extended ACL. Descriptor metadata is checked on each
+`O_PATH` pin. ACL bytes are checked on exact readable reopens before any
+verifier content is read, again after reading, and on a fresh readable reopen
+of the final configured path; any observed drift fails startup. The packaged
+systemd credential store is independently required to be a read-only mount.
+
 Do not enable the socket at boot or restore the public edge until every
 applicable acceptance row below passes on the exact target host. A safe rollback
 first removes or blocks the edge route, then independently attempts both

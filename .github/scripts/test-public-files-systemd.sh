@@ -68,7 +68,7 @@ if getent passwd recasaos-public >/dev/null ||
   getent group recasaos-public >/dev/null; then
   fail "the recasaos-public account unexpectedly already exists"
 fi
-for required_tool in mount mountpoint umount; do
+for required_tool in getfacl mount mountpoint umount; do
   command -v "$required_tool" >/dev/null 2>&1 ||
     fail "required mount test tool is unavailable: $required_tool"
 done
@@ -436,6 +436,90 @@ require_unit_property() {
     fail "$unit property $property is $actual, want $expected"
 }
 
+assert_systemd_credential_for_pid() {
+  local pid=$1
+  local credential_path
+  local credential_metadata
+  local credential_uid
+  local credential_gid
+  local credential_mode
+  local credential_links
+  local credential_size
+  local credential_acl
+  local expected_acl
+  local credential_layout
+  local credential_mount
+  local mount_evidence
+
+  [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]] ||
+    fail "cannot inspect credential for unsafe service PID: $pid"
+  sudo test -d "/proc/$pid" ||
+    fail "service PID disappeared before credential inspection: $pid"
+
+  credential_path="/proc/$pid/root/run/credentials/$service_unit/recasaos-public-file-verifier"
+  sudo test -f "$credential_path" ||
+    fail "systemd credential is not a regular file in the service root"
+  sudo test ! -L "$credential_path" ||
+    fail "systemd credential is a symbolic link in the service root"
+
+  credential_mount="/run/credentials/$service_unit"
+  mount_evidence="$(
+    sudo awk -v target="$credential_mount" '
+      $5 == target {
+        count++
+        options = "," $6 ","
+        if (options ~ /,ro,/)
+          read_only++
+      }
+      END {
+        printf "%d:%d", count + 0, read_only + 0
+      }
+    ' "/proc/$pid/mountinfo"
+  )"
+  [[ "$mount_evidence" == 1:1 ]] ||
+    fail "systemd credential store is not one read-only mount: $mount_evidence"
+
+  credential_metadata="$(
+    sudo stat -c '%u:%g:%a:%h:%s' "$credential_path"
+  )"
+  IFS=: read -r \
+    credential_uid \
+    credential_gid \
+    credential_mode \
+    credential_links \
+    credential_size \
+    <<<"$credential_metadata"
+  credential_acl="$(
+    sudo getfacl --absolute-names --numeric --omit-header -- \
+      "$credential_path"
+  )"
+
+  if [[ "$credential_uid" == 0 &&
+    "$credential_gid" == 0 &&
+    "$credential_mode" == 440 &&
+    "$credential_links" == 1 &&
+    "$credential_size" == 100 ]]; then
+    printf -v expected_acl \
+      'user::r--\nuser:%s:r--\ngroup::---\nmask::r--\nother::---' \
+      "$service_uid"
+    credential_layout=root-owned-named-user-acl
+  elif [[ "$credential_uid" == "$service_uid" &&
+    ( "$credential_gid" == 0 || "$credential_gid" == "$service_gid" ) &&
+    "$credential_mode" == 400 &&
+    "$credential_links" == 1 &&
+    "$credential_size" == 100 ]]; then
+    printf -v expected_acl 'user::r--\ngroup::---\nother::---'
+    credential_layout=service-owned-read-only-fallback
+  else
+    fail "systemd credential metadata is unsafe: $credential_metadata"
+  fi
+
+  [[ "$credential_acl" == "$expected_acl" ]] ||
+    fail "systemd credential access ACL is unsafe for $credential_metadata"
+  printf 'verified systemd credential layout: %s (%s)\n' \
+    "$credential_layout" "$credential_metadata"
+}
+
 socket_is_inactive_and_unbound() {
   if sudo systemctl is-active --quiet "$socket_unit"; then
     return 1
@@ -780,16 +864,7 @@ proc_mount="$(
   "$proc_mount" == *"hidepid=2"* ]] ||
   fail "service procfs does not hide other users' processes"
 
-credential_path="/proc/$portal_pid/root/run/credentials/$service_unit/recasaos-public-file-verifier"
-sudo test -r "$credential_path" ||
-  fail "systemd credential is unavailable in the service root"
-credential_metadata="$(sudo stat -c '%u:%g:%a' "$credential_path")"
-IFS=: read -r credential_uid credential_gid credential_mode \
-  <<<"$credential_metadata"
-[[ "$credential_uid" == "$service_uid" ]] ||
-  fail "systemd credential owner is unsafe: $credential_metadata"
-[[ "$credential_mode" == 400 || "$credential_mode" == 600 ]] ||
-  fail "systemd credential mode is unsafe: $credential_metadata"
+assert_systemd_credential_for_pid "$portal_pid"
 
 listener_count="$(
   sudo ss -H -ltn |
@@ -853,18 +928,37 @@ wait_until "public service restart after SIGKILL" service_has_new_pid
 wait_until "public portal after SIGKILL" page_is_ready
 wait_until "unchanged management sentinel after SIGKILL" sentinel_is_unchanged
 portal_pid="$(sudo systemctl show --property=MainPID --value "$service_unit")"
+assert_systemd_credential_for_pid "$portal_pid"
 
 printf 'invalid verifier\n' | sudo tee "$verifier" >/dev/null
 sudo chmod 0600 "$verifier"
 sudo systemctl restart "$service_unit" >/dev/null 2>&1 || true
 wait_until "fail-closed invalid verifier state" service_is_failed
+failed_portal_pid="$(
+  sudo systemctl show --property=MainPID --value "$service_unit"
+)"
+[[ "$failed_portal_pid" == 0 ]] ||
+  fail "failed verifier left a service process running: $failed_portal_pid"
 wait_until "unchanged management sentinel after invalid verifier" \
   sentinel_is_unchanged
 
 sudo install -o root -g root -m 0600 "$good_verifier" "$verifier"
 sudo systemctl reset-failed "$service_unit"
+# A socket whose trigger repeatedly failed may itself enter trigger-limit-hit.
+# Reset it only after the verifier has been restored, then require a clean
+# positive activation instead of ignoring either unit's recovery result.
+if sudo systemctl is-failed --quiet "$socket_unit"; then
+  sudo systemctl reset-failed "$socket_unit"
+fi
+if ! sudo systemctl is-active --quiet "$socket_unit"; then
+  sudo systemctl start "$socket_unit"
+fi
 wait_until "public portal recovery after verifier restore" page_is_ready
 wait_until "unchanged management sentinel after recovery" sentinel_is_unchanged
+sudo systemctl is-active --quiet "$socket_unit"
+sudo systemctl is-active --quiet "$service_unit"
+portal_pid="$(sudo systemctl show --property=MainPID --value "$service_unit")"
+assert_systemd_credential_for_pid "$portal_pid"
 
 printf '%s\n' \
   'public-files systemd integration passed: isolated identity, root, network,' \
