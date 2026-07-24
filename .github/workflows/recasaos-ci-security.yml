@@ -145,12 +145,14 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
+          # The hosted Azure kernel ships F2FS in its exact-version extras.
           sudo env DEBIAN_FRONTEND=noninteractive \
             apt-get install --yes --no-install-recommends \
               btrfs-progs \
               e2fsprogs \
               f2fs-tools \
               kmod \
+              "linux-modules-extra-$(uname -r)" \
               mount \
               util-linux \
               xfsprogs
