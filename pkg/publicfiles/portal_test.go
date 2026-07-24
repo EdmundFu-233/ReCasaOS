@@ -1,7 +1,8 @@
 package publicfiles
 
 import (
-	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"mime"
 	"net/http"
 	"net/http/httptest"
@@ -170,8 +171,10 @@ func TestParseSafeQueryIsStrictAndRejectsCredentials(t *testing.T) {
 }
 
 func TestBearerAuthorizationRequiresOneExactHeaderToken(t *testing.T) {
-	const token = "test-only-token"
-	portal := &Portal{tokenDigest: sha256.Sum256([]byte(token))}
+	token := testPublicBearer(31)
+	otherToken := testPublicBearer(99)
+	verifier := digestPublicBearer(token)
+	portal := &Portal{bearerVerifier: verifier}
 	tests := []struct {
 		name    string
 		headers []string
@@ -180,10 +183,14 @@ func TestBearerAuthorizationRequiresOneExactHeaderToken(t *testing.T) {
 		{name: "valid", headers: []string{"Bearer " + token}, want: true},
 		{name: "case-insensitive scheme", headers: []string{"bearer " + token}, want: true},
 		{name: "missing"},
-		{name: "wrong", headers: []string{"Bearer wrong"}},
+		{name: "wrong canonical bearer", headers: []string{"Bearer " + otherToken}},
+		{name: "malformed bearer", headers: []string{"Bearer wrong"}},
 		{name: "basic", headers: []string{"Basic " + token}},
 		{name: "space in token", headers: []string{"Bearer " + token + " extra"}},
 		{name: "multiple", headers: []string{"Bearer " + token, "Bearer " + token}},
+		{name: "serialized verifier", headers: []string{"Bearer " + strings.TrimSuffix(string(serializeTestPublicVerifier(verifier)), "\n")}},
+		{name: "hex verifier", headers: []string{"Bearer " + hex.EncodeToString(verifier[:])}},
+		{name: "encoded verifier", headers: []string{"Bearer " + publicBearerPrefix + base64.RawURLEncoding.EncodeToString(verifier[:])}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -195,6 +202,34 @@ func TestBearerAuthorizationRequiresOneExactHeaderToken(t *testing.T) {
 				t.Fatalf("authorized() = %v, want %v", got, test.want)
 			}
 		})
+	}
+}
+
+func TestBearerAuthorizationRejectsObviousLowDiversityBearerEvenWhenDigestMatches(t *testing.T) {
+	for _, raw := range [][]byte{
+		make([]byte, publicBearerRandomBytes),
+		func() []byte {
+			value := make([]byte, publicBearerRandomBytes)
+			for index := range value {
+				value[index] = byte(index % 2)
+			}
+			return value
+		}(),
+		func() []byte {
+			value := make([]byte, publicBearerRandomBytes)
+			for index := range value {
+				value[index] = byte(index % 12)
+			}
+			return value
+		}(),
+	} {
+		candidate := testEncodedPublicBearer(raw)
+		portal := &Portal{bearerVerifier: digestPublicBearer(candidate)}
+		request := httptest.NewRequest(http.MethodGet, BasePath+"/api/list", nil)
+		request.Header.Set("Authorization", "Bearer "+candidate)
+		if portal.authorized(request) {
+			t.Fatalf("obvious low-diversity bearer %q authenticated despite input policy", candidate)
+		}
 	}
 }
 
@@ -210,6 +245,15 @@ func TestPublicAssetsRequireNoCredentialAndContainNoInlineScript(t *testing.T) {
 	}
 	if strings.Contains(recorder.Body.String(), `name="token"`) || !strings.Contains(recorder.Body.String(), `autocomplete="off"`) {
 		t.Fatal("token input can be serialized or lacks autocomplete suppression")
+	}
+	for _, required := range []string{
+		`minlength="47"`,
+		`maxlength="47"`,
+		`pattern="rc1_[A-Za-z0-9_-]{43}"`,
+	} {
+		if !strings.Contains(recorder.Body.String(), required) {
+			t.Errorf("HTML bearer input is missing %q", required)
+		}
 	}
 	if csp := recorder.Header().Get("Content-Security-Policy"); strings.Contains(csp, "unsafe-inline") || !strings.Contains(csp, "default-src 'none'") || !strings.Contains(csp, "worker-src 'self'") {
 		t.Fatalf("unsafe CSP: %q", csp)
@@ -256,6 +300,8 @@ func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *test
 		"recasaos-download-cancel",
 		"window.location.assign(state.requestURL)",
 		"Token forgotten after page restore",
+		"const bearerPattern=/^rc1_[A-Za-z0-9_-]{43}$/",
+		"bearerPattern.test(candidate)",
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("app.js is missing %q", required)
@@ -317,6 +363,8 @@ func TestDownloadWorkerIsNarrowNoStoreAsset(t *testing.T) {
 		"event.replacesClientId!==''&&event.replacesClientId!==prepared.clientId",
 		"self.clients.get(prepared.clientId)",
 		"headers.set('Authorization','Bearer '+authorization.token)",
+		"const bearerPattern=/^rc1_[A-Za-z0-9_-]{43}$/",
+		"!bearerPattern.test(data.token)",
 		"credentials:'omit'",
 		"redirect:'error'",
 		"event.request.signal.removeEventListener('abort',abortFromNavigation)",

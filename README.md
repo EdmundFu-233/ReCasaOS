@@ -32,7 +32,8 @@ The first hardening milestone includes:
 - access/refresh JWT issuer separation and protected debug routes;
 - bounded, traversal-resistant multipart uploads and safer streaming downloads;
 - an opt-in, read-only `/public-files` portal confined with Linux `openat2`, a
-  server-owned root, and a separate header-only bearer token;
+  server-owned root, and a header-only bearer whose server-side configuration
+  contains only a versioned SHA-256 verifier;
 - bounded root file/SSH WebSockets, verified local SSH host keys, one-use SSH
   login tickets, and removal of an SSH infinite retry path;
 - capability-bound outbound fetches with exact endpoint allowlists and
@@ -58,12 +59,17 @@ guide](docs/deployment/public-access.md) proxy only that listener and positive
 route allowlist. Gateway's `/public-files` registration is an intentional 404
 tombstone for stale-route cleanup and is never the portal upstream. A
 particular host is not public-ready until the guide's deployment, restore,
-scanning, and independent-review gates pass.
+scanning, and independent-review gates pass. Verifier-only credentials do not
+change that status: [Issue #25](https://github.com/EdmundFu-233/ReCasaOS/issues/25)
+still requires the Internet-facing listener and potentially blocking filesystem
+work to be isolated from the privileged management daemon.
 
 The portal's large-file browser stream is still a candidate tracked in
-[Issue #20](https://github.com/EdmundFu-233/ReCasaOS/issues/20). Its token is
-current-page-memory-only and header-authenticated, with a 32 MiB bounded
-fallback, but stable Chromium/Firefox/WebKit HTTPS download, memory, retry,
+[Issue #20](https://github.com/EdmundFu-233/ReCasaOS/issues/20). Its client does
+not intentionally persist the bearer in browser storage or a URL. During an
+authorized request the bearer necessarily passes through page, Worker,
+Authorization-header, edge, and server request memory. Stable
+Chromium/Firefox/WebKit HTTPS storage, log, crash, download, memory, retry,
 Range, cancellation, and filename tests remain release gates.
 
 The portal also verifies the already-pinned root descriptor's Linux mount ID
@@ -77,11 +83,16 @@ open until the compatibility and blocking-I/O boundary is independently
 verified. Process isolation from the privileged daemon is tracked in
 [Issue #25](https://github.com/EdmundFu-233/ReCasaOS/issues/25).
 
-The current raw bearer-file configuration also remains a release blocker:
-pathname comparison cannot prove separation across every bind-mount alias.
-Until [Issue #26](https://github.com/EdmundFu-233/ReCasaOS/issues/26) replaces
-it with verifier-only provisioning, do not call a bind-mounted public root or
-token hierarchy public-ready.
+The supported credential candidate is verifier-only. Generate the 47-character
+`rc1_` bearer from 32 random bytes on an independent administrator workstation,
+keep its durable copy only in a password manager, and provision only the strict
+versioned SHA-256 verifier as host credential material. Authorized HTTPS
+requests still carry the bearer transiently to the edge and portal process. The
+host reads the verifier through `RECASAOS_PUBLIC_FILE_VERIFIER_FILE`; when the
+portal is enabled, any non-empty legacy `RECASAOS_PUBLIC_FILE_TOKEN_FILE` value
+fails startup, including when the new setting is also present.
+[Issue #26](https://github.com/EdmundFu-233/ReCasaOS/issues/26)
+remains open until migration, bind-alias, and rotation evidence is reviewed.
 
 Never expose Samba, SSH, daemon ports, debug/API documentation, setup routes,
 privileged v1/v2/v3 APIs, the dedicated portal listener, or root/Gateway

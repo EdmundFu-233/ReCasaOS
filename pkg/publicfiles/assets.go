@@ -13,7 +13,7 @@ const portalHTML = `<!doctype html>
     <h1>ReCasaOS Public Files</h1>
     <form id="login">
       <label for="token">Access token</label>
-      <input id="token" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required>
+      <input id="token" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" minlength="47" maxlength="47" pattern="rc1_[A-Za-z0-9_-]{43}" required>
       <button type="submit">Open files</button>
     </form>
     <section id="browser" hidden>
@@ -35,6 +35,7 @@ const protocolVersion=1;
 const fallbackByteLimit=32*1024*1024;
 const workerReplyTimeoutMs=3000;
 const nativeRequestLifetimeMs=10000;
+const bearerPattern=/^rc1_[A-Za-z0-9_-]{43}$/;
 const login=document.getElementById('login');
 const browser=document.getElementById('browser');
 const tokenInput=document.getElementById('token');
@@ -242,7 +243,7 @@ function handleWorkerChallenge(event){
   port.postMessage({type:'recasaos-download-auth-response',version:protocolVersion,nonce:pending.nonce,path:pending.path,token:accessToken});
 }
 function showError(error){if(!browser.hidden)statusNode.textContent=error&&error.message?error.message:'Request failed';}
-login.addEventListener('submit',event=>{event.preventDefault();const candidate=tokenInput.value.trim();tokenInput.value='';if(!candidate){showLogin('An access token is required');return;}accessToken=candidate;login.hidden=true;browser.hidden=false;load('').catch(showError);prepareWorker();});
+login.addEventListener('submit',event=>{event.preventDefault();const candidate=tokenInput.value;tokenInput.value='';if(!bearerPattern.test(candidate)){showLogin('A valid rc1_ access token is required');return;}accessToken=candidate;login.hidden=true;browser.hidden=false;load('').catch(showError);prepareWorker();});
 upButton.addEventListener('click',()=>{const parts=currentPath.split('/');parts.pop();load(parts.join('/')).catch(showError);});
 document.getElementById('logout').addEventListener('click',()=>forgetAuthorization('Token forgotten for this page'));
 if('serviceWorker' in navigator){
@@ -262,6 +263,7 @@ const pendingLimit=8;
 const basePath='/public-files';
 const filePath=basePath+'/api/file';
 const portalPath=basePath+'/';
+const bearerPattern=/^rc1_[A-Za-z0-9_-]{43}$/;
 const pendingDownloads=new Map();
 const activeDownloads=new Map();
 
@@ -324,7 +326,7 @@ function requestAuthorization(client,download,signal){
     signal.addEventListener('abort',aborted,{once:true});
     channel.port1.onmessage=event=>{
       const data=event.data;
-      if(!exactKeys(data,['nonce','path','token','type','version'])||data.type!=='recasaos-download-auth-response'||data.version!==protocolVersion||data.nonce!==download.nonce||data.path!==download.path||typeof data.token!=='string'||data.token.length<43||data.token.length>4096||!/^[\x21-\x7e]+$/.test(data.token)){finish(new TypeError('download authorization denied'));return;}
+      if(!exactKeys(data,['nonce','path','token','type','version'])||data.type!=='recasaos-download-auth-response'||data.version!==protocolVersion||data.nonce!==download.nonce||data.path!==download.path||typeof data.token!=='string'||!bearerPattern.test(data.token)){finish(new TypeError('download authorization denied'));return;}
       finish(null,data.token);
     };
     channel.port1.onmessageerror=()=>finish(new TypeError('download authorization message error'));

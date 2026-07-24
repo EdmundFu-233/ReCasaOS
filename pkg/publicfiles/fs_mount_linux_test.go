@@ -4,9 +4,12 @@ package publicfiles
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -70,6 +73,18 @@ func runPublicFilesystemTool(t *testing.T, executable string, arguments ...strin
 			strings.TrimSpace(string(output)),
 		)
 	}
+}
+
+func bindPublicTestPath(t *testing.T, source, target string) {
+	t.Helper()
+	if err := unix.Mount(source, target, "", unix.MS_BIND, ""); err != nil {
+		t.Fatalf("explicitly requested bind-alias regression cannot mount %q at %q: %v", source, target, err)
+	}
+	t.Cleanup(func() {
+		if err := unix.Unmount(target, unix.MNT_DETACH); err != nil {
+			t.Errorf("unmount bind-alias regression target %q: %v", target, err)
+		}
+	})
 }
 
 func validateLoopDeviceOutput(output []byte) (string, error) {
@@ -182,6 +197,175 @@ func cleanupLoopMountedFilesystem(t *testing.T, losetupTool, udevadmTool, imageP
 	}
 	settleLoopDeviceRemoval(t, udevadmTool)
 	waitForLoopImageDetach(t, losetupTool, imagePath)
+}
+
+func TestPublicVerifierBindAliasDisclosureCannotAuthenticate(t *testing.T) {
+	requireIsolatedPublicMountTest(t)
+
+	bearer := testPublicBearer(121)
+	verifier := digestPublicBearer(bearer)
+	serialized := serializeTestPublicVerifier(verifier)
+	base64URLVerifier := base64.RawURLEncoding.EncodeToString(verifier[:])
+	bearerShapedVerifier := publicBearerPrefix + base64URLVerifier
+	if !validPublicBearer(bearerShapedVerifier) {
+		t.Fatal("bearer-shaped verifier fixture is not a valid canonical bearer")
+	}
+
+	const verifierName = "public-file.verifier"
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, base string) (rootPath, verifierPath string)
+	}{
+		{
+			name: "root-to-alias",
+			setup: func(t *testing.T, base string) (string, string) {
+				rootPath := filepath.Join(base, "root")
+				aliasPath := filepath.Join(base, "verifier-alias")
+				for _, directory := range []string{rootPath, aliasPath} {
+					if err := os.MkdirAll(directory, 0o700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := os.WriteFile(filepath.Join(rootPath, verifierName), serialized, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				bindPublicTestPath(t, rootPath, aliasPath)
+				return rootPath, filepath.Join(aliasPath, verifierName)
+			},
+		},
+		{
+			name: "alias-to-root",
+			setup: func(t *testing.T, base string) (string, string) {
+				rootPath := filepath.Join(base, "root")
+				aliasPath := filepath.Join(base, "public-root-alias")
+				for _, directory := range []string{rootPath, aliasPath} {
+					if err := os.MkdirAll(directory, 0o700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				verifierPath := filepath.Join(rootPath, verifierName)
+				if err := os.WriteFile(verifierPath, serialized, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				bindPublicTestPath(t, rootPath, aliasPath)
+				return aliasPath, verifierPath
+			},
+		},
+		{
+			name: "nested-bind-alias-to-root",
+			setup: func(t *testing.T, base string) (string, string) {
+				rootPath := filepath.Join(base, "root")
+				firstAlias := filepath.Join(base, "first-alias")
+				nestedAlias := filepath.Join(base, "alias-chain", "nested-alias")
+				for _, directory := range []string{rootPath, firstAlias, nestedAlias} {
+					if err := os.MkdirAll(directory, 0o700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				verifierPath := filepath.Join(rootPath, verifierName)
+				if err := os.WriteFile(verifierPath, serialized, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				bindPublicTestPath(t, rootPath, firstAlias)
+				bindPublicTestPath(t, firstAlias, nestedAlias)
+				return nestedAlias, verifierPath
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rootPath, verifierPath := test.setup(t, t.TempDir())
+			for _, direction := range []struct {
+				name      string
+				ancestor  string
+				candidate string
+			}{
+				{name: "root contains verifier", ancestor: rootPath, candidate: verifierPath},
+				{name: "verifier contains root", ancestor: verifierPath, candidate: rootPath},
+			} {
+				relative, err := filepath.Rel(direction.ancestor, direction.candidate)
+				if err != nil {
+					t.Fatalf("compare lexical path direction %q: %v", direction.name, err)
+				}
+				if relative == "." ||
+					(relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))) {
+					t.Fatalf(
+						"bind-alias fixture is not lexically disjoint (%s): %q relative to %q is %q",
+						direction.name,
+						direction.candidate,
+						direction.ancestor,
+						relative,
+					)
+				}
+			}
+
+			exposedPath := filepath.Join(rootPath, verifierName)
+			exposedInfo, err := os.Stat(exposedPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			configuredInfo, err := os.Stat(verifierPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !os.SameFile(exposedInfo, configuredInfo) {
+				t.Fatalf("configured verifier %q does not alias exposed file %q", verifierPath, exposedPath)
+			}
+
+			portal, err := New(Config{Root: rootPath, VerifierFile: verifierPath})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := portal.Close(); err != nil {
+					t.Errorf("close bind-alias portal: %v", err)
+				}
+			})
+
+			download := serve(
+				portal,
+				requestWithBearer(t, http.MethodGet, BasePath+"/api/file?path="+verifierName, bearer),
+			)
+			if download.Code != http.StatusOK || !bytes.Equal(download.Body.Bytes(), serialized) {
+				t.Fatalf(
+					"strict verifier was not exposed through the expected alias: status=%d body=%q",
+					download.Code,
+					download.Body.Bytes(),
+				)
+			}
+
+			candidates := []struct {
+				name  string
+				value string
+			}{
+				{name: "serialized-verifier", value: string(download.Body.Bytes())},
+				{name: "serialized-verifier-without-lf", value: strings.TrimSuffix(string(download.Body.Bytes()), "\n")},
+				{name: "hex-verifier-digest", value: hex.EncodeToString(verifier[:])},
+				{name: "base64url-verifier-digest", value: base64URLVerifier},
+				{name: "bearer-shaped-base64url-verifier-digest", value: bearerShapedVerifier},
+			}
+			for _, candidate := range candidates {
+				t.Run(candidate.name, func(t *testing.T) {
+					response := serve(
+						portal,
+						requestWithBearer(t, http.MethodGet, BasePath+"/api/list", candidate.value),
+					)
+					if response.Code != http.StatusUnauthorized {
+						t.Fatalf("verifier-derived candidate returned %d, want 401", response.Code)
+					}
+				})
+			}
+
+			response := serve(
+				portal,
+				requestWithBearer(t, http.MethodGet, BasePath+"/api/list", bearer),
+			)
+			if response.Code != http.StatusOK {
+				t.Fatalf("real bearer returned %d after verifier probes, want 200", response.Code)
+			}
+		})
+	}
 }
 
 func TestPinnedPublicRootSurvivesBindMountReplacement(t *testing.T) {

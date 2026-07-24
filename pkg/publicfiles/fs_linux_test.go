@@ -3,7 +3,9 @@
 package publicfiles
 
 import (
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -13,8 +15,6 @@ import (
 
 	"golang.org/x/sys/unix"
 )
-
-const safeOpenTestToken = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_"
 
 const zfsSuperMagic = 0x2fc12fc1 // OpenZFS Linux statfs magic; intentionally not allowlisted.
 
@@ -489,7 +489,112 @@ func TestOpenRegularRevalidatesLinkCountAfterReopen(t *testing.T) {
 	}
 }
 
-func TestTokenRejectsUnsafeObjectBeforeDataOpen(t *testing.T) {
+func TestVerifierReadsStrictSerializedDigest(t *testing.T) {
+	for _, mode := range []os.FileMode{0o400, 0o600} {
+		t.Run(fmt.Sprintf("%04o", mode), func(t *testing.T) {
+			verifierPath := filepath.Join(t.TempDir(), "verifier")
+			expected := digestPublicBearer(testPublicBearer(1))
+			if err := os.WriteFile(verifierPath, serializeTestPublicVerifier(expected), mode); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(verifierPath, mode); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := readVerifierFileSecure(verifierPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != expected {
+				t.Fatalf("read verifier = %x, want %x", got, expected)
+			}
+		})
+	}
+}
+
+func TestVerifierRejectsUnsafePermissions(t *testing.T) {
+	for _, mode := range []os.FileMode{
+		0o000,
+		0o200,
+		0o640,
+		0o604,
+		0o700,
+		0o660,
+		0o600 | os.ModeSetuid,
+		0o600 | os.ModeSetgid,
+		0o600 | os.ModeSticky,
+	} {
+		t.Run(fmt.Sprintf("%04o", mode), func(t *testing.T) {
+			verifierPath := filepath.Join(t.TempDir(), "verifier")
+			expected := digestPublicBearer(testPublicBearer(2))
+			if err := os.WriteFile(verifierPath, serializeTestPublicVerifier(expected), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(verifierPath, mode); err != nil {
+				t.Fatal(err)
+			}
+
+			dataOpenCalls := 0
+			verifier, err := readVerifierFileSecureWith(verifierPath, func(int) (int, error) {
+				dataOpenCalls++
+				return -1, errors.New("unsafe verifier must be rejected before data open")
+			})
+			if err == nil || verifier != ([sha256.Size]byte{}) ||
+				!strings.Contains(err.Error(), "permissions must be exactly 0400 or 0600") {
+				t.Fatalf("unsafe verifier mode %04o returned verifier=%x err=%v", mode, verifier, err)
+			}
+			if dataOpenCalls != 0 {
+				t.Fatalf("unsafe verifier mode %04o reached the data opener %d times", mode, dataOpenCalls)
+			}
+		})
+	}
+}
+
+func TestVerifierRejectsUnexpectedOwner(t *testing.T) {
+	stat := unix.Stat_t{
+		Mode:  unix.S_IFREG | 0o600,
+		Nlink: 1,
+		Uid:   uint32(os.Geteuid()) + 1,
+	}
+	if err := validateVerifierFileStat(&stat); err == nil || !strings.Contains(err.Error(), "owned by the service user") {
+		t.Fatalf("unexpected verifier owner returned %v", err)
+	}
+}
+
+func TestVerifierLoaderPreservesStrictFormatFailure(t *testing.T) {
+	expected := digestPublicBearer(testPublicBearer(3))
+	valid := string(serializeTestPublicVerifier(expected))
+	digestHex := strings.TrimSuffix(strings.TrimPrefix(valid, publicVerifierPrefix), "\n")
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "missing LF", value: strings.TrimSuffix(valid, "\n")},
+		{name: "CRLF", value: strings.TrimSuffix(valid, "\n") + "\r\n"},
+		{name: "extra LF", value: valid + "\n"},
+		{name: "leading whitespace", value: " " + valid},
+		{name: "uppercase digest", value: publicVerifierPrefix + strings.ToUpper(digestHex) + "\n"},
+		{name: "bare digest", value: digestHex},
+		{name: "wrong version", value: strings.Replace(valid, "-v1:", "-v2:", 1)},
+		{name: "wrong algorithm", value: strings.Replace(valid, ":sha256:", ":sha512:", 1)},
+		{name: "overlong", value: valid + strings.Repeat("x", publicVerifierFileMaxBytes)},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			verifierPath := filepath.Join(t.TempDir(), "verifier")
+			if err := os.WriteFile(verifierPath, []byte(test.value), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			verifier, err := readVerifierFileSecure(verifierPath)
+			if !errors.Is(err, errInvalidPublicVerifier) || verifier != ([sha256.Size]byte{}) {
+				t.Fatalf("malformed verifier returned verifier=%x err=%v", verifier, err)
+			}
+		})
+	}
+}
+
+func TestVerifierRejectsUnsafeObjectBeforeDataOpen(t *testing.T) {
 	base := t.TempDir()
 	if err := os.Mkdir(filepath.Join(base, "directory"), 0o700); err != nil {
 		t.Fatal(err)
@@ -498,7 +603,8 @@ func TestTokenRejectsUnsafeObjectBeforeDataOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	linked := filepath.Join(base, "linked")
-	if err := os.WriteFile(linked, []byte(safeOpenTestToken), 0o600); err != nil {
+	encoded := serializeTestPublicVerifier(digestPublicBearer(testPublicBearer(2)))
+	if err := os.WriteFile(linked, encoded, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Link(linked, filepath.Join(base, "linked-again")); err != nil {
@@ -511,47 +617,50 @@ func TestTokenRejectsUnsafeObjectBeforeDataOpen(t *testing.T) {
 	for _, name := range []string{"directory", "pipe", "linked", "symlink"} {
 		t.Run(name, func(t *testing.T) {
 			dataOpenCalls := 0
-			token, err := readTokenFileSecureWith(filepath.Join(base, name), func(int) (int, error) {
+			verifier, err := readVerifierFileSecureWith(filepath.Join(base, name), func(int) (int, error) {
 				dataOpenCalls++
 				return -1, errors.New("data open must not run")
 			})
-			if err == nil || token != nil {
-				t.Fatalf("unsafe token %s returned token=%q err=%v", name, token, err)
+			if err == nil || verifier != ([sha256.Size]byte{}) {
+				t.Fatalf("unsafe verifier %s returned verifier=%x err=%v", name, verifier, err)
 			}
 			if dataOpenCalls != 0 {
-				t.Fatalf("unsafe token %s reached the data opener %d times", name, dataOpenCalls)
+				t.Fatalf("unsafe verifier %s reached the data opener %d times", name, dataOpenCalls)
 			}
 		})
 	}
 }
 
-func TestTokenFailsClosedWhenProcReopenIsUnavailable(t *testing.T) {
-	tokenPath := filepath.Join(t.TempDir(), "token")
-	if err := os.WriteFile(tokenPath, []byte(safeOpenTestToken), 0o600); err != nil {
+func TestVerifierFailsClosedWhenProcReopenIsUnavailable(t *testing.T) {
+	verifierPath := filepath.Join(t.TempDir(), "verifier")
+	expected := digestPublicBearer(testPublicBearer(3))
+	if err := os.WriteFile(verifierPath, serializeTestPublicVerifier(expected), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
 	calls := 0
-	token, err := readTokenFileSecureWith(tokenPath, func(int) (int, error) {
+	verifier, err := readVerifierFileSecureWith(verifierPath, func(int) (int, error) {
 		calls++
 		return -1, unix.ENOENT
 	})
-	if err == nil || token != nil {
-		t.Fatalf("unavailable proc reopen returned token=%q err=%v", token, err)
+	if err == nil || verifier != ([sha256.Size]byte{}) {
+		t.Fatalf("unavailable proc reopen returned verifier=%x err=%v", verifier, err)
 	}
 	if calls != 1 {
 		t.Fatalf("proc reopener called %d times, want exactly once and no fallback", calls)
 	}
 }
 
-func TestTokenRejectsReopenedIdentityMismatch(t *testing.T) {
+func TestVerifierRejectsReopenedIdentityMismatch(t *testing.T) {
 	base := t.TempDir()
-	expectedPath := filepath.Join(base, "expected-token")
-	otherPath := filepath.Join(base, "other-token")
-	if err := os.WriteFile(expectedPath, []byte(safeOpenTestToken), 0o600); err != nil {
+	expectedPath := filepath.Join(base, "expected-verifier")
+	otherPath := filepath.Join(base, "other-verifier")
+	expected := digestPublicBearer(testPublicBearer(4))
+	otherVerifier := digestPublicBearer(testPublicBearer(5))
+	if err := os.WriteFile(expectedPath, serializeTestPublicVerifier(expected), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(otherPath, []byte(strings.Repeat("A1", 32)), 0o600); err != nil {
+	if err := os.WriteFile(otherPath, serializeTestPublicVerifier(otherVerifier), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	other, err := os.Open(otherPath)
@@ -561,33 +670,112 @@ func TestTokenRejectsReopenedIdentityMismatch(t *testing.T) {
 	defer other.Close()
 
 	reopenedFD := -1
-	token, err := readTokenFileSecureWith(expectedPath, func(int) (int, error) {
+	verifier, err := readVerifierFileSecureWith(expectedPath, func(int) (int, error) {
 		fd, duplicateErr := unix.Dup(int(other.Fd()))
 		reopenedFD = fd
 		return fd, duplicateErr
 	})
-	if err == nil || token != nil || !strings.Contains(err.Error(), "stable single-link regular file") {
-		t.Fatalf("identity mismatch returned token=%q err=%v", token, err)
+	if err == nil || verifier != ([sha256.Size]byte{}) || !strings.Contains(err.Error(), "stable single-link regular file") {
+		t.Fatalf("identity mismatch returned verifier=%x err=%v", verifier, err)
 	}
 	var stat unix.Stat_t
 	if statErr := unix.Fstat(reopenedFD, &stat); !errors.Is(statErr, unix.EBADF) {
-		t.Fatalf("rejected token descriptor was not closed: %v", statErr)
+		t.Fatalf("rejected verifier descriptor was not closed: %v", statErr)
 	}
 }
 
-func TestTokenValidatesPermissionsOnReopenedDescriptor(t *testing.T) {
-	tokenPath := filepath.Join(t.TempDir(), "token")
-	if err := os.WriteFile(tokenPath, []byte(safeOpenTestToken), 0o600); err != nil {
+func TestVerifierValidatesPermissionsOnReopenedDescriptor(t *testing.T) {
+	verifierPath := filepath.Join(t.TempDir(), "verifier")
+	expected := digestPublicBearer(testPublicBearer(6))
+	if err := os.WriteFile(verifierPath, serializeTestPublicVerifier(expected), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	token, err := readTokenFileSecureWith(tokenPath, func(pinnedFD int) (int, error) {
-		if err := os.Chmod(tokenPath, 0o640); err != nil {
+	verifier, err := readVerifierFileSecureWith(verifierPath, func(pinnedFD int) (int, error) {
+		if err := os.Chmod(verifierPath, 0o640); err != nil {
 			return -1, err
 		}
 		return reopenPinnedRegular(pinnedFD)
 	})
-	if err == nil || token != nil || !strings.Contains(err.Error(), "inaccessible by group") {
-		t.Fatalf("changed token permissions returned token=%q err=%v", token, err)
+	if err == nil || verifier != ([sha256.Size]byte{}) || !strings.Contains(err.Error(), "permissions must be exactly 0400 or 0600") {
+		t.Fatalf("changed verifier permissions returned verifier=%x err=%v", verifier, err)
+	}
+}
+
+func TestVerifierRejectsWritableParentDirectory(t *testing.T) {
+	tests := []struct {
+		name string
+		mode os.FileMode
+	}{
+		{name: "group writable", mode: 0o720},
+		{name: "other writable", mode: 0o702},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			verifierDir := filepath.Join(t.TempDir(), "credentials")
+			if err := os.Mkdir(verifierDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			verifierPath := filepath.Join(verifierDir, "public.verifier")
+			expected := digestPublicBearer(testPublicBearer(7))
+			if err := os.WriteFile(verifierPath, serializeTestPublicVerifier(expected), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(verifierDir, test.mode); err != nil {
+				t.Fatal(err)
+			}
+
+			verifier, err := readVerifierFileSecure(verifierPath)
+			if err == nil || verifier != ([sha256.Size]byte{}) ||
+				!strings.Contains(err.Error(), "parent directory must not be writable by group or other users") {
+				t.Fatalf("writable verifier parent mode %04o returned verifier=%x err=%v", test.mode.Perm(), verifier, err)
+			}
+		})
+	}
+}
+
+func TestVerifierFailsClosedWhenConfiguredPathIsAtomicallyReplaced(t *testing.T) {
+	base := t.TempDir()
+	configuredPath := filepath.Join(base, "configured.verifier")
+	replacementPath := filepath.Join(base, "replacement.verifier")
+	expected := digestPublicBearer(testPublicBearer(8))
+	replacement := digestPublicBearer(testPublicBearer(9))
+	if expected == replacement {
+		t.Fatal("test verifiers unexpectedly match")
+	}
+	if err := os.WriteFile(configuredPath, serializeTestPublicVerifier(expected), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(replacementPath, serializeTestPublicVerifier(replacement), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	reopenedFD := -1
+	verifier, err := readVerifierFileSecureWith(configuredPath, func(pinnedFD int) (int, error) {
+		fd, reopenErr := reopenPinnedRegular(pinnedFD)
+		if reopenErr != nil {
+			return -1, reopenErr
+		}
+		if exchangeErr := unix.Renameat2(
+			unix.AT_FDCWD,
+			configuredPath,
+			unix.AT_FDCWD,
+			replacementPath,
+			unix.RENAME_EXCHANGE,
+		); exchangeErr != nil {
+			_ = unix.Close(fd)
+			return -1, exchangeErr
+		}
+		reopenedFD = fd
+		return fd, nil
+	})
+	if err == nil || verifier != ([sha256.Size]byte{}) ||
+		!strings.Contains(err.Error(), "verifier path changed while it was being read") {
+		t.Fatalf("atomically replaced verifier path returned verifier=%x err=%v", verifier, err)
+	}
+	var stat unix.Stat_t
+	if statErr := unix.Fstat(reopenedFD, &stat); !errors.Is(statErr, unix.EBADF) {
+		t.Fatalf("reopened verifier descriptor was not closed: %v", statErr)
 	}
 }
