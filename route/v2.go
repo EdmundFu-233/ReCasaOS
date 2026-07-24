@@ -1,8 +1,10 @@
 package route
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"log"
+	"mime"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -34,6 +36,18 @@ var (
 	V3FilePath string
 )
 
+const (
+	v2OpenAPIJWTVerifiedContextKey = "recasaos/v2-openapi-jwt-verified"
+	v2OpenAPISecuritySchemeName    = "access_token"
+)
+
+// v2OpenAPIJWTVerification binds the OpenAPI handoff to the exact request
+// which echo-jwt authenticated. Request headers and generic Echo context
+// values are not authentication evidence.
+type v2OpenAPIJWTVerification struct {
+	request *http.Request
+}
+
 func init() {
 	swagger, err := codegen.GetSwagger()
 	if err != nil {
@@ -61,9 +75,28 @@ func InitV2Router() http.Handler {
 
 	e.Use(safeRequestLogger())
 
-	e.Use(echojwt.WithConfig(echojwt.Config{
+	e.Use(echojwt.WithConfig(v2JWTConfig()))
+	e.Use(privateNoStoreResponses())
+
+	e.Use(echomiddleware.OapiRequestValidatorWithOptions(_swagger, &echomiddleware.Options{
+		Skipper: v2OpenAPIValidationSkipper,
+		Options: openapi3filter.Options{AuthenticationFunc: v2OpenAPIAuthentication},
+	}))
+
+	codegen.RegisterHandlersWithBaseURL(e, appManagement, V2APIPath)
+
+	return httpsecurity.WithSecurityHeaders(httpsecurity.WithCORS(e, httpsecurity.AllowedOriginsFromEnv()))
+}
+
+func v2JWTConfig() echojwt.Config {
+	return echojwt.Config{
 		Skipper: func(c echo.Context) bool {
 			return httpsecurity.LoopbackAuthBypassAllowed(c.Request())
+		},
+		SuccessHandler: func(c echo.Context) {
+			c.Set(v2OpenAPIJWTVerifiedContextKey, v2OpenAPIJWTVerification{
+				request: c.Request(),
+			})
 		},
 		ParseTokenFunc: func(c echo.Context, token string) (interface{}, error) {
 			claims, err := authsecurity.ValidateAccessToken(token, func() (*ecdsa.PublicKey, error) { return external.GetPublicKey(config.CommonInfo.RuntimePath) })
@@ -75,44 +108,50 @@ func InitV2Router() http.Handler {
 			return claims, nil
 		},
 		TokenLookup: "header:Authorization,query:token",
-	}))
-	e.Use(privateNoStoreResponses())
+	}
+}
 
-	// e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
-	// 	return func(c echo.Context) error {
-	// 		switch c.Request().Header.Get(echo.HeaderContentType) {
-	// 		case common.MIMEApplicationYAML: // in case request contains a compose content in YAML
-	// 			return middleware.OapiRequestValidatorWithOptions(_swagger, &middleware.Options{
-	// 				Options: openapi3filter.Options{
-	// 					AuthenticationFunc: openapi3filter.NoopAuthenticationFunc,
-	// 					// ExcludeRequestBody:  true,
-	// 					// ExcludeResponseBody: true,
-	// 				},
-	// 			})(next)(c)
+func v2OpenAPIValidationSkipper(c echo.Context) bool {
+	request := c.Request()
+	if request == nil ||
+		request.URL == nil ||
+		request.Method != http.MethodPost ||
+		request.URL.Path != V2APIPath+"/file/upload" {
+		return false
+	}
 
-	// 		default:
-	// 			return middleware.OapiRequestValidatorWithOptions(_swagger, &middleware.Options{
-	// 				Options: openapi3filter.Options{
-	// 					AuthenticationFunc: openapi3filter.NoopAuthenticationFunc,
-	// 				},
-	// 			})(next)(c)
-	// 		}
-	// 	}
-	// })
+	mediaType, _, err := mime.ParseMediaType(request.Header.Get(echo.HeaderContentType))
+	return err == nil && mediaType == "multipart/form-data"
+}
 
-	e.Use(echomiddleware.OapiRequestValidatorWithOptions(_swagger, &echomiddleware.Options{
-		Skipper: func(c echo.Context) bool {
-			// jump validate when upload file
-			// because file upload can't pass validate
-			// issue: https://github.com/deepmap/oapi-codegen/issues/514
-			return strings.Contains(strings.ToLower(c.Request().Header.Get(echo.HeaderContentType)), "multipart/form-data")
-		},
-		Options: openapi3filter.Options{AuthenticationFunc: openapi3filter.NoopAuthenticationFunc},
-	}))
+func v2OpenAPIAuthentication(ctx context.Context, input *openapi3filter.AuthenticationInput) error {
+	if input == nil ||
+		input.RequestValidationInput == nil ||
+		input.RequestValidationInput.Request == nil ||
+		input.SecuritySchemeName != v2OpenAPISecuritySchemeName ||
+		input.SecurityScheme == nil ||
+		input.SecurityScheme.Type != "apiKey" ||
+		input.SecurityScheme.In != "header" ||
+		input.SecurityScheme.Name != echo.HeaderAuthorization ||
+		len(input.Scopes) != 0 {
+		return echo.ErrUnauthorized
+	}
 
-	codegen.RegisterHandlersWithBaseURL(e, appManagement, V2APIPath)
+	echoContext := echomiddleware.GetEchoContext(ctx)
+	if echoContext == nil ||
+		echoContext.Request() == nil ||
+		echoContext.Request() != input.RequestValidationInput.Request {
+		return echo.ErrUnauthorized
+	}
 
-	return httpsecurity.WithSecurityHeaders(httpsecurity.WithCORS(e, httpsecurity.AllowedOriginsFromEnv()))
+	verification, ok := echoContext.Get(v2OpenAPIJWTVerifiedContextKey).(v2OpenAPIJWTVerification)
+	if ok && verification.request == echoContext.Request() {
+		return nil
+	}
+	if httpsecurity.LoopbackAuthBypassAllowed(echoContext.Request()) {
+		return nil
+	}
+	return echo.ErrUnauthorized
 }
 
 func InitV2DocRouter(docHTML string, docYAML string) http.Handler {
