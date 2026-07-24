@@ -209,8 +209,8 @@ require_exact_sectioned_active_lines "$service" \
   'ProtectKernelLogs=yes' \
   'ProtectKernelModules=yes' \
   'ProtectKernelTunables=yes' \
-  'InaccessiblePaths=-/sys -/dev/shm' \
-  'ReadOnlyPaths=/tmp /var/tmp' \
+  'InaccessiblePaths=+/sys -+/dev/shm' \
+  'ReadOnlyPaths=+/tmp +/var/tmp' \
   'CapabilityBoundingSet=' \
   'AmbientCapabilities=' \
   'NoNewPrivileges=yes' \
@@ -284,9 +284,9 @@ require_exact_key_assignments Service ProcSubset "$service" 'ProcSubset=pid'
 require_exact_key_assignments Service ProtectSystem "$service" 'ProtectSystem=strict'
 require_exact_key_assignments Service ProtectHome "$service" 'ProtectHome=yes'
 require_exact_key_assignments Service InaccessiblePaths "$service" \
-  'InaccessiblePaths=-/sys -/dev/shm'
+  'InaccessiblePaths=+/sys -+/dev/shm'
 require_exact_key_assignments Service ReadOnlyPaths "$service" \
-  'ReadOnlyPaths=/tmp /var/tmp'
+  'ReadOnlyPaths=+/tmp +/var/tmp'
 require_exact_key_assignments Service CapabilityBoundingSet "$service" \
   'CapabilityBoundingSet='
 require_exact_key_assignments Service AmbientCapabilities "$service" \
@@ -314,7 +314,8 @@ for forbidden_service_key in \
   DynamicUser RestrictSUIDSGID PrivateIPC SocketBindAllow SocketBindDeny \
   BindPaths ReadWritePaths ReadWriteDirectories ReadOnlyDirectories \
   InaccessibleDirectories RootImage RootImageOptions MountImages \
-  ExtensionImages DeviceAllow DevicePolicy ExecStartPre ExecStartPost \
+  ExtensionImages TemporaryFileSystem DeviceAllow DevicePolicy \
+  ExecStartPre ExecStartPost \
   ExecStop ExecStopPost ExecReload Wants Requires BindsTo PartOf \
   Environment EnvironmentFile PassEnvironment UnsetEnvironment
 do

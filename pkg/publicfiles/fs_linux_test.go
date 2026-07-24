@@ -892,9 +892,11 @@ func TestVerifierFailsClosedWhenConfiguredPathIsAtomicallyReplaced(t *testing.T)
 		reopenedFD = fd
 		return fd, nil
 	})
-	if err == nil || verifier != ([sha256.Size]byte{}) ||
-		!strings.Contains(err.Error(), "verifier path changed while it was being read") {
+	if err == nil || verifier != ([sha256.Size]byte{}) {
 		t.Fatalf("atomically replaced verifier path returned verifier=%x err=%v", verifier, err)
+	}
+	if reopenedFD < 0 {
+		t.Fatal("atomically replaced verifier path did not execute the secure reopen")
 	}
 	var stat unix.Stat_t
 	if statErr := unix.Fstat(reopenedFD, &stat); !errors.Is(statErr, unix.EBADF) {

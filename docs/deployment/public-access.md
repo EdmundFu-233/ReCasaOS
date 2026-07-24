@@ -548,9 +548,13 @@ unknown or incomplete CLI.
 The packaged service uses a minimal `RootDirectory=`, exposes the share only as
 the read-only `/srv/public`, imports the verifier through `LoadCredential=`,
 has a private network namespace, permits creation of only AF_UNIX sockets, and
-has an empty capability bounding set. It has no dependency on
-`casaos.service`. A portal startup failure, crash, restart limit, or controlled
-stop must leave the management daemon PID and health unchanged.
+has an empty capability bounding set. Its `InaccessiblePaths=` and
+`ReadOnlyPaths=` entries use systemd's `+` prefix so the masks apply inside
+`RootDirectory=` rather than to the host root: jail `/sys` is mandatory and
+inaccessible, `/dev/shm` is inaccessible when present, and jail `/tmp` and
+`/var/tmp` are read-only. It has no dependency on `casaos.service`. A portal
+startup failure, crash, restart limit, or controlled stop must leave the
+management daemon PID and health unchanged.
 
 On ACL-capable systems, systemd keeps the runtime credential owned by
 `root:root` and grants only the service UID named-user read access. Linux then

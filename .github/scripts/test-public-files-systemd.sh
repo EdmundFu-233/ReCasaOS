@@ -49,12 +49,16 @@ management_dir="${workspace}/management"
 response_file="${workspace}/response"
 nested_backing="${workspace}/nested-backing"
 nested_mount="${share}/covered"
+host_shm_sentinel_prefix="/dev/shm/recasaos-public-files-ci-${run_key}."
+host_shm_sentinel=
 test_bearer='rc1_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8'
 
 case "$workspace" in
   /run/recasaos-public-files-ci-[0-9]*-[0-9]*) ;;
   *) fail "refusing unsafe workspace path: $workspace" ;;
 esac
+[[ "$host_shm_sentinel_prefix" =~ ^/dev/shm/recasaos-public-files-ci-[0-9]+-[0-9]+\.$ ]] ||
+  fail "refusing unsafe shared-memory sentinel prefix: $host_shm_sentinel_prefix"
 
 [[ ! -e "$workspace" ]] || fail "test workspace already exists"
 [[ ! -e "$service_path" && ! -e "$socket_path" &&
@@ -68,12 +72,13 @@ if getent passwd recasaos-public >/dev/null ||
   getent group recasaos-public >/dev/null; then
   fail "the recasaos-public account unexpectedly already exists"
 fi
-for required_tool in getfacl mount mountpoint umount; do
+for required_tool in getfacl mktemp mount mountpoint umount; do
   command -v "$required_tool" >/dev/null 2>&1 ||
     fail "required mount test tool is unavailable: $required_tool"
 done
 account_cleanup_authorized=1
 nested_mount_cleanup_required=0
+host_shm_sentinel_created=0
 
 cleanup_problem() {
   printf 'public-files systemd test cleanup: %s\n' "$*" >&2
@@ -327,6 +332,24 @@ cleanup() {
     cleanup_verify_unit_inactive "$unit"
   done
 
+  if [[ "$host_shm_sentinel_created" == 1 ]]; then
+    if [[ ! "$host_shm_sentinel" =~ ^/dev/shm/recasaos-public-files-ci-[0-9]+-[0-9]+\.[A-Za-z0-9]{6}$ ]]; then
+      cleanup_problem \
+        "refusing unsafe shared-memory sentinel cleanup: $host_shm_sentinel"
+    else
+      sudo rm -f -- "$host_shm_sentinel"
+      command_status=$?
+      if [[ "$command_status" != 0 ]]; then
+        cleanup_problem \
+          "could not remove shared-memory sentinel (status $command_status)"
+      fi
+      if [[ -e "$host_shm_sentinel" || -L "$host_shm_sentinel" ]]; then
+        cleanup_problem \
+          "shared-memory sentinel remains after cleanup: $host_shm_sentinel"
+      fi
+    fi
+  fi
+
   if [[ "$nested_mount_cleanup_required" == 1 ]]; then
     sudo mountpoint -q -- "$nested_mount" >/dev/null 2>&1
     mountpoint_status=$?
@@ -520,6 +543,48 @@ assert_systemd_credential_for_pid() {
     "$credential_layout" "$credential_metadata"
 }
 
+assert_service_api_vfs_isolation() {
+  local pid=$1
+  local dev_shm_mode
+  local temporary_path
+
+  [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]] ||
+    fail "cannot inspect API VFS isolation for unsafe service PID: $pid"
+  sudo test -d "/proc/$pid" ||
+    fail "service PID disappeared before API VFS inspection: $pid"
+
+  sudo test ! -e "/proc/$pid/root/sys/kernel" ||
+    fail "host sysfs kernel tree is visible in the service root"
+  sudo test ! -e "/proc/$pid/root/sys/class" ||
+    fail "host sysfs class tree is visible in the service root"
+  if sudo awk '
+    $5 == "/sys" {
+      for (field = 1; field <= NF; field++)
+        if ($field == "-" && $(field + 1) == "sysfs")
+          found = 1
+    }
+    END { exit found ? 0 : 1 }
+  ' "/proc/$pid/mountinfo"; then
+    fail "a sysfs filesystem is mounted at /sys in the service namespace"
+  fi
+
+  sudo test ! -e "/proc/$pid/root/proc/sys" ||
+    fail "non-process procfs APIs are visible in the service root"
+  sudo test ! -e "/proc/$pid/root$host_shm_sentinel" ||
+    fail "host shared-memory contents are visible in the service root"
+  dev_shm_mode="$(sudo stat -Lc %a "/proc/$pid/root/dev/shm")"
+  [[ "$dev_shm_mode" == 0 ]] ||
+    fail "service /dev/shm mode is $dev_shm_mode, want inaccessible mode 0"
+
+  for temporary_path in tmp var/tmp; do
+    sudo test -d "/proc/$pid/root/$temporary_path" ||
+      fail "service /$temporary_path directory is missing"
+    if sudo touch "/proc/$pid/root/$temporary_path/forbidden" 2>/dev/null; then
+      fail "service /$temporary_path is writable"
+    fi
+  done
+}
+
 socket_is_inactive_and_unbound() {
   if sudo systemctl is-active --quiet "$socket_unit"; then
     return 1
@@ -631,6 +696,14 @@ nested_mount_cleanup_required=1
 sudo mount --bind "$nested_backing" "$nested_mount"
 sudo chmod 0555 "$rootfs/proc" "$rootfs/sys"
 sudo chmod 01777 "$rootfs/tmp" "$rootfs/var/tmp"
+host_shm_sentinel="$(mktemp "${host_shm_sentinel_prefix}XXXXXX")"
+[[ "$host_shm_sentinel" =~ ^/dev/shm/recasaos-public-files-ci-[0-9]+-[0-9]+\.[A-Za-z0-9]{6}$ ]] ||
+  fail "mktemp returned an unsafe shared-memory sentinel: $host_shm_sentinel"
+host_shm_sentinel_created=1
+printf '%s\n' 'host shared-memory sentinel must remain hidden' |
+  sudo tee "$host_shm_sentinel" >/dev/null
+sudo chown root:root "$host_shm_sentinel"
+sudo chmod 0600 "$host_shm_sentinel"
 
 digest="$(printf '%s' "$test_bearer" | sha256sum | awk '{ print $1 }')"
 printf 'recasaos-public-verifier-v1:sha256:%s\n' "$digest" |
@@ -835,12 +908,6 @@ fi
 if sudo chmod 0666 "/proc/$portal_pid/root/srv/public/report.txt" 2>/dev/null; then
   fail "service share metadata is writable"
 fi
-sudo test ! -e "/proc/$portal_pid/root/sys/kernel" ||
-  fail "host sysfs is visible in the service root"
-sudo test ! -e "/proc/$portal_pid/root/proc/sys" ||
-  fail "non-process procfs APIs are visible in the service root"
-sudo test ! -e "/proc/$portal_pid/root/dev/shm" ||
-  fail "shared-memory device path is visible in the service root"
 for host_device in /dev/fuse /dev/kvm /dev/net/tun; do
   sudo test ! -e "/proc/$portal_pid/root$host_device" ||
     fail "host device is visible in the service root: $host_device"
@@ -865,6 +932,7 @@ proc_mount="$(
   fail "service procfs does not hide other users' processes"
 
 assert_systemd_credential_for_pid "$portal_pid"
+assert_service_api_vfs_isolation "$portal_pid"
 
 listener_count="$(
   sudo ss -H -ltn |
@@ -929,6 +997,7 @@ wait_until "public portal after SIGKILL" page_is_ready
 wait_until "unchanged management sentinel after SIGKILL" sentinel_is_unchanged
 portal_pid="$(sudo systemctl show --property=MainPID --value "$service_unit")"
 assert_systemd_credential_for_pid "$portal_pid"
+assert_service_api_vfs_isolation "$portal_pid"
 
 printf 'invalid verifier\n' | sudo tee "$verifier" >/dev/null
 sudo chmod 0600 "$verifier"
@@ -959,6 +1028,7 @@ sudo systemctl is-active --quiet "$socket_unit"
 sudo systemctl is-active --quiet "$service_unit"
 portal_pid="$(sudo systemctl show --property=MainPID --value "$service_unit")"
 assert_systemd_credential_for_pid "$portal_pid"
+assert_service_api_vfs_isolation "$portal_pid"
 
 printf '%s\n' \
   'public-files systemd integration passed: isolated identity, root, network,' \

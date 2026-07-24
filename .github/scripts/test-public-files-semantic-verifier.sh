@@ -68,6 +68,9 @@ printf '%s\n' \
   '! grep -q "^ExecStart=/usr/bin/recasaos-public-files " "$service"' \
   '[[ "$(grep -c "^ExecStart=" "$service")" == 1 ]]' \
   'grep -Eq '"'"'^ExecStart=/tmp/recasaos-systemd-verify\.[^/]+/recasaos-public-files serve --activation-name=public-files --listen=127\.0\.0\.1:39777 --root=/srv/public --verifier-file=\$\{CREDENTIALS_DIRECTORY\}/recasaos-public-file-verifier$'"'"' "$service"' \
+  '[[ "$(grep -Fxc "InaccessiblePaths=+/sys -+/dev/shm" "$service")" == 1 ]]' \
+  '[[ "$(grep -Fxc "ReadOnlyPaths=+/tmp +/var/tmp" "$service")" == 1 ]]' \
+  '! grep -q "^TemporaryFileSystem=" "$service"' \
   '[[ -f "${service}.d/ci.conf" ]]' \
   '[[ -f "${socket}.d/ci.conf" ]]' \
   'case "${FAKE_SYSTEMD_ANALYZE_MODE:-success}" in' \

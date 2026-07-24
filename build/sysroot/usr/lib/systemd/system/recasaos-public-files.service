@@ -50,8 +50,12 @@ ProtectControlGroups=yes
 ProtectKernelLogs=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
-InaccessiblePaths=-/sys -/dev/shm
-ReadOnlyPaths=/tmp /var/tmp
+# Access-control paths are host-relative by default even with RootDirectory=.
+# The + prefix is therefore required to apply these controls inside the jail.
+# /sys is mandatory and must fail startup if it cannot be masked. An already
+# absent jail /dev/shm is also safe, so only that path retains the - prefix.
+InaccessiblePaths=+/sys -+/dev/shm
+ReadOnlyPaths=+/tmp +/var/tmp
 
 CapabilityBoundingSet=
 AmbientCapabilities=

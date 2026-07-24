@@ -63,6 +63,30 @@ expect_rejected() {
     writable-bind)
       printf '\n[Service]\nBindPaths=/etc:/srv/public\n' >>"$service"
       ;;
+    host-relative-isolation)
+      sed \
+        's|InaccessiblePaths=+/sys -+/dev/shm|InaccessiblePaths=-/sys -/dev/shm|' \
+        "$service" >"$service.next"
+      mv -f -- "$service.next" "$service"
+      ;;
+    optional-sys-isolation)
+      sed \
+        's|InaccessiblePaths=+/sys -+/dev/shm|InaccessiblePaths=-+/sys -+/dev/shm|' \
+        "$service" >"$service.next"
+      mv -f -- "$service.next" "$service"
+      ;;
+    temporary-sysfs-mask)
+      printf '\n[Service]\nTemporaryFileSystem=/sys:ro\n' >>"$service"
+      ;;
+    reset-inaccessible-paths)
+      printf '\n[Service]\nInaccessiblePaths=\n' >>"$service"
+      ;;
+    host-relative-temporary-paths)
+      sed \
+        's|ReadOnlyPaths=+/tmp +/var/tmp|ReadOnlyPaths=/tmp /var/tmp|' \
+        "$service" >"$service.next"
+      mv -f -- "$service.next" "$service"
+      ;;
     extra-credential)
       printf '\n[Service]\nLoadCredential=extra:/etc/shadow\n' >>"$service"
       ;;
@@ -150,6 +174,11 @@ expect_rejected() {
 "$checker" "$repo_root" >/dev/null
 expect_rejected duplicate-root
 expect_rejected writable-bind
+expect_rejected host-relative-isolation
+expect_rejected optional-sys-isolation
+expect_rejected temporary-sysfs-mask
+expect_rejected reset-inaccessible-paths
+expect_rejected host-relative-temporary-paths
 expect_rejected extra-credential
 expect_rejected extra-listener
 expect_rejected extra-user
