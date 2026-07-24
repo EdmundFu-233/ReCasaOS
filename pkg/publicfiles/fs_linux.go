@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
@@ -19,17 +20,33 @@ import (
 const resolveUnderRoot = unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_XDEV
 
 var (
-	errPinnedObjectNotRegular = errors.New("pinned object is not a single-link regular file")
-	errPinnedIdentityChanged  = errors.New("pinned regular file identity changed during reopen")
+	errPinnedObjectNotRegular         = errors.New("pinned object is not a single-link regular file")
+	errPinnedIdentityChanged          = errors.New("pinned regular file identity changed during reopen")
+	errPublicRootFilesystemNotAllowed = errors.New("public file root filesystem is not allowlisted")
 )
 
 type pinnedRegularReopener func(int) (int, error)
 
+type rootFilesystemIdentity struct {
+	mountID uint64
+	magic   int64
+}
+
+type rootFilesystemInspector func(int) (rootFilesystemIdentity, error)
+
 type secureRoot struct {
-	file *os.File
+	file           *os.File
+	mountID        uint64
+	filesystemType uint32
+	mu             sync.RWMutex
+	closed         bool
 }
 
 func openSecureRoot(absolutePath string) (*secureRoot, error) {
+	return openSecureRootWith(absolutePath, inspectPublicRootFilesystem)
+}
+
+func openSecureRootWith(absolutePath string, inspect rootFilesystemInspector) (*secureRoot, error) {
 	rootFD, err := unix.Open("/", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, ErrUnsupported
@@ -38,7 +55,7 @@ func openSecureRoot(absolutePath string) (*secureRoot, error) {
 
 	relative := strings.TrimPrefix(absolutePath, "/")
 	fd, err := unix.Openat2(rootFD, relative, &unix.OpenHow{
-		Flags:   uint64(unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC | unix.O_NOFOLLOW),
+		Flags:   uint64(unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC | unix.O_NOFOLLOW),
 		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_SYMLINKS,
 	})
 	if err != nil {
@@ -53,20 +70,97 @@ func openSecureRoot(absolutePath string) (*secureRoot, error) {
 		unix.Close(fd)
 		return nil, errors.New("configured root is not a directory")
 	}
-	root := &secureRoot{file: os.NewFile(uintptr(fd), "public-file-root")}
+	if inspect == nil {
+		unix.Close(fd)
+		return nil, errors.New("configured root filesystem inspector is unavailable")
+	}
+	identity, err := inspect(fd)
+	if err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("cannot verify configured root filesystem: %w", err)
+	}
+	if identity.mountID == 0 {
+		unix.Close(fd)
+		return nil, fmt.Errorf("%w: kernel reported an invalid mount identifier", ErrUnsupported)
+	}
+	if _, allowed := publicRootFilesystemName(identity.magic); !allowed {
+		unix.Close(fd)
+		return nil, fmt.Errorf("%w: filesystem type %#x; supported local filesystems are ext2/3/4, XFS, Btrfs, tmpfs, and F2FS", errPublicRootFilesystemNotAllowed, uint32(identity.magic))
+	}
+	root := &secureRoot{
+		file:           os.NewFile(uintptr(fd), "public-file-root"),
+		mountID:        identity.mountID,
+		filesystemType: uint32(identity.magic),
+	}
 
-	// Probe the exact openat2 policy at startup. There is intentionally no
-	// fallback for older kernels or seccomp profiles that reject it.
-	probe, err := root.open(".", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW)
+	// Probe both the exact openat2 policy and directory-read permission through
+	// the already-pinned root descriptor. Reopening absolutePath here would
+	// reintroduce a pathname-replacement race. There is intentionally no weaker
+	// fallback for unreadable roots, older kernels, or rejecting seccomp
+	// profiles.
+	probe, err := root.open(".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW)
 	if err != nil {
 		root.close()
 		if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EINVAL) {
 			return nil, ErrUnsupported
 		}
+		if errors.Is(err, unix.EACCES) || errors.Is(err, unix.EPERM) {
+			return nil, fmt.Errorf("configured root is not readable by the service user: %w", err)
+		}
 		return nil, errors.New("openat2 policy probe failed")
 	}
 	unix.Close(probe)
 	return root, nil
+}
+
+func inspectPublicRootFilesystem(fd int) (rootFilesystemIdentity, error) {
+	var identity rootFilesystemIdentity
+	var filesystem unix.Statfs_t
+	if err := unix.Fstatfs(fd, &filesystem); err != nil {
+		return identity, fmt.Errorf("inspect filesystem type from pinned root: %w", err)
+	}
+	identity.magic = int64(filesystem.Type)
+	mountID, err := publicRootMountID(fd)
+	if err != nil {
+		return rootFilesystemIdentity{}, err
+	}
+	identity.mountID = mountID
+	return identity, nil
+}
+
+func publicRootMountID(fd int) (uint64, error) {
+	var stat unix.Statx_t
+	if err := unix.Statx(fd, "", unix.AT_EMPTY_PATH|unix.AT_NO_AUTOMOUNT|unix.AT_SYMLINK_NOFOLLOW|unix.AT_STATX_DONT_SYNC, unix.STATX_TYPE|unix.STATX_MNT_ID, &stat); err != nil {
+		if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EINVAL) {
+			return 0, fmt.Errorf("%w: statx mount identifiers: %v", ErrUnsupported, err)
+		}
+		return 0, fmt.Errorf("inspect mount identity from pinned root: %w", err)
+	}
+	if stat.Mask&unix.STATX_MNT_ID == 0 || stat.Mnt_id == 0 {
+		return 0, fmt.Errorf("%w: kernel did not report a statx mount identifier", ErrUnsupported)
+	}
+	return stat.Mnt_id, nil
+}
+
+func publicRootFilesystemName(magic int64) (string, bool) {
+	normalized := uint32(magic)
+	if magic != int64(normalized) && magic != int64(int32(normalized)) {
+		return "", false
+	}
+	switch normalized {
+	case uint32(unix.EXT4_SUPER_MAGIC): // Shared by ext2, ext3, and ext4.
+		return "ext2/3/4", true
+	case uint32(unix.XFS_SUPER_MAGIC):
+		return "XFS", true
+	case uint32(unix.BTRFS_SUPER_MAGIC):
+		return "Btrfs", true
+	case uint32(unix.TMPFS_MAGIC):
+		return "tmpfs", true
+	case uint32(unix.F2FS_SUPER_MAGIC):
+		return "F2FS", true
+	default:
+		return "", false
+	}
 }
 
 func readTokenFileSecure(absolutePath string) ([]byte, error) {
@@ -147,14 +241,49 @@ func decodesToStrongToken(token []byte) bool {
 }
 
 func (r *secureRoot) close() error {
-	return r.file.Close()
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	if r.file == nil {
+		return nil
+	}
+	err := r.file.Close()
+	r.file = nil
+	return err
 }
 
 func (r *secureRoot) open(relative string, flags int) (int, error) {
-	return unix.Openat2(int(r.file.Fd()), relative, &unix.OpenHow{
+	if r == nil {
+		return -1, unix.EBADF
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.closed || r.file == nil {
+		return -1, unix.EBADF
+	}
+	fd, err := unix.Openat2(int(r.file.Fd()), relative, &unix.OpenHow{
 		Flags:   uint64(flags),
 		Resolve: resolveUnderRoot,
 	})
+	if err != nil {
+		return -1, err
+	}
+	mountID, err := publicRootMountID(fd)
+	if err != nil {
+		unix.Close(fd)
+		return -1, err
+	}
+	if mountID != r.mountID {
+		unix.Close(fd)
+		return -1, unix.EXDEV
+	}
+	return fd, nil
 }
 
 func (r *secureRoot) list(relative string, maxEntries int) ([]Entry, error) {

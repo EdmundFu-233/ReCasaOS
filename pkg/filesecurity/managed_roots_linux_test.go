@@ -482,6 +482,7 @@ func TestManagedMkdirAllPreservesEarlierCreationWhenLaterComponentBecomesSymlink
 }
 
 func TestManagedDirectDirectoryRenameRejectsNestedBindMount(t *testing.T) {
+	requireIsolatedPrivilegedMountTest(t)
 	root := t.TempDir()
 	source := filepath.Join(root, "source")
 	mountedChild := filepath.Join(source, "mounted")
@@ -490,10 +491,7 @@ func TestManagedDirectDirectoryRenameRejectsNestedBindMount(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := unix.Mount(backing, mountedChild, "", unix.MS_BIND, ""); err != nil {
-		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
-			t.Skipf("bind mounts are unavailable in this Linux test environment: %v", err)
-		}
-		t.Fatal(err)
+		t.Fatalf("explicitly requested nested-rename regression cannot mount: %v", err)
 	}
 	defer func() {
 		if err := unix.Unmount(mountedChild, unix.MNT_DETACH); err != nil {
@@ -607,6 +605,7 @@ func TestManagedRemovalPlanRejectsExternalTopLevelReplacement(t *testing.T) {
 }
 
 func TestManagedRemoveAllPreflightsNestedMountBeforeDeletingSibling(t *testing.T) {
+	requireIsolatedPrivilegedMountTest(t)
 	root := t.TempDir()
 	target := filepath.Join(root, "target")
 	mountedChild := filepath.Join(target, "mounted")
@@ -619,10 +618,7 @@ func TestManagedRemoveAllPreflightsNestedMountBeforeDeletingSibling(t *testing.T
 		t.Fatal(err)
 	}
 	if err := unix.Mount(backing, mountedChild, "", unix.MS_BIND, ""); err != nil {
-		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
-			t.Skipf("bind mounts are unavailable in this Linux test environment: %v", err)
-		}
-		t.Fatal(err)
+		t.Fatalf("explicitly requested nested-removal regression cannot mount: %v", err)
 	}
 	defer func() {
 		if err := unix.Unmount(mountedChild, unix.MNT_DETACH); err != nil {
@@ -859,6 +855,7 @@ func TestManagedRootsTreeSizeDepthBudget(t *testing.T) {
 }
 
 func TestManagedRootsTreeSizeRejectsNestedBindMount(t *testing.T) {
+	requireIsolatedPrivilegedMountTest(t)
 	root := t.TempDir()
 	source := filepath.Join(root, "source")
 	nestedMount := filepath.Join(source, "mounted")
@@ -870,10 +867,7 @@ func TestManagedRootsTreeSizeRejectsNestedBindMount(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := unix.Mount(external, nestedMount, "", unix.MS_BIND, ""); err != nil {
-		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
-			t.Skipf("bind mounts are unavailable in this Linux test environment: %v", err)
-		}
-		t.Fatal(err)
+		t.Fatalf("explicitly requested nested-size regression cannot mount: %v", err)
 	}
 	defer func() {
 		if err := unix.Unmount(nestedMount, unix.MNT_DETACH); err != nil {
