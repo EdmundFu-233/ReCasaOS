@@ -1,0 +1,87 @@
+[Unit]
+Description=ReCasaOS isolated public-file portal
+ConditionPathIsDirectory=/srv/recasaos-public
+ConditionPathIsRegular=/etc/recasaos/public-file.verifier
+StartLimitIntervalSec=2min
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=recasaos-public
+Group=recasaos-public
+SupplementaryGroups=
+UMask=0077
+
+# The service executable is a statically linked binary inside this minimal
+# root. The host share is the only application data exposed inside the jail.
+RootDirectory=/usr/lib/recasaos-public-files/rootfs
+WorkingDirectory=/
+MountAPIVFS=yes
+# Keep submounts visible so the portal's mount-ID and RESOLVE_NO_XDEV checks
+# reject them. A non-recursive bind could expose files hidden below a host
+# mountpoint as ordinary same-mount content inside the service.
+BindReadOnlyPaths=/srv/recasaos-public:/srv/public:rbind
+LoadCredential=recasaos-public-file-verifier:/etc/recasaos/public-file.verifier
+
+# systemd 247 supports $CREDENTIALS_DIRECTORY expansion in ExecStart. The %d
+# credential-directory specifier is newer (systemd 251) and is intentionally
+# not used so this unit remains valid on the declared minimum version.
+ExecStart=/usr/bin/recasaos-public-files serve --activation-name=public-files --listen=127.0.0.1:39777 --root=/srv/public --verifier-file=${CREDENTIALS_DIRECTORY}/recasaos-public-file-verifier
+
+# The AF_INET listener is created by the socket unit in the host network
+# namespace. This process may accept that inherited descriptor but cannot open
+# a new IP socket or reach host-loopback management services.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+PrivateDevices=yes
+PrivateMounts=yes
+PrivateTmp=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectSystem=strict
+ProtectHome=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+InaccessiblePaths=-/sys -/dev/shm
+ReadOnlyPaths=/tmp /var/tmp
+
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RemoveIPC=yes
+
+# Keep openat2 available: the portal's descriptor-relative traversal depends
+# on it. In particular, do not add DynamicUser= or RestrictSUIDSGID= here.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@clock @cpu-emulation @debug @keyring @module @mount @obsolete @privileged @raw-io @reboot @swap memfd_create
+SystemCallErrorNumber=EPERM
+
+LimitCORE=0
+LimitNOFILE=512
+TasksMax=128
+MemoryMax=256M
+# MemoryLimit is the cgroup-v1 fallback; MemoryMax takes precedence on cgroup v2.
+MemoryLimit=256M
+MemorySwapMax=0
+CPUQuota=100%
+TimeoutStartSec=15s
+TimeoutStopSec=10s
+KillMode=control-group
+Restart=on-failure
+RestartSec=5s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=recasaos-public-files

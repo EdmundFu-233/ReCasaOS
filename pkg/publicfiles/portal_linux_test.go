@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -67,81 +66,6 @@ func serve(portal *Portal, request *http.Request) *httptest.ResponseRecorder {
 	recorder := httptest.NewRecorder()
 	portal.ServeHTTP(recorder, request)
 	return recorder
-}
-
-func TestNewFromEnvIsExplicitlyDisabled(t *testing.T) {
-	t.Setenv("RECASAOS_PUBLIC_FILE_ENABLED", "")
-	t.Setenv("RECASAOS_PUBLIC_FILE_ROOT", "/should/not/be/read")
-	t.Setenv("RECASAOS_PUBLIC_FILE_VERIFIER_FILE", "/should/not/be/read")
-	t.Setenv("RECASAOS_PUBLIC_FILE_TOKEN_FILE", "/should/not/be/read")
-	portal, err := NewFromEnv()
-	if portal != nil || !errors.Is(err, ErrDisabled) {
-		t.Fatalf("NewFromEnv() = (%v, %v), want (nil, ErrDisabled)", portal, err)
-	}
-}
-
-func TestNewFromEnvRequiresCompleteSafeConfiguration(t *testing.T) {
-	t.Setenv("RECASAOS_PUBLIC_FILE_ENABLED", "1")
-	t.Setenv("RECASAOS_PUBLIC_FILE_ROOT", "")
-	t.Setenv("RECASAOS_PUBLIC_FILE_VERIFIER_FILE", "")
-	t.Setenv("RECASAOS_PUBLIC_FILE_TOKEN_FILE", "")
-	if portal, err := NewFromEnv(); portal != nil || err == nil {
-		t.Fatalf("enabled incomplete configuration must fail closed: (%v, %v)", portal, err)
-	}
-}
-
-func TestNewFromEnvEnablesOnlyWithExplicitSafeConfiguration(t *testing.T) {
-	base := t.TempDir()
-	root := filepath.Join(base, "shared")
-	if err := os.Mkdir(root, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	verifierFile := filepath.Join(base, "verifier")
-	writeTestVerifierFile(t, verifierFile, testToken, 0o600)
-	t.Setenv("RECASAOS_PUBLIC_FILE_ENABLED", "1")
-	t.Setenv("RECASAOS_PUBLIC_FILE_ROOT", root)
-	t.Setenv("RECASAOS_PUBLIC_FILE_VERIFIER_FILE", verifierFile)
-	t.Setenv("RECASAOS_PUBLIC_FILE_TOKEN_FILE", "")
-	portal, err := NewFromEnv()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if portal == nil {
-		t.Fatal("explicit safe configuration returned a nil portal")
-	}
-	if err := portal.Close(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestNewFromEnvRejectsNonEmptyLegacyRawBearerSetting(t *testing.T) {
-	base := t.TempDir()
-	root := filepath.Join(base, "shared")
-	if err := os.Mkdir(root, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	verifierFile := filepath.Join(base, "verifier")
-	writeTestVerifierFile(t, verifierFile, testToken, 0o600)
-
-	for _, test := range []struct {
-		name         string
-		legacyValue  string
-		verifierFile string
-	}{
-		{name: "legacy setting only", legacyValue: "/legacy/raw-bearer"},
-		{name: "legacy and valid verifier together", legacyValue: "/legacy/raw-bearer", verifierFile: verifierFile},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			t.Setenv("RECASAOS_PUBLIC_FILE_ENABLED", "1")
-			t.Setenv("RECASAOS_PUBLIC_FILE_ROOT", root)
-			t.Setenv("RECASAOS_PUBLIC_FILE_TOKEN_FILE", test.legacyValue)
-			t.Setenv("RECASAOS_PUBLIC_FILE_VERIFIER_FILE", test.verifierFile)
-			portal, err := NewFromEnv()
-			if portal != nil || !errors.Is(err, ErrLegacyRawBearerConfig) {
-				t.Fatalf("NewFromEnv() = (%v, %v), want legacy raw-bearer error", portal, err)
-			}
-		})
-	}
 }
 
 func TestNewRejectsUnsafeRootsAndVerifierFiles(t *testing.T) {

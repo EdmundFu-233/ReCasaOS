@@ -9,7 +9,7 @@ component or the browser UI is compatible, patched, or releasable.
 | Area | Source of truth in this repository | Boundary |
 | --- | --- | --- |
 | Root service | `main.go`, `route/`, `service/`, `pkg/`, `internal/` | Registers CasaOS API routes with the Gateway and performs file, storage, system, and integration operations. |
-| Public file portal | `pkg/publicfiles/`, `deploy/`, `docs/deployment/public-access.md` | Opt-in read-only capability with a server-side root and independent token. It does not make administrative APIs public-ready. |
+| Public file portal | `cmd/recasaos-public-files/`, `pkg/publicfiles/`, `build/sysroot/usr/lib/systemd/system/recasaos-public-files.*`, `deploy/`, `docs/deployment/public-access.md` | Opt-in read-only capability in a separate non-root, socket-activated service with a pinned server-side root and independent bearer credential. The host provisions only its verifier. It does not make administrative APIs public-ready. |
 | Root OpenAPI contract | `api/casaos/openapi.yaml` | Generates the `codegen` server/types used by the root service. Contract changes require compatibility review with all clients. |
 | Configuration sample | `conf/conf.conf.sample` | Documents root-service settings only; it is not a complete deployment manifest for the full CasaOS stack. |
 | Root release and CI | `.goreleaser*.yaml`, `.github/workflows/` | Builds and checks this repository. External services remain independently versioned. |
@@ -24,11 +24,11 @@ be hand-edited.
 | --- | --- | --- |
 | Administrative Web UI | `.gitmodules` declares `UI` from `IceWhaleTech/CasaOS-UI` on `main` | Dashboard/login behavior lives outside the root Go service. The dedicated public-files page is embedded locally and does not depend on this UI. This checkout has no tracked `UI` gitlink, so `--recurse-submodules` cannot provide a reproducible admin UI revision. |
 | CasaOS Common | Go module `github.com/IceWhaleTech/CasaOS-Common` | Supplies shared runtime discovery, Gateway management, and JWT helpers. Its API and security behavior are locked through `go.mod` plus `go.sum`. |
-| Gateway | Discovered through `CasaOS-Common/external` at runtime | Owns the private management listener, administrative routing, dashboard entry point, and upstream client-IP forwarding. It must not be the public-file edge upstream. The root service separately owns the literal-loopback public-portal listener; Gateway's registered `/public-files` handler is only a 404 tombstone. |
+| Gateway | Discovered through `CasaOS-Common/external` at runtime | Owns the private management listener, administrative routing, dashboard entry point, and upstream client-IP forwarding. It must not be the public-file edge upstream. The independent `recasaos-public-files.socket` owns the literal-loopback portal listener; Gateway's registered `/public-files` handler is only a 404 tombstone. |
 | User/authentication service | Reached through Gateway routes and runtime public-key material | Owns account enrollment, token issuance, revocation, and session policy. Root endpoints validate its JWTs; end-to-end authentication must be tested across both components. |
 | Message Bus | Runtime address is discovered via `CasaOS-Common`; its client is generated from the OpenAPI document at upstream commit `ba87168fcfa4ac5ff7a114f66a139eb5fe427646` | Event delivery is optional in parts of the root service, but schema drift can still break notifications. Updating the pinned specification requires review and regenerated-client tests. |
 | App management and other `casaos-*` daemons | Routed or queried through Gateway/runtime integration | Installation, privilege, health, and compatibility are separate release gates. |
-| Installer, OS packaging, and service units | External to this repository | Decide users, capabilities, filesystem permissions, bind addresses, upgrades, and rollback. They are part of the security boundary even when the root binary is unchanged. |
+| Installer and full OS packaging | External to this repository | Decide component versions, upgrades, and rollback. This repository contains candidate CasaOS and isolated public-file units, but the full installer must preserve their reviewed users, capabilities, filesystem permissions, bind addresses, and default-disabled public exposure. |
 
 ## Locking policy
 

@@ -1,28 +1,21 @@
-# Install as:
-#   /etc/systemd/system/casaos.service.d/recasaos-public-files-verifier.conf
+# RETIRED AND INTENTIONALLY INERT.
 #
-# This is a verifier-only migration example for the current candidate. It does
-# not isolate the Internet-facing listener from the privileged management
-# daemon. Issue #25 remains a production public-readiness blocker.
-# Requires systemd 247 or newer for LoadCredential= and the %d credential
-# directory specifier. Verify the installed unit before restarting CasaOS.
+# Do not install this file as a casaos.service drop-in. Older candidates used
+# that pattern to run an Internet-facing listener inside the privileged CasaOS
+# management daemon. ReCasaOS now ships an independent, non-root,
+# socket-activated recasaos-public-files.service instead.
 #
-# The source file must be exactly 100 bytes:
-#   recasaos-public-verifier-v1:sha256:<64 lowercase hexadecimal characters><LF>
+# Before enabling the new recasaos-public-files.socket, remove the old drop-in
+# from /etc/systemd/system/casaos.service.d/ and confirm that casaos.service has
+# no RECASAOS_PUBLIC_FILE_* environment variables. Removing this file does not
+# remove or alter files in /srv/recasaos-public.
 #
-# Generate the raw rc1_ bearer only on an independent administrator workstation,
-# retain it only in a password manager, and transfer only this verifier file to
-# the ReCasaOS host.
+# The verifier remains a host file at:
+#   /etc/recasaos/public-file.verifier
 #
-# Remove RECASAOS_PUBLIC_FILE_TOKEN_FILE from every old drop-in. Any non-empty
-# value is a rejected legacy configuration when the portal is enabled, even
-# when the verifier variable below is also present.
-
-[Service]
-LoadCredential=recasaos-public-file-verifier:/etc/recasaos/public-file.verifier
-Environment=RECASAOS_PUBLIC_FILE_ENABLED=1
-Environment=RECASAOS_PUBLIC_FILE_ROOT=/srv/recasaos-public
-Environment=RECASAOS_PUBLIC_FILE_VERIFIER_FILE=%d/recasaos-public-file-verifier
-Environment=RECASAOS_PUBLIC_FILE_LISTEN=127.0.0.1:39777
-Environment=RECASAOS_TRUST_LOOPBACK_AUTH_BYPASS=0
-LimitCORE=0
+# The independent service imports it with LoadCredential=. On systemd 247 the
+# service command uses ${CREDENTIALS_DIRECTORY}; do not substitute the newer
+# %d credential-directory specifier, which requires systemd 251.
+#
+# This example contains no unit directives by design, so copying it cannot
+# re-enable the retired privileged-daemon integration.

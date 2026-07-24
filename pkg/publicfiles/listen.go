@@ -4,27 +4,11 @@ import (
 	"errors"
 	"net"
 	"net/netip"
-	"os"
 	"strconv"
 	"strings"
 )
 
-const (
-	ListenAddressEnv     = "RECASAOS_PUBLIC_FILE_LISTEN"
-	DefaultListenAddress = "127.0.0.1:39777"
-)
-
-// ListenAddressFromEnv returns a literal loopback TCP address for the
-// dedicated portal listener. Hostnames, wildcard addresses, port zero, and
-// non-loopback addresses are rejected so the portal cannot accidentally bind
-// to a public interface.
-func ListenAddressFromEnv() (string, error) {
-	value := strings.TrimSpace(os.Getenv(ListenAddressEnv))
-	if value == "" {
-		value = DefaultListenAddress
-	}
-	return ValidateListenAddress(value)
-}
+const DefaultListenAddress = "127.0.0.1:39777"
 
 func ValidateListenAddress(value string) (string, error) {
 	host, portValue, err := net.SplitHostPort(value)

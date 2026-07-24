@@ -20,11 +20,13 @@ scan, or Internet acceptance test. The `.invalid` names and documentation IPs
 in the examples are placeholders. A specific host remains unverified until an
 operator completes and records every applicable acceptance test below.
 
-Verifier-only provisioning removes the raw bearer from the server filesystem,
-but it does not isolate the listener from the privileged daemon.
+Verifier-only provisioning removes the raw bearer from the server filesystem.
+The listener has also moved into a separate non-root, socket-activated service,
+so its lifecycle no longer shares the privileged management daemon. That first
+split is not the full blocking-I/O boundary:
 [Issue #25](https://github.com/EdmundFu-233/ReCasaOS/issues/25) remains a
-production public-readiness blocker regardless of whether the credential
-migration below succeeds.
+production public-readiness blocker until filesystem operations use bounded
+killable workers and the hung-storage matrix passes.
 
 The portal is deliberately limited:
 
@@ -121,8 +123,9 @@ server-side credential file or environment setting. Generate it only on an
 independent administrator workstation, keep its durable copy only in a password
 manager, and send only its verifier as deployment material. The portal still
 receives the raw bearer transiently in each authorized request header.
-Completing this credential migration does not make the current privileged
-in-process portal public-ready; Issue #25 remains open.
+Completing this credential migration and staging the independent service does
+not make a host public-ready; Issue #25 and the target-host acceptance matrix
+remain open.
 
 Use a dedicated directory containing only files approved for public download.
 Do not point it at a home directory, `/DATA`, an application-data tree, backup
@@ -140,9 +143,12 @@ path; do not bypass the policy to obtain compatibility.
 A bind mount receives its own mount ID but retains the backing filesystem
 type, so it is eligible only when that backing type is allowlisted. Every
 descriptor-relative open is rechecked against the root's captured mount ID and
-`RESOLVE_NO_XDEV` still rejects nested mount crossings. These checks occur
-before a usable Portal or download-slot pool is returned. They prevent a known
-network/FUSE root from entering the request path, but they do not make local
+`RESOLVE_NO_XDEV` still rejects nested mount crossings. The packaged service
+uses a recursive read-only bind so host submounts remain visible as distinct
+mounts and are rejected; a non-recursive bind is forbidden because it could
+reveal underlying files that the host submount normally covers. These checks
+occur before a usable Portal or download-slot pool is returned. They prevent a
+known network/FUSE root from entering the request path, but they do not make local
 kernel or block-device I/O interruptible: a bad disk, remote block device, or
 kernel fault can still block, and even the initial startup open can wait on a
 path whose kernel lookup is already hung. Filesystem classification itself can
@@ -150,9 +156,9 @@ also wait for a broken userspace filesystem daemon. There is no claimed startup
 hard timeout. Host storage and the mount namespace remain trusted operator
 boundaries. This is a staged control for
 [Issue #22](https://github.com/EdmundFu-233/ReCasaOS/issues/22), not proof that
-the in-process portal can safely contain every blocking storage failure.
-Separating the Internet-facing handler and killable filesystem work from the
-privileged daemon remains required by
+the isolated portal process can safely contain every blocking storage failure.
+The management daemon no longer runs the handler, but moving every filesystem
+operation into bounded killable workers remains required by
 [Issue #25](https://github.com/EdmundFu-233/ReCasaOS/issues/25).
 
 Privileged bind, tmpfs, and loopback filesystem regressions run only in a
@@ -234,11 +240,213 @@ environment, unit file, diagnostic command, shell history, issue, URL, or log.
 Authorized clients necessarily send it in an HTTPS `Authorization` header; the
 edge and portal must be configured and tested not to log that header.
 
-### Publish the verifier on the host
+### Hold the verifier until the clean-host gate
 
-Create the dedicated share and publish the transferred verifier with a
-same-directory rename. Replace `/path/to/transferred.verifier` with the
-authenticated transfer destination:
+Keep the transferred verifier at its authenticated transfer destination; do not
+create or overwrite `/etc/recasaos` yet. Section 2 first proves that the target
+has no prior candidate payload, account, share, unit, or verifier, then
+validates and publishes the verifier as part of the staged installation. If any
+of that state already exists, stop and use a separately reviewed upgrade or
+removal procedure.
+
+The verifier loader requires the exact versioned line, a stable single-link
+regular file, service-safe ownership, and restrictive permissions. It rejects
+unexpected whitespace, uppercase or non-hexadecimal digest text, links, and
+ambiguous legacy input.
+
+Remove every `RECASAOS_PUBLIC_FILE_*` setting from environment files, service
+drop-ins, container definitions, and process-manager settings before restart.
+The standalone binary has no environment configuration fallback and rejects
+every non-empty legacy setting before it loads the activation descriptor.
+During a first migration, stop public routing, remove the legacy raw-token file
+from the host, and do not use that legacy path as rollback. Until those steps
+finish, the host is in a maintenance migration state and is not public-ready.
+
+## 2. Stage the isolated service with public routing disabled
+
+The standalone service requires Linux 5.8 or newer and systemd 247 or newer.
+`LoadCredential=` is available at that systemd baseline. The packaged unit
+intentionally uses `${CREDENTIALS_DIRECTORY}` in `ExecStart`; the shorter `%d`
+credential-directory specifier was added later and must not be substituted
+while systemd 247 remains supported.
+
+Check the actual target before installing anything:
+
+```bash
+(
+  set -euo pipefail
+  systemd_version="$(systemd --version | awk 'NR == 1 { print $2 }')"
+  [[ "$systemd_version" =~ ^[0-9]+$ ]]
+  (( systemd_version >= 247 ))
+  manager_version="$(sudo systemctl show --property=Version --value)"
+  [[ "$manager_version" =~ ^([0-9]+) ]]
+  manager_major="${BASH_REMATCH[1]}"
+  (( manager_major >= 247 ))
+  kernel_version="$(uname -r)"
+  [[ "$kernel_version" =~ ^([0-9]+)\.([0-9]+) ]]
+  kernel_major="${BASH_REMATCH[1]}"
+  kernel_minor="${BASH_REMATCH[2]}"
+  (( kernel_major > 5 || (kernel_major == 5 && kernel_minor >= 8) ))
+  printf 'reviewed prerequisites: systemd-binary=%s manager=%s kernel=%s\n' \
+    "$systemd_version" "$manager_version" "$kernel_version"
+)
+```
+
+This repository still disables binary releases until the component BOM,
+installer, clean upgrade, and rollback path are locked. Do not replace a live
+CasaOS installation with an ad hoc local build. The commands below describe the
+candidate artifact layout for an isolated test host or reviewed package build;
+keep public DNS and the TLS edge disabled throughout staging.
+
+### Retire the privileged-daemon integration
+
+Older candidates installed
+`/etc/systemd/system/casaos.service.d/recasaos-public-files-verifier.conf`.
+That drop-in must not remain active. Quarantine that exact file in a root-only
+operator workspace, reload systemd, and upgrade/restart the management daemon
+through the reviewed ReCasaOS package procedure. Never use the old drop-in as a
+rollback path.
+
+Before continuing, both of these checks must exit zero without printing
+environment values:
+
+```bash
+(
+  set -euo pipefail
+  old_dropin=/etc/systemd/system/casaos.service.d/recasaos-public-files-verifier.conf
+  ! sudo test -e "$old_dropin"
+  ! sudo test -L "$old_dropin"
+  sudo systemctl cat casaos.service >/dev/null
+  if sudo systemctl cat casaos.service |
+    grep -q 'RECASAOS_PUBLIC_FILE_'
+  then
+    printf '%s\n' \
+      'casaos.service still contains legacy public-file environment settings' >&2
+    exit 1
+  fi
+)
+```
+
+The root daemon must retain only the Gateway 404 tombstone for `/public-files`;
+it must not import `pkg/publicfiles`, read a portal credential, or bind port
+39777. The repository's
+`.github/scripts/check-public-files-service-boundary.sh` enforces that
+dependency and source boundary.
+
+### Install the candidate payload
+
+Build the public binary as an unprivileged user. It is static and deliberately
+not UPX-compressed because the service enables `MemoryDenyWriteExecute=yes`.
+
+```bash
+make build-public-files
+```
+
+This is a clean-host staging procedure, not an upgrade procedure. Before its
+first mutation, fail if any candidate payload, account, share, unit override,
+or higher-priority sysusers/tmpfiles configuration already exists:
+
+```bash
+(
+  set -euo pipefail
+  manager_version="$(sudo systemctl show --property=Version --value)"
+  test -n "$manager_version"
+
+  require_absent_unit() {
+    local unit="$1"
+    local load_state active_state enabled_state
+    local active_status=0 enabled_status=0
+
+    load_state="$(
+      sudo systemctl show --property=LoadState --value "$unit"
+    )"
+    if test "$load_state" != not-found; then
+      printf 'refusing existing or unreadable unit state: %s (%s)\n' \
+        "$unit" "$load_state" >&2
+      exit 1
+    fi
+
+    active_state="$(sudo systemctl is-active "$unit" 2>/dev/null)" ||
+      active_status=$?
+    if test "$active_status" -eq 0 ||
+      { test "$active_state" != inactive &&
+        test "$active_state" != unknown; }
+    then
+      printf 'refusing ambiguous active state: %s (%s/%s)\n' \
+        "$unit" "$active_state" "$active_status" >&2
+      exit 1
+    fi
+
+    enabled_state="$(sudo systemctl is-enabled "$unit" 2>/dev/null)" ||
+      enabled_status=$?
+    if test "$enabled_status" -eq 0 || test "$enabled_state" != not-found; then
+      printf 'refusing ambiguous enablement state: %s (%s/%s)\n' \
+        "$unit" "$enabled_state" "$enabled_status" >&2
+      exit 1
+    fi
+  }
+
+  for target in \
+    /usr/lib/recasaos-public-files \
+    /etc/recasaos \
+    /usr/lib/systemd/system/recasaos-public-files.service \
+    /usr/lib/systemd/system/recasaos-public-files.service.d \
+    /usr/lib/systemd/system/recasaos-public-files.socket \
+    /usr/lib/systemd/system/recasaos-public-files.socket.d \
+    /usr/local/lib/systemd/system/recasaos-public-files.service \
+    /usr/local/lib/systemd/system/recasaos-public-files.service.d \
+    /usr/local/lib/systemd/system/recasaos-public-files.socket \
+    /usr/local/lib/systemd/system/recasaos-public-files.socket.d \
+    /lib/systemd/system/recasaos-public-files.service \
+    /lib/systemd/system/recasaos-public-files.service.d \
+    /lib/systemd/system/recasaos-public-files.socket \
+    /lib/systemd/system/recasaos-public-files.socket.d \
+    /usr/lib/sysusers.d/recasaos-public-files.conf \
+    /usr/lib/tmpfiles.d/recasaos-public-files.conf \
+    /etc/systemd/system/recasaos-public-files.service \
+    /etc/systemd/system/recasaos-public-files.service.d \
+    /etc/systemd/system/recasaos-public-files.socket \
+    /etc/systemd/system/recasaos-public-files.socket.d \
+    /run/systemd/system/recasaos-public-files.service \
+    /run/systemd/system/recasaos-public-files.service.d \
+    /run/systemd/system/recasaos-public-files.socket \
+    /run/systemd/system/recasaos-public-files.socket.d \
+    /etc/sysusers.d/recasaos-public-files.conf \
+    /run/sysusers.d/recasaos-public-files.conf \
+    /usr/local/lib/sysusers.d/recasaos-public-files.conf \
+    /etc/tmpfiles.d/recasaos-public-files.conf \
+    /run/tmpfiles.d/recasaos-public-files.conf \
+    /usr/local/lib/tmpfiles.d/recasaos-public-files.conf \
+    /srv/recasaos-public
+  do
+    if sudo test -e "$target" || sudo test -L "$target"; then
+      printf 'refusing to overwrite existing candidate state: %s\n' \
+        "$target" >&2
+      exit 1
+    fi
+  done
+  ! getent passwd recasaos-public >/dev/null
+  ! getent group recasaos-public >/dev/null
+  require_absent_unit recasaos-public-files.service
+  require_absent_unit recasaos-public-files.socket
+  candidate_binary=build/sysroot/usr/lib/recasaos-public-files/rootfs/usr/bin/recasaos-public-files
+  test -x "$candidate_binary"
+  test ! -L "$candidate_binary"
+  file "$candidate_binary" | grep -q 'statically linked'
+  sudo test -f /path/to/transferred.verifier
+  ! sudo test -L /path/to/transferred.verifier
+  test "$(sudo stat -c '%s' /path/to/transferred.verifier)" -eq 100
+  sudo env LC_ALL=C grep -Eq \
+    '^recasaos-public-verifier-v1:sha256:[0-9a-f]{64}$' \
+    /path/to/transferred.verifier
+  sh deploy/systemd/check-public-files-units.sh .
+)
+```
+
+If this gate finds prior candidate state, stop and use a separately reviewed
+upgrade or removal procedure; do not delete or overwrite it from this guide.
+On a clean isolated test host, a reviewed package installs the binary and
+metadata at the following exact paths:
 
 ```bash
 (
@@ -249,260 +457,142 @@ authenticated transfer destination:
       '^recasaos-public-verifier-v1:sha256:[0-9a-f]{64}$' "$1"
   }
 
+  sudo install -D -o root -g root -m 0755 \
+    build/sysroot/usr/lib/recasaos-public-files/rootfs/usr/bin/recasaos-public-files \
+    /usr/lib/recasaos-public-files/rootfs/usr/bin/recasaos-public-files
+  sudo install -D -o root -g root -m 0644 \
+    build/sysroot/usr/lib/systemd/system/recasaos-public-files.service \
+    /usr/lib/systemd/system/recasaos-public-files.service
+  sudo install -D -o root -g root -m 0644 \
+    build/sysroot/usr/lib/systemd/system/recasaos-public-files.socket \
+    /usr/lib/systemd/system/recasaos-public-files.socket
+  sudo install -D -o root -g root -m 0644 \
+    build/sysroot/usr/lib/sysusers.d/recasaos-public-files.conf \
+    /usr/lib/sysusers.d/recasaos-public-files.conf
+  sudo install -D -o root -g root -m 0644 \
+    build/sysroot/usr/lib/tmpfiles.d/recasaos-public-files.conf \
+    /usr/lib/tmpfiles.d/recasaos-public-files.conf
+
+  sudo systemd-sysusers /usr/lib/sysusers.d/recasaos-public-files.conf
+  sudo systemd-tmpfiles --create \
+    /usr/lib/tmpfiles.d/recasaos-public-files.conf
+
   verify_verifier_file /path/to/transferred.verifier
-  sudo install -d -o root -g root -m 0750 /srv/recasaos-public
   sudo install -d -o root -g root -m 0700 /etc/recasaos
   sudo install -o root -g root -m 0600 \
     /path/to/transferred.verifier \
     /etc/recasaos/public-file.verifier.next
   verify_verifier_file /etc/recasaos/public-file.verifier.next
+  sudo test ! -e /etc/recasaos/public-file.verifier
+  sudo test ! -L /etc/recasaos/public-file.verifier
   sudo mv -f -- \
     /etc/recasaos/public-file.verifier.next \
     /etc/recasaos/public-file.verifier
-)
-```
 
-The verifier loader requires the exact versioned line, a stable single-link
-regular file, service-safe ownership, and restrictive permissions. It rejects
-unexpected whitespace, uppercase or non-hexadecimal digest text, links, and
-ambiguous legacy input.
-
-Remove `RECASAOS_PUBLIC_FILE_TOKEN_FILE` from every environment file, service
-drop-in, container definition, and process-manager setting before restart.
-When the portal is enabled, any non-empty value fails closed, including when
-`RECASAOS_PUBLIC_FILE_VERIFIER_FILE` is also present. An empty value is treated
-as unset. A disabled portal ignores the legacy setting entirely so an old
-template cannot terminate the management daemon, but the setting should still
-be removed during migration.
-During a first migration, stop public routing, remove the legacy raw-token file
-from the host, and do not use that legacy path as rollback. Until those steps
-finish, the host is in a maintenance migration state and is not public-ready.
-
-## 2. Enable the verifier-only candidate
-
-This drop-in requires systemd 247 or newer. `LoadCredential=`, the runtime
-credential directory, and its `%d` unit specifier are not implied by the Linux
-5.8 kernel requirement. Check the actual target host before installing the
-drop-in:
-
-```bash
-(
-  set -euo pipefail
-  systemd_version="$(systemd --version | awk 'NR == 1 { print $2 }')"
-  test "$systemd_version" -ge 247
-)
-```
-
-Validate this requirement and the credential file ownership/mode behavior on
-every supported target distribution during a maintenance window. Do not
-continue unless the version gate exits zero.
-
-Install the reviewed
-[`deploy/systemd/recasaos-public-files-verifier.conf.example`](../../deploy/systemd/recasaos-public-files-verifier.conf.example)
-as a root-owned `casaos.service` drop-in. The example sets:
-
-```text
-RECASAOS_PUBLIC_FILE_ENABLED=1
-RECASAOS_PUBLIC_FILE_ROOT=/srv/recasaos-public
-RECASAOS_PUBLIC_FILE_VERIFIER_FILE=%d/recasaos-public-file-verifier
-RECASAOS_PUBLIC_FILE_LISTEN=127.0.0.1:39777
-RECASAOS_TRUST_LOOPBACK_AUTH_BYPASS=0
-```
-
-Its `LoadCredential=` directive copies the strict verifier into systemd's
-private service credential directory; `%d` expands to that directory. It also
-sets `LimitCORE=0`. Do not add `RECASAOS_PUBLIC_FILE_TOKEN_FILE`; any non-empty
-value is rejected rather than guessing whether legacy material is a bearer or
-a digest.
-
-Example installation from a reviewed checkout:
-
-```bash
-(
-  set -euo pipefail
-  dropin=/etc/systemd/system/casaos.service.d/recasaos-public-files-verifier.conf
-  backup_dir=
-  backup_dropin=
-  staged_dropin=
-  recovery_candidate=
-  original_identity=
-  had_previous_dropin=0
-  dropin_modified=0
-  restart_attempted=0
-
-  restore_dropin_on_failure() {
-    status=$?
-    trap - EXIT
-    set +e
-    recovery_status=0
-
-    if test "$status" -ne 0 && test "$dropin_modified" -eq 1; then
-      if test "$had_previous_dropin" -eq 1; then
-        if current_identity="$(
-          sudo stat -c '%d:%i' -- "$dropin" 2>/dev/null
-        )" && test "$current_identity" = "$original_identity"; then
-          :
-        elif sudo test -f "$backup_dropin" &&
-          ! sudo test -L "$backup_dropin"; then
-          if sudo test -e "$recovery_candidate" ||
-            sudo test -L "$recovery_candidate"; then
-            recovery_status=1
-          elif ! sudo ln -- "$backup_dropin" "$recovery_candidate"; then
-            recovery_status=1
-          elif ! sudo mv -fT -- "$recovery_candidate" "$dropin"; then
-            recovery_status=1
-          elif ! current_identity="$(
-            sudo stat -c '%d:%i' -- "$dropin"
-          )" || test "$current_identity" != "$original_identity"; then
-            recovery_status=1
-          fi
-        else
-          recovery_status=1
-        fi
-      else
-        sudo rm -f -- "$dropin" || recovery_status=1
-      fi
-
-      if test "$recovery_status" -eq 0; then
-        sudo systemctl daemon-reload || recovery_status=1
-      fi
-      if test "$recovery_status" -eq 0 &&
-        test "$restart_attempted" -eq 1; then
-        sudo systemctl restart casaos.service || recovery_status=1
-        if test "$recovery_status" -eq 0; then
-          sudo systemctl is-active --quiet casaos.service ||
-            recovery_status=1
-        fi
-      fi
-
-      if test "$recovery_status" -ne 0; then
-        echo "automatic CasaOS drop-in recovery failed" >&2
-        echo "keep the maintenance window open; do not restore routing" >&2
-        if test -n "$backup_dir"; then
-          echo "preserved root-only recovery workspace: $backup_dir" >&2
-        else
-          echo "inspect the intended drop-in path: $dropin" >&2
-        fi
-        exit 1
-      fi
-    fi
-
-    for cleanup_file in \
-      "$recovery_candidate" "$staged_dropin" "$backup_dropin"; do
-      if test -n "$cleanup_file" &&
-        { sudo test -e "$cleanup_file" ||
-          sudo test -L "$cleanup_file"; }; then
-        if ! sudo unlink -- "$cleanup_file"; then
-          echo "root-only recovery artifact remains: $cleanup_file" >&2
-        fi
-      fi
-    done
-    if test -n "$backup_dir" && ! sudo rmdir -- "$backup_dir"; then
-      echo "root-only recovery workspace remains: $backup_dir" >&2
-    fi
-    exit "$status"
-  }
-  trap restore_dropin_on_failure EXIT
-
-  sudo install -d -o root -g root -m 0755 \
-    /etc/systemd/system/casaos.service.d
-  sudo install -d -o root -g root -m 0700 /etc/recasaos
-  if sudo test -L "$dropin"; then
-    echo "refusing a symlinked CasaOS drop-in" >&2
-    exit 1
-  fi
-  if sudo test -e "$dropin"; then
-    if ! sudo test -f "$dropin"; then
-      echo "refusing a non-regular CasaOS drop-in" >&2
-      exit 1
-    fi
-    original_identity="$(sudo stat -c '%d:%i' -- "$dropin")"
-    had_previous_dropin=1
-  fi
-
-  backup_dir="$(sudo mktemp -d \
-    /etc/systemd/system/casaos.service.d/.recasaos-backup.XXXXXX)"
-  sudo chmod 0700 "$backup_dir"
-  backup_dropin="$backup_dir/original"
-  staged_dropin="$backup_dir/pending"
-  recovery_candidate="$backup_dir/recovery"
-
-  if test "$had_previous_dropin" -eq 1; then
-    sudo ln -- "$dropin" "$backup_dropin"
-    test "$(
-      sudo stat -c '%d:%i' -- "$backup_dropin"
-    )" = "$original_identity"
-  fi
-
-  sudo install -o root -g root -m 0644 \
-    deploy/systemd/recasaos-public-files-verifier.conf.example \
-    "$staged_dropin"
-
-  # Replacing one directory entry on the same filesystem is atomic.
-  dropin_modified=1
-  sudo mv -fT -- "$staged_dropin" "$dropin"
-  selinux_enabled=0
-  if test -e /sys/fs/selinux/enforce; then
-    selinux_enabled=1
-  elif command -v getenforce >/dev/null 2>&1; then
-    selinux_state="$(getenforce)"
-    if test "$selinux_state" != Disabled; then
-      selinux_enabled=1
-    fi
-  fi
-  if test "$selinux_enabled" -eq 1; then
-    command -v restorecon >/dev/null 2>&1
-    sudo restorecon "$dropin"
-  fi
-
-  # This is a hard gate: reload/restart is unreachable when verification fails.
-  sudo systemd-analyze verify casaos.service
   sudo systemctl daemon-reload
-  restart_attempted=1
-  sudo systemctl restart casaos.service
-  sudo systemctl is-active --quiet casaos.service
-
-  # The new service is now committed. Cleanup must never roll it back.
-  trap - EXIT
-  if sudo test -e "$backup_dropin"; then
-    sudo unlink -- "$backup_dropin"
-  fi
-  sudo rmdir -- "$backup_dir"
+  sudo env \
+    RECASAOS_SYSTEMD_VERIFY=1 \
+    RECASAOS_SYSTEMD_LIVE_VERIFY=1 \
+    sh deploy/systemd/check-public-files-units.sh .
 )
 ```
 
-The local `EXIT` trap restores the previous drop-in (or removes a first-time
-drop-in) and reloads systemd on failure. The backup is a hard link in a
-root-only directory on the same filesystem, so restoring it keeps the original
-inode, ownership, mode, ACLs, security labels, and extended attributes instead
-of relying on a lossy copy. If a restart was already attempted, the trap also
-restarts the previous service configuration and verifies that it is active.
-The trap deletes the backup only after every required recovery step succeeds.
-On any recovery error it exits nonzero, prints the preserved root-only recovery
-workspace, and leaves the maintenance window open. Do not restore public
-routing until `casaos.service` is active under the intended configuration.
-No shell trap can handle `SIGKILL` or a host power loss. After either event,
-inspect any root-only `.recasaos-backup.*` workspace in the drop-in directory
-and reconcile the recorded original with the active drop-in before continuing.
+If any command in this staging block fails, keep the public edge and socket
+disabled. Do not rerun it blindly or delete partial paths; inventory the exact
+state and use a separately reviewed removal or upgrade procedure.
 
-The enable flag, root, and verifier credential are required. The listener
-accepts only a literal loopback IP and canonical port from 1 to 65535;
-hostnames, wildcard/public addresses, and port zero make startup fail. An
-enabled but unsafe, malformed, legacy, or incomplete configuration fails closed
-during startup. Never enable the legacy loopback auth bypass behind a reverse
-proxy.
+The live verification compares every installed payload with the reviewed
+checkout, rejects higher-priority unit fragments and drop-ins, requires the
+socket to remain disabled and inactive, and rechecks the verifier, share, and
+binary metadata. The same fail-fast block publishes the transferred verifier
+only after the complete clean-host gate passes.
 
-After restart, verify locally that
-`127.0.0.1:39777/public-files/` serves the portal. Gateway also registers
-`/public-files`, but that handler is a deliberate 404 tombstone used to clear
-or prevent a stale historical route. It does not serve files, and the public
-edge must never proxy Gateway for this portal. Verify the tombstone returns 404
-and that the dashboard remains reachable only through its normal private access
-path. Do not print a bearer or verifier during routine diagnostics.
+The system account receives a host-specific numeric UID/GID; the unit never
+hard-codes one. The share directory is `root:recasaos-public` mode `0750`.
+Approve each published file explicitly and make it a single-link regular file
+readable by that group, normally `root:recasaos-public` mode `0640`. Do not
+recursively change ownership or permissions on an existing data tree and do
+not make the share world-readable.
 
-This drop-in still runs the listener inside the privileged management daemon.
-It is a verifier migration example, not the least-privileged service boundary
-required by Issue #25.
+The socket is intentionally not enabled by the package. Start it only while
+the public edge remains disabled:
+
+```bash
+(
+  set -euo pipefail
+  sudo systemctl start recasaos-public-files.socket
+  status="$(
+    curl -q -sS -o /dev/null -w '%{http_code}' \
+      http://127.0.0.1:39777/public-files/
+  )"
+  test "$status" = 200
+  sudo systemctl is-active --quiet recasaos-public-files.socket
+  sudo systemctl is-active --quiet recasaos-public-files.service
+)
+```
+
+Starting the service directly without its socket fails closed: the binary
+requires exactly one inherited descriptor named `public-files`, verifies that
+it is a TCP listener at the configured literal-loopback address, and never
+calls `net.Listen`. It also refuses root UID/GID, supplementary privilege
+groups, capabilities, a permissive umask, missing `NoNewPrivileges`, missing
+seccomp, every old `RECASAOS_PUBLIC_FILE_*` environment setting, and any
+unknown or incomplete CLI.
+
+The packaged service uses a minimal `RootDirectory=`, exposes the share only as
+the read-only `/srv/public`, imports the verifier through `LoadCredential=`,
+has a private network namespace, permits creation of only AF_UNIX sockets, and
+has an empty capability bounding set. It has no dependency on
+`casaos.service`. A portal startup failure, crash, restart limit, or controlled
+stop must leave the management daemon PID and health unchanged.
+
+Do not enable the socket at boot or restore the public edge until every
+applicable acceptance row below passes on the exact target host. A safe rollback
+first removes or blocks the edge route, then independently attempts both
+systemd shutdown operations. The two `false` commands are deliberate
+fail-closed placeholders: replace them with the reviewed, synchronous edge
+withdrawal and independent route-closed verification commands for the actual
+deployment. Running the template unchanged still attempts both systemd
+operations but exits nonzero:
+
+```bash
+(
+  set -uo pipefail
+  rollback_status=0
+
+  false || rollback_status=1 # Replace with edge withdrawal/reload.
+  false || rollback_status=1 # Replace with independent route-closed proof.
+
+  sudo systemctl disable --now recasaos-public-files.socket ||
+    rollback_status=1
+  sudo systemctl stop recasaos-public-files.service ||
+    rollback_status=1
+
+  socket_state="$(
+    sudo systemctl show --property=ActiveState --value \
+      recasaos-public-files.socket
+  )" || rollback_status=1
+  service_state="$(
+    sudo systemctl show --property=ActiveState --value \
+      recasaos-public-files.service
+  )" || rollback_status=1
+  test "${socket_state:-}" = inactive || rollback_status=1
+  test "${service_state:-}" = inactive || rollback_status=1
+
+  if test "$rollback_status" -ne 0; then
+    printf '%s\n' \
+      'rollback incomplete; keep routing withdrawn and investigate every failed step' >&2
+  fi
+  exit "$rollback_status"
+)
+```
+
+Rollback must not restore the retired root-daemon drop-in. The first process
+split prevents public-service lifecycle failures from stopping the privileged
+management daemon, but the long-lived public process still performs filesystem
+open, list, read, and seek operations. Issue #25 therefore remains open until
+those operations use a bounded killable-worker protocol and hung-storage tests
+pass.
 
 ### Rotate, verify, and roll back
 
@@ -511,10 +601,21 @@ workstation exactly as in section 1. Keep both the previous and pending raw
 bearers in the password manager until verification finishes. Transfer only the
 pending verifier to the host.
 
+The production hostname's portal route must remain withdrawn for the complete
+rotation and rollback window. Before changing the verifier, prepare a separate,
+temporary validation hostname such as `rotation-check.files.example.net` with
+a publicly trusted certificate, the same portal-only route/upstream controls,
+and an exact source-IP allowlist containing only the unrelated test client.
+All other sources and every non-portal route must be denied. Protect this route
+with a short recorded automatic expiry as well as an explicit removal command,
+and verify the deny from a second, non-allowlisted source. Do not use the
+production hostname as this validation endpoint.
+
 Before publication, retain a root-only rollback copy of the current strict
 verifier. Stage the pending verifier in the same directory, then publish it
-with one rename and restart the service so systemd creates a new credential
-instance:
+with one rename and restart only `recasaos-public-files.service` so systemd
+creates a new credential instance. The management daemon must not be restarted
+by this procedure:
 
 ```bash
 (
@@ -524,6 +625,20 @@ instance:
     sudo env LC_ALL=C grep -Eq \
       '^recasaos-public-verifier-v1:sha256:[0-9a-f]{64}$' "$1"
   }
+
+  for rotation_artifact in \
+    /etc/recasaos/public-file.verifier.rollback \
+    /etc/recasaos/public-file.verifier.next \
+    /etc/recasaos/public-file.verifier.rollback.next
+  do
+    if sudo test -e "$rotation_artifact" ||
+      sudo test -L "$rotation_artifact"
+    then
+      printf 'refusing to overwrite retained rotation evidence: %s\n' \
+        "$rotation_artifact" >&2
+      exit 1
+    fi
+  done
 
   verify_verifier_file /etc/recasaos/public-file.verifier
   verify_verifier_file /path/to/pending.verifier
@@ -538,14 +653,15 @@ instance:
   sudo mv -f -- \
     /etc/recasaos/public-file.verifier.next \
     /etc/recasaos/public-file.verifier
-  sudo systemctl restart casaos.service
-  sudo systemctl is-active --quiet casaos.service
+  sudo systemctl restart recasaos-public-files.service
+  sudo systemctl is-active --quiet recasaos-public-files.service
 )
 ```
 
 Changing the source verifier without a successful restart does not rotate the
-credential already loaded by the running process. From an unrelated client,
-require **old = 401** and **new = 200**. The fail-fast template below
+credential already loaded by the running process. Enable the temporary
+source-allowlisted validation route, then from that unrelated allowlisted
+client require **old = 401** and **new = 200**. The fail-fast template below
 intentionally stops at both `false` commands; replace them with reviewed
 password-manager commands that print exactly one bearer to stdout for command
 substitution. Feeding the header over standard input keeps the bearer out of
@@ -562,12 +678,12 @@ the `curl` argument list:
   old_status="$(
     builtin printf 'Authorization: Bearer %s\n' "$old_bearer" |
       command curl -q -sS -o /dev/null -w '%{http_code}' -H @- \
-        'https://files.example.net/public-files/api/list?path='
+        'https://rotation-check.files.example.net/public-files/api/list?path='
   )"
   new_status="$(
     builtin printf 'Authorization: Bearer %s\n' "$new_bearer" |
       command curl -q -sS -o /dev/null -w '%{http_code}' -H @- \
-        'https://files.example.net/public-files/api/list?path='
+        'https://rotation-check.files.example.net/public-files/api/list?path='
   )"
   test "$old_status" = 401
   test "$new_status" = 200
@@ -575,9 +691,16 @@ the `curl` argument list:
 )
 ```
 
-If restart or either assertion fails, stop public routing, restore the previous
-strict verifier with another same-directory rename, restart, and prove the
-inverse result—old bearer 200, pending bearer 401—before restoring routing:
+Immediately after this gate exits, whether successfully or not, remove the
+temporary validation route, reload the edge, and prove from the same client that
+the validation hostname no longer reaches the portal. The gate is incomplete
+until that teardown proof is recorded.
+
+If restart or either assertion fails, first complete that validation-route
+teardown. The production route is already withdrawn. Restore the previous strict
+verifier with another same-directory rename, restart, and prove the inverse
+result—old bearer 200, pending bearer 401—before restoring any production
+routing:
 
 ```bash
 (
@@ -596,14 +719,16 @@ inverse result—old bearer 200, pending bearer 401—before restoring routing:
   sudo mv -f -- \
     /etc/recasaos/public-file.verifier.rollback.next \
     /etc/recasaos/public-file.verifier
-  sudo systemctl restart casaos.service
-  sudo systemctl is-active --quiet casaos.service
+  sudo systemctl reset-failed recasaos-public-files.service
+  sudo systemctl restart recasaos-public-files.service
+  sudo systemctl is-active --quiet recasaos-public-files.service
 )
 ```
 
-From the unrelated client, run this separate inverse gate after rollback. As
-above, replace both `false` commands with the reviewed password-manager
-retrieval commands:
+For this inverse test, re-enable a fresh instance of the same temporary,
+source-allowlisted validation route, then run this separate gate from the
+allowlisted unrelated client. As above, replace both `false` commands with the
+reviewed password-manager retrieval commands:
 
 ```bash
 (
@@ -616,18 +741,22 @@ retrieval commands:
   old_status="$(
     builtin printf 'Authorization: Bearer %s\n' "$old_bearer" |
       command curl -q -sS -o /dev/null -w '%{http_code}' -H @- \
-        'https://files.example.net/public-files/api/list?path='
+        'https://rotation-check.files.example.net/public-files/api/list?path='
   )"
   new_status="$(
     builtin printf 'Authorization: Bearer %s\n' "$new_bearer" |
       command curl -q -sS -o /dev/null -w '%{http_code}' -H @- \
-        'https://files.example.net/public-files/api/list?path='
+        'https://rotation-check.files.example.net/public-files/api/list?path='
   )"
   test "$old_status" = 200
   test "$new_status" = 401
   unset old_bearer new_bearer old_status new_status
 )
 ```
+
+Immediately remove and externally verify removal of the temporary validation
+route after this inverse gate, including on failure. Never leave that route
+available while investigating a failed rollback.
 
 After a successful rotation, remove the rollback verifier according to the
 recorded change procedure and retire the old bearer from the password manager.
@@ -655,8 +784,12 @@ Before enabling either:
 5. Permit inbound TCP 80/443 only on the public interface. Do not expose SSH,
    Samba, databases, message bus, daemon control, Gateway, the dedicated portal
    listener, or other root-service listener ports.
-6. Keep the no-query access-log format. Authorization belongs in the header,
-   but query strings can still contain sensitive filenames.
+6. Keep the no-query access-log format and the supplied runtime-error control:
+   Caddy deletes `request>uri` from its default runtime logger, while each
+   public Nginx server discards its request-scoped error log. Authorization
+   belongs in the header, but query strings can still contain sensitive
+   filenames. Access-log formatting alone does not prove runtime errors are
+   query-free.
 7. Keep the final 404 deny and the 1 MiB request-body ceiling. Portal downloads
    are responses, so large files do not require a large request limit.
 8. Keep the edge proxy on a currently supported, fully patched release. The
@@ -680,6 +813,19 @@ The Nginx example includes per-client request and connection limits. Stock
 Caddy has no equivalent request-rate limiter in the supplied example; a public
 Caddy deployment therefore requires a separate, reviewed rate-limiting
 edge/WAF or another independently verified control in front of it.
+
+By default, both Caddy and Nginx runtime error records may attach the request
+URI, including its query, when an upstream, timeout, routing, or TLS error
+occurs. The supplied templates add candidate controls for that separate sink:
+Caddy's global runtime-log filter deletes `request>uri`, and each public Nginx
+server sends its error log to `/dev/null` while retaining the query-free access
+log and requiring out-of-band health/metrics. Before a host can be public-ready,
+validate that filter or disable/drop behavior on the exact proxy version, then
+inject upstream resets, timeouts, bad responses, client aborts, and malformed
+requests and inspect every edge, journal, application, and crash sink. If the
+target versions cannot prevent or reliably discard URI/query-bearing runtime
+records, public exposure remains blocked; do not claim the template text or
+access-log format alone closes this boundary.
 
 HSTS is intentionally scoped to the portal hostname. Add `includeSubDomains`
 only after every subdomain is permanently HTTPS-only.
@@ -739,15 +885,15 @@ token in the URL. Also verify:
 | Route enumeration | `/public-files` is the only proxied namespace; v1/v2/v3, docs, debug, setup, SSH, and admin routes are 404. The edge upstream is exactly `127.0.0.1:39777`, never Gateway. |
 | TLS | Trusted chain and hostname; TLS 1.2/1.3; renewal tested and monitored. |
 | Authentication | Missing, malformed, duplicate, wrong, and query-string tokens fail without revealing why. After atomic verifier publication and a controlled restart, the old bearer returns 401 and the new bearer returns 200. |
-| Credential isolation | The raw `rc1_` bearer was generated off-host, its only durable operator copy is in the password manager, and the host provisions only the exact versioned verifier through `recasaos-public-file-verifier`; authorized requests still place the bearer transiently in edge and portal memory. `LimitCORE=0` is active. Missing or malformed verifier input and any non-empty legacy `RECASAOS_PUBLIC_FILE_TOKEN_FILE` value fail startup when the portal is enabled. Bidirectional bind-alias and rollback tests fail closed. |
-| Process isolation | Issue #25 is resolved with reviewed evidence that the Internet-facing listener and potentially blocking filesystem work cannot inherit or stop the privileged management daemon. The current in-process candidate does not pass this row. |
+| Credential isolation | The raw `rc1_` bearer was generated off-host, its only durable operator copy is in the password manager, and the host provisions only the exact versioned verifier through `recasaos-public-file-verifier`; authorized requests still place the bearer transiently in edge and portal memory. `LimitCORE=0` is active. Missing or malformed verifier input and every non-empty legacy `RECASAOS_PUBLIC_FILE_*` environment setting fail startup. Bidirectional bind-alias and rollback tests fail closed. |
+| Process isolation | The Internet-facing socket and service run under the dedicated non-root `recasaos-public` identity, have no capability or CasaOS-service dependency, cannot create IP sockets, see only the minimal root plus read-only share and credential, and can fail/restart without changing the management daemon PID or health. The current staged service passes that lifecycle split but still performs filesystem work in its long-lived process; Issue #25 and this row remain open until bounded killable workers and hung-storage tests pass. |
 | Path confinement | Absolute/parent/encoded traversal, hidden names, symlinks, hardlinks, mount points, devices, pipes, and sockets cannot be listed or downloaded. |
 | Root filesystem | Startup records the mount ID and allowlisted filesystem type from the pinned root FD. FUSE, network, overlay, ZFS, and unknown roots are rejected before the listener is usable; replacing or remounting the configured pathname does not redirect the live portal away from its original descriptor. |
 | Browser boundary | CSP has no inline/eval allowance; the supplied client is designed not to write the bearer to a URL, Referer, history, cookie, Cache API, Web Storage, or IndexedDB, while page, Worker, header, edge, and server request memory remain transient handling boundaries. In stable Chromium, Firefox, and WebKit over real HTTPS, verify storage, DevTools, proxy/application logs, and crash artifacts do not retain it; verify a large download starts without full-body buffering and preserves bytes/filename; replay, another tab, Worker restart, logout, rotation, redirect, and malformed messages fail closed. Record memory measurements and initial Range, retry/resume, and cancellation results. |
 | Response handling | GET, HEAD, and one byte range work, including offsets above 4 GiB; multi-range work is rejected; 401/404/416/503 and successful private-file responses retain `no-store` and `nosniff`. A progressing transfer can cross the base write timeout, while idle and below-budget clients are terminated. |
 | Client cancellation | After a large response starts, abort the client and verify that the chosen edge promptly closes its loopback upstream request and releases portal download capacity. Test both HTTP/1.1 and HTTP/2 at the public edge when both are enabled. |
 | Resource bounds | Oversized directory and request-body tests fail; slow clients do not exhaust all edge connections. Nginx rate/connection limits or the separately reviewed Caddy-fronting limiter are exercised. |
-| Logs | No bearer, verifier, query, private host path, file content, cookie, or personal data appears in edge/application logs or crash artifacts. |
+| Logs | No bearer, verifier, query, private host path, file content, cookie, or personal data appears in edge/application logs or crash artifacts. Because Caddy/Nginx runtime errors may include the URI/query independently of access-log formatting, an exact-version filter or reviewed disable/drop policy is active and fault injection proves upstream failures, timeouts, aborts, malformed requests, and TLS/routing errors remain query-free in every collected sink. Without that evidence this row fails. |
 | Backups | Share and configuration can be restored to an isolated host with recorded checksums and acceptable RPO/RTO. |
 
 Any failed row blocks public DNS/exposure. Passing repository static tests does
@@ -776,6 +922,7 @@ hostname to obtain those features.
 
 This repository currently supplies a candidate application boundary and
 deployment test plan, not a production public-ready package. No host may be
-called public-ready until Issues #22, #25, and #26 are resolved with reviewed
-evidence, and the acceptance matrix, restore drill, vulnerability gates, and
-independent deployment review also pass for the locked component set.
+called public-ready until Issues #22 and #25 are resolved with reviewed
+evidence, Issue #20's browser matrix is complete, and the acceptance matrix,
+restore drill, vulnerability gates, and independent deployment review also
+pass for the locked component set.

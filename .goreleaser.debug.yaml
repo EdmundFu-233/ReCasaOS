@@ -78,6 +78,72 @@ builds:
       - linux
     goarch:
       - riscv64
+  - id: recasaos-public-files-amd64
+    binary: build/sysroot/usr/lib/recasaos-public-files/rootfs/usr/bin/recasaos-public-files
+    main: ./cmd/recasaos-public-files
+    env:
+      - CGO_ENABLED=0
+    gcflags:
+      - all=-N -l
+    ldflags:
+      - -X main.version={{.Version}}
+    tags:
+      - netgo
+      - osusergo
+    goos:
+      - linux
+    goarch:
+      - amd64
+  - id: recasaos-public-files-arm64
+    binary: build/sysroot/usr/lib/recasaos-public-files/rootfs/usr/bin/recasaos-public-files
+    main: ./cmd/recasaos-public-files
+    env:
+      - CGO_ENABLED=0
+    gcflags:
+      - all=-N -l
+    ldflags:
+      - -X main.version={{.Version}}
+    tags:
+      - netgo
+      - osusergo
+    goos:
+      - linux
+    goarch:
+      - arm64
+  - id: recasaos-public-files-arm-7
+    binary: build/sysroot/usr/lib/recasaos-public-files/rootfs/usr/bin/recasaos-public-files
+    main: ./cmd/recasaos-public-files
+    env:
+      - CGO_ENABLED=0
+    gcflags:
+      - all=-N -l
+    ldflags:
+      - -X main.version={{.Version}}
+    tags:
+      - netgo
+      - osusergo
+    goos:
+      - linux
+    goarch:
+      - arm
+    goarm:
+      - "7"
+  - id: recasaos-public-files-riscv64
+    binary: build/sysroot/usr/lib/recasaos-public-files/rootfs/usr/bin/recasaos-public-files
+    main: ./cmd/recasaos-public-files
+    env:
+      - CGO_ENABLED=0
+    gcflags:
+      - all=-N -l
+    ldflags:
+      - -X main.version={{.Version}}
+    tags:
+      - netgo
+      - osusergo
+    goos:
+      - linux
+    goarch:
+      - riscv64
   - id: casaos-migration-tool-amd64
     binary: build/sysroot/usr/bin/casaos-migration-tool
     main: ./cmd/migration-tool
@@ -157,6 +223,10 @@ archives:
       - casaos-arm64
       - casaos-arm-7
       - casaos-riscv64
+      - recasaos-public-files-amd64
+      - recasaos-public-files-arm64
+      - recasaos-public-files-arm-7
+      - recasaos-public-files-riscv64
     files:
       - build/**/*
   - name_template: >-

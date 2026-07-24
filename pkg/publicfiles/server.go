@@ -53,7 +53,8 @@ func defaultHTTPServerConfig() httpServerConfig {
 // NewHTTPServer returns the dedicated public-file server with finite header,
 // body and connection limits. File responses replace the server's absolute
 // write cutoff with a progress-aware idle deadline and cumulative minimum-rate
-// budget. The public listener must still be created with ListenAddressFromEnv.
+// budget. Production callers must supply the reviewed systemd-activated
+// loopback listener; this package never binds a network address itself.
 func NewHTTPServer(handler http.Handler) *http.Server {
 	return newHTTPServer(handler, defaultHTTPServerConfig())
 }

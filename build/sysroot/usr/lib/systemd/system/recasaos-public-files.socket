@@ -1,0 +1,20 @@
+[Unit]
+Description=ReCasaOS public-file portal socket
+ConditionPathIsDirectory=/srv/recasaos-public
+ConditionPathIsRegular=/etc/recasaos/public-file.verifier
+
+[Socket]
+ListenStream=127.0.0.1:39777
+Accept=no
+Service=recasaos-public-files.service
+FileDescriptorName=public-files
+Backlog=128
+NoDelay=yes
+IPAccounting=yes
+IPAddressDeny=any
+IPAddressAllow=localhost
+TriggerLimitIntervalSec=30s
+TriggerLimitBurst=3
+
+[Install]
+WantedBy=sockets.target

@@ -5,7 +5,6 @@ package main
 import (
 	"context"
 	_ "embed"
-	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -25,7 +24,6 @@ import (
 	"github.com/IceWhaleTech/CasaOS/pkg/cache"
 	"github.com/IceWhaleTech/CasaOS/pkg/config"
 	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
-	"github.com/IceWhaleTech/CasaOS/pkg/publicfiles"
 	"github.com/IceWhaleTech/CasaOS/pkg/samba"
 	"github.com/IceWhaleTech/CasaOS/pkg/sqlite"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/file"
@@ -33,13 +31,15 @@ import (
 	"github.com/IceWhaleTech/CasaOS/service"
 	"github.com/coreos/go-systemd/daemon"
 	"go.uber.org/zap"
-	"golang.org/x/net/netutil"
 
 	"github.com/robfig/cron/v3"
 	"gorm.io/gorm"
 )
 
-const LOCALHOST = "127.0.0.1"
+const (
+	LOCALHOST                = "127.0.0.1"
+	publicFilesTombstonePath = "/public-files"
+)
 
 var sqliteDB *gorm.DB
 
@@ -136,30 +136,6 @@ func main() {
 		"doc":          v2DocRouter,
 		"public-files": http.NotFoundHandler(),
 	}
-	publicFilePortal, portalErr := publicfiles.NewFromEnv()
-	if portalErr != nil && !errors.Is(portalErr, publicfiles.ErrDisabled) {
-		panic(portalErr)
-	}
-	if publicFilePortal != nil {
-		defer publicFilePortal.Close()
-		publicAddress, err := publicfiles.ListenAddressFromEnv()
-		if err != nil {
-			panic(err)
-		}
-		publicListener, err := net.Listen("tcp", publicAddress)
-		if err != nil {
-			panic(err)
-		}
-		publicListener = netutil.LimitListener(publicListener, 96)
-		publicServer := publicfiles.NewHTTPServer(publicFilePortal)
-		defer publicServer.Close()
-		go func() {
-			if err := publicServer.Serve(publicListener); err != nil && err != http.ErrServerClosed {
-				panic(err)
-			}
-		}()
-		logger.Info("ReCasaOS read-only public file portal is enabled", zap.String("address", publicListener.Addr().String()))
-	}
 	mux := &util_http.HandlerMultiplexer{
 		HandlerMap: handlers,
 	}
@@ -194,7 +170,7 @@ func main() {
 		route.V2APIPath,
 		route.V2DocPath,
 		route.V3FilePath,
-		publicfiles.BasePath,
+		publicFilesTombstonePath,
 	}
 	for _, apiPath := range routers {
 		err = service.MyService.Gateway().CreateRoute(&model.Route{

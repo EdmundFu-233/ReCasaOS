@@ -42,6 +42,21 @@ jobs:
       - name: Enforce offline release and migration policy
         run: .github/scripts/check-release-policy.sh
 
+      - name: Validate GoReleaser configuration
+        run: .github/scripts/check-goreleaser-config.sh
+
+      - name: Verify public-file service dependency boundary
+        run: .github/scripts/check-public-files-service-boundary.sh
+
+      - name: Verify public-file systemd packaging boundary
+        run: deploy/systemd/check-public-files-units.sh .
+
+      - name: Exercise public-file unit checker negative cases
+        run: .github/scripts/test-public-files-unit-checker.sh
+
+      - name: Cross-compile isolated public-file service
+        run: .github/scripts/check-public-files-builds.sh
+
       - name: Verify formatting
         shell: bash
         run: |
@@ -103,7 +118,7 @@ jobs:
               -run '^TestPrepareSecureDatabaseDirectoryRejectsForeignOwnedChildInStickyAncestor$'
 
       - name: Run security-sensitive race tests
-        run: go test -race ./pkg/authsecurity ./pkg/filesecurity ./pkg/httpsecurity ./pkg/netsecurity ./pkg/publicfiles ./pkg/samba ./pkg/sqlite ./pkg/utils/file ./pkg/utils/httper ./route/v1 ./service
+        run: go test -race ./cmd/recasaos-public-files ./pkg/authsecurity ./pkg/filesecurity ./pkg/httpsecurity ./pkg/netsecurity ./pkg/publicfiles ./pkg/samba ./pkg/sqlite ./pkg/utils/file ./pkg/utils/httper ./route/v1 ./service
 
       - name: Run vet
         run: go vet ./...
@@ -212,6 +227,33 @@ jobs:
                 -test.run '^(TestPublicVerifierBindAliasDisclosureCannotAuthenticate|TestPinnedPublicRootSurvivesBindMountReplacement|TestPublicRootRejectsNestedBindMount|TestPublicRootAcceptsTmpfsInIsolatedNamespace|TestPublicRootAllowlistedFilesystemCompatibilityMatrix)$' \
                 -test.timeout=9m \
                 -test.v
+
+  # Run this check for every PR. A skipped job is reported as successful and
+  # must not be mistaken for systemd isolation evidence. The job has no
+  # secrets or write permission, and its script separately refuses any runner
+  # that is not GitHub-hosted.
+  isolated-public-files-service:
+    name: Isolated public-files systemd service
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go 1.26.5
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: "1.26.5"
+          cache: true
+
+      - name: Exercise the isolated public-files service
+        timeout-minutes: 10
+        env:
+          RECASAOS_TRUSTED_SYSTEMD_CI: "1"
+          RECASAOS_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: .github/scripts/test-public-files-systemd.sh
 
   govulncheck:
     name: Generate and scan reachable Go vulnerabilities

@@ -28,10 +28,8 @@ const (
 )
 
 var (
-	ErrDisabled              = errors.New("public file portal is disabled")
-	ErrUnsupported           = errors.New("public file portal requires Linux openat2 and statx mount-ID support")
-	ErrLegacyRawBearerConfig = errors.New("RECASAOS_PUBLIC_FILE_TOKEN_FILE is forbidden; configure only a verifier file")
-	errEntryLimit            = errors.New("directory entry limit exceeded")
+	ErrUnsupported = errors.New("public file portal requires Linux openat2 and statx mount-ID support")
+	errEntryLimit  = errors.New("directory entry limit exceeded")
 )
 
 // Config contains the complete public-file security boundary. Root and
@@ -59,23 +57,6 @@ type Portal struct {
 	bearerVerifier [sha256.Size]byte
 	maxEntries     int
 	downloadSlots  chan struct{}
-}
-
-// NewFromEnv creates a portal only when RECASAOS_PUBLIC_FILE_ENABLED is
-// exactly "1". An enabled but incomplete or unsafe configuration fails
-// closed with an error.
-func NewFromEnv() (*Portal, error) {
-	if os.Getenv("RECASAOS_PUBLIC_FILE_ENABLED") != "1" {
-		return nil, ErrDisabled
-	}
-	if os.Getenv("RECASAOS_PUBLIC_FILE_TOKEN_FILE") != "" {
-		return nil, ErrLegacyRawBearerConfig
-	}
-
-	return New(Config{
-		Root:         os.Getenv("RECASAOS_PUBLIC_FILE_ROOT"),
-		VerifierFile: os.Getenv("RECASAOS_PUBLIC_FILE_VERIFIER_FILE"),
-	})
 }
 
 // New validates the configured paths, securely opens the root directory and
