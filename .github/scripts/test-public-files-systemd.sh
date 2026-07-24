@@ -700,8 +700,8 @@ host_shm_sentinel="$(mktemp "${host_shm_sentinel_prefix}XXXXXX")"
 [[ "$host_shm_sentinel" =~ ^/dev/shm/recasaos-public-files-ci-[0-9]+-[0-9]+\.[A-Za-z0-9]{6}$ ]] ||
   fail "mktemp returned an unsafe shared-memory sentinel: $host_shm_sentinel"
 host_shm_sentinel_created=1
-printf '%s\n' 'host shared-memory sentinel must remain hidden' |
-  sudo tee "$host_shm_sentinel" >/dev/null
+printf '%s\n' 'host shared-memory sentinel must remain hidden' \
+  >"$host_shm_sentinel"
 sudo chown root:root "$host_shm_sentinel"
 sudo chmod 0600 "$host_shm_sentinel"
 
