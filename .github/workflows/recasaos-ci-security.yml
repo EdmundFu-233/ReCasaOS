@@ -60,19 +60,18 @@ jobs:
       - name: Run tests
         run: go test ./...
 
-      - name: Exercise mount-boundary regressions in the ephemeral runner
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        shell: bash
-        run: |
-          sudo env \
-            "PATH=$PATH" \
-            GOTOOLCHAIN=local \
-            GOCACHE=/tmp/recasaos-go-build-cache \
-            go test -count=1 ./pkg/filesecurity \
-              -run '^(TestManagedRootsTreeSizeRejectsNestedBindMount|TestManagedDirectoryCopyRejectsBindMountAliasIntoSource|TestManagedReplaceCleanupRejectsBindAliasAncestorOfConfiguredRoot)$'
-
       - name: Verify isolated Samba probe privilege boundary
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        if: >-
+          github.event_name != 'pull_request' ||
+          (
+            github.event.pull_request.head.repo.full_name == github.repository &&
+            github.actor != 'dependabot[bot]' &&
+            (
+              github.event.pull_request.author_association == 'OWNER' ||
+              github.event.pull_request.author_association == 'MEMBER' ||
+              github.event.pull_request.author_association == 'COLLABORATOR'
+            )
+          )
         shell: bash
         run: |
           sudo env \
@@ -83,7 +82,17 @@ jobs:
               -run '^TestRealProbeSandboxDropsIdentityAndAppliesLimitsBeforeReady$'
 
       - name: Verify SQLite sticky-directory ownership boundary
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        if: >-
+          github.event_name != 'pull_request' ||
+          (
+            github.event.pull_request.head.repo.full_name == github.repository &&
+            github.actor != 'dependabot[bot]' &&
+            (
+              github.event.pull_request.author_association == 'OWNER' ||
+              github.event.pull_request.author_association == 'MEMBER' ||
+              github.event.pull_request.author_association == 'COLLABORATOR'
+            )
+          )
         shell: bash
         run: |
           sudo env \
@@ -98,6 +107,111 @@ jobs:
 
       - name: Run vet
         run: go vet ./...
+
+  # This guard controls only ReCasaOS's dedicated mount mutations. Standard
+  # GitHub-hosted runners themselves provide passwordless sudo, so it is not a
+  # sandbox for arbitrary fork code. An untrusted PR must be reproduced at the
+  # exact commit on a trusted same-repository branch before this skipped matrix
+  # can be treated as merge evidence (tracked in Issue #27).
+  privileged-mount-tests:
+    name: Privileged mount regressions (isolated namespace)
+    if: >-
+      github.event_name != 'pull_request' ||
+      (
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.actor != 'dependabot[bot]' &&
+        (
+          github.event.pull_request.author_association == 'OWNER' ||
+          github.event.pull_request.author_association == 'MEMBER' ||
+          github.event.pull_request.author_association == 'COLLABORATOR'
+        )
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go 1.26.5
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: "1.26.5"
+          cache: true
+
+      - name: Install filesystem compatibility tools
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          sudo apt-get update
+          # The hosted Azure kernel ships F2FS in its exact-version extras.
+          sudo env DEBIAN_FRONTEND=noninteractive \
+            apt-get install --yes --no-install-recommends \
+              btrfs-progs \
+              e2fsprogs \
+              f2fs-tools \
+              kmod \
+              "linux-modules-extra-$(uname -r)" \
+              mount \
+              udev \
+              util-linux \
+              xfsprogs
+          for tool in losetup mkfs.btrfs mkfs.ext4 mkfs.f2fs mkfs.xfs mount udevadm umount; do
+            if ! command -v "$tool" >/dev/null; then
+              printf 'required privileged filesystem test tool is unavailable: %s\n' "$tool" >&2
+              exit 1
+            fi
+          done
+          for module in loop xfs btrfs f2fs; do
+            sudo modprobe "$module"
+          done
+          if [[ ! -c /dev/loop-control ]]; then
+            printf 'loop-control device is unavailable after loading the loop module\n' >&2
+            exit 1
+          fi
+
+      - name: Compile privileged test binaries without root
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          umask 022
+          CGO_ENABLED=0 go test -c \
+            -o "$RUNNER_TEMP/recasaos-filesecurity.test" \
+            ./pkg/filesecurity
+          CGO_ENABLED=0 go test -c \
+            -o "$RUNNER_TEMP/recasaos-publicfiles.test" \
+            ./pkg/publicfiles
+          test -x "$RUNNER_TEMP/recasaos-filesecurity.test"
+          test -x "$RUNNER_TEMP/recasaos-publicfiles.test"
+
+      - name: Exercise management mount-boundary regressions
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          sudo unshare --mount --propagation private --fork --kill-child=KILL \
+            env \
+              PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+              RECASAOS_PRIVILEGED_MOUNT_TEST=1 \
+              "$RUNNER_TEMP/recasaos-filesecurity.test" \
+                -test.count=1 \
+                -test.run '^(TestManagedDirectDirectoryRenameRejectsNestedBindMount|TestManagedRemoveAllPreflightsNestedMountBeforeDeletingSibling|TestManagedRootsTreeSizeRejectsNestedBindMount|TestManagedDirectoryCopyRejectsBindMountAliasIntoSource|TestManagedRegularCopyRejectsDestinationBindAliasIntoAnotherConfiguredRoot|TestManagedReplaceCleanupRejectsBindAliasAncestorOfConfiguredRoot)$' \
+                -test.timeout=4m \
+                -test.v
+
+      - name: Exercise public-root mount and filesystem regressions
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          sudo unshare --mount --propagation private --fork --kill-child=KILL \
+            env \
+              PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+              RECASAOS_PRIVILEGED_MOUNT_TEST=1 \
+              "$RUNNER_TEMP/recasaos-publicfiles.test" \
+                -test.count=1 \
+                -test.run '^(TestPinnedPublicRootSurvivesBindMountReplacement|TestPublicRootRejectsNestedBindMount|TestPublicRootAcceptsTmpfsInIsolatedNamespace|TestPublicRootAllowlistedFilesystemCompatibilityMatrix)$' \
+                -test.timeout=9m \
+                -test.v
 
   govulncheck:
     name: Generate and scan reachable Go vulnerabilities

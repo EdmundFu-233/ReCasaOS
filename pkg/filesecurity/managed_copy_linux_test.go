@@ -1924,6 +1924,7 @@ func TestManagedDirectoryTransferRejectsCrossConfiguredRootAndReplaceMove(t *tes
 }
 
 func TestManagedDirectoryCopyRejectsBindMountAliasIntoSource(t *testing.T) {
+	requireIsolatedPrivilegedMountTest(t)
 	root := t.TempDir()
 	source := filepath.Join(root, "source")
 	boundSourceChild := filepath.Join(source, "child")
@@ -1935,10 +1936,7 @@ func TestManagedDirectoryCopyRejectsBindMountAliasIntoSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := unix.Mount(boundSourceChild, alias, "", unix.MS_BIND, ""); err != nil {
-		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
-			t.Skipf("bind mounts are unavailable in this Linux test environment: %v", err)
-		}
-		t.Fatal(err)
+		t.Fatalf("explicitly requested bind-alias regression cannot mount: %v", err)
 	}
 	defer func() {
 		if err := unix.Unmount(alias, unix.MNT_DETACH); err != nil {
@@ -1956,6 +1954,7 @@ func TestManagedDirectoryCopyRejectsBindMountAliasIntoSource(t *testing.T) {
 }
 
 func TestManagedRegularCopyRejectsDestinationBindAliasIntoAnotherConfiguredRoot(t *testing.T) {
+	requireIsolatedPrivilegedMountTest(t)
 	base := t.TempDir()
 	rootA := filepath.Join(base, "root-a")
 	rootB := filepath.Join(base, "root-b")
@@ -1967,10 +1966,7 @@ func TestManagedRegularCopyRejectsDestinationBindAliasIntoAnotherConfiguredRoot(
 		}
 	}
 	if err := unix.Mount(backing, alias, "", unix.MS_BIND, ""); err != nil {
-		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
-			t.Skipf("bind mounts are unavailable in this Linux test environment: %v", err)
-		}
-		t.Fatal(err)
+		t.Fatalf("explicitly requested destination-bind regression cannot mount: %v", err)
 	}
 	defer func() {
 		if err := unix.Unmount(alias, unix.MNT_DETACH); err != nil {
@@ -2005,6 +2001,7 @@ func TestManagedRegularCopyRejectsDestinationBindAliasIntoAnotherConfiguredRoot(
 }
 
 func TestManagedReplaceCleanupRejectsBindAliasAncestorOfConfiguredRoot(t *testing.T) {
+	requireIsolatedPrivilegedMountTest(t)
 	root := t.TempDir()
 	backing := filepath.Join(root, "backing")
 	protectedRoot := filepath.Join(backing, "protected")
@@ -2017,10 +2014,7 @@ func TestManagedReplaceCleanupRejectsBindAliasAncestorOfConfiguredRoot(t *testin
 		}
 	}
 	if err := unix.Mount(backing, target, "", unix.MS_BIND, ""); err != nil {
-		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
-			t.Skipf("bind mounts are unavailable in this Linux test environment: %v", err)
-		}
-		t.Fatal(err)
+		t.Fatalf("explicitly requested replace-bind regression cannot mount: %v", err)
 	}
 	defer func() {
 		if err := unix.Unmount(target, unix.MNT_DETACH); err != nil {

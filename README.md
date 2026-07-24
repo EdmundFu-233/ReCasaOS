@@ -66,6 +66,23 @@ current-page-memory-only and header-authenticated, with a 32 MiB bounded
 fallback, but stable Chromium/Firefox/WebKit HTTPS download, memory, retry,
 Range, cancellation, and filename tests remain release gates.
 
+The portal also verifies the already-pinned root descriptor's Linux mount ID
+and filesystem type before it becomes available. Only ext2/3/4, XFS, Btrfs,
+tmpfs, and F2FS are allowlisted; FUSE, network filesystems, overlayfs, ZFS, and
+unknown or unverified types fail startup. There is no unrestricted fallback.
+This keeps unsupported roots out of the in-process download-slot boundary; it
+does not certify the health or locality of an allowlisted filesystem's block
+device. [Issue #22](https://github.com/EdmundFu-233/ReCasaOS/issues/22) remains
+open until the compatibility and blocking-I/O boundary is independently
+verified. Process isolation from the privileged daemon is tracked in
+[Issue #25](https://github.com/EdmundFu-233/ReCasaOS/issues/25).
+
+The current raw bearer-file configuration also remains a release blocker:
+pathname comparison cannot prove separation across every bind-mount alias.
+Until [Issue #26](https://github.com/EdmundFu-233/ReCasaOS/issues/26) replaces
+it with verifier-only provisioning, do not call a bind-mounted public root or
+token hierarchy public-ready.
+
 Never expose Samba, SSH, daemon ports, debug/API documentation, setup routes,
 privileged v1/v2/v3 APIs, the dedicated portal listener, or root/Gateway
 listeners directly. Keep the management Gateway on a firewalled private/VPN

@@ -30,7 +30,7 @@ const (
 
 var (
 	ErrDisabled    = errors.New("public file portal is disabled")
-	ErrUnsupported = errors.New("public file portal requires Linux openat2 support")
+	ErrUnsupported = errors.New("public file portal requires Linux openat2 and statx mount-ID support")
 	errEntryLimit  = errors.New("directory entry limit exceeded")
 )
 
@@ -76,9 +76,9 @@ func NewFromEnv() (*Portal, error) {
 }
 
 // New validates the configured paths, securely opens the root directory and
-// loads the bearer token. It does not provide a non-openat2 filesystem
-// fallback because a weaker path check would reintroduce symlink and TOCTOU
-// escapes.
+// loads the bearer token. It does not provide a non-openat2 or unrestricted
+// filesystem fallback because weaker path and root checks would reintroduce
+// symlink, TOCTOU, and blocking-network-filesystem risks.
 func New(config Config) (*Portal, error) {
 	rootPath, err := validateAbsoluteConfigPath(config.Root, false)
 	if err != nil {
