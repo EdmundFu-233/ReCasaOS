@@ -1149,6 +1149,125 @@ storage_workers_are_stopped() {
   [[ "$count" == "$expected" ]]
 }
 
+print_capacity_journal_diagnostics() {
+  local diagnostics
+
+  if [[ -z "$capacity_journal_cursor" ||
+    "$capacity_journal_cursor" == *$'\n'* ||
+    "${#capacity_journal_cursor}" -gt 4096 ]]; then
+    printf 'capacity journal diagnostics: cursor unavailable\n' >&2
+    return
+  fi
+  if ! diagnostics="$(
+    sudo journalctl \
+      --unit="$service_unit" \
+      --no-pager \
+      --after-cursor="$capacity_journal_cursor" \
+      --lines=2048 \
+      --output=cat 2>/dev/null |
+      awk '
+        BEGIN {
+          allowed["recasaos-systemd-test-event=handler-entered"] = 1
+          allowed["recasaos-systemd-test-event=handler-download-slot-acquired"] = 1
+          allowed["recasaos-systemd-test-event=handler-download-slot-rejected"] = 1
+          allowed["recasaos-systemd-test-event=coordinator-context-rejected"] = 1
+          allowed["recasaos-systemd-test-event=coordinator-pre-slot-rejected"] = 1
+          allowed["recasaos-systemd-test-event=coordinator-manager-unavailable"] = 1
+          allowed["recasaos-systemd-test-event=coordinator-signal-failure"] = 1
+          allowed["recasaos-systemd-test-event=coordinator-quarantine-limit"] = 1
+          allowed["recasaos-systemd-test-event=coordinator-slots-full"] = 1
+          allowed["recasaos-systemd-test-event=coordinator-slot-acquired"] = 1
+          allowed["recasaos-systemd-test-event=worker-start-capacity-failure"] = 1
+          allowed["recasaos-systemd-test-event=worker-start-protocol-failure"] = 1
+          allowed["recasaos-systemd-test-event=worker-post-start-rejected"] = 1
+          allowed["recasaos-systemd-test-event=worker-process-registered"] = 1
+          allowed["recasaos-systemd-test-event=coordinator-open-response"] = 1
+          allowed["recasaos-systemd-test-event=coordinator-read-response"] = 1
+          allowed["recasaos-systemd-test-event=child-first-read-sent"] = 1
+        }
+        {
+          if ($0 in allowed) {
+            print "capacity journal event: " $0
+            event_count++
+          } else if ($0 ~ /^recasaos-systemd-test-event=[a-z0-9-]+$/) {
+            unknown_event = 1
+          }
+
+          known_fatal = 0
+          if (index($0, "runtime: failed to create new OS thread") ||
+            index($0, "fatal error: newosproc")) {
+            new_thread = 1
+            if (index($0, "errno=11)")) {
+              new_thread_eagain = 1
+            }
+            if (index($0, "errno=12)")) {
+              new_thread_enomem = 1
+            }
+            known_fatal = 1
+          }
+          if (index($0, "runtime: may need to increase max user processes")) {
+            new_thread = 1
+            new_thread_eagain = 1
+            known_fatal = 1
+          }
+          if (index($0, "runtime: failed to allocate stack for the new OS thread")) {
+            thread_stack_allocation = 1
+            known_fatal = 1
+          }
+          if (index($0, "out of memory (stackalloc)")) {
+            thread_stack_allocation = 1
+            known_fatal = 1
+          }
+          if (index($0, "failed to reserve page summary memory")) {
+            page_summary_reservation = 1
+            known_fatal = 1
+          }
+          if (index($0, "out of memory") ||
+            index($0, "cannot allocate memory")) {
+            out_of_memory = 1
+            known_fatal = 1
+          }
+          if (index($0, "cannot map pages in arena address space")) {
+            arena_map_failure = 1
+            known_fatal = 1
+          }
+          if (index($0, "memory reservation exceeds address space limit")) {
+            arena_address_range = 1
+            known_fatal = 1
+          }
+          if (index($0, "unexpected fault address") ||
+            $0 == "fatal error: fault" ||
+            index($0, "fatal error: unexpected signal during runtime execution")) {
+            unexpected_fault = 1
+            known_fatal = 1
+          }
+          if (index($0, "fatal error:") && !known_fatal) {
+            other_fatal = 1
+          }
+        }
+        END {
+          printf "capacity journal summary: events=%d unknown-event=%s new-thread=%s new-thread-eagain=%s new-thread-enomem=%s thread-stack-allocation=%s page-summary-reservation=%s out-of-memory=%s arena-map-failure=%s arena-address-range=%s unexpected-fault=%s other-runtime-fatal=%s\n",
+            event_count + 0,
+            unknown_event ? "yes" : "no",
+            new_thread ? "yes" : "no",
+            new_thread_eagain ? "yes" : "no",
+            new_thread_enomem ? "yes" : "no",
+            thread_stack_allocation ? "yes" : "no",
+            page_summary_reservation ? "yes" : "no",
+            out_of_memory ? "yes" : "no",
+            arena_map_failure ? "yes" : "no",
+            arena_address_range ? "yes" : "no",
+            unexpected_fault ? "yes" : "no",
+            other_fatal ? "yes" : "no"
+        }
+      '
+  )"; then
+    printf 'capacity journal diagnostics: query failed\n' >&2
+    return
+  fi
+  printf '%s\n' "$diagnostics" >&2
+}
+
 print_storage_worker_diagnostics() {
   local actual_worker_count
   local cgroup_file
@@ -1159,7 +1278,16 @@ print_storage_worker_diagnostics() {
   local failure_line
   local ready_file
   local start_time
+  local worker_command
+  local worker_end_command
+  local worker_end_parent
+  local worker_end_start_time
+  local worker_limit_diagnostics
+  local worker_parent
+  local worker_pid
   local worker_pids
+  local worker_resource_diagnostics
+  local worker_start_time
   if worker_pids="$(storage_worker_pids 2>/dev/null)"; then
     if [[ -z "$worker_pids" ]]; then
       actual_worker_count=0
@@ -1184,6 +1312,96 @@ print_storage_worker_diagnostics() {
     "$max_storage_worker_count" \
     "$worker_pids" >&2
   sudo ps -o pid=,ppid=,stat=,etime=,args= --ppid "$portal_pid" >&2 || true
+  while IFS= read -r worker_pid; do
+    [[ "$worker_pid" =~ ^[0-9]+$ && "$worker_pid" -gt 1 ]] || continue
+    worker_start_time="$(
+      process_start_time "$worker_pid" 2>/dev/null || true
+    )"
+    worker_parent="$(
+      sudo ps -o ppid= -p "$worker_pid" 2>/dev/null |
+        awk 'NR == 1 { gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print }' ||
+        true
+    )"
+    worker_command="$(
+      sudo cat "/proc/${worker_pid}/cmdline" 2>/dev/null |
+        tr '\0' ' ' || true
+    )"
+    if [[ ! "$worker_start_time" =~ ^[0-9]+$ ||
+      "$worker_parent" != "$portal_pid" ||
+      "$worker_command" != '/proc/self/exe --internal-public-files-storage-worker file ' ]]; then
+      printf 'storage worker resource diagnostics: identity unavailable\n' >&2
+      continue
+    fi
+    if ! worker_resource_diagnostics="$(
+      sudo awk '
+        $1 == "VmSize:" { vm_size = $2 }
+        $1 == "VmPeak:" { vm_peak = $2 }
+        $1 == "VmRSS:" { vm_rss = $2 }
+        $1 == "Threads:" { threads = $2 }
+        END {
+          if (vm_size == "") vm_size = "unknown"
+          if (vm_peak == "") vm_peak = "unknown"
+          if (vm_rss == "") vm_rss = "unknown"
+          if (threads == "") threads = "unknown"
+          printf "vm-size-kib=%s vm-peak-kib=%s vm-rss-kib=%s threads=%s\n",
+            vm_size, vm_peak, vm_rss, threads
+        }
+      ' "/proc/${worker_pid}/status" 2>/dev/null
+    )"; then
+      printf 'storage worker resource diagnostics: identity unavailable\n' >&2
+      continue
+    fi
+    if ! worker_limit_diagnostics="$(
+      sudo awk '
+        $1 == "Max" && $2 == "processes" {
+          nproc_soft = $3
+          nproc_hard = $4
+        }
+        $1 == "Max" && $2 == "address" && $3 == "space" {
+          address_soft = $4
+          address_hard = $5
+        }
+        END {
+          if (nproc_soft == "") nproc_soft = "unknown"
+          if (nproc_hard == "") nproc_hard = "unknown"
+          if (address_soft == "") address_soft = "unknown"
+          if (address_hard == "") address_hard = "unknown"
+          printf "nproc-soft=%s nproc-hard=%s address-soft=%s address-hard=%s\n",
+            nproc_soft, nproc_hard, address_soft, address_hard
+        }
+      ' "/proc/${worker_pid}/limits" 2>/dev/null
+    )"; then
+      printf 'storage worker resource diagnostics: identity unavailable\n' >&2
+      continue
+    fi
+    worker_end_start_time="$(
+      process_start_time "$worker_pid" 2>/dev/null || true
+    )"
+    worker_end_parent="$(
+      sudo ps -o ppid= -p "$worker_pid" 2>/dev/null |
+        awk 'NR == 1 { gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print }' ||
+        true
+    )"
+    worker_end_command="$(
+      sudo cat "/proc/${worker_pid}/cmdline" 2>/dev/null |
+        tr '\0' ' ' || true
+    )"
+    if [[ ! "$worker_end_start_time" =~ ^[0-9]+$ ||
+      "$worker_end_start_time" != "$worker_start_time" ||
+      "$worker_end_parent" != "$portal_pid" ||
+      "$worker_end_parent" != "$worker_parent" ||
+      "$worker_end_command" != "$worker_command" ||
+      "$worker_end_command" != '/proc/self/exe --internal-public-files-storage-worker file ' ||
+      ! "$worker_resource_diagnostics" =~ ^vm-size-kib=([0-9]+|unknown)\ vm-peak-kib=([0-9]+|unknown)\ vm-rss-kib=([0-9]+|unknown)\ threads=([0-9]+|unknown)$ ||
+      ! "$worker_limit_diagnostics" =~ ^nproc-soft=([0-9]+|unlimited|unknown)\ nproc-hard=([0-9]+|unlimited|unknown)\ address-soft=([0-9]+|unlimited|unknown)\ address-hard=([0-9]+|unlimited|unknown)$ ]]; then
+      printf 'storage worker resource diagnostics: identity unavailable\n' >&2
+      continue
+    fi
+    printf 'storage worker resource diagnostics: pid=%s %s\n' \
+      "$worker_pid" "$worker_resource_diagnostics" >&2
+    printf 'storage worker limit diagnostics: pid=%s %s\n' \
+      "$worker_pid" "$worker_limit_diagnostics" >&2
+  done <<<"$worker_pids"
   for client_index in "${!slow_download_pids[@]}"; do
     client_pid="${slow_download_pids[$client_index]}"
     ready_file="${slow_download_ready_files[$client_index]}"
@@ -1251,6 +1469,7 @@ print_storage_worker_diagnostics() {
   fi
   sudo ss -H -tinp \
     '( sport = :39777 or dport = :39777 )' >&2 || true
+  print_capacity_journal_diagnostics
   sudo journalctl --no-pager --output=short-monotonic --lines=80 \
     --unit="$socket_unit" --unit="$service_unit" >&2 || true
 }
