@@ -168,6 +168,9 @@ func defaultStorageWorkerCommand(
 		Setpgid: true,
 		PidFD:   pidfd,
 	}
+	if storageWorkerSystemdTestEnabled {
+		configureStorageWorkerSystemdTestCommand(command)
+	}
 	return command, nil
 }
 
@@ -413,6 +416,11 @@ func (m *isolatedStorageManager) openRegular(
 		process.abort()
 		return nil, nil, err
 	}
+	if storageWorkerSystemdTestEnabled {
+		reportStorageWorkerSystemdTestEvent(
+			systemdStorageWorkerTestOpenResponse,
+		)
+	}
 	info := isolatedFileInfo{
 		name:    path.Base(relativePath),
 		size:    response.Size,
@@ -458,37 +466,88 @@ func (m *isolatedStorageManager) startRequestWorker(
 	mode string,
 ) (*isolatedStorageProcess, error) {
 	if err := ctx.Err(); err != nil {
+		if storageWorkerSystemdTestEnabled {
+			reportStorageWorkerSystemdTestEvent(
+				systemdStorageWorkerTestContextRejected,
+			)
+		}
 		return nil, errStorageTimeout
 	}
+	var rejectionEvent systemdStorageWorkerTestEvent
 	m.mu.Lock()
 	if m.closed || m.root == nil ||
 		m.signalFailure.Load() ||
 		m.quarantine.Load() >= m.quarantineAdmissionLimit {
+		if storageWorkerSystemdTestEnabled {
+			rejectionEvent = systemdStorageWorkerTestPreSlotRejected
+			switch {
+			case m.closed || m.root == nil:
+				rejectionEvent = systemdStorageWorkerTestManagerUnavailable
+			case m.signalFailure.Load():
+				rejectionEvent = systemdStorageWorkerTestSignalFailure
+			case m.quarantine.Load() >= m.quarantineAdmissionLimit:
+				rejectionEvent = systemdStorageWorkerTestQuarantineLimit
+			}
+		}
 		m.mu.Unlock()
+		if storageWorkerSystemdTestEnabled {
+			reportStorageWorkerSystemdTestEvent(rejectionEvent)
+		}
 		return nil, errStorageCapacity
 	}
 	select {
 	case m.slots <- struct{}{}:
 	default:
 		m.mu.Unlock()
+		if storageWorkerSystemdTestEnabled {
+			reportStorageWorkerSystemdTestEvent(
+				systemdStorageWorkerTestSlotsFull,
+			)
+		}
 		return nil, errStorageCapacity
 	}
 	m.mu.Unlock()
+	if storageWorkerSystemdTestEnabled {
+		reportStorageWorkerSystemdTestEvent(
+			systemdStorageWorkerTestSlotAcquired,
+		)
+	}
 
 	process, err := startIsolatedStorageProcess(m, m.commandFactory, mode)
 	if err != nil {
 		<-m.slots
+		if storageWorkerSystemdTestEnabled {
+			if errors.Is(err, errStorageCapacity) {
+				reportStorageWorkerSystemdTestEvent(
+					systemdStorageWorkerTestStartCapacityFailure,
+				)
+			} else {
+				reportStorageWorkerSystemdTestEvent(
+					systemdStorageWorkerTestStartProtocolFailure,
+				)
+			}
+		}
 		return nil, err
 	}
 	m.mu.Lock()
 	if m.closed || m.signalFailure.Load() {
 		m.mu.Unlock()
+		if storageWorkerSystemdTestEnabled {
+			reportStorageWorkerSystemdTestEvent(
+				systemdStorageWorkerTestPostStartRejected,
+			)
+		}
 		go process.reap()
 		process.abort()
 		return nil, errStorageCapacity
 	}
 	m.workers[process] = struct{}{}
 	m.mu.Unlock()
+	if storageWorkerSystemdTestEnabled {
+		reportStorageWorkerSystemdTestEvent(
+			systemdStorageWorkerTestProcessRegistered,
+		)
+	}
 	go process.reap()
 	return process, nil
 }
@@ -762,6 +821,11 @@ func (f *isolatedStorageFile) Read(buffer []byte) (int, error) {
 			f.fail(errStorageProtocol)
 		}
 		return 0, f.sourceErr
+	}
+	if storageWorkerSystemdTestEnabled {
+		reportStorageWorkerSystemdTestEvent(
+			systemdStorageWorkerTestReadResponse,
+		)
 	}
 	count := copy(buffer, frame.payload)
 	f.offset += int64(count)

@@ -1,0 +1,26 @@
+package publicfiles
+
+// systemdStorageWorkerTestEvent is a numeric-only hook contract shared by the
+// production no-op and CI-tagged implementations. Human-readable event strings
+// exist only in the tagged file and must remain absent from release binaries.
+type systemdStorageWorkerTestEvent uint8
+
+const (
+	systemdStorageWorkerTestHandlerEntered systemdStorageWorkerTestEvent = iota + 1
+	systemdStorageWorkerTestDownloadSlotAcquired
+	systemdStorageWorkerTestDownloadSlotRejected
+	systemdStorageWorkerTestContextRejected
+	systemdStorageWorkerTestPreSlotRejected
+	systemdStorageWorkerTestManagerUnavailable
+	systemdStorageWorkerTestSignalFailure
+	systemdStorageWorkerTestQuarantineLimit
+	systemdStorageWorkerTestSlotsFull
+	systemdStorageWorkerTestSlotAcquired
+	systemdStorageWorkerTestStartCapacityFailure
+	systemdStorageWorkerTestStartProtocolFailure
+	systemdStorageWorkerTestPostStartRejected
+	systemdStorageWorkerTestProcessRegistered
+	systemdStorageWorkerTestOpenResponse
+	systemdStorageWorkerTestReadResponse
+	systemdStorageWorkerTestChildFirstReadSent
+)

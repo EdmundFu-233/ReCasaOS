@@ -342,10 +342,25 @@ func (p *Portal) serveFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "invalid relative path")
 		return
 	}
+	if storageWorkerSystemdTestEnabled {
+		reportStorageWorkerSystemdTestEvent(
+			systemdStorageWorkerTestHandlerEntered,
+		)
+	}
 	select {
 	case p.downloadSlots <- struct{}{}:
+		if storageWorkerSystemdTestEnabled {
+			reportStorageWorkerSystemdTestEvent(
+				systemdStorageWorkerTestDownloadSlotAcquired,
+			)
+		}
 		defer func() { <-p.downloadSlots }()
 	default:
+		if storageWorkerSystemdTestEnabled {
+			reportStorageWorkerSystemdTestEvent(
+				systemdStorageWorkerTestDownloadSlotRejected,
+			)
+		}
 		w.Header().Set("Retry-After", "5")
 		writeError(w, r, http.StatusServiceUnavailable, "download capacity reached")
 		return

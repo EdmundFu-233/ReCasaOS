@@ -50,6 +50,7 @@ systemd_test_binary="${workspace}/recasaos-public-files-systemd-test"
 management_dir="${workspace}/management"
 response_file="${workspace}/response"
 ninth_response_headers="${workspace}/ninth-response.headers"
+capacity_events="${workspace}/capacity-events"
 nested_backing="${workspace}/nested-backing"
 nested_mount="${share}/covered"
 host_shm_sentinel_prefix="/dev/shm/recasaos-public-files-ci-${run_key}."
@@ -126,6 +127,7 @@ latest_slow_download_start_time=
 last_storage_worker_count=0
 max_storage_worker_count=0
 portal_invocation=
+capacity_journal_cursor=
 
 cleanup_problem() {
   printf 'public-files systemd test cleanup: %s\n' "$*" >&2
@@ -1131,6 +1133,8 @@ storage_workers_are_stopped() {
 }
 
 print_storage_worker_diagnostics() {
+  local actual_worker_count
+  local cgroup_file
   local client_index
   local client_pid
   local control_group
@@ -1138,10 +1142,30 @@ print_storage_worker_diagnostics() {
   local failure_line
   local ready_file
   local start_time
-  printf 'storage worker diagnostics: last=%s max=%s pids=%q\n' \
+  local worker_pids
+  if worker_pids="$(storage_worker_pids 2>/dev/null)"; then
+    if [[ -z "$worker_pids" ]]; then
+      actual_worker_count=0
+    elif ! actual_worker_count="$(
+      printf '%s\n' "$worker_pids" |
+        awk '
+          NF != 1 || $1 !~ /^[0-9]+$/ || $1 <= 1 { exit 1 }
+          { count++ }
+          END { print count + 0 }
+        '
+    )"; then
+      actual_worker_count=unknown
+      worker_pids=unknown
+    fi
+  else
+    actual_worker_count=unknown
+    worker_pids=unknown
+  fi
+  printf 'storage worker diagnostics: actual=%s cached-last=%s cached-max=%s pids=%q\n' \
+    "$actual_worker_count" \
     "$last_storage_worker_count" \
     "$max_storage_worker_count" \
-    "$(storage_worker_pids)" >&2
+    "$worker_pids" >&2
   sudo ps -o pid=,ppid=,stat=,etime=,args= --ppid "$portal_pid" >&2 || true
   for client_index in "${!slow_download_pids[@]}"; do
     client_pid="${slow_download_pids[$client_index]}"
@@ -1178,19 +1202,125 @@ print_storage_worker_diagnostics() {
     --property=ExecMainCode \
     --property=ExecMainStatus \
     --property=ControlGroup \
+    --property=TasksCurrent \
+    --property=TasksMax \
+    --property=MemoryCurrent \
+    --property=MemoryMax \
     "$service_unit" >&2 || true
+  sudo systemctl show \
+    --property=MemoryPeak \
+    "$service_unit" >&2 2>/dev/null || true
   control_group="$(
     sudo systemctl show --property=ControlGroup --value \
       "$service_unit" 2>/dev/null || true
   )"
   if [[ "$control_group" == "/system.slice/$service_unit" ]]; then
-    printf 'service cgroup memory events:\n' >&2
-    sudo cat "/sys/fs/cgroup${control_group}/memory.events" >&2 || true
+    for cgroup_file in \
+      memory.current \
+      memory.peak \
+      memory.max \
+      memory.events \
+      pids.current \
+      pids.max \
+      pids.events
+    do
+      if sudo test -f \
+        "/sys/fs/cgroup${control_group}/${cgroup_file}"; then
+        printf 'service cgroup %s:\n' "$cgroup_file" >&2
+        sudo cat \
+          "/sys/fs/cgroup${control_group}/${cgroup_file}" >&2 || true
+      fi
+    done
   fi
   sudo ss -H -tinp \
     '( sport = :39777 or dport = :39777 )' >&2 || true
   sudo journalctl --no-pager --output=short-monotonic --lines=80 \
     --unit="$socket_unit" --unit="$service_unit" >&2 || true
+}
+
+capture_capacity_journal_cursor() {
+  local cursor
+
+  [[ "$capacity_events" =~ ^/run/recasaos-public-files-ci-[0-9]+-[0-9]+/capacity-events$ ]] ||
+    fail "refusing unsafe capacity event path: $capacity_events"
+  [[ ! -e "$capacity_events" && ! -L "$capacity_events" ]] ||
+    fail "capacity event path already exists"
+  install -m 0600 /dev/null "$capacity_events"
+  cursor="$(
+    sudo journalctl \
+      --unit="$service_unit" \
+      --no-pager \
+      --lines=1 \
+      --show-cursor \
+      --output=cat |
+      awk '
+        /^-- cursor: / {
+          count++
+          sub(/^-- cursor: /, "")
+          cursor = $0
+        }
+        END {
+          if (count != 1 || cursor == "")
+            exit 1
+          print cursor
+        }
+      '
+  )" || fail "could not capture the capacity-phase journal cursor"
+  [[ -n "$cursor" && "$cursor" != *$'\n'* &&
+    "${#cursor}" -le 4096 ]] ||
+    fail "capacity-phase journal cursor is unsafe"
+  capacity_journal_cursor=$cursor
+}
+
+capacity_phase_events_are_complete() {
+  [[ -n "$capacity_journal_cursor" &&
+    "$capacity_journal_cursor" != *$'\n'* &&
+    "${#capacity_journal_cursor}" -le 4096 ]] || return 1
+  [[ -f "$capacity_events" && ! -L "$capacity_events" ]] || return 1
+  sudo journalctl \
+    --unit="$service_unit" \
+    --no-pager \
+    --after-cursor="$capacity_journal_cursor" \
+    --output=cat |
+    awk '
+      /^recasaos-systemd-test-event=[a-z0-9-]+$/ &&
+        length($0) <= 96 {
+        print
+      }
+    ' >"$capacity_events" || return 1
+  awk '
+    BEGIN {
+      # Eight successful holders emit seven events each. The ninth request
+      # enters the handler, acquires one of 64 download slots, then reaches the
+      # independently bounded eight-worker coordinator and is rejected there.
+      expected["recasaos-systemd-test-event=handler-entered"] = 9
+      expected["recasaos-systemd-test-event=handler-download-slot-acquired"] = 9
+      expected["recasaos-systemd-test-event=handler-download-slot-rejected"] = 0
+      expected["recasaos-systemd-test-event=coordinator-context-rejected"] = 0
+      expected["recasaos-systemd-test-event=coordinator-pre-slot-rejected"] = 0
+      expected["recasaos-systemd-test-event=coordinator-manager-unavailable"] = 0
+      expected["recasaos-systemd-test-event=coordinator-signal-failure"] = 0
+      expected["recasaos-systemd-test-event=coordinator-quarantine-limit"] = 0
+      expected["recasaos-systemd-test-event=coordinator-slots-full"] = 1
+      expected["recasaos-systemd-test-event=coordinator-slot-acquired"] = 8
+      expected["recasaos-systemd-test-event=worker-start-capacity-failure"] = 0
+      expected["recasaos-systemd-test-event=worker-start-protocol-failure"] = 0
+      expected["recasaos-systemd-test-event=worker-post-start-rejected"] = 0
+      expected["recasaos-systemd-test-event=worker-process-registered"] = 8
+      expected["recasaos-systemd-test-event=coordinator-open-response"] = 8
+      expected["recasaos-systemd-test-event=coordinator-read-response"] = 8
+      expected["recasaos-systemd-test-event=child-first-read-sent"] = 8
+    }
+    { observed[$0]++ }
+    END {
+      for (event in observed)
+        if (!(event in expected))
+          exit 1
+      for (event in expected)
+        if (observed[event] + 0 != expected[event])
+          exit 1
+    }
+  ' "$capacity_events"
 }
 
 slow_download_marker_is_valid() {
@@ -1297,13 +1427,17 @@ try:
         response.extend(chunk)
         if len(response) > 32768:
             raise RuntimeError("response headers exceeded the bounded limit")
-    header_block = bytes(response).split(b"\r\n\r\n", 1)[0]
+    header_block, initial_body = bytes(response).split(b"\r\n\r\n", 1)
     header_lines = header_block.split(b"\r\n")
-    if header_lines[0] != b"HTTP/1.1 200 OK":
-        raise RuntimeError(
-            "slow download did not receive exact HTTP/1.1 200 OK"
-        )
+    status_match = re.fullmatch(
+        rb"HTTP/1\.1 ([1-5][0-9]{2}) [\x20-\x7e]{1,64}",
+        header_lines[0],
+    )
+    if status_match is None:
+        raise RuntimeError("slow download received an invalid status line")
+    status_code = int(status_match.group(1))
     content_lengths = []
+    retry_after_values = []
     transfer_encodings = []
     for header_line in header_lines[1:]:
         if b":" not in header_line:
@@ -1314,8 +1448,45 @@ try:
         header_name = header_name.lower()
         if header_name == b"content-length":
             content_lengths.append(header_value.strip())
+        elif header_name == b"retry-after":
+            retry_after_values.append(header_value.strip())
         elif header_name == b"transfer-encoding":
             transfer_encodings.append(header_value.strip())
+    if header_lines[0] != b"HTTP/1.1 200 OK":
+        error_class = "unclassified"
+        if (
+            len(content_lengths) == 1
+            and re.fullmatch(rb"[0-9]{1,3}", content_lengths[0])
+            and not transfer_encodings
+        ):
+            body_length = int(content_lengths[0])
+            if body_length <= 512 and len(initial_body) <= body_length:
+                body = bytearray(initial_body)
+                while len(body) < body_length:
+                    chunk = client.recv(body_length - len(body))
+                    if not chunk:
+                        break
+                    body.extend(chunk)
+                if len(body) != body_length:
+                    error_class = "truncated-bounded-error"
+                else:
+                    error_class = {
+                        b'{"error":"storage capacity unavailable"}':
+                            "storage-capacity-unavailable",
+                        b'{"error":"download capacity reached"}':
+                            "download-capacity-reached",
+                        b'{"error":"unable to open file"}':
+                            "unable-to-open-file",
+                    }.get(bytes(body), "unrecognized-bounded-error")
+        retry_after_5 = (
+            "yes" if retry_after_values == [b"5"] else "no"
+        )
+        raise RuntimeError(
+            "slow download rejected: "
+            f"status={status_code} "
+            f"retry_after_5={retry_after_5} "
+            f"error={error_class}"
+        )
     expected_length = sys.argv[2].encode("ascii")
     if expected_length != b"67108864":
         raise RuntimeError("slow download fixture length is invalid")
@@ -1501,6 +1672,13 @@ done
 if cmp -s -- "$production_binary" "$systemd_test_binary"; then
   fail "systemd capacity binary is identical to the production build"
 fi
+if LC_ALL=C grep -aFq -- \
+  'recasaos-systemd-test-event=' "$production_binary"; then
+  fail "production binary contains CI-only systemd event diagnostics"
+fi
+LC_ALL=C grep -aFq -- \
+  'recasaos-systemd-test-event=' "$systemd_test_binary" ||
+  fail "tagged binary omitted CI-only systemd event diagnostics"
 sudo install -o root -g root -m 0755 \
   "$production_binary" \
   "$rootfs/usr/bin/recasaos-public-files"
@@ -1837,6 +2015,7 @@ activate_public_binary \
   "$systemd_test_binary" \
   "systemd capacity binary activation"
 wait_until "storage workers before bounded load" storage_worker_count_is 0
+capture_capacity_journal_cursor
 worker_capacity_deadline=$((SECONDS + 15))
 for expected_worker_count in {1..8}; do
   start_slow_download
@@ -1900,6 +2079,9 @@ ninth_status="$(
   ' "$ninth_response_headers"
 )" == 1:0 ]] ||
   fail "ninth concurrent storage request lacked one exact Retry-After value 5"
+wait_until_before "storage worker capacity event chain" \
+  "$worker_capacity_deadline" \
+  capacity_phase_events_are_complete
 
 tasks_current="$(
   sudo systemctl show --property=TasksCurrent --value "$service_unit"
