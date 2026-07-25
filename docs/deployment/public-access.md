@@ -174,6 +174,14 @@ the isolated portal process can safely contain every blocking storage failure.
 The bounded worker protocol is implemented, but its real FUSE, device-mapper,
 D-state, restart, and resource-headroom evidence remains required by
 [Issue #25](https://github.com/EdmundFu-233/ReCasaOS/issues/25).
+The hosted systemd job uses the production build for activation, sandbox and
+API smoke checks. For deterministic worker saturation and coordinator cleanup,
+it temporarily swaps in a non-release CI-tagged binary whose worker for the
+exact synthetic `worker-load.bin` fixture stops itself after its first
+successful read. Closing the clients then exercises coordinator pidfd
+cancellation, and a main-process crash exercises systemd control-group cleanup.
+This synchronization is not an uninterruptible-storage simulation and cannot
+close the D-state or exact-release qualification gates.
 
 Privileged bind, tmpfs, and loopback filesystem regressions run only in a
 dedicated ephemeral CI job. The compatibility matrix formats and mounts ext4,

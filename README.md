@@ -78,6 +78,12 @@ until exact-head Linux CI and real hung-storage/D-state tests prove those bounds
 on the supported deployment stack. The declared systemd 247 floor is
 source-reviewed but is not yet execution-qualified; the Ubuntu 24.04/systemd
 255 integration job is not evidence for that floor.
+That hosted job runs the normal production build for activation, sandbox and
+API smoke checks. Only its deterministic worker-capacity and
+coordinator-cleanup phases swap in a non-release, CI-tagged binary whose exact
+synthetic fixture worker stops itself after one successful read. This proves
+admission, pidfd cancellation and control-group cleanup mechanics; it is not
+byte-identical release evidence and does not simulate uninterruptible storage.
 
 The portal's large-file browser stream is still a candidate tracked in
 [Issue #20](https://github.com/EdmundFu-233/ReCasaOS/issues/20). Its client does

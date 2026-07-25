@@ -45,15 +45,19 @@ rootfs="${workspace}/rootfs"
 share="${workspace}/share"
 verifier="${workspace}/public-file.verifier"
 good_verifier="${workspace}/public-file.verifier.good"
+production_binary="${workspace}/recasaos-public-files-production"
+systemd_test_binary="${workspace}/recasaos-public-files-systemd-test"
 management_dir="${workspace}/management"
 response_file="${workspace}/response"
+ninth_response_headers="${workspace}/ninth-response.headers"
 nested_backing="${workspace}/nested-backing"
 nested_mount="${share}/covered"
 host_shm_sentinel_prefix="/dev/shm/recasaos-public-files-ci-${run_key}."
 host_shm_sentinel=
 test_bearer='rc1_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8'
-# The fixture is sparse. Its size exceeds normal socket buffering while the
-# client's receive buffer and advertised TCP window are explicitly bounded.
+# The fixture is sparse. The dedicated CI-tagged worker returns its first real
+# chunk, then stops itself only for this exact file so the HTTP client can
+# validate committed response headers before worker-capacity checks begin.
 worker_load_bytes=67108864
 
 case "$workspace" in
@@ -76,25 +80,52 @@ if getent passwd recasaos-public >/dev/null ||
   fail "the recasaos-public account unexpectedly already exists"
 fi
 for required_tool in \
-  find getfacl mktemp mount mountpoint pgrep ps ss truncate umount
+  cmp find getfacl mktemp mount mountpoint pgrep ps ss systemctl truncate umount
 do
   command -v "$required_tool" >/dev/null 2>&1 ||
     fail "required mount test tool is unavailable: $required_tool"
 done
 [[ -x /usr/bin/python3 ]] ||
   fail "required Python interpreter is unavailable: /usr/bin/python3"
+/usr/bin/python3 -c '
+import os
+import signal
+
+if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+    raise SystemExit(1)
+' || fail "Python pidfd signaling support is unavailable"
+systemctl_help="$(LC_ALL=C systemctl --help)" ||
+  fail "could not inspect systemctl kill option compatibility"
+systemctl_kill_selector=
+# systemd 247 documents --kill-who; newer releases document --kill-whom.
+# Select only an option that this exact runner advertises.
+if grep -Fq -- '--kill-whom=WHOM' <<<"$systemctl_help"; then
+  systemctl_kill_selector='--kill-whom=main'
+fi
+if grep -Fq -- '--kill-who=WHO' <<<"$systemctl_help"; then
+  [[ -z "$systemctl_kill_selector" ]] ||
+    fail "systemctl exposes ambiguous kill selector options"
+  systemctl_kill_selector='--kill-who=main'
+fi
+[[ -n "$systemctl_kill_selector" ]] ||
+  fail "systemctl exposes no supported exact kill selector option"
 account_cleanup_authorized=1
 nested_mount_cleanup_required=0
 host_shm_sentinel_created=0
 slow_download_pids=()
 slow_download_ready_files=()
 slow_download_failure_files=()
+slow_download_start_times=()
 slow_download_sequence=0
+bounded_worker_pids=()
+bounded_worker_start_times=()
 latest_slow_download_pid=
 latest_slow_download_ready_file=
 latest_slow_download_failure_file=
+latest_slow_download_start_time=
 last_storage_worker_count=0
 max_storage_worker_count=0
+portal_invocation=
 
 cleanup_problem() {
   printf 'public-files systemd test cleanup: %s\n' "$*" >&2
@@ -379,11 +410,73 @@ cleanup_account_entry() {
   esac
 }
 
+process_start_time() {
+  local pid=$1
+  local stat_line
+  local -a stat_fields=()
+
+  [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]] || return 1
+  [[ -r "/proc/$pid/stat" ]] || return 1
+  stat_line="$(<"/proc/$pid/stat")" || return 1
+  [[ "$stat_line" == *") "* ]] || return 1
+  IFS=' ' read -r -a stat_fields <<<"${stat_line##*) }"
+  [[ "${#stat_fields[@]}" -gt 19 &&
+    "${stat_fields[19]}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${stat_fields[19]}"
+}
+
+terminate_exact_background_process() {
+  local pid=$1
+  local start_time=$2
+
+  [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 &&
+    "$start_time" =~ ^[0-9]+$ ]] || return 1
+  /usr/bin/python3 -c '
+import os
+import signal
+import sys
+
+pid = int(sys.argv[1])
+expected_start = sys.argv[2].encode("ascii")
+try:
+    pidfd = os.pidfd_open(pid, 0)
+except ProcessLookupError:
+    raise SystemExit(0)
+try:
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as stat_file:
+            stat_data = stat_file.read()
+    except FileNotFoundError:
+        raise SystemExit(0)
+    marker = stat_data.rfind(b") ")
+    fields = stat_data[marker + 2:].split() if marker >= 0 else []
+    if len(fields) <= 19 or not fields[19].isdigit():
+        raise RuntimeError("could not parse exact process start time")
+    if fields[19] != expected_start:
+        raise SystemExit(0)
+    try:
+        signal.pidfd_send_signal(pidfd, signal.SIGTERM, None, 0)
+    except ProcessLookupError:
+        pass
+finally:
+    os.close(pidfd)
+' "$pid" "$start_time"
+}
+
 cleanup_background_downloads() {
+  local client_index
   local pid
-  for pid in "${slow_download_pids[@]}"; do
-    if kill -0 "$pid" 2>/dev/null; then
-      kill -TERM "$pid" 2>/dev/null || true
+
+  for client_index in "${!slow_download_pids[@]}"; do
+    pid="${slow_download_pids[$client_index]}"
+    if ! terminate_exact_background_process \
+      "$pid" "${slow_download_start_times[$client_index]}"; then
+      if [[ -n "${cleanup_failed+x}" ]]; then
+        cleanup_problem \
+          "could not terminate exact download client identity $pid"
+      else
+        fail "could not terminate exact download client identity $pid"
+      fi
     fi
   done
   for pid in "${slow_download_pids[@]}"; do
@@ -392,9 +485,11 @@ cleanup_background_downloads() {
   slow_download_pids=()
   slow_download_ready_files=()
   slow_download_failure_files=()
+  slow_download_start_times=()
   latest_slow_download_pid=
   latest_slow_download_ready_file=
   latest_slow_download_failure_file=
+  latest_slow_download_start_time=
   last_storage_worker_count=0
   max_storage_worker_count=0
 }
@@ -600,15 +695,9 @@ trap cleanup EXIT
 
 "$repo_root/deploy/systemd/check-public-files-units.sh" "$repo_root"
 
-wait_until() {
-  description=$1
-  shift
-  for ((attempt = 0; attempt < 150; attempt++)); do
-    if "$@"; then
-      return 0
-    fi
-    sleep 0.1
-  done
+print_wait_timeout_diagnostics() {
+  local description=$1
+
   if [[ "$description" == "public portal activation" ]]; then
     printf '%s\n' 'public-files activation diagnostics:' >&2
     sudo systemctl show \
@@ -633,6 +722,41 @@ wait_until() {
       print_storage_worker_diagnostics
       ;;
   esac
+}
+
+wait_until() {
+  local attempt
+  local attempt_limit=150
+  local description=$1
+
+  shift
+  if [[ "$description" == "public service restart after SIGKILL" ]]; then
+    attempt_limit=300
+  fi
+  for ((attempt = 0; attempt < attempt_limit; attempt++)); do
+    if "$@"; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  print_wait_timeout_diagnostics "$description"
+  fail "timed out waiting for ${description}"
+}
+
+wait_until_before() {
+  local deadline=$2
+  local description=$1
+
+  [[ "$deadline" =~ ^[0-9]+$ ]] ||
+    fail "invalid wait deadline for $description"
+  shift 2
+  while ((SECONDS < deadline)); do
+    if "$@"; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  print_wait_timeout_diagnostics "$description"
   fail "timed out waiting for ${description}"
 }
 
@@ -852,14 +976,81 @@ page_is_ready() {
   )" == 200 ]]
 }
 
+activate_public_binary() {
+  local binary=$1
+  local description=$2
+  local previous_invocation
+  local previous_pid
+  local next_invocation
+  local next_pid
+  local stopped_pid
+  local stopped_state
+
+  [[ "$binary" == "$production_binary" ||
+    "$binary" == "$systemd_test_binary" ]] ||
+    fail "refusing unreviewed portal binary path: $binary"
+  [[ -f "$binary" && ! -L "$binary" && -x "$binary" ]] ||
+    fail "portal binary is unsafe before $description"
+  previous_pid="${portal_pid:-0}"
+  previous_invocation="$(
+    sudo systemctl show --property=InvocationID --value "$service_unit"
+  )"
+
+  sudo systemctl stop "$socket_unit" "$service_unit"
+  stopped_state="$(
+    sudo systemctl show --property=ActiveState --value "$service_unit"
+  )"
+  stopped_pid="$(
+    sudo systemctl show --property=MainPID --value "$service_unit"
+  )"
+  [[ "$stopped_state" == inactive && "$stopped_pid" == 0 ]] ||
+    fail "service did not fully stop before $description"
+  wait_until "$description stopped listener" socket_is_inactive_and_unbound
+  sudo install -o root -g root -m 0755 \
+    "$binary" "$rootfs/usr/bin/recasaos-public-files"
+  sudo cmp -s -- "$binary" "$rootfs/usr/bin/recasaos-public-files" ||
+    fail "installed portal bytes differ before $description"
+  sudo systemctl start "$socket_unit"
+  wait_until "public portal activation" page_is_ready
+
+  next_pid="$(
+    sudo systemctl show --property=MainPID --value "$service_unit"
+  )"
+  next_invocation="$(
+    sudo systemctl show --property=InvocationID --value "$service_unit"
+  )"
+  [[ "$next_pid" =~ ^[0-9]+$ && "$next_pid" -gt 1 ]] ||
+    fail "$description produced no service process"
+  [[ "$next_pid" != "$previous_pid" ]] ||
+    fail "$description reused the previous service PID"
+  [[ -n "$next_invocation" && "$next_invocation" != "$previous_invocation" ]] ||
+    fail "$description did not create a new service invocation"
+  portal_pid=$next_pid
+  portal_invocation=$next_invocation
+
+  assert_service_cgroup_limits
+  assert_systemd_credential_for_pid "$portal_pid"
+  assert_service_api_vfs_isolation "$portal_pid"
+  wait_until "unchanged management sentinel after $description" \
+    sentinel_is_unchanged
+}
+
 service_is_failed() {
   sudo systemctl is-failed --quiet "$service_unit"
 }
 
 service_has_new_pid() {
+  local current_invocation
+  local current_pid
+
   current_pid="$(sudo systemctl show --property=MainPID --value "$service_unit")"
+  current_invocation="$(
+    sudo systemctl show --property=InvocationID --value "$service_unit"
+  )"
   [[ "$current_pid" =~ ^[0-9]+$ && "$current_pid" -gt 1 &&
-    "$current_pid" != "$portal_pid" ]]
+    "$current_pid" != "$portal_pid" &&
+    -n "$current_invocation" &&
+    "$current_invocation" != "$portal_invocation" ]]
 }
 
 storage_worker_pids() {
@@ -890,10 +1081,15 @@ storage_worker_count() {
 }
 
 slow_download_process_is_live() {
+  local expected_start_time=$2
   local process_state
   local pid=$1
+  local start_time
 
-  [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]] || return 1
+  [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 &&
+    "$expected_start_time" =~ ^[0-9]+$ ]] || return 1
+  start_time="$(process_start_time "$pid")" || return 1
+  [[ "$start_time" == "$expected_start_time" ]] || return 1
   process_state="$(
     ps -o stat= -p "$pid" 2>/dev/null |
       awk 'NR == 1 { print substr($1, 1, 1) }' || true
@@ -914,6 +1110,26 @@ storage_worker_count_is() {
   [[ "$count" == "$expected" ]]
 }
 
+storage_workers_are_stopped() {
+  local expected=$1
+  local count=0
+  local process_state
+  local worker_pid
+
+  slow_downloads_are_healthy || return 1
+  while IFS= read -r worker_pid; do
+    [[ "$worker_pid" =~ ^[0-9]+$ && "$worker_pid" -gt 1 ]] ||
+      return 1
+    process_state="$(
+      ps -o stat= -p "$worker_pid" 2>/dev/null |
+        awk 'NR == 1 { print substr($1, 1, 1) }' || true
+    )"
+    [[ "$process_state" == T ]] || return 1
+    count=$((count + 1))
+  done < <(storage_worker_pids)
+  [[ "$count" == "$expected" ]]
+}
+
 print_storage_worker_diagnostics() {
   local client_index
   local client_pid
@@ -921,6 +1137,7 @@ print_storage_worker_diagnostics() {
   local failure_file
   local failure_line
   local ready_file
+  local start_time
   printf 'storage worker diagnostics: last=%s max=%s pids=%q\n' \
     "$last_storage_worker_count" \
     "$max_storage_worker_count" \
@@ -930,7 +1147,8 @@ print_storage_worker_diagnostics() {
     client_pid="${slow_download_pids[$client_index]}"
     ready_file="${slow_download_ready_files[$client_index]}"
     failure_file="${slow_download_failure_files[$client_index]}"
-    if slow_download_process_is_live "$client_pid"; then
+    start_time="${slow_download_start_times[$client_index]}"
+    if slow_download_process_is_live "$client_pid" "$start_time"; then
       printf 'slow download client %s: alive ready=%s failure=%s\n' \
         "$client_pid" \
         "$(slow_download_marker_is_valid "$ready_file" &&
@@ -988,6 +1206,7 @@ slow_download_is_ready() {
   local failure_file=$3
   local pid=$1
   local ready_file=$2
+  local start_time=$4
 
   if [[ -s "$failure_file" ]]; then
     print_storage_worker_diagnostics
@@ -998,11 +1217,11 @@ slow_download_is_ready() {
       fail "slow download client $pid produced an unsafe ready marker"
     slow_download_marker_is_valid "$ready_file" ||
       fail "slow download client $pid produced an invalid ready marker"
-    slow_download_process_is_live "$pid" ||
+    slow_download_process_is_live "$pid" "$start_time" ||
       fail "slow download client $pid exited after becoming ready"
     return 0
   fi
-  slow_download_process_is_live "$pid" ||
+  slow_download_process_is_live "$pid" "$start_time" ||
     fail "slow download client $pid exited before becoming ready"
   return 1
 }
@@ -1014,7 +1233,8 @@ slow_downloads_are_healthy() {
     slow_download_is_ready \
       "${slow_download_pids[$client_index]}" \
       "${slow_download_ready_files[$client_index]}" \
-      "${slow_download_failure_files[$client_index]}" || return 1
+      "${slow_download_failure_files[$client_index]}" \
+      "${slow_download_start_times[$client_index]}" || return 1
   done
 }
 
@@ -1023,6 +1243,7 @@ start_slow_download() {
   local pid
   local ready_file
   local ready_temp_file
+  local start_time
 
   slow_download_sequence=$((slow_download_sequence + 1))
   ready_file="${workspace}/slow-download-${slow_download_sequence}.ready"
@@ -1055,14 +1276,6 @@ try:
         raise ValueError("invalid bearer format")
 
     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
-    if client.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF) > 16384:
-        raise RuntimeError("kernel did not preserve the bounded receive buffer")
-    if not hasattr(socket, "TCP_WINDOW_CLAMP"):
-        raise RuntimeError("kernel TCP window clamp support is unavailable")
-    client.setsockopt(socket.IPPROTO_TCP, socket.TCP_WINDOW_CLAMP, 4096)
-    if client.getsockopt(socket.IPPROTO_TCP, socket.TCP_WINDOW_CLAMP) > 16384:
-        raise RuntimeError("kernel did not preserve the bounded TCP window")
     client.settimeout(10)
     client.connect(("127.0.0.1", 39777))
     client.sendall(
@@ -1086,21 +1299,28 @@ try:
             raise RuntimeError("response headers exceeded the bounded limit")
     header_block = bytes(response).split(b"\r\n\r\n", 1)[0]
     header_lines = header_block.split(b"\r\n")
-    status_line = header_lines[0].split(b" ", 2)
-    if len(status_line) < 2 or status_line[1] != b"200":
-        raise RuntimeError("slow download did not receive HTTP 200")
+    if header_lines[0] != b"HTTP/1.1 200 OK":
+        raise RuntimeError(
+            "slow download did not receive exact HTTP/1.1 200 OK"
+        )
     content_lengths = []
+    transfer_encodings = []
     for header_line in header_lines[1:]:
         if b":" not in header_line:
             raise RuntimeError("slow download received a malformed header")
         header_name, header_value = header_line.split(b":", 1)
-        if header_name.lower() == b"content-length":
+        if not header_name or header_name != header_name.strip():
+            raise RuntimeError("slow download received a malformed header name")
+        header_name = header_name.lower()
+        if header_name == b"content-length":
             content_lengths.append(header_value.strip())
+        elif header_name == b"transfer-encoding":
+            transfer_encodings.append(header_value.strip())
     expected_length = sys.argv[2].encode("ascii")
     if expected_length != b"67108864":
         raise RuntimeError("slow download fixture length is invalid")
-    if content_lengths != [expected_length]:
-        raise RuntimeError("slow download received an unexpected content length")
+    if content_lengths != [expected_length] or transfer_encodings:
+        raise RuntimeError("slow download received unsafe framing headers")
 
     marker_path = sys.argv[1]
     marker_temp_path = marker_path + ".tmp"
@@ -1142,16 +1362,30 @@ except Exception as error:
     raise SystemExit(1)
 ' "$ready_file" "$worker_load_bytes" 2>"$failure_file" &
   pid=$!
+  start_time="$(process_start_time "$pid")" || {
+    wait "$pid" 2>/dev/null || true
+    fail "slow download client exited before identity capture"
+  }
   slow_download_pids+=("$pid")
   slow_download_ready_files+=("$ready_file")
   slow_download_failure_files+=("$failure_file")
+  slow_download_start_times+=("$start_time")
   latest_slow_download_pid=$pid
   latest_slow_download_ready_file=$ready_file
   latest_slow_download_failure_file=$failure_file
+  latest_slow_download_start_time=$start_time
 }
 
-process_is_gone() {
-  [[ ! -e "/proc/$1" ]]
+process_identity_is_gone() {
+  local current_start_time
+  local expected_start_time=$2
+  local pid=$1
+
+  [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 &&
+    "$expected_start_time" =~ ^[0-9]+$ ]] || return 1
+  [[ ! -e "/proc/$pid" ]] && return 0
+  current_start_time="$(process_start_time "$pid")" || return 1
+  [[ "$current_start_time" != "$expected_start_time" ]]
 }
 
 sentinel_is_unchanged() {
@@ -1234,12 +1468,41 @@ sudo install -o root -g root -m 0600 "$verifier" "$good_verifier"
   fail "test verifier has the wrong length"
 
 CGO_ENABLED=0 GOOS=linux go build -trimpath -tags 'netgo osusergo' \
-  -o "$workspace/recasaos-public-files" \
+  -o "$production_binary" \
   ./cmd/recasaos-public-files
-file "$workspace/recasaos-public-files" | grep -q 'statically linked' ||
-  fail "public-files binary is not static"
+CGO_ENABLED=0 GOOS=linux go build -trimpath \
+  -tags 'netgo osusergo recasaos_publicfiles_systemd_test' \
+  -o "$systemd_test_binary" \
+  ./cmd/recasaos-public-files
+production_gate_files="$(
+  CGO_ENABLED=0 GOOS=linux go list \
+    -tags 'netgo osusergo' \
+    -f '{{range .GoFiles}}{{println .}}{{end}}' \
+    ./pkg/publicfiles |
+    awk '/^worker_systemd_test_gate_(disabled|enabled)_linux\.go$/ { print }'
+)" || fail "could not inspect production public-files gate selection"
+[[ "$production_gate_files" == \
+  worker_systemd_test_gate_disabled_linux.go ]] ||
+  fail "production build selected unsafe systemd test gates: $production_gate_files"
+systemd_test_gate_files="$(
+  CGO_ENABLED=0 GOOS=linux go list \
+    -tags 'netgo osusergo recasaos_publicfiles_systemd_test' \
+    -f '{{range .GoFiles}}{{println .}}{{end}}' \
+    ./pkg/publicfiles |
+    awk '/^worker_systemd_test_gate_(disabled|enabled)_linux\.go$/ { print }'
+)" || fail "could not inspect tagged public-files gate selection"
+[[ "$systemd_test_gate_files" == \
+  worker_systemd_test_gate_enabled_linux.go ]] ||
+  fail "tagged build selected unexpected systemd test gates: $systemd_test_gate_files"
+for built_binary in "$production_binary" "$systemd_test_binary"; do
+  file "$built_binary" | grep -q 'statically linked' ||
+    fail "public-files binary is not static: $built_binary"
+done
+if cmp -s -- "$production_binary" "$systemd_test_binary"; then
+  fail "systemd capacity binary is identical to the production build"
+fi
 sudo install -o root -g root -m 0755 \
-  "$workspace/recasaos-public-files" \
+  "$production_binary" \
   "$rootfs/usr/bin/recasaos-public-files"
 
 sudo install -o root -g root -m 0644 \
@@ -1293,7 +1556,7 @@ sudo systemctl daemon-reload
 "$repo_root/deploy/systemd/verify-public-files-units.sh" \
   "$service_path" \
   "$socket_path" \
-  "$workspace/recasaos-public-files" \
+  "$production_binary" \
   "$override_path" \
   "$socket_override_path"
 require_unit_property "$service_unit" Type notify
@@ -1388,6 +1651,11 @@ sudo systemctl is-active --quiet "$service_unit"
 portal_pid="$(sudo systemctl show --property=MainPID --value "$service_unit")"
 [[ "$portal_pid" =~ ^[0-9]+$ && "$portal_pid" -gt 1 ]] ||
   fail "public-files service has no process"
+portal_invocation="$(
+  sudo systemctl show --property=InvocationID --value "$service_unit"
+)"
+[[ -n "$portal_invocation" ]] ||
+  fail "public-files service has no invocation identity"
 assert_service_cgroup_limits
 cgroup_limit_view="/proc/$portal_pid/root/run/recasaos-cgroup"
 sudo test -d "$cgroup_limit_view" ||
@@ -1565,25 +1833,73 @@ printf '%s\n' 'systemd isolation fixture' |
   cmp - "$response_file" ||
   fail "downloaded bytes differ from the approved file"
 
+activate_public_binary \
+  "$systemd_test_binary" \
+  "systemd capacity binary activation"
 wait_until "storage workers before bounded load" storage_worker_count_is 0
+worker_capacity_deadline=$((SECONDS + 15))
 for expected_worker_count in {1..8}; do
   start_slow_download
-  wait_until "slow download $expected_worker_count response" \
+  wait_until_before "slow download $expected_worker_count response" \
+    "$worker_capacity_deadline" \
     slow_download_is_ready \
     "$latest_slow_download_pid" \
     "$latest_slow_download_ready_file" \
-    "$latest_slow_download_failure_file"
-  wait_until "$expected_worker_count bounded storage workers" \
+    "$latest_slow_download_failure_file" \
+    "$latest_slow_download_start_time"
+  wait_until_before "$expected_worker_count bounded storage workers" \
+    "$worker_capacity_deadline" \
     storage_worker_count_is "$expected_worker_count"
+  wait_until_before "$expected_worker_count stopped storage workers" \
+    "$worker_capacity_deadline" \
+    storage_workers_are_stopped "$expected_worker_count"
+done
+mapfile -t bounded_worker_pids < <(storage_worker_pids)
+[[ "${#bounded_worker_pids[@]}" == 8 ]] ||
+  fail "bounded load did not retain exactly eight worker identities"
+for bounded_worker_pid in "${bounded_worker_pids[@]}"; do
+  bounded_worker_start_time="$(
+    process_start_time "$bounded_worker_pid"
+  )" || fail "could not capture bounded worker identity"
+  bounded_worker_start_times+=("$bounded_worker_start_time")
 done
 
+install -m 0600 /dev/null "$ninth_response_headers"
 ninth_status="$(
   printf 'Authorization: Bearer %s\n' "$test_bearer" |
-    curl -q -sS --max-time 5 -H @- -o /dev/null -w '%{http_code}' \
+    curl -q -sS --max-time 5 -H @- \
+      -D "$ninth_response_headers" \
+      -o /dev/null \
+      -w '%{http_code}' \
       'http://127.0.0.1:39777/public-files/api/file?path=worker-load.bin'
 )"
 [[ "$ninth_status" == 503 ]] ||
   fail "ninth concurrent storage request returned $ninth_status, want 503"
+[[ "$(
+  awk '
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      separator = index(line, ":")
+      if (separator == 0) {
+        next
+      }
+      name = tolower(substr(line, 1, separator - 1))
+      if (name != "retry-after") {
+        next
+      }
+      count++
+      value = substr(line, separator + 1)
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      if (value != "5") {
+        invalid++
+      }
+    }
+    END { printf "%d:%d\n", count + 0, invalid + 0 }
+  ' "$ninth_response_headers"
+)" == 1:0 ]] ||
+  fail "ninth concurrent storage request lacked one exact Retry-After value 5"
 
 tasks_current="$(
   sudo systemctl show --property=TasksCurrent --value "$service_unit"
@@ -1648,9 +1964,28 @@ while IFS= read -r worker_pid; do
     sudo find "/proc/$worker_pid/fd" -mindepth 1 -maxdepth 1 -print
   )
 done < <(storage_worker_pids)
-
+((SECONDS < worker_capacity_deadline + 10)) ||
+  fail "bounded worker phase exceeded its 25-second cancellation budget"
+worker_cancellation_deadline=$((worker_capacity_deadline + 13))
+((SECONDS < worker_cancellation_deadline)) ||
+  fail "bounded worker phase left no pre-timeout cancellation window"
 cleanup_background_downloads
-wait_until "storage worker reap after bounded load" storage_worker_count_is 0
+for bounded_worker_index in "${!bounded_worker_pids[@]}"; do
+  bounded_worker_pid="${bounded_worker_pids[$bounded_worker_index]}"
+  wait_until_before "storage worker $bounded_worker_pid pidfd cancellation" \
+    "$worker_cancellation_deadline" \
+    process_identity_is_gone \
+    "$bounded_worker_pid" \
+    "${bounded_worker_start_times[$bounded_worker_index]}"
+done
+bounded_worker_pids=()
+bounded_worker_start_times=()
+wait_until_before "storage worker reap after bounded load" \
+  "$worker_cancellation_deadline" \
+  storage_worker_count_is 0
+activate_public_binary \
+  "$production_binary" \
+  "production binary restoration after capacity test"
 
 for blocked_file in \
   covered/must-remain-covered.txt \
@@ -1675,30 +2010,59 @@ for management_path in /v1 /v2 /v3 /debug /swagger /public-files/../v1; do
 done
 wait_until "unchanged management sentinel" sentinel_is_unchanged
 
-wait_until "storage workers before coordinator SIGKILL load" \
+activate_public_binary \
+  "$systemd_test_binary" \
+  "systemd coordinator cleanup binary activation"
+coordinator_cleanup_deadline=$((SECONDS + 15))
+wait_until_before "storage workers before coordinator SIGKILL load" \
+  "$coordinator_cleanup_deadline" \
   storage_worker_count_is 0
 start_slow_download
-wait_until "slow download before coordinator SIGKILL response" \
+wait_until_before "slow download before coordinator SIGKILL response" \
+  "$coordinator_cleanup_deadline" \
   slow_download_is_ready \
   "$latest_slow_download_pid" \
   "$latest_slow_download_ready_file" \
-  "$latest_slow_download_failure_file"
-wait_until "active worker before coordinator SIGKILL" storage_worker_count_is 1
+  "$latest_slow_download_failure_file" \
+  "$latest_slow_download_start_time"
+wait_until_before "active worker before coordinator SIGKILL" \
+  "$coordinator_cleanup_deadline" \
+  storage_worker_count_is 1
+wait_until_before "stopped storage worker before coordinator SIGKILL" \
+  "$coordinator_cleanup_deadline" \
+  storage_workers_are_stopped 1
 worker_before_coordinator_kill="$(storage_worker_pids)"
 [[ "$worker_before_coordinator_kill" =~ ^[0-9]+$ ]] ||
   fail "could not capture the worker before coordinator SIGKILL"
-sudo kill -KILL "$portal_pid"
-wait_until "public service restart after SIGKILL" service_has_new_pid
-wait_until "old worker cgroup cleanup after coordinator SIGKILL" \
-  process_is_gone "$worker_before_coordinator_kill"
+worker_before_coordinator_kill_start_time="$(
+  process_start_time "$worker_before_coordinator_kill"
+)" || fail "could not capture the coordinator-cleanup worker identity"
+sudo systemctl kill \
+  "$systemctl_kill_selector" \
+  --signal=SIGKILL \
+  "$service_unit"
+wait_until_before "public service restart after SIGKILL" \
+  "$coordinator_cleanup_deadline" \
+  service_has_new_pid
+wait_until_before "old worker cgroup cleanup after coordinator SIGKILL" \
+  "$coordinator_cleanup_deadline" \
+  process_identity_is_gone \
+  "$worker_before_coordinator_kill" \
+  "$worker_before_coordinator_kill_start_time"
 cleanup_background_downloads
 wait_until "public portal after SIGKILL" page_is_ready
 wait_until "unchanged management sentinel after SIGKILL" sentinel_is_unchanged
 portal_pid="$(sudo systemctl show --property=MainPID --value "$service_unit")"
+portal_invocation="$(
+  sudo systemctl show --property=InvocationID --value "$service_unit"
+)"
 assert_service_cgroup_limits
 assert_systemd_credential_for_pid "$portal_pid"
 assert_service_api_vfs_isolation "$portal_pid"
 
+activate_public_binary \
+  "$production_binary" \
+  "production binary restoration after coordinator cleanup"
 printf 'invalid verifier\n' | sudo tee "$verifier" >/dev/null
 sudo chmod 0600 "$verifier"
 sudo systemctl restart "$service_unit" >/dev/null 2>&1 || true

@@ -377,6 +377,12 @@ func runStorageFileWorker(connection *net.UnixConn) error {
 			); err != nil {
 				return err
 			}
+			if err := holdStorageFileWorkerForSystemdTest(
+				request.Path,
+				readRequest.Offset,
+			); err != nil {
+				return err
+			}
 		case storageWorkerCloseRequest:
 			if len(next.payload) != 0 {
 				return errStorageProtocol

@@ -161,7 +161,13 @@ basic public route-separation requirement, but these release gates remain:
   247 floor is source-reviewed but not execution-qualified; closing Issue #25
   additionally requires the exact release candidate to pass under PID 1 on a
   pristine, ephemeral Debian 11/systemd 247 unified-cgroup-v2 VM. Ubuntu
-  24.04/systemd 255 evidence does not satisfy that compatibility-floor gate;
+  24.04/systemd 255 evidence does not satisfy that compatibility-floor gate.
+  Its normal activation, sandbox and API smoke checks use the production build,
+  while the deterministic worker-capacity and coordinator-cleanup sections
+  temporarily use a non-release CI build tag that stops only the exact
+  synthetic fixture worker after one successful read. Those sections prove
+  admission, pidfd cancellation and control-group cleanup mechanics, not
+  release-byte equivalence or D-state;
 - no independent deployment review or penetration test of a locked Linux host;
 - the shared portal token is a capability, not per-user authorization or MFA;
 - Issue #20's browser-stream candidate still lacks the required real-HTTPS
