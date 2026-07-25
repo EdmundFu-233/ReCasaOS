@@ -273,6 +273,18 @@ func TestPublicAssetsRequireNoCredentialAndContainNoInlineScript(t *testing.T) {
 	}
 }
 
+func TestPublicStylesHonorHiddenState(t *testing.T) {
+	portal := &Portal{}
+	recorder := httptest.NewRecorder()
+	portal.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, BasePath+"/style.css", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("style.css status = %d, want 200", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), "[hidden]{display:none!important}") {
+		t.Fatal("portal CSS can override the hidden attribute")
+	}
+}
+
 func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *testing.T) {
 	portal := &Portal{}
 	recorder := httptest.NewRecorder()

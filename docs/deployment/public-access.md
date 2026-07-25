@@ -104,6 +104,25 @@ redirects, initial Range, transparent retry/resume, and cancellation. The
 current nonce is deliberately one-shot, so a later automatic retry with the
 same URL fails closed rather than silently reusing authorization.
 
+The repository also contains a narrower CI smoke test. On an ephemeral
+GitHub-hosted Ubuntu 24.04 runner it installs a one-run CA into the system and
+NSS trust stores, keeps TLS verification enabled, and exercises the real
+portal handler and frontend with the Playwright-bundled Chromium, Firefox, and
+WebKit engines. The job receives no production credential and retains no
+trace, HAR, video, browser profile, or HTML-report artifact. This does not
+exercise the production `NewIsolated` coordinator, systemd/cgroup sandbox,
+Caddy/Nginx, public DNS, HSTS, retail Chrome/Firefox, Safari/iOS, or a target
+host. It is not sufficient to close Issue #20 or enable public routing.
+The cancel smoke requires all three engines to report the local download as
+canceled to Playwright, and exactly one authorized upstream request to reach a
+terminal state within the 40-second test-harness deadline. Chromium and WebKit
+must classify that request as canceled; Playwright Firefox may classify it as
+canceled or completed. That outcome is consistent with Mozilla
+[Bug 1825388](https://bugzilla.mozilla.org/show_bug.cgi?id=1825388), which
+covers a related Service Worker cancellation path, but does not establish the
+same root cause. The exception is only a no-retained-slot assertion; it is not
+Firefox cancellation evidence.
+
 The dedicated application server treats 30 seconds without a successful file
 write as a stalled download. A cumulative budget also requires at least 64 KiB
 per second after a 30-second grace period. Each bounded file-body write can

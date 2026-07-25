@@ -1,0 +1,15 @@
+{
+  "name": "@recasaos/public-files-browser-tests",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.18.0"
+  },
+  "scripts": {
+    "smoke": "playwright test --config=playwright.config.js"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.0"
+  }
+}

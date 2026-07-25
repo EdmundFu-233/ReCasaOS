@@ -258,6 +258,60 @@ jobs:
           RECASAOS_RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: .github/scripts/test-public-files-systemd.sh
 
+  public-files-browser-smoke:
+    name: Public-files HTTPS browser smoke (Playwright)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go 1.26.5
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: "1.26.5"
+          cache: false
+
+      - name: Set up Node.js 24.18.0
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24.18.0"
+          package-manager-cache: false
+
+      - name: Install exact browser-test dependencies
+        shell: bash
+        run: |
+          test "$(node --version)" = "v24.18.0"
+          npm ci --ignore-scripts --prefix browser-tests
+          test "$(
+            browser-tests/node_modules/.bin/playwright --version
+          )" = "Version 1.62.0"
+
+      - name: Install ephemeral browser dependencies
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          browser-tests/node_modules/.bin/playwright install \
+            --with-deps \
+            chromium \
+            firefox \
+            webkit
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive \
+            apt-get install --yes --no-install-recommends \
+              libnss3-tools \
+              openssl
+          command -v certutil
+          command -v openssl
+
+      - name: Exercise the HTTPS browser boundary
+        timeout-minutes: 15
+        env:
+          RECASAOS_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: .github/scripts/test-public-files-browser.sh
+
   govulncheck:
     name: Generate and scan reachable Go vulnerabilities
     runs-on: ubuntu-24.04

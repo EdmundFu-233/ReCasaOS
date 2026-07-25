@@ -24,3 +24,14 @@ updates:
     labels:
       - dependencies
       - github-actions
+
+  - package-ecosystem: npm
+    directory: "/browser-tests"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:15"
+      timezone: America/Toronto
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
