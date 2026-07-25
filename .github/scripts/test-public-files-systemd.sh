@@ -60,6 +60,8 @@ test_bearer='rc1_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8'
 # chunk, then stops itself only for this exact file so the HTTP client can
 # validate committed response headers before worker-capacity checks begin.
 worker_load_bytes=67108864
+storage_worker_address_space_ceiling=2147483648
+storage_worker_address_space_minimum_reserve=134217728
 
 case "$workspace" in
   /run/recasaos-public-files-ci-[0-9]*-[0-9]*) ;;
@@ -81,7 +83,7 @@ if getent passwd recasaos-public >/dev/null ||
   fail "the recasaos-public account unexpectedly already exists"
 fi
 for required_tool in \
-  cmp find getfacl mktemp mount mountpoint pgrep ps ss systemctl truncate umount
+  cmp find getfacl mktemp mount mountpoint pgrep ps sort ss systemctl truncate umount
 do
   command -v "$required_tool" >/dev/null 2>&1 ||
     fail "required mount test tool is unavailable: $required_tool"
@@ -104,6 +106,19 @@ if "'" in source:
         "slow download holder contains a shell-breaking single quote"
     )
 compile(source, "start_slow_download.py", "exec")
+
+limit_start = (
+    "    \"$storage_worker_address_space_minimum_reserve\" <<'PYTHON'\n"
+)
+limit_end = "\nPYTHON\n}\n\nprint_capacity_journal_diagnostics()"
+if script.count(limit_start) != 1 or script.count(limit_end) != 1:
+    raise SystemExit("address-space evidence sentinels are not unique")
+limit_source = script.split(limit_start, 1)[1].split(limit_end, 1)[0]
+compile(
+    limit_source,
+    "assert_storage_worker_address_space_limit.py",
+    "exec",
+)
 PYTHON
 /usr/bin/python3 -c '
 import os
@@ -1149,6 +1164,131 @@ storage_workers_are_stopped() {
   [[ "$count" == "$expected" ]]
 }
 
+assert_storage_worker_address_space_limit() {
+  local build_label=$3
+  local expected_start_time=$2
+  local worker_pid=$1
+
+  [[ "$worker_pid" =~ ^[0-9]+$ && "$worker_pid" -gt 1 &&
+    "$expected_start_time" =~ ^[0-9]+$ ]] ||
+    fail "cannot inspect unsafe storage worker identity"
+  [[ "$build_label" == production || "$build_label" == systemd-test ]] ||
+    fail "cannot inspect storage worker with unsafe build label"
+  sudo /usr/bin/python3 - \
+    "$worker_pid" \
+    "$expected_start_time" \
+    "$portal_pid" \
+    "$build_label" \
+    "$storage_worker_address_space_ceiling" \
+    "$storage_worker_address_space_minimum_reserve" <<'PYTHON'
+import os
+from pathlib import Path
+import re
+import sys
+
+pid = int(sys.argv[1])
+expected_start = sys.argv[2].encode("ascii")
+expected_parent = int(sys.argv[3])
+build_label = sys.argv[4]
+ceiling = int(sys.argv[5])
+minimum_reserve = int(sys.argv[6])
+
+if (
+    pid <= 1
+    or expected_parent <= 1
+    or build_label not in {"production", "systemd-test"}
+    or ceiling != 2 * 1024 * 1024 * 1024
+    or minimum_reserve != 128 * 1024 * 1024
+):
+    raise SystemExit("unsafe address-space evidence arguments")
+
+proc = Path(f"/proc/{pid}")
+portal_proc = Path(f"/proc/{expected_parent}")
+expected_command = (
+    b"/proc/self/exe\0"
+    b"--internal-public-files-storage-worker\0"
+    b"file\0"
+)
+
+
+def identity():
+    stat_data = (proc / "stat").read_bytes()
+    marker = stat_data.rfind(b") ")
+    fields = stat_data[marker + 2:].split() if marker >= 0 else []
+    if len(fields) <= 19 or not fields[19].isdigit():
+        raise RuntimeError("could not parse storage worker start time")
+    status = (proc / "status").read_text(encoding="ascii")
+    parents = re.findall(r"^PPid:\s*([0-9]+)\s*$", status, re.MULTILINE)
+    if len(parents) != 1:
+        raise RuntimeError("could not parse storage worker parent")
+    return fields[19], int(parents[0]), (proc / "cmdline").read_bytes(), status
+
+
+start_before, parent_before, command_before, _ = identity()
+if (
+    start_before != expected_start
+    or parent_before != expected_parent
+    or command_before != expected_command
+):
+    raise RuntimeError("storage worker identity changed before limit inspection")
+
+worker_executable = os.stat(proc / "exe")
+portal_executable = os.stat(portal_proc / "exe")
+if (
+    worker_executable.st_dev != portal_executable.st_dev
+    or worker_executable.st_ino != portal_executable.st_ino
+):
+    raise RuntimeError("storage worker does not share the reviewed portal image")
+
+address_limits = []
+for line in (proc / "limits").read_text(encoding="ascii").splitlines():
+    fields = line.split()
+    if fields[:3] == ["Max", "address", "space"]:
+        if (
+            len(fields) != 6
+            or fields[5] != "bytes"
+            or not fields[3].isdigit()
+            or not fields[4].isdigit()
+        ):
+            raise RuntimeError("storage worker address-space limit is malformed")
+        address_limits.append((int(fields[3]), int(fields[4])))
+if len(address_limits) != 1:
+    raise RuntimeError("could not parse one storage worker address-space limit")
+soft, hard = address_limits[0]
+
+start_after, parent_after, command_after, status_after = identity()
+if (
+    start_after != start_before
+    or parent_after != parent_before
+    or command_after != command_before
+):
+    raise RuntimeError("storage worker identity changed during limit inspection")
+
+vm_sizes = re.findall(
+    r"^VmSize:\s*([0-9]+)\s+kB\s*$",
+    status_after,
+    re.MULTILINE,
+)
+if len(vm_sizes) != 1:
+    raise RuntimeError("could not parse one storage worker VmSize")
+vm_size_kib = int(vm_sizes[0])
+if vm_size_kib <= 0 or vm_size_kib > ceiling // 1024:
+    raise RuntimeError("storage worker VmSize is outside the reviewed ceiling")
+vm_size_bytes = vm_size_kib * 1024
+if soft != hard or soft <= vm_size_bytes or soft > ceiling:
+    raise RuntimeError("storage worker address-space limit is unsafe")
+reserve = soft - vm_size_bytes
+if reserve < minimum_reserve:
+    raise RuntimeError("storage worker address-space reserve is too small")
+
+print(
+    "storage worker address-space evidence: "
+    f"build={build_label} pid={pid} vm-size-kib={vm_size_kib} "
+    f"soft-bytes={soft} hard-bytes={hard} reserve-bytes={reserve}"
+)
+PYTHON
+}
+
 print_capacity_journal_diagnostics() {
   local diagnostics
 
@@ -1881,26 +2021,84 @@ CGO_ENABLED=0 GOOS=linux go build -trimpath \
   -tags 'netgo osusergo recasaos_publicfiles_systemd_test' \
   -o "$systemd_test_binary" \
   ./cmd/recasaos-public-files
-production_gate_files="$(
+build_input_template=
+build_input_template+='{{range .GoFiles}}{{$.ImportPath}} GoFiles {{.}}{{"\n"}}{{end}}'
+build_input_template+='{{range .CgoFiles}}{{$.ImportPath}} CgoFiles {{.}}{{"\n"}}{{end}}'
+build_input_template+='{{range .CFiles}}{{$.ImportPath}} CFiles {{.}}{{"\n"}}{{end}}'
+build_input_template+='{{range .CXXFiles}}{{$.ImportPath}} CXXFiles {{.}}{{"\n"}}{{end}}'
+build_input_template+='{{range .MFiles}}{{$.ImportPath}} MFiles {{.}}{{"\n"}}{{end}}'
+build_input_template+='{{range .HFiles}}{{$.ImportPath}} HFiles {{.}}{{"\n"}}{{end}}'
+build_input_template+='{{range .FFiles}}{{$.ImportPath}} FFiles {{.}}{{"\n"}}{{end}}'
+build_input_template+='{{range .SFiles}}{{$.ImportPath}} SFiles {{.}}{{"\n"}}{{end}}'
+build_input_template+='{{range .SwigFiles}}{{$.ImportPath}} SwigFiles {{.}}{{"\n"}}{{end}}'
+build_input_template+='{{range .SwigCXXFiles}}{{$.ImportPath}} SwigCXXFiles {{.}}{{"\n"}}{{end}}'
+build_input_template+='{{range .SysoFiles}}{{$.ImportPath}} SysoFiles {{.}}{{"\n"}}{{end}}'
+build_input_template+='{{range .EmbedFiles}}{{$.ImportPath}} EmbedFiles {{.}}{{"\n"}}{{end}}'
+production_build_inputs="$(
   CGO_ENABLED=0 GOOS=linux go list \
+    -deps \
     -tags 'netgo osusergo' \
-    -f '{{range .GoFiles}}{{println .}}{{end}}' \
-    ./pkg/publicfiles |
-    awk '/^worker_systemd_test_gate_(disabled|enabled)_linux\.go$/ { print }'
-)" || fail "could not inspect production public-files gate selection"
+    -f "$build_input_template" \
+    ./cmd/recasaos-public-files |
+    LC_ALL=C sort -u
+)" || fail "could not inspect production public-files build inputs"
+production_gate_files="$(
+  printf '%s\n' "$production_build_inputs" |
+    awk '
+      $1 == "github.com/IceWhaleTech/CasaOS/pkg/publicfiles" &&
+        $2 == "GoFiles" &&
+        $3 ~ /^worker_systemd_test_gate_(disabled|enabled)_linux\.go$/ {
+        print $3
+      }
+    '
+)"
 [[ "$production_gate_files" == \
   worker_systemd_test_gate_disabled_linux.go ]] ||
   fail "production build selected unsafe systemd test gates: $production_gate_files"
-systemd_test_gate_files="$(
+systemd_test_build_inputs="$(
   CGO_ENABLED=0 GOOS=linux go list \
+    -deps \
     -tags 'netgo osusergo recasaos_publicfiles_systemd_test' \
-    -f '{{range .GoFiles}}{{println .}}{{end}}' \
-    ./pkg/publicfiles |
-    awk '/^worker_systemd_test_gate_(disabled|enabled)_linux\.go$/ { print }'
-)" || fail "could not inspect tagged public-files gate selection"
+    -f "$build_input_template" \
+    ./cmd/recasaos-public-files |
+    LC_ALL=C sort -u
+)" || fail "could not inspect tagged public-files build inputs"
+systemd_test_gate_files="$(
+  printf '%s\n' "$systemd_test_build_inputs" |
+    awk '
+      $1 == "github.com/IceWhaleTech/CasaOS/pkg/publicfiles" &&
+        $2 == "GoFiles" &&
+        $3 ~ /^worker_systemd_test_gate_(disabled|enabled)_linux\.go$/ {
+        print $3
+      }
+    '
+)"
 [[ "$systemd_test_gate_files" == \
   worker_systemd_test_gate_enabled_linux.go ]] ||
   fail "tagged build selected unexpected systemd test gates: $systemd_test_gate_files"
+production_shared_build_inputs="$(
+  printf '%s\n' "$production_build_inputs" |
+    awk '
+      !(
+        $1 == "github.com/IceWhaleTech/CasaOS/pkg/publicfiles" &&
+        $2 == "GoFiles" &&
+        $3 ~ /^worker_systemd_test_gate_(disabled|enabled)_linux\.go$/
+      )
+    '
+)"
+systemd_test_shared_build_inputs="$(
+  printf '%s\n' "$systemd_test_build_inputs" |
+    awk '
+      !(
+        $1 == "github.com/IceWhaleTech/CasaOS/pkg/publicfiles" &&
+        $2 == "GoFiles" &&
+        $3 ~ /^worker_systemd_test_gate_(disabled|enabled)_linux\.go$/
+      )
+    '
+)"
+[[ -n "$production_shared_build_inputs" &&
+  "$production_shared_build_inputs" == "$systemd_test_shared_build_inputs" ]] ||
+  fail "production and tagged binaries select different shared build inputs"
 for built_binary in "$production_binary" "$systemd_test_binary"; do
   file "$built_binary" | grep -q 'statically linked' ||
     fail "public-files binary is not static: $built_binary"
@@ -2247,9 +2445,46 @@ printf '%s\n' 'systemd isolation fixture' |
   cmp - "$response_file" ||
   fail "downloaded bytes differ from the approved file"
 
+sudo cmp -s -- "/proc/$portal_pid/exe" "$production_binary" ||
+  fail "running production portal bytes differ from the reviewed binary"
+production_worker_deadline=$((SECONDS + 15))
+start_slow_download
+wait_until_before "production slow download response" \
+  "$production_worker_deadline" \
+  slow_download_is_ready \
+  "$latest_slow_download_pid" \
+  "$latest_slow_download_ready_file" \
+  "$latest_slow_download_failure_file" \
+  "$latest_slow_download_start_time"
+wait_until_before "one production storage worker" \
+  "$production_worker_deadline" \
+  storage_worker_count_is 1
+production_worker_pid="$(storage_worker_pids)"
+[[ "$production_worker_pid" =~ ^[0-9]+$ && "$production_worker_pid" -gt 1 ]] ||
+  fail "production probe did not retain exactly one storage worker"
+production_worker_start_time="$(
+  process_start_time "$production_worker_pid"
+)" || fail "could not capture production storage worker identity"
+assert_storage_worker_address_space_limit \
+  "$production_worker_pid" \
+  "$production_worker_start_time" \
+  production
+cleanup_background_downloads
+production_cleanup_deadline=$((SECONDS + 10))
+wait_until_before "production storage worker pidfd cancellation" \
+  "$production_cleanup_deadline" \
+  process_identity_is_gone \
+  "$production_worker_pid" \
+  "$production_worker_start_time"
+wait_until_before "production storage worker reap" \
+  "$production_cleanup_deadline" \
+  storage_worker_count_is 0
+
 activate_public_binary \
   "$systemd_test_binary" \
   "systemd capacity binary activation"
+sudo cmp -s -- "/proc/$portal_pid/exe" "$systemd_test_binary" ||
+  fail "running systemd-test portal bytes differ from the reviewed binary"
 wait_until "storage workers before bounded load" storage_worker_count_is 0
 capture_capacity_journal_cursor
 worker_capacity_deadline=$((SECONDS + 15))
@@ -2318,6 +2553,12 @@ ninth_status="$(
 wait_until_before "storage worker capacity event chain" \
   "$worker_capacity_deadline" \
   capacity_phase_events_are_complete
+for bounded_worker_index in "${!bounded_worker_pids[@]}"; do
+  assert_storage_worker_address_space_limit \
+    "${bounded_worker_pids[$bounded_worker_index]}" \
+    "${bounded_worker_start_times[$bounded_worker_index]}" \
+    systemd-test
+done
 
 tasks_current="$(
   sudo systemctl show --property=TasksCurrent --value "$service_unit"
