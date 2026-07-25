@@ -37,11 +37,6 @@ export default defineConfig({
       name: 'firefox',
       use: {
         browserName: 'firefox',
-        launchOptions: {
-          firefoxUserPrefs: {
-            'security.enterprise_roots.enabled': true,
-          },
-        },
       },
     },
     {

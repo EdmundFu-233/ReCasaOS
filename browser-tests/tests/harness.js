@@ -1,9 +1,12 @@
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
+import { lstat, mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { promisify } from 'node:util';
 import { test as base, expect } from '@playwright/test';
 
+const execFileAsync = promisify(execFile);
 const readyKeys = ['control_origin', 'fixtures', 'origin'];
 const fixtureKeys = ['report.txt', 'stream.bin'];
 const fixtureValueKeys = ['sha256', 'size'];
@@ -33,6 +36,154 @@ function requiredAbsoluteEnvironmentPath(name) {
     throw new Error(`required absolute environment path ${name} is missing`);
   }
   return value;
+}
+
+function isSafeFirefoxProfilePath(profilePath, runnerTemp) {
+  return (
+    path.dirname(profilePath) === runnerTemp &&
+    path.basename(profilePath).startsWith('recasaos-firefox-profile-')
+  );
+}
+
+async function removeFirefoxProfile(profilePath, runnerTemp) {
+  if (!isSafeFirefoxProfilePath(profilePath, runnerTemp)) {
+    throw new Error('refusing unsafe Firefox profile cleanup');
+  }
+  await rm(profilePath, {
+    force: true,
+    maxRetries: 3,
+    recursive: true,
+    retryDelay: 100,
+  });
+}
+
+async function createTrustedFirefoxProfile(runnerTemp, certificateFile) {
+  const profilePath = await mkdtemp(
+    path.join(runnerTemp, 'recasaos-firefox-profile-'),
+  );
+  try {
+    if (!isSafeFirefoxProfilePath(profilePath, runnerTemp)) {
+      throw new Error('Firefox profile path is unsafe');
+    }
+    const metadata = await lstat(profilePath);
+    if (
+      !metadata.isDirectory() ||
+      metadata.isSymbolicLink() ||
+      metadata.uid !== process.geteuid() ||
+      (metadata.mode & 0o777) !== 0o700
+    ) {
+      throw new Error('Firefox profile metadata is unsafe');
+    }
+
+    const database = `sql:${profilePath}`;
+    await execFileAsync(
+      'certutil',
+      ['-N', '-d', database, '--empty-password'],
+      { timeout: 5_000 },
+    );
+    await execFileAsync(
+      'certutil',
+      [
+        '-A',
+        '-d',
+        database,
+        '-n',
+        'ReCasaOS ephemeral browser test CA',
+        '-t',
+        'C,,',
+        '-i',
+        certificateFile,
+      ],
+      { timeout: 5_000 },
+    );
+    await execFileAsync(
+      'certutil',
+      [
+        '-L',
+        '-d',
+        database,
+        '-n',
+        'ReCasaOS ephemeral browser test CA',
+      ],
+      { timeout: 5_000 },
+    );
+    return profilePath;
+  } catch {
+    await removeFirefoxProfile(profilePath, runnerTemp);
+    throw new Error('could not create the trusted Firefox test profile');
+  }
+}
+
+async function launchIsolatedContext(browserName, playwright) {
+  const contextOptions = {
+    acceptDownloads: true,
+    ignoreHTTPSErrors: false,
+    serviceWorkers: 'allow',
+  };
+  if (browserName !== 'firefox') {
+    const browser = await playwright[browserName].launch({
+      headless: true,
+    });
+    try {
+      const context = await browser.newContext(contextOptions);
+      return { browser, context, profilePath: null };
+    } catch (error) {
+      await browser.close();
+      throw error;
+    }
+  }
+
+  const runnerTemp = requiredAbsoluteEnvironmentPath('RUNNER_TEMP');
+  const certificateFile = requiredAbsoluteEnvironmentPath(
+    'RECASAOS_BROWSER_CERTIFICATE',
+  );
+  const profilePath = await createTrustedFirefoxProfile(
+    runnerTemp,
+    certificateFile,
+  );
+  try {
+    const context = await playwright.firefox.launchPersistentContext(
+      profilePath,
+      {
+        ...contextOptions,
+        headless: true,
+      },
+    );
+    return { browser: null, context, profilePath };
+  } catch (error) {
+    await removeFirefoxProfile(profilePath, runnerTemp);
+    throw error;
+  }
+}
+
+async function closeLaunchedContext(launched) {
+  const cleanupErrors = [];
+  try {
+    await launched.context.close();
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  if (launched.browser !== null) {
+    try {
+      await launched.browser.close();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  if (launched.profilePath !== null) {
+    try {
+      const runnerTemp = requiredAbsoluteEnvironmentPath('RUNNER_TEMP');
+      await removeFirefoxProfile(launched.profilePath, runnerTemp);
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  if (cleanupErrors.length !== 0) {
+    throw new AggregateError(
+      cleanupErrors,
+      'browser test context cleanup failed',
+    );
+  }
 }
 
 function parseURL(value, protocol, label) {
@@ -266,6 +417,22 @@ export function freshBearer() {
 }
 
 export const test = base.extend({
+  context: async ({ browserName, playwright }, use) => {
+    const launched = await launchIsolatedContext(browserName, playwright);
+    try {
+      await use(launched.context);
+    } finally {
+      await closeLaunchedContext(launched);
+    }
+  },
+  page: async ({ context }, use) => {
+    const page = await context.newPage();
+    try {
+      await use(page);
+    } finally {
+      await page.close();
+    }
+  },
   portal: [
     async ({}, use) => {
       const bearer = freshBearer();
