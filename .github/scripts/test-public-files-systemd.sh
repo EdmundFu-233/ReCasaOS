@@ -78,10 +78,18 @@ do
   command -v "$required_tool" >/dev/null 2>&1 ||
     fail "required mount test tool is unavailable: $required_tool"
 done
+[[ -x /usr/bin/python3 ]] ||
+  fail "required Python interpreter is unavailable: /usr/bin/python3"
 account_cleanup_authorized=1
 nested_mount_cleanup_required=0
 host_shm_sentinel_created=0
 slow_download_pids=()
+slow_download_ready_files=()
+slow_download_failure_files=()
+slow_download_sequence=0
+latest_slow_download_pid=
+latest_slow_download_ready_file=
+latest_slow_download_failure_file=
 last_storage_worker_count=0
 max_storage_worker_count=0
 
@@ -379,6 +387,13 @@ cleanup_background_downloads() {
     wait "$pid" 2>/dev/null || true
   done
   slow_download_pids=()
+  slow_download_ready_files=()
+  slow_download_failure_files=()
+  latest_slow_download_pid=
+  latest_slow_download_ready_file=
+  latest_slow_download_failure_file=
+  last_storage_worker_count=0
+  max_storage_worker_count=0
 }
 
 cleanup_public_port_is_unbound() {
@@ -611,7 +626,7 @@ wait_until() {
     sudo ss -H -ltnp 'sport = :39777' >&2 || true
   fi
   case "$description" in
-    *storage\ worker* | *active\ worker*)
+    *storage\ worker* | *active\ worker* | *slow\ download*)
       print_storage_worker_diagnostics
       ;;
   esac
@@ -859,9 +874,23 @@ storage_worker_count() {
   fi
 }
 
+slow_download_process_is_live() {
+  local process_state
+  local pid=$1
+
+  [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]] || return 1
+  process_state="$(
+    ps -o stat= -p "$pid" 2>/dev/null |
+      awk 'NR == 1 { print substr($1, 1, 1) }' || true
+  )"
+  [[ -n "$process_state" && "$process_state" != Z &&
+    "$process_state" != X ]]
+}
+
 storage_worker_count_is() {
   local expected=$1
   local count
+  slow_downloads_are_healthy || return 1
   count="$(storage_worker_count)"
   last_storage_worker_count=$count
   if ((count > max_storage_worker_count)); then
@@ -871,30 +900,196 @@ storage_worker_count_is() {
 }
 
 print_storage_worker_diagnostics() {
+  local client_index
   local client_pid
+  local failure_file
+  local ready_file
   printf 'storage worker diagnostics: last=%s max=%s pids=%q\n' \
     "$last_storage_worker_count" \
     "$max_storage_worker_count" \
     "$(storage_worker_pids)" >&2
   sudo ps -o pid=,ppid=,stat=,etime=,args= --ppid "$portal_pid" >&2 || true
-  for client_pid in "${slow_download_pids[@]}"; do
-    if kill -0 "$client_pid" 2>/dev/null; then
-      printf 'slow download client %s: alive\n' "$client_pid" >&2
+  for client_index in "${!slow_download_pids[@]}"; do
+    client_pid="${slow_download_pids[$client_index]}"
+    ready_file="${slow_download_ready_files[$client_index]}"
+    failure_file="${slow_download_failure_files[$client_index]}"
+    if slow_download_process_is_live "$client_pid"; then
+      printf 'slow download client %s: alive ready=%s failure=%s\n' \
+        "$client_pid" \
+        "$(slow_download_marker_is_valid "$ready_file" &&
+          printf yes || printf no)" \
+        "$([[ -s "$failure_file" ]] && printf yes || printf no)" >&2
     else
-      printf 'slow download client %s: exited\n' "$client_pid" >&2
+      printf 'slow download client %s: exited ready=%s failure=%s\n' \
+        "$client_pid" \
+        "$(slow_download_marker_is_valid "$ready_file" &&
+          printf yes || printf no)" \
+        "$([[ -s "$failure_file" ]] && printf yes || printf no)" >&2
+    fi
+    if [[ -s "$failure_file" ]]; then
+      while IFS= read -r failure_line; do
+        printf 'slow download client %s error: %s\n' \
+          "$client_pid" "$failure_line" >&2
+      done <"$failure_file"
     fi
   done
   sudo journalctl --no-pager --output=short-monotonic --lines=80 \
     --unit="$socket_unit" --unit="$service_unit" >&2 || true
 }
 
+slow_download_marker_is_valid() {
+  local marker_value
+  local ready_file=$1
+
+  [[ -f "$ready_file" && ! -L "$ready_file" ]] || return 1
+  marker_value="$(<"$ready_file")"
+  [[ "$marker_value" == ready ]]
+}
+
+slow_download_is_ready() {
+  local failure_file=$3
+  local pid=$1
+  local ready_file=$2
+
+  if [[ -s "$failure_file" ]]; then
+    while IFS= read -r failure_line; do
+      printf 'slow download client %s error: %s\n' \
+        "$pid" "$failure_line" >&2
+    done <"$failure_file"
+    fail "slow download client $pid failed before becoming ready"
+  fi
+  if [[ -e "$ready_file" || -L "$ready_file" ]]; then
+    [[ -f "$ready_file" && ! -L "$ready_file" ]] ||
+      fail "slow download client $pid produced an unsafe ready marker"
+    slow_download_marker_is_valid "$ready_file" ||
+      fail "slow download client $pid produced an invalid ready marker"
+    slow_download_process_is_live "$pid" ||
+      fail "slow download client $pid exited after becoming ready"
+    return 0
+  fi
+  slow_download_process_is_live "$pid" ||
+    fail "slow download client $pid exited before becoming ready"
+  return 1
+}
+
+slow_downloads_are_healthy() {
+  local client_index
+
+  for client_index in "${!slow_download_pids[@]}"; do
+    slow_download_is_ready \
+      "${slow_download_pids[$client_index]}" \
+      "${slow_download_ready_files[$client_index]}" \
+      "${slow_download_failure_files[$client_index]}" || return 1
+  done
+}
+
 start_slow_download() {
-  printf 'Authorization: Bearer %s\n' "$test_bearer" |
-    curl -q -sS --http1.1 --limit-rate 1K --max-time 120 \
-      -H @- \
-      'http://127.0.0.1:39777/public-files/api/file?path=worker-load.bin' \
-      -o /dev/null 2>/dev/null &
-  slow_download_pids+=("$!")
+  local failure_file
+  local pid
+  local ready_file
+  local ready_temp_file
+
+  slow_download_sequence=$((slow_download_sequence + 1))
+  ready_file="${workspace}/slow-download-${slow_download_sequence}.ready"
+  ready_temp_file="${ready_file}.tmp"
+  failure_file="${workspace}/slow-download-${slow_download_sequence}.failure"
+  [[ "$ready_file" =~ ^/run/recasaos-public-files-ci-[0-9]+-[0-9]+/slow-download-[0-9]+\.ready$ ]] ||
+    fail "refusing unsafe slow download ready path: $ready_file"
+  [[ "$failure_file" =~ ^/run/recasaos-public-files-ci-[0-9]+-[0-9]+/slow-download-[0-9]+\.failure$ ]] ||
+    fail "refusing unsafe slow download failure path: $failure_file"
+  [[ ! -e "$ready_file" && ! -L "$ready_file" &&
+    ! -e "$ready_temp_file" && ! -L "$ready_temp_file" &&
+    ! -e "$failure_file" && ! -L "$failure_file" ]] ||
+    fail "slow download state path already exists"
+  install -m 0600 /dev/null "$failure_file"
+
+  printf '%s\n' "$test_bearer" |
+    /usr/bin/python3 -c '
+import os
+import re
+import socket
+import sys
+import time
+
+try:
+    token_input = sys.stdin.buffer.read(129)
+    if len(token_input) > 128 or not token_input.endswith(b"\n"):
+        raise ValueError("invalid bounded bearer input")
+    token = token_input[:-1]
+    if re.fullmatch(rb"rc1_[A-Za-z0-9_-]{43}", token) is None:
+        raise ValueError("invalid bearer format")
+
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    if client.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF) > 16384:
+        raise RuntimeError("kernel did not preserve the bounded receive buffer")
+    client.settimeout(10)
+    client.connect(("127.0.0.1", 39777))
+    client.sendall(
+        b"GET /public-files/api/file?path=worker-load.bin HTTP/1.1\r\n"
+        b"Host: 127.0.0.1:39777\r\n"
+        b"Authorization: Bearer " + token + b"\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+    )
+
+    response = bytearray()
+    while b"\r\n\r\n" not in response:
+        chunk = client.recv(4096)
+        if not chunk:
+            raise RuntimeError("server closed before sending response headers")
+        response.extend(chunk)
+        if len(response) > 32768:
+            raise RuntimeError("response headers exceeded the bounded limit")
+    header_block = bytes(response).split(b"\r\n\r\n", 1)[0]
+    header_lines = header_block.split(b"\r\n")
+    status_line = header_lines[0].split(b" ", 2)
+    if len(status_line) < 2 or status_line[1] != b"200":
+        raise RuntimeError("slow download did not receive HTTP 200")
+    content_lengths = []
+    for header_line in header_lines[1:]:
+        if b":" not in header_line:
+            raise RuntimeError("slow download received a malformed header")
+        header_name, header_value = header_line.split(b":", 1)
+        if header_name.lower() == b"content-length":
+            content_lengths.append(header_value.strip())
+    if content_lengths != [b"67108864"]:
+        raise RuntimeError("slow download received an unexpected content length")
+
+    marker_path = sys.argv[1]
+    marker_temp_path = marker_path + ".tmp"
+    marker = b"ready\n"
+    marker_fd = os.open(
+        marker_temp_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        if os.write(marker_fd, marker) != len(marker):
+            raise RuntimeError("could not write the complete ready marker")
+    finally:
+        os.close(marker_fd)
+    os.link(marker_temp_path, marker_path, follow_symlinks=False)
+    os.unlink(marker_temp_path)
+
+    client.settimeout(None)
+    time.sleep(120)
+except Exception as error:
+    print(
+        "slow download holder failed: "
+        f"{type(error).__name__}: {error}",
+        file=sys.stderr,
+        flush=True,
+    )
+    raise SystemExit(1)
+' "$ready_file" 2>"$failure_file" &
+  pid=$!
+  slow_download_pids+=("$pid")
+  slow_download_ready_files+=("$ready_file")
+  slow_download_failure_files+=("$failure_file")
+  latest_slow_download_pid=$pid
+  latest_slow_download_ready_file=$ready_file
+  latest_slow_download_failure_file=$failure_file
 }
 
 process_is_gone() {
@@ -1312,10 +1507,17 @@ printf '%s\n' 'systemd isolation fixture' |
   cmp - "$response_file" ||
   fail "downloaded bytes differ from the approved file"
 
-for _ in {1..8}; do
+wait_until "storage workers before bounded load" storage_worker_count_is 0
+for expected_worker_count in {1..8}; do
   start_slow_download
+  wait_until "slow download $expected_worker_count response" \
+    slow_download_is_ready \
+    "$latest_slow_download_pid" \
+    "$latest_slow_download_ready_file" \
+    "$latest_slow_download_failure_file"
+  wait_until "$expected_worker_count bounded storage workers" \
+    storage_worker_count_is "$expected_worker_count"
 done
-wait_until "eight bounded storage workers" storage_worker_count_is 8
 
 ninth_status="$(
   printf 'Authorization: Bearer %s\n' "$test_bearer" |
@@ -1415,7 +1617,14 @@ for management_path in /v1 /v2 /v3 /debug /swagger /public-files/../v1; do
 done
 wait_until "unchanged management sentinel" sentinel_is_unchanged
 
+wait_until "storage workers before coordinator SIGKILL load" \
+  storage_worker_count_is 0
 start_slow_download
+wait_until "slow download before coordinator SIGKILL response" \
+  slow_download_is_ready \
+  "$latest_slow_download_pid" \
+  "$latest_slow_download_ready_file" \
+  "$latest_slow_download_failure_file"
 wait_until "active worker before coordinator SIGKILL" storage_worker_count_is 1
 worker_before_coordinator_kill="$(storage_worker_pids)"
 [[ "$worker_before_coordinator_kill" =~ ^[0-9]+$ ]] ||
