@@ -47,6 +47,19 @@ func TestValidateRelativePath(t *testing.T) {
 	}
 }
 
+func TestValidatePortalConfigRejectsInvalidUTF8Paths(t *testing.T) {
+	invalidPath := string([]byte{'/', 't', 'm', 'p', '/', 0xff})
+	tests := []Config{
+		{Root: invalidPath, VerifierFile: "/tmp/verifier"},
+		{Root: "/tmp/share", VerifierFile: invalidPath},
+	}
+	for _, config := range tests {
+		if _, err := validatePortalConfig(config); err == nil {
+			t.Fatalf("invalid UTF-8 configuration path was accepted: %#v", config)
+		}
+	}
+}
+
 func TestIsSafeVisibleNameRejectsUnicodeFormatCharacters(t *testing.T) {
 	tests := []struct {
 		name      string

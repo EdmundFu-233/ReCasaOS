@@ -63,6 +63,24 @@ expect_rejected() {
     writable-bind)
       printf '\n[Service]\nBindPaths=/etc:/srv/public\n' >>"$service"
       ;;
+    missing-cgroup-limit-bind)
+      sed \
+        '\|^BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.swap.max:/run/recasaos-cgroup/memory.swap.max:norbind$|d' \
+        "$service" >"$service.next"
+      mv -f -- "$service.next" "$service"
+      ;;
+    recursive-cgroup-limit-bind)
+      sed \
+        's|:/run/recasaos-cgroup/pids.max:norbind$|:/run/recasaos-cgroup/pids.max:rbind|' \
+        "$service" >"$service.next"
+      mv -f -- "$service.next" "$service"
+      ;;
+    missing-cgroup-limit-target)
+      sed \
+        '\|^f /usr/lib/recasaos-public-files/rootfs/run/recasaos-cgroup/memory.max 0000 root root -$|d' \
+        "$tmpfiles" >"$tmpfiles.next"
+      mv -f -- "$tmpfiles.next" "$tmpfiles"
+      ;;
     host-relative-isolation)
       sed \
         's|InaccessiblePaths=+/sys -+/dev/shm|InaccessiblePaths=-/sys -/dev/shm|' \
@@ -136,6 +154,49 @@ expect_rejected() {
       ' "$service" >"$service.next"
       mv -f -- "$service.next" "$service"
       ;;
+    wrong-readiness-type)
+      sed 's/^Type=notify$/Type=exec/' "$service" >"$service.next"
+      mv -f -- "$service.next" "$service"
+      ;;
+    missing-notify-access)
+      sed '/^NotifyAccess=main$/d' "$service" >"$service.next"
+      mv -f -- "$service.next" "$service"
+      ;;
+    missing-cgroup-v2-gate)
+      sed '/^ConditionPathExists=\/sys\/fs\/cgroup\/cgroup.controllers$/d' \
+        "$service" >"$service.next"
+      mv -f -- "$service.next" "$service"
+      ;;
+    missing-socket-cgroup-v2-gate)
+      sed '/^ConditionPathExists=\/sys\/fs\/cgroup\/system.slice\/memory.swap.max$/d' \
+        "$socket" >"$socket.next"
+      mv -f -- "$socket.next" "$socket"
+      ;;
+    reduced-memory-budget)
+      sed 's/^MemoryMax=512M$/MemoryMax=256M/' "$service" >"$service.next"
+      mv -f -- "$service.next" "$service"
+      ;;
+    reduced-task-budget)
+      sed 's/^TasksMax=256$/TasksMax=128/' "$service" >"$service.next"
+      mv -f -- "$service.next" "$service"
+      ;;
+    expanded-fd-budget)
+      sed 's/^LimitNOFILE=512$/LimitNOFILE=1024/' "$service" >"$service.next"
+      mv -f -- "$service.next" "$service"
+      ;;
+    enabled-swap)
+      sed 's/^MemorySwapMax=0$/MemorySwapMax=512M/' "$service" >"$service.next"
+      mv -f -- "$service.next" "$service"
+      ;;
+    process-only-kill-mode)
+      sed 's/^KillMode=control-group$/KillMode=process/' "$service" >"$service.next"
+      mv -f -- "$service.next" "$service"
+      ;;
+    allow-clone3)
+      sed 's/ @swap clone3 memfd_create$/ @swap memfd_create/' \
+        "$service" >"$service.next"
+      mv -f -- "$service.next" "$service"
+      ;;
     unsupported-regular-file-condition)
       sed \
         's|ConditionFileNotEmpty=/etc/recasaos/public-file.verifier|ConditionPathIsRegular=/etc/recasaos/public-file.verifier|' \
@@ -174,6 +235,9 @@ expect_rejected() {
 "$checker" "$repo_root" >/dev/null
 expect_rejected duplicate-root
 expect_rejected writable-bind
+expect_rejected missing-cgroup-limit-bind
+expect_rejected recursive-cgroup-limit-bind
+expect_rejected missing-cgroup-limit-target
 expect_rejected host-relative-isolation
 expect_rejected optional-sys-isolation
 expect_rejected temporary-sysfs-mask
@@ -186,6 +250,16 @@ expect_rejected extra-tmpfiles-path
 expect_rejected candidate-symlink
 expect_rejected wrong-socket-section
 expect_rejected swapped-syscall-filter-order
+expect_rejected wrong-readiness-type
+expect_rejected missing-notify-access
+expect_rejected missing-cgroup-v2-gate
+expect_rejected missing-socket-cgroup-v2-gate
+expect_rejected reduced-memory-budget
+expect_rejected reduced-task-budget
+expect_rejected expanded-fd-budget
+expect_rejected enabled-swap
+expect_rejected process-only-kill-mode
+expect_rejected allow-clone3
 expect_rejected unsupported-regular-file-condition
 expect_rejected missing-semantic-verifier
 expect_rejected linked-semantic-verifier

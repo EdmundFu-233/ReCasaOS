@@ -16,6 +16,9 @@ command -v go >/dev/null 2>&1 || die "go is unavailable"
 [[ -d cmd/recasaos-public-files ]] || die "public-file service command is missing"
 compgen -G 'cmd/recasaos-public-files/*.go' >/dev/null ||
   die "public-file service command has no Go source"
+production_main="cmd/recasaos-public-files/main_linux.go"
+[[ -f "$production_main" ]] ||
+  die "public-file service Linux entrypoint is missing"
 
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/recasaos-public-files-boundary.XXXXXX")"
 trap 'rm -rf -- "$work_dir"' EXIT
@@ -115,6 +118,22 @@ do
     die "pkg/publicfiles retains forbidden environment API: ${forbidden_legacy_api}"
   fi
 done
+
+isolated_constructor_count="$(
+  grep -Ec 'return[[:space:]]+publicfiles\.NewIsolated\(config\)' \
+    "$production_main" || true
+)"
+[[ "$isolated_constructor_count" == 1 ]] ||
+  die "production portal must call publicfiles.NewIsolated exactly once"
+if grep -Eq 'return[[:space:]]+publicfiles\.New\(config\)' "$production_main"; then
+  die "production portal must not use the in-process publicfiles.New constructor"
+fi
+worker_dispatch_count="$(
+  grep -Ec 'publicfiles\.RunInternalStorageWorker\(os\.Args\[2\]\)' \
+    "$production_main" || true
+)"
+[[ "$worker_dispatch_count" == 1 ]] ||
+  die "production entrypoint must dispatch the internal storage worker exactly once"
 
 root_listener_count="$(grep -Ec 'net\.Listen[[:space:]]*\(' main.go || true)"
 [[ "$root_listener_count" == "1" ]] ||

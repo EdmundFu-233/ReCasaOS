@@ -178,10 +178,15 @@ require_exact_sectioned_active_lines "$service" \
   'ConditionPathIsDirectory=/srv/recasaos-public' \
   'ConditionFileNotEmpty=/etc/recasaos/public-file.verifier' \
   'ConditionPathIsSymbolicLink=!/etc/recasaos/public-file.verifier' \
+  'ConditionPathExists=/sys/fs/cgroup/cgroup.controllers' \
+  'ConditionPathExists=/sys/fs/cgroup/system.slice/memory.max' \
+  'ConditionPathExists=/sys/fs/cgroup/system.slice/memory.swap.max' \
+  'ConditionPathExists=/sys/fs/cgroup/system.slice/pids.max' \
   'StartLimitIntervalSec=2min' \
   'StartLimitBurst=5' \
   '[Service]' \
-  'Type=exec' \
+  'Type=notify' \
+  'NotifyAccess=main' \
   'User=recasaos-public' \
   'Group=recasaos-public' \
   'SupplementaryGroups=' \
@@ -190,6 +195,9 @@ require_exact_sectioned_active_lines "$service" \
   'WorkingDirectory=/' \
   'MountAPIVFS=yes' \
   'BindReadOnlyPaths=/srv/recasaos-public:/srv/public:rbind' \
+  'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.max:/run/recasaos-cgroup/memory.max:norbind' \
+  'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.swap.max:/run/recasaos-cgroup/memory.swap.max:norbind' \
+  'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/pids.max:/run/recasaos-cgroup/pids.max:norbind' \
   'LoadCredential=recasaos-public-file-verifier:/etc/recasaos/public-file.verifier' \
   'ExecStart=/usr/bin/recasaos-public-files serve --activation-name=public-files --listen=127.0.0.1:39777 --root=/srv/public --verifier-file=${CREDENTIALS_DIRECTORY}/recasaos-public-file-verifier' \
   'PrivateNetwork=yes' \
@@ -221,15 +229,15 @@ require_exact_sectioned_active_lines "$service" \
   'RemoveIPC=yes' \
   'SystemCallArchitectures=native' \
   'SystemCallFilter=@system-service' \
-  'SystemCallFilter=~@clock @cpu-emulation @debug @keyring @module @mount @obsolete @privileged @raw-io @reboot @swap memfd_create' \
+  'SystemCallFilter=~@clock @cpu-emulation @debug @keyring @module @mount @obsolete @privileged @raw-io @reboot @swap clone3 memfd_create' \
   'SystemCallErrorNumber=EPERM' \
   'LimitCORE=0' \
   'LimitNOFILE=512' \
-  'TasksMax=128' \
-  'MemoryMax=256M' \
+  'TasksMax=256' \
+  'MemoryMax=512M' \
   'MemorySwapMax=0' \
   'CPUQuota=100%' \
-  'TimeoutStartSec=15s' \
+  'TimeoutStartSec=30s' \
   'TimeoutStopSec=10s' \
   'KillMode=control-group' \
   'Restart=on-failure' \
@@ -243,6 +251,10 @@ require_exact_sectioned_active_lines "$socket" \
   'ConditionPathIsDirectory=/srv/recasaos-public' \
   'ConditionFileNotEmpty=/etc/recasaos/public-file.verifier' \
   'ConditionPathIsSymbolicLink=!/etc/recasaos/public-file.verifier' \
+  'ConditionPathExists=/sys/fs/cgroup/cgroup.controllers' \
+  'ConditionPathExists=/sys/fs/cgroup/system.slice/memory.max' \
+  'ConditionPathExists=/sys/fs/cgroup/system.slice/memory.swap.max' \
+  'ConditionPathExists=/sys/fs/cgroup/system.slice/pids.max' \
   '[Socket]' \
   'ListenStream=127.0.0.1:39777' \
   'Accept=no' \
@@ -258,7 +270,8 @@ require_exact_sectioned_active_lines "$socket" \
   '[Install]' \
   'WantedBy=sockets.target'
 
-require_exact_key_assignments Service Type "$service" 'Type=exec'
+require_exact_key_assignments Service Type "$service" 'Type=notify'
+require_exact_key_assignments Service NotifyAccess "$service" 'NotifyAccess=main'
 require_exact_key_assignments Service User "$service" 'User=recasaos-public'
 require_exact_key_assignments Service Group "$service" 'Group=recasaos-public'
 require_exact_key_assignments Service SupplementaryGroups "$service" 'SupplementaryGroups='
@@ -266,7 +279,10 @@ require_exact_key_assignments Service UMask "$service" 'UMask=0077'
 require_exact_key_assignments Service RootDirectory "$service" \
   'RootDirectory=/usr/lib/recasaos-public-files/rootfs'
 require_exact_key_assignments Service BindReadOnlyPaths "$service" \
-  'BindReadOnlyPaths=/srv/recasaos-public:/srv/public:rbind'
+  'BindReadOnlyPaths=/srv/recasaos-public:/srv/public:rbind' \
+  'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.max:/run/recasaos-cgroup/memory.max:norbind' \
+  'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.swap.max:/run/recasaos-cgroup/memory.swap.max:norbind' \
+  'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/pids.max:/run/recasaos-cgroup/pids.max:norbind'
 require_exact_key_assignments Service LoadCredential "$service" \
   'LoadCredential=recasaos-public-file-verifier:/etc/recasaos/public-file.verifier'
 require_exact_key_assignments Service ExecStart "$service" \
@@ -297,7 +313,7 @@ require_exact_key_assignments Service SystemCallArchitectures "$service" \
   'SystemCallArchitectures=native'
 require_exact_key_assignments Service SystemCallFilter "$service" \
   'SystemCallFilter=@system-service' \
-  'SystemCallFilter=~@clock @cpu-emulation @debug @keyring @module @mount @obsolete @privileged @raw-io @reboot @swap memfd_create'
+  'SystemCallFilter=~@clock @cpu-emulation @debug @keyring @module @mount @obsolete @privileged @raw-io @reboot @swap clone3 memfd_create'
 
 require_exact_key_assignments Socket ListenStream "$socket" \
   'ListenStream=127.0.0.1:39777'
@@ -350,6 +366,10 @@ require_exact_active_lines "$tmpfiles" \
   'd /usr/lib/recasaos-public-files/rootfs/sys 0555 root root -' \
   'd /usr/lib/recasaos-public-files/rootfs/dev 0755 root root -' \
   'd /usr/lib/recasaos-public-files/rootfs/run 0755 root root -' \
+  'd /usr/lib/recasaos-public-files/rootfs/run/recasaos-cgroup 0555 root root -' \
+  'f /usr/lib/recasaos-public-files/rootfs/run/recasaos-cgroup/memory.max 0000 root root -' \
+  'f /usr/lib/recasaos-public-files/rootfs/run/recasaos-cgroup/memory.swap.max 0000 root root -' \
+  'f /usr/lib/recasaos-public-files/rootfs/run/recasaos-cgroup/pids.max 0000 root root -' \
   'd /usr/lib/recasaos-public-files/rootfs/tmp 01777 root root -' \
   'd /usr/lib/recasaos-public-files/rootfs/var 0755 root root -' \
   'd /usr/lib/recasaos-public-files/rootfs/var/tmp 01777 root root -'
@@ -387,6 +407,19 @@ if test "${RECASAOS_SYSTEMD_LIVE_VERIFY:-0}" = 1; then
     )
     test "$live_directory_actual" = "$live_directory_expected" ||
       fail "installed directory metadata is unsafe: $live_directory_path ($live_directory_actual)"
+  }
+
+  require_live_file_metadata() {
+    live_file_path=$1
+    test -f "$live_file_path" ||
+      fail "installed placeholder file is missing: $live_file_path"
+    test ! -L "$live_file_path" ||
+      fail "installed placeholder file is a symlink: $live_file_path"
+    live_file_actual=$(
+      stat -c '%U:%G:%a:%h:%s' "$live_file_path"
+    )
+    test "$live_file_actual" = root:root:0:1:0 ||
+      fail "installed placeholder metadata is unsafe: $live_file_path ($live_file_actual)"
   }
 
   for pair in \
@@ -474,6 +507,14 @@ if test "${RECASAOS_SYSTEMD_LIVE_VERIFY:-0}" = 1; then
     /usr/lib/recasaos-public-files/rootfs/dev root:root:755
   require_live_directory_metadata \
     /usr/lib/recasaos-public-files/rootfs/run root:root:755
+  require_live_directory_metadata \
+    /usr/lib/recasaos-public-files/rootfs/run/recasaos-cgroup root:root:555
+  require_live_file_metadata \
+    /usr/lib/recasaos-public-files/rootfs/run/recasaos-cgroup/memory.max
+  require_live_file_metadata \
+    /usr/lib/recasaos-public-files/rootfs/run/recasaos-cgroup/memory.swap.max
+  require_live_file_metadata \
+    /usr/lib/recasaos-public-files/rootfs/run/recasaos-cgroup/pids.max
   require_live_directory_metadata \
     /usr/lib/recasaos-public-files/rootfs/tmp root:root:1777
   require_live_directory_metadata \

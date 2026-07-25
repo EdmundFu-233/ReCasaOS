@@ -123,6 +123,42 @@ func openSecureRootWith(absolutePath string, inspect rootFilesystemInspector) (*
 	return root, nil
 }
 
+// secureRootFromWorkerFD reconstructs the exact bootstrap-pinned root inside a
+// disposable worker. The long-lived portal passes but never inspects this
+// descriptor. Every worker independently verifies its directory type, mount
+// identity and filesystem policy before using it.
+func secureRootFromWorkerFD(
+	fd int,
+	expectedMountID uint64,
+	expectedFilesystemType uint32,
+) (*secureRoot, error) {
+	if fd < 0 || expectedMountID == 0 {
+		return nil, errStorageProtocol
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return nil, errStorageProtocol
+	}
+	identity, err := inspectPublicRootFilesystem(fd)
+	if err != nil ||
+		identity.mountID != expectedMountID ||
+		uint32(identity.magic) != expectedFilesystemType {
+		return nil, errStorageProtocol
+	}
+	if _, allowed := publicRootFilesystemName(identity.magic); !allowed {
+		return nil, errStorageProtocol
+	}
+	file := os.NewFile(uintptr(fd), "public-file-worker-root")
+	if file == nil {
+		return nil, errStorageProtocol
+	}
+	return &secureRoot{
+		file:           file,
+		mountID:        expectedMountID,
+		filesystemType: expectedFilesystemType,
+	}, nil
+}
+
 func inspectPublicRootFilesystem(fd int) (rootFilesystemIdentity, error) {
 	var identity rootFilesystemIdentity
 	var filesystem unix.Statfs_t
@@ -398,7 +434,9 @@ func (r *secureRoot) list(relative string, maxEntries int) ([]Entry, error) {
 
 	entries := make([]Entry, 0, len(names))
 	for _, name := range names {
-		if !isSafeVisibleName(name) || strings.HasPrefix(name, ".") || strings.Contains(name, "/") {
+		if !isSafeVisibleName(name) ||
+			strings.HasPrefix(name, ".") ||
+			strings.ContainsAny(name, `/\`) {
 			continue
 		}
 		childPath := name

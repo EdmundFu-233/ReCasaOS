@@ -3,6 +3,10 @@ Description=ReCasaOS public-file portal socket
 ConditionPathIsDirectory=/srv/recasaos-public
 ConditionFileNotEmpty=/etc/recasaos/public-file.verifier
 ConditionPathIsSymbolicLink=!/etc/recasaos/public-file.verifier
+ConditionPathExists=/sys/fs/cgroup/cgroup.controllers
+ConditionPathExists=/sys/fs/cgroup/system.slice/memory.max
+ConditionPathExists=/sys/fs/cgroup/system.slice/memory.swap.max
+ConditionPathExists=/sys/fs/cgroup/system.slice/pids.max
 
 [Socket]
 ListenStream=127.0.0.1:39777

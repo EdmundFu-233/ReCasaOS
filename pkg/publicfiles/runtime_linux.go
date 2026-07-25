@@ -9,11 +9,26 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
-	serviceRuntimeStatusPath     = "/proc/self/status"
-	serviceRuntimeStatusMaxBytes = 64 << 10
+	serviceRuntimeStatusPath          = "/proc/self/status"
+	serviceRuntimeStatusMaxBytes      = 64 << 10
+	serviceRuntimeCgroupPath          = "/proc/self/cgroup"
+	serviceRuntimeCgroupMaxBytes      = 16 << 10
+	serviceRuntimeCgroupUnitPath      = "/system.slice/recasaos-public-files.service"
+	serviceRuntimeMountInfoPath       = "/proc/self/mountinfo"
+	serviceRuntimeMountInfoMaxBytes   = 4 << 20
+	serviceRuntimeCgroupLimitsPath    = "/run/recasaos-cgroup"
+	serviceRuntimeCgroupLimitMaxBytes = 64
+	serviceRuntimeMemoryMaxFile       = "memory.max"
+	serviceRuntimeMemoryMaxValue      = "536870912"
+	serviceRuntimeMemorySwapMaxFile   = "memory.swap.max"
+	serviceRuntimeMemorySwapMaxValue  = "0"
+	serviceRuntimeProcessLimitFile    = "pids.max"
+	serviceRuntimeProcessLimitValue   = "256"
 )
 
 var ErrUnsafeServiceRuntime = errors.New("public file service runtime isolation is unsafe")
@@ -24,6 +39,9 @@ var ErrUnsafeServiceRuntime = errors.New("public file service runtime isolation 
 // copied binary or weakened override from silently running with management
 // authority.
 func ValidateServiceRuntime() error {
+	if err := disableServiceRuntimeDumpability(); err != nil {
+		return fmt.Errorf("%w: cannot disable process memory inspection: %v", ErrUnsafeServiceRuntime, err)
+	}
 	status, err := readServiceRuntimeStatus(serviceRuntimeStatusPath)
 	if err != nil {
 		return fmt.Errorf("%w: cannot inspect process status: %v", ErrUnsafeServiceRuntime, err)
@@ -31,24 +49,307 @@ func ValidateServiceRuntime() error {
 	if err := validateServiceRuntimeStatus(status, os.Geteuid(), os.Getegid()); err != nil {
 		return fmt.Errorf("%w: %v", ErrUnsafeServiceRuntime, err)
 	}
+	cgroup, err := readServiceRuntimeFile(
+		serviceRuntimeCgroupPath,
+		serviceRuntimeCgroupMaxBytes,
+	)
+	if err != nil {
+		return fmt.Errorf("%w: cannot inspect process cgroup: %v", ErrUnsafeServiceRuntime, err)
+	}
+	if err := validateServiceRuntimeCgroup(cgroup); err != nil {
+		return fmt.Errorf("%w: %v", ErrUnsafeServiceRuntime, err)
+	}
+	if err := validateServiceRuntimeCgroupLimits(serviceRuntimeCgroupLimitsPath); err != nil {
+		return fmt.Errorf("%w: %v", ErrUnsafeServiceRuntime, err)
+	}
+	return nil
+}
+
+func disableServiceRuntimeDumpability() error {
+	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
+		return err
+	}
+	value, _, errno := unix.Syscall6(
+		unix.SYS_PRCTL,
+		uintptr(unix.PR_GET_DUMPABLE),
+		0,
+		0,
+		0,
+		0,
+		0,
+	)
+	if errno != 0 {
+		return errno
+	}
+	if value != 0 {
+		return errors.New("process remains dumpable")
+	}
 	return nil
 }
 
 func readServiceRuntimeStatus(path string) ([]byte, error) {
+	return readServiceRuntimeFile(path, serviceRuntimeStatusMaxBytes)
+}
+
+func readServiceRuntimeFile(path string, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		return nil, errors.New("runtime inspection limit is invalid")
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
 
-	status, err := io.ReadAll(io.LimitReader(file, serviceRuntimeStatusMaxBytes+1))
+	content, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(status) > serviceRuntimeStatusMaxBytes {
-		return nil, errors.New("process status exceeds the safety limit")
+	if int64(len(content)) > maxBytes {
+		return nil, errors.New("runtime inspection file exceeds the safety limit")
 	}
-	return status, nil
+	return content, nil
+}
+
+func validateServiceRuntimeCgroup(content []byte) error {
+	if len(content) == 0 ||
+		len(content) > serviceRuntimeCgroupMaxBytes ||
+		content[len(content)-1] != '\n' ||
+		strings.ContainsRune(string(content), '\x00') {
+		return errors.New("service cgroup metadata is malformed")
+	}
+	lines := strings.Split(strings.TrimSuffix(string(content), "\n"), "\n")
+	if len(lines) != 1 {
+		return errors.New("service requires the unified cgroup v2 hierarchy")
+	}
+	fields := strings.Split(lines[0], ":")
+	if len(fields) != 3 ||
+		fields[0] != "0" ||
+		fields[1] != "" ||
+		fields[2] != serviceRuntimeCgroupUnitPath {
+		return errors.New("service is not running in its reviewed cgroup v2 unit")
+	}
+	return nil
+}
+
+func validateServiceRuntimeCgroupLimits(path string) error {
+	directoryFD, err := unix.Open(
+		path,
+		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+		0,
+	)
+	if err != nil {
+		return fmt.Errorf("cannot open the service cgroup limit view: %w", err)
+	}
+	defer unix.Close(directoryFD)
+
+	var directoryMetadata unix.Stat_t
+	if err := unix.Fstat(directoryFD, &directoryMetadata); err != nil {
+		return fmt.Errorf("cannot inspect the service cgroup limit directory: %w", err)
+	}
+	if err := validateServiceRuntimeCgroupLimitDirectoryMetadata(directoryMetadata); err != nil {
+		return err
+	}
+
+	mountInfo, err := readServiceRuntimeFile(
+		serviceRuntimeMountInfoPath,
+		serviceRuntimeMountInfoMaxBytes,
+	)
+	if err != nil {
+		return fmt.Errorf("cannot inspect the service mount table: %w", err)
+	}
+
+	limits := []struct {
+		name     string
+		expected string
+	}{
+		{name: serviceRuntimeMemoryMaxFile, expected: serviceRuntimeMemoryMaxValue},
+		{name: serviceRuntimeMemorySwapMaxFile, expected: serviceRuntimeMemorySwapMaxValue},
+		{name: serviceRuntimeProcessLimitFile, expected: serviceRuntimeProcessLimitValue},
+	}
+	for _, limit := range limits {
+		content, mountID, err := readServiceRuntimeCgroupLimitAt(
+			directoryFD,
+			limit.name,
+			serviceRuntimeCgroupLimitMaxBytes,
+		)
+		if err != nil {
+			return fmt.Errorf("cannot inspect service cgroup limit %s: %w", limit.name, err)
+		}
+		if err := validateServiceRuntimeCgroupLimitMount(
+			mountInfo,
+			mountID,
+			limit.name,
+		); err != nil {
+			return err
+		}
+		if err := validateServiceRuntimeCgroupLimitValue(
+			limit.name,
+			content,
+			limit.expected,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateServiceRuntimeCgroupLimitDirectoryMetadata(metadata unix.Stat_t) error {
+	if metadata.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return errors.New("service cgroup limit view is not a directory")
+	}
+	// ValidateServiceRuntime has already proved that the service has a
+	// dedicated non-root identity and no capabilities. Host root remains a
+	// trusted boundary, so owner-write is safe; the service's group and other
+	// identities must not be able to replace entries below the pinned dirfd.
+	if metadata.Uid != 0 ||
+		metadata.Gid != 0 ||
+		metadata.Mode&0o022 != 0 {
+		return fmt.Errorf(
+			"service cgroup limit directory metadata is unsafe: uid=%d gid=%d mode=%#o",
+			metadata.Uid,
+			metadata.Gid,
+			metadata.Mode&0o7777,
+		)
+	}
+	return nil
+}
+
+func validateServiceRuntimeCgroupLimitMount(
+	content []byte,
+	expectedMountID uint64,
+	name string,
+) error {
+	if expectedMountID == 0 ||
+		name == "" ||
+		strings.ContainsRune(name, '/') ||
+		len(content) == 0 ||
+		len(content) > serviceRuntimeMountInfoMaxBytes ||
+		content[len(content)-1] != '\n' ||
+		strings.ContainsRune(string(content), '\x00') {
+		return errors.New("service mount metadata is malformed")
+	}
+
+	expectedRoot := serviceRuntimeCgroupUnitPath + "/" + name
+	expectedTarget := serviceRuntimeCgroupLimitsPath + "/" + name
+	matches := 0
+	for _, line := range strings.Split(strings.TrimSuffix(string(content), "\n"), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 10 {
+			return errors.New("service mount metadata is malformed")
+		}
+		separator := -1
+		for index := 6; index < len(fields); index++ {
+			if fields[index] == "-" {
+				separator = index
+				break
+			}
+		}
+		if separator < 0 || separator+3 >= len(fields) {
+			return errors.New("service mount metadata is malformed")
+		}
+		if fields[4] != expectedTarget {
+			continue
+		}
+		matches++
+
+		mountID, err := strconv.ParseUint(fields[0], 10, 64)
+		if err != nil || mountID != expectedMountID {
+			return errors.New("service cgroup limit mount identity is unexpected")
+		}
+		if fields[3] != expectedRoot {
+			return errors.New("service cgroup limit view is bound from an unexpected cgroup")
+		}
+		if fields[separator+1] != "cgroup2" {
+			return errors.New("service cgroup limit mount is not cgroup v2")
+		}
+		if !commaSeparatedRuntimeOption(fields[5], "ro") ||
+			commaSeparatedRuntimeOption(fields[5], "rw") {
+			return errors.New("service cgroup limit mount is not read-only")
+		}
+	}
+	if matches != 1 {
+		return errors.New("service cgroup limit mount must appear exactly once")
+	}
+	return nil
+}
+
+func commaSeparatedRuntimeOption(options, expected string) bool {
+	for _, option := range strings.Split(options, ",") {
+		if option == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func readServiceRuntimeCgroupLimitAt(
+	directoryFD int,
+	name string,
+	maxBytes int64,
+) ([]byte, uint64, error) {
+	if maxBytes <= 0 {
+		return nil, 0, errors.New("runtime inspection limit is invalid")
+	}
+	fileFD, err := unix.Openat(
+		directoryFD,
+		name,
+		unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+		0,
+	)
+	if err != nil {
+		return nil, 0, err
+	}
+	file := os.NewFile(uintptr(fileFD), name)
+	if file == nil {
+		unix.Close(fileFD)
+		return nil, 0, errors.New("cannot represent the runtime inspection file")
+	}
+	defer file.Close()
+
+	var filesystem unix.Statfs_t
+	if err := unix.Fstatfs(fileFD, &filesystem); err != nil {
+		return nil, 0, err
+	}
+	if filesystem.Type != unix.CGROUP2_SUPER_MAGIC {
+		return nil, 0, errors.New("runtime cgroup limit is not backed by cgroup v2")
+	}
+	if filesystem.Flags&unix.ST_RDONLY == 0 {
+		return nil, 0, errors.New("runtime cgroup limit is not mounted read-only")
+	}
+
+	var metadata unix.Statx_t
+	if err := unix.Statx(
+		fileFD,
+		"",
+		unix.AT_EMPTY_PATH|unix.AT_STATX_SYNC_AS_STAT,
+		unix.STATX_TYPE|unix.STATX_MNT_ID,
+		&metadata,
+	); err != nil {
+		return nil, 0, err
+	}
+	if metadata.Mask&unix.STATX_MNT_ID == 0 || metadata.Mnt_id == 0 {
+		return nil, 0, errors.New("runtime cgroup limit has no stable mount identity")
+	}
+	if metadata.Mode&unix.S_IFMT != unix.S_IFREG {
+		return nil, 0, errors.New("runtime cgroup limit is not a regular file")
+	}
+
+	content, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil {
+		return nil, 0, err
+	}
+	if int64(len(content)) > maxBytes {
+		return nil, 0, errors.New("runtime inspection file exceeds the safety limit")
+	}
+	return content, metadata.Mnt_id, nil
+}
+
+func validateServiceRuntimeCgroupLimitValue(name string, content []byte, expected string) error {
+	if string(content) != expected+"\n" {
+		return fmt.Errorf("service cgroup limit %s differs from the reviewed boundary", name)
+	}
+	return nil
 }
 
 func validateServiceRuntimeStatus(status []byte, effectiveUID, effectiveGID int) error {

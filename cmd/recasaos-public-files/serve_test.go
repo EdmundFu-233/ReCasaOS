@@ -272,6 +272,10 @@ func TestRunServeValidatesRuntimeBeforeLoadingActivation(t *testing.T) {
 			t.Fatal("server factory was called")
 			return nil
 		},
+		notifyReady: func() error {
+			t.Fatal("readiness was notified")
+			return nil
+		},
 		shutdownTimeout: time.Second,
 		connectionLimit: maxActiveConnections,
 	})
@@ -305,6 +309,10 @@ func TestRunServeRejectsLegacyConfigurationEnvironmentWithoutExposingValue(t *te
 		},
 		newServer: func(http.Handler) publicFileHTTPServer {
 			t.Fatal("server factory was called")
+			return nil
+		},
+		notifyReady: func() error {
+			t.Fatal("readiness was notified")
 			return nil
 		},
 		shutdownTimeout: time.Second,
@@ -379,7 +387,8 @@ func TestRunServeGracefulCancellationClosesPortal(t *testing.T) {
 	var shutdownCalls atomic.Int32
 	server := &fakeHTTPServer{
 		serve: func(listener net.Listener) error {
-			defer listener.Close()
+			stopAccept := startAcceptProbe(listener)
+			defer stopAccept()
 			close(started)
 			<-release
 			return http.ErrServerClosed
@@ -397,10 +406,17 @@ func TestRunServeGracefulCancellationClosesPortal(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
+	ready := make(chan struct{})
+	dependencies := lifecycleDependencies(activationFile, portal, server, time.Second)
+	dependencies.notifyReady = func() error {
+		close(ready)
+		return nil
+	}
 	go func() {
-		result <- runServe(ctx, config, lifecycleDependencies(activationFile, portal, server, time.Second))
+		result <- runServe(ctx, config, dependencies)
 	}()
 	<-started
+	<-ready
 	cancel()
 	if err := <-result; err != nil {
 		t.Fatalf("runServe() error = %v", err)
@@ -425,7 +441,8 @@ func TestRunServeForcesCloseWithoutClosingPortalAfterShutdownTimeout(t *testing.
 	var forceCloseCalls atomic.Int32
 	server := &fakeHTTPServer{
 		serve: func(listener net.Listener) error {
-			defer listener.Close()
+			stopAccept := startAcceptProbe(listener)
+			defer stopAccept()
 			close(started)
 			<-release
 			return http.ErrServerClosed
@@ -442,10 +459,17 @@ func TestRunServeForcesCloseWithoutClosingPortalAfterShutdownTimeout(t *testing.
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
+	ready := make(chan struct{})
+	dependencies := lifecycleDependencies(activationFile, portal, server, 20*time.Millisecond)
+	dependencies.notifyReady = func() error {
+		close(ready)
+		return nil
+	}
 	go func() {
-		result <- runServe(ctx, config, lifecycleDependencies(activationFile, portal, server, 20*time.Millisecond))
+		result <- runServe(ctx, config, dependencies)
 	}()
 	<-started
+	<-ready
 	cancel()
 	if err := <-result; err == nil {
 		t.Fatal("runServe() error = nil, want forced-shutdown error")
@@ -467,7 +491,8 @@ func TestRunServeReturnsServeErrorAfterCleanQuiescence(t *testing.T) {
 	sentinel := errors.New("accept failed")
 	server := &fakeHTTPServer{
 		serve: func(listener net.Listener) error {
-			_ = listener.Close()
+			stopAccept := startAcceptProbe(listener)
+			stopAccept()
 			return sentinel
 		},
 		shutdown: func(context.Context) error {
@@ -481,6 +506,165 @@ func TestRunServeReturnsServeErrorAfterCleanQuiescence(t *testing.T) {
 	err := runServe(context.Background(), config, lifecycleDependencies(activationFile, portal, server, time.Second))
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("runServe() error = %v, want sentinel", err)
+	}
+	if portal.closeCalls.Load() != 1 {
+		t.Fatalf("portal Close() calls = %d, want 1", portal.closeCalls.Load())
+	}
+}
+
+func TestRunServeNotifiesOnlyAfterServerEntersAcceptLoop(t *testing.T) {
+	t.Parallel()
+
+	activationFile, address := newActivatedTCPFile(t, requiredActivationName)
+	config := testServeConfig(address)
+	portal := &fakePortal{}
+	serveEntered := make(chan struct{})
+	allowAccept := make(chan struct{})
+	notified := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	server := &fakeHTTPServer{
+		serve: func(listener net.Listener) error {
+			close(serveEntered)
+			<-allowAccept
+			stopAccept := startAcceptProbe(listener)
+			defer stopAccept()
+			<-release
+			return http.ErrServerClosed
+		},
+		shutdown: func(context.Context) error {
+			releaseOnce.Do(func() { close(release) })
+			return nil
+		},
+		close: func() error {
+			releaseOnce.Do(func() { close(release) })
+			return nil
+		},
+	}
+	dependencies := lifecycleDependencies(activationFile, portal, server, time.Second)
+	dependencies.notifyReady = func() error {
+		close(notified)
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- runServe(ctx, config, dependencies)
+	}()
+
+	<-serveEntered
+	select {
+	case <-notified:
+		t.Fatal("readiness was notified before Serve entered its accept loop")
+	default:
+	}
+	close(allowAccept)
+	<-notified
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("runServe() error = %v", err)
+	}
+}
+
+func TestRunServeReadinessFailureStopsServerBeforeClosingPortal(t *testing.T) {
+	t.Parallel()
+
+	activationFile, address := newActivatedTCPFile(t, requiredActivationName)
+	config := testServeConfig(address)
+	portal := &fakePortal{}
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	var closeCalls atomic.Int32
+	server := &fakeHTTPServer{
+		serve: func(listener net.Listener) error {
+			stopAccept := startAcceptProbe(listener)
+			defer stopAccept()
+			<-release
+			return http.ErrServerClosed
+		},
+		shutdown: func(context.Context) error {
+			t.Error("Shutdown() called after readiness notification failure")
+			return nil
+		},
+		close: func() error {
+			closeCalls.Add(1)
+			releaseOnce.Do(func() { close(release) })
+			return nil
+		},
+	}
+	sentinel := errors.New("sd_notify failed")
+	dependencies := lifecycleDependencies(activationFile, portal, server, time.Second)
+	dependencies.notifyReady = func() error {
+		return sentinel
+	}
+
+	err := runServe(context.Background(), config, dependencies)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("runServe() error = %v, want readiness sentinel", err)
+	}
+	if closeCalls.Load() != 1 {
+		t.Fatalf("server Close() calls = %d, want 1", closeCalls.Load())
+	}
+	if portal.closeCalls.Load() != 1 {
+		t.Fatalf("portal Close() calls = %d, want 1", portal.closeCalls.Load())
+	}
+}
+
+func TestRunServeCancellationBeforeAcceptNeverNotifiesReady(t *testing.T) {
+	t.Parallel()
+
+	activationFile, address := newActivatedTCPFile(t, requiredActivationName)
+	config := testServeConfig(address)
+	portal := &fakePortal{}
+	serveEntered := make(chan struct{})
+	allowAccept := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	var closeCalls atomic.Int32
+	var notifyCalls atomic.Int32
+	server := &fakeHTTPServer{
+		serve: func(listener net.Listener) error {
+			close(serveEntered)
+			<-allowAccept
+			stopAccept := startAcceptProbe(listener)
+			defer stopAccept()
+			<-release
+			return http.ErrServerClosed
+		},
+		shutdown: func(context.Context) error {
+			t.Error("Shutdown() called before readiness")
+			return nil
+		},
+		close: func() error {
+			closeCalls.Add(1)
+			releaseOnce.Do(func() {
+				close(allowAccept)
+				close(release)
+			})
+			return nil
+		},
+	}
+	dependencies := lifecycleDependencies(activationFile, portal, server, time.Second)
+	dependencies.notifyReady = func() error {
+		notifyCalls.Add(1)
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- runServe(ctx, config, dependencies)
+	}()
+
+	<-serveEntered
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("runServe() error = %v, want clean cancellation", err)
+	}
+	if notifyCalls.Load() != 0 {
+		t.Fatalf("readiness notifications = %d, want 0", notifyCalls.Load())
+	}
+	if closeCalls.Load() != 1 {
+		t.Fatalf("server Close() calls = %d, want 1", closeCalls.Load())
 	}
 	if portal.closeCalls.Load() != 1 {
 		t.Fatalf("portal Close() calls = %d, want 1", portal.closeCalls.Load())
@@ -599,6 +783,24 @@ func renameFile(t *testing.T, file *os.File, name string) *os.File {
 	return os.NewFile(uintptr(descriptor), name)
 }
 
+func startAcceptProbe(listener net.Listener) func() {
+	done := make(chan struct{})
+	go func() {
+		connection, _ := listener.Accept()
+		if connection != nil {
+			_ = connection.Close()
+		}
+		close(done)
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			_ = listener.Close()
+			<-done
+		})
+	}
+}
+
 func testServeConfig(address string) serveConfig {
 	return serveConfig{
 		activationName: requiredActivationName,
@@ -629,6 +831,9 @@ func lifecycleDependencies(
 		},
 		newServer: func(http.Handler) publicFileHTTPServer {
 			return server
+		},
+		notifyReady: func() error {
+			return nil
 		},
 		shutdownTimeout: timeout,
 		connectionLimit: maxActiveConnections,
