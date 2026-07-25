@@ -198,6 +198,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
   fail "browser harness build is missing or unsafe"
 
 export RECASAOS_BROWSER_HARNESS="$harness"
+export RECASAOS_BROWSER_CA_CERTIFICATE="$ca_certificate"
 export RECASAOS_BROWSER_CERTIFICATE="$server_certificate"
 export RECASAOS_BROWSER_PRIVATE_KEY="$server_key"
 export RECASAOS_BROWSER_TEST=1

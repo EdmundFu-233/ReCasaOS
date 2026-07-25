@@ -101,11 +101,11 @@ the production systemd service. Passing that job is useful frontend protocol
 evidence, but it is not stable Chrome/Firefox/Safari, proxy, target-host, or
 Internet-readiness evidence and does not close Issue #20.
 Its cancel smoke has a deliberately narrower meaning: all three engines must
-report the local download as canceled to Playwright, and every authorized
+report the local download as canceled to Playwright, and exactly one authorized
 upstream request must reach a terminal state within the 40-second test-harness
-deadline. Chromium and WebKit must additionally classify at least one upstream
-request as canceled; Firefox is not required to classify any as canceled. That
-Firefox outcome is consistent with Mozilla's open
+deadline. Chromium and WebKit must classify that request as canceled; Firefox
+may classify it as canceled or completed. That Firefox outcome is consistent
+with Mozilla's open
 [Bug 1825388](https://bugzilla.mozilla.org/show_bug.cgi?id=1825388), in which
 response-body cancellation is not propagated to a Service Worker, but the
 native-download path exercised here is not identical. It proves that the test

@@ -75,6 +75,23 @@ async function loginAndWaitForNativeStreaming(page, portal) {
     .toBe(true);
 }
 
+function fileRequestState(snapshot) {
+  return {
+    active_file_requests: snapshot.active_file_requests,
+    authorized_file_requests: snapshot.authorized_file_requests,
+    canceled_file_requests: snapshot.canceled_file_requests,
+    completed_file_requests: snapshot.completed_file_requests,
+  };
+}
+
+async function expectFileRequestStateToRemainQuiescent(portal, terminal) {
+  await delay(1_000);
+  expect(
+    fileRequestState(await readSnapshot(portal)),
+    'the terminal file-request counters must remain quiescent',
+  ).toEqual(fileRequestState(terminal));
+}
+
 async function hashDownload(download) {
   let stream;
   try {
@@ -282,17 +299,32 @@ test('native browser download preserves bytes and leaves no bearer residue', asy
 
   const after = await waitForSnapshot(
     portal,
-    (snapshot) =>
-      snapshot.active_file_requests === 0 &&
-      snapshot.completed_file_requests > before.completed_file_requests,
+    (snapshot) => {
+      const authorizedDelta =
+        snapshot.authorized_file_requests -
+        before.authorized_file_requests;
+      const canceledDelta =
+        snapshot.canceled_file_requests -
+        before.canceled_file_requests;
+      const completedDelta =
+        snapshot.completed_file_requests -
+        before.completed_file_requests;
+      return (
+        snapshot.active_file_requests === 0 &&
+        authorizedDelta === 1 &&
+        canceledDelta === 0 &&
+        completedDelta === 1
+      );
+    },
     'completed native browser download cleanup',
   );
   expect(
-    after.authorized_file_requests > before.authorized_file_requests,
-    'native download must use the authenticated file endpoint',
-  ).toBe(true);
+    after.authorized_file_requests - before.authorized_file_requests,
+    'native download must use exactly one authenticated file request',
+  ).toBe(1);
   expect(after.authorization_on_other_path).toBe(0);
   expect(after.credential_query_requests).toBe(0);
+  await expectFileRequestStateToRemainQuiescent(portal, after);
 });
 
 test('canceling a browser download reaches bounded terminal cleanup', async ({
@@ -332,8 +364,10 @@ test('canceling a browser download reaches bounded terminal cleanup', async ({
         before.completed_file_requests;
       return (
         snapshot.active_file_requests === 0 &&
-        authorizedDelta >= 1 &&
-        canceledDelta + completedDelta === authorizedDelta
+        authorizedDelta === 1 &&
+        canceledDelta + completedDelta === 1 &&
+        (browserName === 'firefox' ||
+          (canceledDelta === 1 && completedDelta === 0))
       );
     },
     'terminal native browser download cleanup',
@@ -347,32 +381,17 @@ test('canceling a browser download reaches bounded terminal cleanup', async ({
     after.completed_file_requests - before.completed_file_requests;
   expect(
     canceledDelta + completedDelta,
-    'every authenticated browser request must reach one terminal state',
-  ).toBe(authorizedDelta);
+    'the authenticated browser request must reach exactly one terminal state',
+  ).toBe(1);
   expect(
     authorizedDelta,
-    'the canceled browser download must use the authenticated endpoint',
-  ).toBeGreaterThanOrEqual(1);
+    'the canceled browser download must use exactly one authenticated request',
+  ).toBe(1);
   if (browserName !== 'firefox') {
     expect(
       canceledDelta,
       'Chromium and WebKit must propagate cancellation upstream',
-    ).toBeGreaterThanOrEqual(1);
+    ).toBe(1);
   }
-  await delay(1_000);
-  const quiescent = await readSnapshot(portal);
-  expect(
-    {
-      active_file_requests: quiescent.active_file_requests,
-      authorized_file_requests: quiescent.authorized_file_requests,
-      canceled_file_requests: quiescent.canceled_file_requests,
-      completed_file_requests: quiescent.completed_file_requests,
-    },
-    'the terminal file-request counters must remain quiescent',
-  ).toEqual({
-    active_file_requests: 0,
-    authorized_file_requests: after.authorized_file_requests,
-    canceled_file_requests: after.canceled_file_requests,
-    completed_file_requests: after.completed_file_requests,
-  });
+  await expectFileRequestStateToRemainQuiescent(portal, after);
 });

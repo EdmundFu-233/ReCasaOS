@@ -114,11 +114,10 @@ exercise the production `NewIsolated` coordinator, systemd/cgroup sandbox,
 Caddy/Nginx, public DNS, HSTS, retail Chrome/Firefox, Safari/iOS, or a target
 host. It is not sufficient to close Issue #20 or enable public routing.
 The cancel smoke requires all three engines to report the local download as
-canceled to Playwright, and every authorized upstream request to reach a
+canceled to Playwright, and exactly one authorized upstream request to reach a
 terminal state within the 40-second test-harness deadline. Chromium and WebKit
-must additionally increment the upstream cancellation counter; Playwright
-Firefox need not classify any upstream request as canceled. That outcome is
-consistent with Mozilla
+must classify that request as canceled; Playwright Firefox may classify it as
+canceled or completed. That outcome is consistent with Mozilla
 [Bug 1825388](https://bugzilla.mozilla.org/show_bug.cgi?id=1825388), which
 covers a related Service Worker cancellation path, but does not establish the
 same root cause. The exception is only a no-retained-slot assertion; it is not

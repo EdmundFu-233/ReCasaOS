@@ -57,7 +57,7 @@ async function removeFirefoxProfile(profilePath, runnerTemp) {
   });
 }
 
-async function createTrustedFirefoxProfile(runnerTemp, certificateFile) {
+async function createTrustedFirefoxProfile(runnerTemp, caCertificateFile) {
   const profilePath = await mkdtemp(
     path.join(runnerTemp, 'recasaos-firefox-profile-'),
   );
@@ -92,7 +92,7 @@ async function createTrustedFirefoxProfile(runnerTemp, certificateFile) {
         '-t',
         'C,,',
         '-i',
-        certificateFile,
+        caCertificateFile,
       ],
       { timeout: 5_000 },
     );
@@ -104,6 +104,20 @@ async function createTrustedFirefoxProfile(runnerTemp, certificateFile) {
         database,
         '-n',
         'ReCasaOS ephemeral browser test CA',
+      ],
+      { timeout: 5_000 },
+    );
+    await execFileAsync(
+      'certutil',
+      [
+        '-V',
+        '-d',
+        database,
+        '-n',
+        'ReCasaOS ephemeral browser test CA',
+        '-u',
+        'L',
+        '-e',
       ],
       { timeout: 5_000 },
     );
@@ -134,12 +148,12 @@ async function launchIsolatedContext(browserName, playwright) {
   }
 
   const runnerTemp = requiredAbsoluteEnvironmentPath('RUNNER_TEMP');
-  const certificateFile = requiredAbsoluteEnvironmentPath(
-    'RECASAOS_BROWSER_CERTIFICATE',
+  const caCertificateFile = requiredAbsoluteEnvironmentPath(
+    'RECASAOS_BROWSER_CA_CERTIFICATE',
   );
   const profilePath = await createTrustedFirefoxProfile(
     runnerTemp,
-    certificateFile,
+    caCertificateFile,
   );
   try {
     const context = await playwright.firefox.launchPersistentContext(

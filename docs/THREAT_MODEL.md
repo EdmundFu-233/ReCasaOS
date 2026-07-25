@@ -178,11 +178,11 @@ basic public route-separation requirement, but these release gates remain:
   TLS verification, but it is only loopback handler/frontend evidence. It is
   not stable retail Chrome/Firefox/Safari, a real edge, production systemd,
   target-host, or transparent retry/resume evidence. Its cancellation smoke
-  requires every engine to report local cancellation to Playwright and every
-  authorized upstream request to reach a terminal state within the test-harness
-  deadline. Chromium and WebKit must additionally classify at least one
-  upstream request as canceled; Firefox need not classify any as canceled.
-  That outcome is consistent with Mozilla
+  requires every engine to report local cancellation to Playwright and exactly
+  one authorized upstream request to reach a terminal state within the
+  test-harness deadline. Chromium and WebKit must classify that request as
+  canceled; Firefox may classify it as canceled or completed. That outcome is
+  consistent with Mozilla
   [Bug 1825388](https://bugzilla.mozilla.org/show_bug.cgi?id=1825388), which
   remains open for a related Service Worker cancellation path, but does not
   establish the same root cause; that branch proves bounded fixture cleanup,
