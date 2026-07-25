@@ -73,7 +73,7 @@ if getent passwd recasaos-public >/dev/null ||
   fail "the recasaos-public account unexpectedly already exists"
 fi
 for required_tool in \
-  find getfacl mktemp mount mountpoint pgrep ss truncate umount
+  find getfacl mktemp mount mountpoint pgrep ps ss truncate umount
 do
   command -v "$required_tool" >/dev/null 2>&1 ||
     fail "required mount test tool is unavailable: $required_tool"
@@ -82,6 +82,8 @@ account_cleanup_authorized=1
 nested_mount_cleanup_required=0
 host_shm_sentinel_created=0
 slow_download_pids=()
+last_storage_worker_count=0
+max_storage_worker_count=0
 
 cleanup_problem() {
   printf 'public-files systemd test cleanup: %s\n' "$*" >&2
@@ -608,6 +610,11 @@ wait_until() {
       --unit="$socket_unit" --unit="$service_unit" >&2 || true
     sudo ss -H -ltnp 'sport = :39777' >&2 || true
   fi
+  case "$description" in
+    *storage\ worker* | *active\ worker*)
+      print_storage_worker_diagnostics
+      ;;
+  esac
   fail "timed out waiting for ${description}"
 }
 
@@ -854,7 +861,31 @@ storage_worker_count() {
 
 storage_worker_count_is() {
   local expected=$1
-  [[ "$(storage_worker_count)" == "$expected" ]]
+  local count
+  count="$(storage_worker_count)"
+  last_storage_worker_count=$count
+  if ((count > max_storage_worker_count)); then
+    max_storage_worker_count=$count
+  fi
+  [[ "$count" == "$expected" ]]
+}
+
+print_storage_worker_diagnostics() {
+  local client_pid
+  printf 'storage worker diagnostics: last=%s max=%s pids=%q\n' \
+    "$last_storage_worker_count" \
+    "$max_storage_worker_count" \
+    "$(storage_worker_pids)" >&2
+  sudo ps -o pid=,ppid=,stat=,etime=,args= --ppid "$portal_pid" >&2 || true
+  for client_pid in "${slow_download_pids[@]}"; do
+    if kill -0 "$client_pid" 2>/dev/null; then
+      printf 'slow download client %s: alive\n' "$client_pid" >&2
+    else
+      printf 'slow download client %s: exited\n' "$client_pid" >&2
+    fi
+  done
+  sudo journalctl --no-pager --output=short-monotonic --lines=80 \
+    --unit="$socket_unit" --unit="$service_unit" >&2 || true
 }
 
 start_slow_download() {
