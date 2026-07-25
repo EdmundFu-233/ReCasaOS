@@ -147,13 +147,8 @@ func validateServiceRuntimeCgroupLimits(path string) error {
 	if err := unix.Fstat(directoryFD, &directoryMetadata); err != nil {
 		return fmt.Errorf("cannot inspect the service cgroup limit directory: %w", err)
 	}
-	if directoryMetadata.Mode&unix.S_IFMT != unix.S_IFDIR {
-		return errors.New("service cgroup limit view is not a directory")
-	}
-	if directoryMetadata.Uid != 0 ||
-		directoryMetadata.Gid != 0 ||
-		directoryMetadata.Mode&0o222 != 0 {
-		return errors.New("service cgroup limit directory metadata is unsafe")
+	if err := validateServiceRuntimeCgroupLimitDirectoryMetadata(directoryMetadata); err != nil {
+		return err
 	}
 
 	mountInfo, err := readServiceRuntimeFile(
@@ -195,6 +190,27 @@ func validateServiceRuntimeCgroupLimits(path string) error {
 		); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func validateServiceRuntimeCgroupLimitDirectoryMetadata(metadata unix.Stat_t) error {
+	if metadata.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return errors.New("service cgroup limit view is not a directory")
+	}
+	// ValidateServiceRuntime has already proved that the service has a
+	// dedicated non-root identity and no capabilities. Host root remains a
+	// trusted boundary, so owner-write is safe; the service's group and other
+	// identities must not be able to replace entries below the pinned dirfd.
+	if metadata.Uid != 0 ||
+		metadata.Gid != 0 ||
+		metadata.Mode&0o022 != 0 {
+		return fmt.Errorf(
+			"service cgroup limit directory metadata is unsafe: uid=%d gid=%d mode=%#o",
+			metadata.Uid,
+			metadata.Gid,
+			metadata.Mode&0o7777,
+		)
 	}
 	return nil
 }

@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 const safeServiceRuntimeStatus = `Name:	recasaos-public
@@ -55,6 +57,69 @@ func TestValidateServiceRuntimeCgroupRejectsWeakenedBoundary(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			if err := validateServiceRuntimeCgroup([]byte(content)); err == nil {
 				t.Fatal("weakened cgroup boundary was accepted")
+			}
+		})
+	}
+}
+
+func TestValidateServiceRuntimeCgroupLimitDirectoryMetadata(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata unix.Stat_t
+		wantErr  bool
+	}{
+		{
+			name:     "root owned read only",
+			metadata: unix.Stat_t{Mode: unix.S_IFDIR | 0o555},
+		},
+		{
+			name:     "root owner writable",
+			metadata: unix.Stat_t{Mode: unix.S_IFDIR | 0o755},
+		},
+		{
+			name:     "group writable",
+			metadata: unix.Stat_t{Mode: unix.S_IFDIR | 0o775},
+			wantErr:  true,
+		},
+		{
+			name:     "other writable",
+			metadata: unix.Stat_t{Mode: unix.S_IFDIR | 0o757},
+			wantErr:  true,
+		},
+		{
+			name:     "world writable",
+			metadata: unix.Stat_t{Mode: unix.S_IFDIR | 0o777},
+			wantErr:  true,
+		},
+		{
+			name:     "sticky world writable",
+			metadata: unix.Stat_t{Mode: unix.S_IFDIR | 0o1777},
+			wantErr:  true,
+		},
+		{
+			name:     "service owned",
+			metadata: unix.Stat_t{Mode: unix.S_IFDIR | 0o555, Uid: 62001},
+			wantErr:  true,
+		},
+		{
+			name:     "service group",
+			metadata: unix.Stat_t{Mode: unix.S_IFDIR | 0o555, Gid: 62001},
+			wantErr:  true,
+		},
+		{
+			name:     "regular file",
+			metadata: unix.Stat_t{Mode: unix.S_IFREG | 0o444},
+			wantErr:  true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateServiceRuntimeCgroupLimitDirectoryMetadata(test.metadata)
+			if test.wantErr && err == nil {
+				t.Fatal("unsafe cgroup limit directory metadata was accepted")
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("safe cgroup limit directory metadata was rejected: %v", err)
 			}
 		})
 	}
