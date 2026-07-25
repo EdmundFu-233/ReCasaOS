@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import {
   expect,
   freshBearer,
@@ -294,7 +295,8 @@ test('native browser download preserves bytes and leaves no bearer residue', asy
   expect(after.credential_query_requests).toBe(0);
 });
 
-test('canceling a browser download releases the active request', async ({
+test('canceling a browser download reaches bounded terminal cleanup', async ({
+  browserName,
   page,
   portal,
 }) => {
@@ -316,11 +318,61 @@ test('canceling a browser download releases the active request', async ({
     failure === 'canceled',
     'Playwright must report an explicitly canceled download',
   ).toBe(true);
-  await waitForSnapshot(
+  const after = await waitForSnapshot(
     portal,
-    (snapshot) =>
-      snapshot.active_file_requests === 0 &&
-      snapshot.canceled_file_requests > before.canceled_file_requests,
-    'canceled native browser download cleanup',
+    (snapshot) => {
+      const authorizedDelta =
+        snapshot.authorized_file_requests -
+        before.authorized_file_requests;
+      const canceledDelta =
+        snapshot.canceled_file_requests -
+        before.canceled_file_requests;
+      const completedDelta =
+        snapshot.completed_file_requests -
+        before.completed_file_requests;
+      return (
+        snapshot.active_file_requests === 0 &&
+        authorizedDelta >= 1 &&
+        canceledDelta + completedDelta === authorizedDelta
+      );
+    },
+    'terminal native browser download cleanup',
+    40_000,
   );
+  const authorizedDelta =
+    after.authorized_file_requests - before.authorized_file_requests;
+  const canceledDelta =
+    after.canceled_file_requests - before.canceled_file_requests;
+  const completedDelta =
+    after.completed_file_requests - before.completed_file_requests;
+  expect(
+    canceledDelta + completedDelta,
+    'every authenticated browser request must reach one terminal state',
+  ).toBe(authorizedDelta);
+  expect(
+    authorizedDelta,
+    'the canceled browser download must use the authenticated endpoint',
+  ).toBeGreaterThanOrEqual(1);
+  if (browserName !== 'firefox') {
+    expect(
+      canceledDelta,
+      'Chromium and WebKit must propagate cancellation upstream',
+    ).toBeGreaterThanOrEqual(1);
+  }
+  await delay(1_000);
+  const quiescent = await readSnapshot(portal);
+  expect(
+    {
+      active_file_requests: quiescent.active_file_requests,
+      authorized_file_requests: quiescent.authorized_file_requests,
+      canceled_file_requests: quiescent.canceled_file_requests,
+      completed_file_requests: quiescent.completed_file_requests,
+    },
+    'the terminal file-request counters must remain quiescent',
+  ).toEqual({
+    active_file_requests: 0,
+    authorized_file_requests: after.authorized_file_requests,
+    canceled_file_requests: after.canceled_file_requests,
+    completed_file_requests: after.completed_file_requests,
+  });
 });
