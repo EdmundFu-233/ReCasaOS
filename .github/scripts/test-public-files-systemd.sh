@@ -2079,21 +2079,23 @@ systemd_test_gate_files="$(
 production_shared_build_inputs="$(
   printf '%s\n' "$production_build_inputs" |
     awk '
-      !(
-        $1 == "github.com/IceWhaleTech/CasaOS/pkg/publicfiles" &&
+      $1 == "github.com/IceWhaleTech/CasaOS/pkg/publicfiles" &&
         $2 == "GoFiles" &&
-        $3 ~ /^worker_systemd_test_gate_(disabled|enabled)_linux\.go$/
-      )
+        $3 ~ /^worker_systemd_test_gate_(disabled|enabled)_linux\.go$/ {
+        next
+      }
+      { print }
     '
 )"
 systemd_test_shared_build_inputs="$(
   printf '%s\n' "$systemd_test_build_inputs" |
     awk '
-      !(
-        $1 == "github.com/IceWhaleTech/CasaOS/pkg/publicfiles" &&
+      $1 == "github.com/IceWhaleTech/CasaOS/pkg/publicfiles" &&
         $2 == "GoFiles" &&
-        $3 ~ /^worker_systemd_test_gate_(disabled|enabled)_linux\.go$/
-      )
+        $3 ~ /^worker_systemd_test_gate_(disabled|enabled)_linux\.go$/ {
+        next
+      }
+      { print }
     '
 )"
 [[ -n "$production_shared_build_inputs" &&
