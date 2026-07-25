@@ -88,6 +88,23 @@ do
 done
 [[ -x /usr/bin/python3 ]] ||
   fail "required Python interpreter is unavailable: /usr/bin/python3"
+/usr/bin/python3 - \
+  "$repo_root/.github/scripts/test-public-files-systemd.sh" <<'PYTHON'
+from pathlib import Path
+import sys
+
+script = Path(sys.argv[1]).read_text(encoding="utf-8")
+start = "    /usr/bin/python3 -c '\n"
+end = "\n' \"$ready_file\" \"$worker_load_bytes\" 2>\"$failure_file\" &"
+if script.count(start) != 1 or script.count(end) != 1:
+    raise SystemExit("slow download holder sentinels are not unique")
+source = script.split(start, 1)[1].split(end, 1)[0]
+if "'" in source:
+    raise SystemExit(
+        "slow download holder contains a shell-breaking single quote"
+    )
+compile(source, "start_slow_download.py", "exec")
+PYTHON
 /usr/bin/python3 -c '
 import os
 import signal
@@ -1471,11 +1488,11 @@ try:
                     error_class = "truncated-bounded-error"
                 else:
                     error_class = {
-                        b'{"error":"storage capacity unavailable"}':
+                        b"{\"error\":\"storage capacity unavailable\"}":
                             "storage-capacity-unavailable",
-                        b'{"error":"download capacity reached"}':
+                        b"{\"error\":\"download capacity reached\"}":
                             "download-capacity-reached",
-                        b'{"error":"unable to open file"}':
+                        b"{\"error\":\"unable to open file\"}":
                             "unable-to-open-file",
                     }.get(bytes(body), "unrecognized-bounded-error")
         retry_after_5 = (
