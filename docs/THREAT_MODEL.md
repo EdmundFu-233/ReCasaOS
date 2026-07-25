@@ -172,7 +172,12 @@ basic public route-separation requirement, but these release gates remain:
 - the shared portal token is a capability, not per-user authorization or MFA;
 - Issue #20's browser-stream candidate still lacks the required real-HTTPS
   Chromium/Firefox/WebKit memory, filename, Range, retry/resume, cancellation,
-  restart, replay, logout, and rotation evidence;
+  restart, replay, logout, and rotation evidence. The repository's isolated
+  Ubuntu 24.04 browser smoke uses an ephemeral runner-trusted CA and the
+  Playwright-bundled Chromium, Firefox, and WebKit engines without disabling
+  TLS verification, but it is only loopback handler/frontend evidence. It is
+  not stable retail Chrome/Firefox/Safari, a real edge, production systemd,
+  target-host, or transparent retry/resume evidence;
 - stock Caddy needs a separate, reviewed request-rate limiting edge/WAF; the
   supplied Caddy example provides routing, header, TLS, and body-size controls
   but does not itself rate-limit requests;

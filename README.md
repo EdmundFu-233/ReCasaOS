@@ -92,6 +92,14 @@ authorized request the bearer necessarily passes through page, Worker,
 Authorization-header, edge, and server request memory. Stable
 Chromium/Firefox/WebKit HTTPS storage, log, crash, download, memory, retry,
 Range, cancellation, and filename tests remain release gates.
+The repository's browser smoke job is deliberately narrower: it runs the
+bundled Playwright Chromium, Firefox, and WebKit engines on Ubuntu 24.04
+against the real portal handler over loopback HTTPS, using an ephemeral CA
+installed into that disposable runner's trust stores. It does not disable TLS
+verification, record traces/HAR/video, receive production credentials, or run
+the production systemd service. Passing that job is useful frontend protocol
+evidence, but it is not stable Chrome/Firefox/Safari, proxy, target-host, or
+Internet-readiness evidence and does not close Issue #20.
 
 The portal also verifies the already-pinned root descriptor's Linux mount ID
 and filesystem type before it becomes available. Only ext2/3/4, XFS, Btrfs,
