@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/IceWhaleTech/CasaOS/pkg/publicfiles"
@@ -43,12 +44,33 @@ type publicFileHTTPServer interface {
 	Close() error
 }
 
+type acceptReadyListener struct {
+	net.Listener
+	accepting chan struct{}
+	once      sync.Once
+}
+
+func newAcceptReadyListener(listener net.Listener) *acceptReadyListener {
+	return &acceptReadyListener{
+		Listener:  listener,
+		accepting: make(chan struct{}),
+	}
+}
+
+func (l *acceptReadyListener) Accept() (net.Conn, error) {
+	l.once.Do(func() {
+		close(l.accepting)
+	})
+	return l.Listener.Accept()
+}
+
 type serveDependencies struct {
 	validateRuntime func() error
 	environ         func() []string
 	activationFiles func(bool) []*os.File
 	newPortal       func(publicfiles.Config) (publicFilePortal, error)
 	newServer       func(http.Handler) publicFileHTTPServer
+	notifyReady     func() error
 	shutdownTimeout time.Duration
 	connectionLimit int
 }
@@ -150,7 +172,7 @@ func validateAbsolutePath(value string, file bool) (string, error) {
 
 func runServe(ctx context.Context, config serveConfig, dependencies serveDependencies) error {
 	if dependencies.validateRuntime == nil || dependencies.environ == nil || dependencies.activationFiles == nil ||
-		dependencies.newPortal == nil || dependencies.newServer == nil {
+		dependencies.newPortal == nil || dependencies.newServer == nil || dependencies.notifyReady == nil {
 		return errors.New("public file service dependencies are incomplete")
 	}
 	if dependencies.shutdownTimeout <= 0 || dependencies.connectionLimit != maxActiveConnections {
@@ -189,10 +211,17 @@ func runServe(ctx context.Context, config serveConfig, dependencies serveDepende
 		_ = portal.Close()
 		return errors.New("initialize public file HTTP server: server is nil")
 	}
+	if ctx.Err() != nil {
+		if closeErr := portal.Close(); closeErr != nil {
+			return fmt.Errorf("close public file portal after cancellation before readiness: %w", closeErr)
+		}
+		return nil
+	}
 	limitedListener := netutil.LimitListener(listener, dependencies.connectionLimit)
+	readyListener := newAcceptReadyListener(limitedListener)
 	serveResult := make(chan error, 1)
 	go func() {
-		serveResult <- server.Serve(limitedListener)
+		serveResult <- server.Serve(readyListener)
 	}()
 
 	var (
@@ -200,6 +229,56 @@ func runServe(ctx context.Context, config serveConfig, dependencies serveDepende
 		serveReturned     bool
 		stoppedBeforeTerm bool
 	)
+	select {
+	case serveErr = <-serveResult:
+		serveReturned = true
+		closeErr := portal.Close()
+		if serveErr == nil {
+			if closeErr != nil {
+				return fmt.Errorf("public file HTTP server stopped before readiness without a result; portal cleanup failed: %w", closeErr)
+			}
+			return errors.New("public file HTTP server stopped before readiness without a result")
+		}
+		if closeErr != nil {
+			return fmt.Errorf("public file HTTP server failed before readiness: %w; portal cleanup failed: %v", serveErr, closeErr)
+		}
+		return fmt.Errorf("public file HTTP server failed before readiness: %w", serveErr)
+	case <-readyListener.accepting:
+	case <-ctx.Done():
+		if cleanupErr := stopUnreadyServer(server, portal, serveResult, dependencies.shutdownTimeout); cleanupErr != nil {
+			return fmt.Errorf("stop public file service after cancellation before readiness: %w", cleanupErr)
+		}
+		return nil
+	}
+	select {
+	case serveErr = <-serveResult:
+		serveReturned = true
+		closeErr := portal.Close()
+		if serveErr == nil {
+			if closeErr != nil {
+				return fmt.Errorf("public file HTTP server stopped before readiness notification without a result; portal cleanup failed: %w", closeErr)
+			}
+			return errors.New("public file HTTP server stopped before readiness notification without a result")
+		}
+		if closeErr != nil {
+			return fmt.Errorf("public file HTTP server stopped before readiness notification: %w; portal cleanup failed: %v", serveErr, closeErr)
+		}
+		return fmt.Errorf("public file HTTP server stopped before readiness notification: %w", serveErr)
+	default:
+	}
+	if ctx.Err() != nil {
+		if cleanupErr := stopUnreadyServer(server, portal, serveResult, dependencies.shutdownTimeout); cleanupErr != nil {
+			return fmt.Errorf("stop public file service after cancellation before readiness notification: %w", cleanupErr)
+		}
+		return nil
+	}
+	if err := dependencies.notifyReady(); err != nil {
+		cleanupErr := stopUnreadyServer(server, portal, serveResult, dependencies.shutdownTimeout)
+		if cleanupErr != nil {
+			return fmt.Errorf("notify service readiness: %w; cleanup failed: %v", err, cleanupErr)
+		}
+		return fmt.Errorf("notify service readiness: %w", err)
+	}
 	select {
 	case serveErr = <-serveResult:
 		serveReturned = true
@@ -245,6 +324,31 @@ func runServe(ctx context.Context, config serveConfig, dependencies serveDepende
 		return fmt.Errorf("public file HTTP server stopped before termination was requested: %w", serveErr)
 	}
 	return nil
+}
+
+func stopUnreadyServer(
+	server publicFileHTTPServer,
+	portal publicFilePortal,
+	serveResult <-chan error,
+	timeout time.Duration,
+) error {
+	closeErr := server.Close()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	var serveErr error
+	select {
+	case serveErr = <-serveResult:
+	case <-timer.C:
+		return errors.Join(closeErr, errors.New("HTTP server did not stop after readiness failure"))
+	}
+	portalErr := portal.Close()
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		serveErr = fmt.Errorf("HTTP server cleanup result: %w", serveErr)
+	} else {
+		serveErr = nil
+	}
+	return errors.Join(closeErr, serveErr, portalErr)
 }
 
 func rejectLegacyConfigurationEnvironment(environment []string) error {

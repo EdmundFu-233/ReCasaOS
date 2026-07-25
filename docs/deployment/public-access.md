@@ -21,12 +21,14 @@ in the examples are placeholders. A specific host remains unverified until an
 operator completes and records every applicable acceptance test below.
 
 Verifier-only provisioning removes the raw bearer from the server filesystem.
-The listener has also moved into a separate non-root, socket-activated service,
-so its lifecycle no longer shares the privileged management daemon. That first
-split is not the full blocking-I/O boundary:
+systemd owns the dedicated loopback listener, while its request handler runs in
+a separate non-root, socket-activated service whose lifecycle no longer shares
+the privileged management daemon. The standalone coordinator delegates
+bootstrap, list, open, and read operations to bounded same-binary workers and
+retains no readable share file. This is the candidate blocking-I/O boundary, but
 [Issue #25](https://github.com/EdmundFu-233/ReCasaOS/issues/25) remains a
-production public-readiness blocker until filesystem operations use bounded
-killable workers and the hung-storage matrix passes.
+production public-readiness blocker until exact-head Linux CI and the real
+hung-storage matrix prove the implementation.
 
 The portal is deliberately limited:
 
@@ -39,6 +41,9 @@ The portal is deliberately limited:
   `NO_SYMLINKS`, `NO_MAGICLINKS`, and `NO_XDEV`;
 - pinned-descriptor `statx` mount identity and `fstatfs` type checks before the
   portal is returned, with no unrestricted filesystem fallback;
+- at most eight active storage workers, fixed operation deadlines, pidfd-based
+  termination, and admission quarantine for killed children that cannot be
+  reaped;
 - no hidden files, symlinks, hard-linked files, devices, sockets, pipes, or
   mount-boundary traversal;
 - bounded directory listings, strict browser CSP, no-store responses, and no
@@ -124,8 +129,8 @@ independent administrator workstation, keep its durable copy only in a password
 manager, and send only its verifier as deployment material. The portal still
 receives the raw bearer transiently in each authorized request header.
 Completing this credential migration and staging the independent service does
-not make a host public-ready; Issue #25 and the target-host acceptance matrix
-remain open.
+not make a host public-ready; Issue #25's real hung-storage evidence and the
+complete target-host acceptance matrix remain open.
 
 Use a dedicated directory containing only files approved for public download.
 Do not point it at a home directory, `/DATA`, an application-data tree, backup
@@ -150,15 +155,24 @@ reveal underlying files that the host submount normally covers. These checks
 occur before a usable Portal or download-slot pool is returned. They prevent a
 known network/FUSE root from entering the request path, but they do not make local
 kernel or block-device I/O interruptible: a bad disk, remote block device, or
-kernel fault can still block, and even the initial startup open can wait on a
-path whose kernel lookup is already hung. Filesystem classification itself can
-also wait for a broken userspace filesystem daemon. There is no claimed startup
-hard timeout. Host storage and the mount namespace remain trusted operator
-boundaries. This is a staged control for
+kernel fault can still block a worker. Bootstrap has a 12-second coordinator
+deadline, and the packaged `Type=notify` service has a 30-second startup
+deadline, but those deadlines cannot physically complete a child already stuck
+in uninterruptible kernel sleep. The parent kills timed-out workers through an
+atomically acquired pidfd, quarantines an unreaped child, stops new admission
+once four such children are retained, and relies on the unit-wide `TasksMax=256`,
+`MemoryMax=512M`, disabled swap, and `KillMode=control-group` as final bounds.
+If pidfd signaling returns an error other than ESRCH, the coordinator closes
+all later worker admission and keeps the active slot until the child is reaped;
+it never risks signaling a reused numeric PID.
+Up to eight request workers may already be active when three older quarantined
+workers exist, so one coordinator generation can retain eleven children. Host
+storage and the mount namespace remain trusted operator boundaries. This is a
+staged control for
 [Issue #22](https://github.com/EdmundFu-233/ReCasaOS/issues/22), not proof that
 the isolated portal process can safely contain every blocking storage failure.
-The management daemon no longer runs the handler, but moving every filesystem
-operation into bounded killable workers remains required by
+The bounded worker protocol is implemented, but its real FUSE, device-mapper,
+D-state, restart, and resource-headroom evidence remains required by
 [Issue #25](https://github.com/EdmundFu-233/ReCasaOS/issues/25).
 
 Privileged bind, tmpfs, and loopback filesystem regressions run only in a
@@ -264,17 +278,43 @@ finish, the host is in a maintenance migration state and is not public-ready.
 
 ## 2. Stage the isolated service with public routing disabled
 
-The standalone service requires Linux 5.8 or newer and systemd 247 or newer.
-`LoadCredential=` is available at that systemd baseline. The packaged unit
-intentionally uses `${CREDENTIALS_DIRECTORY}` in `ExecStart`; the shorter `%d`
+The standalone service requires Linux 5.8 or newer, systemd 247 or newer, and
+the unified cgroup v2 hierarchy with effective `memory` and `pids` controllers.
+`MemorySwapMax=0` is not an enforceable boundary on cgroup v1, so both the
+service and socket fail their conditions before activation unless the required
+cgroup v2 controller files exist. The service unit then exposes only its own
+`memory.max`, `memory.swap.max`, and `pids.max` files as three separate
+read-only mounts below `/run/recasaos-cgroup` inside the jail. Before loading
+the verifier, the process requires exact `/system.slice/recasaos-public-files.service`
+membership and cross-checks each open file's mount ID against `/proc/self/mountinfo`,
+its exact service-cgroup source, the cgroup2 filesystem, the read-only mount
+flag, and the reviewed value. `LoadCredential=` is available at the systemd
+baseline. The packaged unit intentionally uses
+`${CREDENTIALS_DIRECTORY}` in `ExecStart`; the shorter `%d`
 credential-directory specifier was added later and must not be substituted
 while systemd 247 remains supported. The staging checker accommodates
 `systemd-analyze`'s host-path executable check with a disposable unit copy; the
 production `ExecStart` remains byte-locked and the live activation gate proves
 the executable inside `RootDirectory=`. Both the service and socket require a
 non-empty verifier and independently reject a verifier-path symlink before
-activation, so an unsafe verifier state cannot leave the loopback listener
-bound.
+their initial activation, so either condition prevents the socket from binding
+when it is already unsafe at that point. A non-empty malformed verifier, or a
+verifier changed after socket activation, instead makes service bootstrap and
+readiness fail but does not automatically unbind systemd's existing socket.
+Keep edge routing and health publication disabled, stop both units, reprovision
+the verifier, and repeat the activation tests before treating that listener as
+usable.
+
+> **Compatibility qualification status:** the systemd 247 floor is
+> source-reviewed but has not been execution-qualified. The current GitHub
+> integration runs on Ubuntu 24.04/systemd 255 and does not satisfy that floor.
+> Keep Issue #25 open, and do not enable public routing on a systemd 247 host,
+> until the exact release candidate passes under PID 1 on a pristine,
+> ephemeral Debian 11/systemd 247 VM with unified cgroup v2. That run must
+> exercise the three read-only effective-limit binds, readiness, restart,
+> cancellation, cleanup, and version-appropriate resource-headroom checks.
+> Debian 11 is a compatibility target, not a recommended new deployment
+> platform.
 
 Check the actual target before installing anything:
 
@@ -293,7 +333,17 @@ Check the actual target before installing anything:
   kernel_major="${BASH_REMATCH[1]}"
   kernel_minor="${BASH_REMATCH[2]}"
   (( kernel_major > 5 || (kernel_major == 5 && kernel_minor >= 8) ))
-  printf 'reviewed prerequisites: systemd-binary=%s manager=%s kernel=%s\n' \
+  [[ "$(stat -fc %T /sys/fs/cgroup)" == cgroup2fs ]]
+  for controller_file in \
+    cgroup.controllers memory.max memory.swap.max pids.max
+  do
+    [[ -f "/sys/fs/cgroup/$controller_file" ]]
+  done
+  controllers=" $(< /sys/fs/cgroup/cgroup.controllers) "
+  [[ "$controllers" == *" memory "* ]]
+  [[ "$controllers" == *" pids "* ]]
+  printf \
+    'reviewed prerequisites: systemd-binary=%s manager=%s kernel=%s cgroup=v2\n' \
     "$systemd_version" "$manager_version" "$kernel_version"
 )
 ```
@@ -545,8 +595,20 @@ groups, capabilities, a permissive umask, missing `NoNewPrivileges`, missing
 seccomp, every old `RECASAOS_PUBLIC_FILE_*` environment setting, and any
 unknown or incomplete CLI.
 
+The service uses `Type=notify` with `NotifyAccess=main`. It sends `READY=1` only
+after the bootstrap worker has returned a validated verifier digest and pinned
+root and the HTTP server has entered the inherited listener's accept loop.
+Cancellation, server failure, or notification failure before readiness stops
+the server and closes the portal rather than publishing a false-ready state.
+The coordinator's per-process `LimitNOFILE=512`, each worker's smaller
+per-process descriptor limit, and the unit-wide `TasksMax=256`,
+`MemoryMax=512M`, `MemorySwapMax=0`, and `KillMode=control-group` are part of
+the reviewed worker-containment boundary; they do not replace the target-host
+hung-storage tests.
+
 The packaged service uses a minimal `RootDirectory=`, exposes the share only as
-the read-only `/srv/public`, imports the verifier through `LoadCredential=`,
+the read-only `/srv/public`, exposes only the three read-only effective cgroup
+limit files described above, imports the verifier through `LoadCredential=`,
 has a private network namespace, permits creation of only AF_UNIX sockets, and
 has an empty capability bounding set. Its `InaccessiblePaths=` and
 `ReadOnlyPaths=` entries use systemd's `+` prefix so the masks apply inside
@@ -609,12 +671,15 @@ operations but exits nonzero:
 )
 ```
 
-Rollback must not restore the retired root-daemon drop-in. The first process
-split prevents public-service lifecycle failures from stopping the privileged
-management daemon, but the long-lived public process still performs filesystem
-open, list, read, and seek operations. Issue #25 therefore remains open until
-those operations use a bounded killable-worker protocol and hung-storage tests
-pass.
+Rollback must not restore the retired root-daemon drop-in. The process split
+prevents public-service lifecycle failures from stopping the privileged
+management daemon, and the standalone coordinator delegates share filesystem
+operations to bounded disposable workers. Stopping the coordinator aborts
+active workers, and `KillMode=control-group` cleans normally killable
+descendants; a worker stuck in uninterruptible D-state can nevertheless outlive
+the coordinator or a stop attempt. Issue #25 remains open until exact-head
+Linux and hostile-storage tests prove timeout, quarantine, cgroup cleanup,
+restart, cancellation, operator recovery, and resource-headroom behavior.
 
 ### Rotate, verify, and roll back
 
@@ -908,13 +973,14 @@ token in the URL. Also verify:
 | TLS | Trusted chain and hostname; TLS 1.2/1.3; renewal tested and monitored. |
 | Authentication | Missing, malformed, duplicate, wrong, and query-string tokens fail without revealing why. After atomic verifier publication and a controlled restart, the old bearer returns 401 and the new bearer returns 200. |
 | Credential isolation | The raw `rc1_` bearer was generated off-host, its only durable operator copy is in the password manager, and the host provisions only the exact versioned verifier through `recasaos-public-file-verifier`; authorized requests still place the bearer transiently in edge and portal memory. `LimitCORE=0` is active. Missing or malformed verifier input and every non-empty legacy `RECASAOS_PUBLIC_FILE_*` environment setting fail startup. Bidirectional bind-alias and rollback tests fail closed. |
-| Process isolation | The Internet-facing socket and service run under the dedicated non-root `recasaos-public` identity, have no capability or CasaOS-service dependency, cannot create IP sockets, see only the minimal root plus read-only share and credential, and can fail/restart without changing the management daemon PID or health. The current staged service passes that lifecycle split but still performs filesystem work in its long-lived process; Issue #25 and this row remain open until bounded killable workers and hung-storage tests pass. |
+| Process isolation | systemd owns the Internet-facing loopback socket; the coordinator and workers run under the dedicated non-root `recasaos-public` identity, have no capability or CasaOS-service dependency, cannot create IP sockets, see only the minimal root, read-only share, credential, and three read-only effective cgroup limit files, and can fail/restart without changing the management daemon PID or health. Before loading the credential, the coordinator proves exact service cgroup membership and the source, mount identity, filesystem, read-only flag, and value of all three limit files. It becomes nondumpable; its retained storage and authentication state is limited to the verifier digest, an `O_PATH` root descriptor, fixed mount metadata, and bounded worker-manager state. It reports readiness only after bootstrap and HTTP accept. Bootstrap, list, open, classification, and read run in same-binary workers which inherit neither the AF_INET listener nor raw bearer. At most eight workers are active. Pre-response overload and list/open timeout return 503 with `Retry-After`; a mid-stream read timeout aborts the response connection because its success headers are already committed. Pidfd cancellation and `KillMode=control-group` clean normally killable children. A non-ESRCH pidfd signaling error closes later admission without a numeric-PID fallback. This row and Issue #25 remain open until real hostile-storage and target-host tests prove D-state admission control, unit resource bounds, restart, and recovery. |
+| Platform floor | The exact release candidate passes under PID 1 on a pristine, ephemeral Debian 11/systemd 247 host with Linux 5.8 or newer and unified cgroup v2. Record the manager and kernel versions, the three cgroup-control-file mount identities, cgroup2/read-only provenance, effective values, readiness, restart, cancellation, cleanup, and version-appropriate resource-headroom evidence. Ubuntu 24.04-only, parser-only, or ordinary-container evidence does not satisfy this row. |
 | Path confinement | Absolute/parent/encoded traversal, hidden names, symlinks, hardlinks, mount points, devices, pipes, and sockets cannot be listed or downloaded. |
 | Root filesystem | Startup records the mount ID and allowlisted filesystem type from the pinned root FD. FUSE, network, overlay, ZFS, and unknown roots are rejected before the listener is usable; replacing or remounting the configured pathname does not redirect the live portal away from its original descriptor. |
 | Browser boundary | CSP has no inline/eval allowance; the supplied client is designed not to write the bearer to a URL, Referer, history, cookie, Cache API, Web Storage, or IndexedDB, while page, Worker, header, edge, and server request memory remain transient handling boundaries. In stable Chromium, Firefox, and WebKit over real HTTPS, verify storage, DevTools, proxy/application logs, and crash artifacts do not retain it; verify a large download starts without full-body buffering and preserves bytes/filename; replay, another tab, Worker restart, logout, rotation, redirect, and malformed messages fail closed. Record memory measurements and initial Range, retry/resume, and cancellation results. |
 | Response handling | GET, HEAD, and one byte range work, including offsets above 4 GiB; multi-range work is rejected; 401/404/416/503 and successful private-file responses retain `no-store` and `nosniff`. A progressing transfer can cross the base write timeout, while idle and below-budget clients are terminated. |
 | Client cancellation | After a large response starts, abort the client and verify that the chosen edge promptly closes its loopback upstream request and releases portal download capacity. Test both HTTP/1.1 and HTTP/2 at the public edge when both are enabled. |
-| Resource bounds | Oversized directory and request-body tests fail; slow clients do not exhaust all edge connections. Nginx rate/connection limits or the separately reviewed Caddy-fronting limiter are exercised. |
+| Resource bounds | Eight concurrent storage workers succeed while a ninth request returns 503 with `Retry-After`; `TasksCurrent` and `MemoryCurrent` remain below the reviewed unit headroom. Record `MemoryPeak` when the manager exposes it; systemd 247 instead requires separately reviewed guest-side peak sampling or equivalent version-appropriate evidence, and the missing property is not itself a pass. Workers expose neither the AF_INET listener nor raw bearer, all non-stdio descriptors are close-on-exec, and normally killable workers are reaped after cancellation and coordinator SIGKILL. Injected pidfd-signaling failure must close admission and retain capacity until reap. Real FUSE and device-mapper D-state cases must additionally prove that the four-worker quarantine admission threshold, `TasksMax=256`, `MemoryMax=512M`, `MemorySwapMax=0`, restart behavior, and operator recovery remain bounded. `LimitNOFILE` and worker RLIMITs are per-process rather than an aggregate cgroup FD cap. Oversized directory and request-body tests fail; Nginx rate/connection limits or the separately reviewed Caddy-fronting limiter are exercised. |
 | Logs | No bearer, verifier, query, private host path, file content, cookie, or personal data appears in edge/application logs or crash artifacts. Because Caddy/Nginx runtime errors may include the URI/query independently of access-log formatting, an exact-version filter or reviewed disable/drop policy is active and fault injection proves upstream failures, timeouts, aborts, malformed requests, and TLS/routing errors remain query-free in every collected sink. Without that evidence this row fails. |
 | Backups | Share and configuration can be restored to an isolated host with recorded checksums and acceptable RPO/RTO. |
 

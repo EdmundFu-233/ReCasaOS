@@ -3,11 +3,19 @@ Description=ReCasaOS isolated public-file portal
 ConditionPathIsDirectory=/srv/recasaos-public
 ConditionFileNotEmpty=/etc/recasaos/public-file.verifier
 ConditionPathIsSymbolicLink=!/etc/recasaos/public-file.verifier
+# MemorySwapMax is effective only on the unified hierarchy. Refuse to start or
+# bind the public listener unless the host exposes the exact cgroup-v2 memory
+# and pids controller files required by the worker-containment boundary.
+ConditionPathExists=/sys/fs/cgroup/cgroup.controllers
+ConditionPathExists=/sys/fs/cgroup/memory.max
+ConditionPathExists=/sys/fs/cgroup/memory.swap.max
+ConditionPathExists=/sys/fs/cgroup/pids.max
 StartLimitIntervalSec=2min
 StartLimitBurst=5
 
 [Service]
-Type=exec
+Type=notify
+NotifyAccess=main
 User=recasaos-public
 Group=recasaos-public
 SupplementaryGroups=
@@ -22,6 +30,12 @@ MountAPIVFS=yes
 # reject them. A non-recursive bind could expose files hidden below a host
 # mountpoint as ordinary same-mount content inside the service.
 BindReadOnlyPaths=/srv/recasaos-public:/srv/public:rbind
+# Expose only this unit's three effective cgroup-v2 limit files at fixed paths
+# inside the jail. The process validates each mount's cgroup source, identity,
+# read-only flag, and exact value before it loads the public credential.
+BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.max:/run/recasaos-cgroup/memory.max:norbind
+BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.swap.max:/run/recasaos-cgroup/memory.swap.max:norbind
+BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/pids.max:/run/recasaos-cgroup/pids.max:norbind
 LoadCredential=recasaos-public-file-verifier:/etc/recasaos/public-file.verifier
 
 # systemd 247 supports $CREDENTIALS_DIRECTORY expansion in ExecStart. The %d
@@ -70,16 +84,21 @@ RemoveIPC=yes
 # on it. In particular, do not add DynamicUser= or RestrictSUIDSGID= here.
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-SystemCallFilter=~@clock @cpu-emulation @debug @keyring @module @mount @obsolete @privileged @raw-io @reboot @swap memfd_create
+SystemCallFilter=~@clock @cpu-emulation @debug @keyring @module @mount @obsolete @privileged @raw-io @reboot @swap clone3 memfd_create
 SystemCallErrorNumber=EPERM
 
 LimitCORE=0
 LimitNOFILE=512
-TasksMax=128
-MemoryMax=256M
+# One coordinator generation can retain eight active plus three previously
+# quarantined workers before admission closes. TasksMax and MemoryMax are the
+# final unit-wide bounds, including any unkillable remnants from an older
+# restart generation. Each child has RLIMIT_AS=1GiB and GOMAXPROCS=1, while
+# GOMEMLIMIT=24MiB remains only a soft runtime budget.
+TasksMax=256
+MemoryMax=512M
 MemorySwapMax=0
 CPUQuota=100%
-TimeoutStartSec=15s
+TimeoutStartSec=30s
 TimeoutStopSec=10s
 KillMode=control-group
 Restart=on-failure

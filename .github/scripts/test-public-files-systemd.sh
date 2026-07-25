@@ -72,13 +72,16 @@ if getent passwd recasaos-public >/dev/null ||
   getent group recasaos-public >/dev/null; then
   fail "the recasaos-public account unexpectedly already exists"
 fi
-for required_tool in getfacl mktemp mount mountpoint umount; do
+for required_tool in \
+  find getfacl mktemp mount mountpoint pgrep ss truncate umount
+do
   command -v "$required_tool" >/dev/null 2>&1 ||
     fail "required mount test tool is unavailable: $required_tool"
 done
 account_cleanup_authorized=1
 nested_mount_cleanup_required=0
 host_shm_sentinel_created=0
+slow_download_pids=()
 
 cleanup_problem() {
   printf 'public-files systemd test cleanup: %s\n' "$*" >&2
@@ -90,6 +93,7 @@ cleanup_stop_unit() {
   local load_state
   local active_state
   local command_status
+  local stop_status
 
   load_state="$(
     sudo systemctl show --property=LoadState --value "$unit"
@@ -98,11 +102,11 @@ cleanup_stop_unit() {
   if [[ "$command_status" != 0 ]]; then
     cleanup_problem \
       "could not query $unit before stopping it (status $command_status)"
-    return
+    return 1
   fi
   if [[ -z "$load_state" ]]; then
     cleanup_problem "systemd returned an empty LoadState for $unit"
-    return
+    return 1
   fi
 
   active_state="$(
@@ -112,23 +116,23 @@ cleanup_stop_unit() {
   if [[ "$command_status" != 0 ]]; then
     cleanup_problem \
       "could not query $unit state before stopping it (status $command_status)"
-    return
+    return 1
   fi
   if [[ -z "$active_state" ]]; then
     cleanup_problem "systemd returned an empty ActiveState for $unit"
-    return
+    return 1
   fi
   if [[ "$load_state" == not-found && "$active_state" == inactive ]]; then
-    return
+    return 0
   fi
-  if [[ "$active_state" == inactive || "$active_state" == failed ]]; then
-    return
+  if [[ "$active_state" == inactive ]]; then
+    return 0
   fi
 
   sudo systemctl stop "$unit" >/dev/null
-  command_status=$?
-  if [[ "$command_status" != 0 ]]; then
-    cleanup_problem "could not stop $unit (status $command_status)"
+  stop_status=$?
+  if [[ "$stop_status" != 0 ]]; then
+    cleanup_problem "could not stop $unit (status $stop_status)"
   fi
 
   active_state="$(
@@ -138,12 +142,97 @@ cleanup_stop_unit() {
   if [[ "$command_status" != 0 ]]; then
     cleanup_problem \
       "could not verify $unit after stopping it (status $command_status)"
-    return
+    return 1
   fi
   if [[ "$active_state" != inactive && "$active_state" != failed ]]; then
     cleanup_problem \
       "$unit remains in ActiveState=${active_state:-unknown} after stop"
+    return 1
   fi
+  [[ "$stop_status" == 0 ]] || return 1
+  return 0
+}
+
+cleanup_unit_cgroup_is_empty() {
+  local unit=$1
+  local recorded_control_group=${2-}
+  local control_group
+  local command_status
+  local cgroup_path
+  local populated
+  local remaining_pids
+
+  if [[ "$#" == 2 ]]; then
+    control_group=$recorded_control_group
+  else
+    control_group="$(
+      sudo systemctl show --property=ControlGroup --value "$unit"
+    )"
+    command_status=$?
+    if [[ "$command_status" != 0 ]]; then
+      cleanup_problem \
+        "could not query $unit cgroup before cleanup (status $command_status)"
+      return 1
+    fi
+  fi
+  if [[ -z "$control_group" ]]; then
+    return 0
+  fi
+  case "$control_group" in
+    /*)
+      if [[ "$control_group" == *"/../"* ||
+        "$control_group" == */.. ||
+        "$control_group" == *$'\n'* ]]; then
+        cleanup_problem "refusing unsafe $unit cgroup path: $control_group"
+        return 1
+      fi
+      ;;
+    *)
+      cleanup_problem "refusing non-absolute $unit cgroup path: $control_group"
+      return 1
+      ;;
+  esac
+  cgroup_path="/sys/fs/cgroup${control_group}"
+  if [[ ! -e "$cgroup_path" ]]; then
+    return 0
+  fi
+  if [[ ! -f "$cgroup_path/cgroup.events" ||
+    ! -f "$cgroup_path/cgroup.procs" ]]; then
+    cleanup_problem "$unit cgroup has no inspectable v2 process state"
+    return 1
+  fi
+  populated="$(
+    sudo awk '$1 == "populated" { count++; value = $2 }
+      END {
+        if (count != 1 || (value != 0 && value != 1))
+          exit 1
+        print value
+      }' "$cgroup_path/cgroup.events"
+  )"
+  command_status=$?
+  if [[ "$command_status" != 0 ]]; then
+    cleanup_problem "could not validate $unit cgroup populated state"
+    return 1
+  fi
+  remaining_pids="$(
+    sudo awk 'NF {
+      if (seen)
+        printf ","
+      printf "%s", $1
+      seen = 1
+    }' "$cgroup_path/cgroup.procs"
+  )"
+  command_status=$?
+  if [[ "$command_status" != 0 ]]; then
+    cleanup_problem "could not inspect $unit cgroup processes"
+    return 1
+  fi
+  if [[ "$populated" != 0 || -n "$remaining_pids" ]]; then
+    cleanup_problem \
+      "$unit cgroup remains populated after stop (pids: ${remaining_pids:-descendant-subgroup})"
+    return 1
+  fi
+  return 0
 }
 
 cleanup_reset_failed_unit() {
@@ -277,16 +366,88 @@ cleanup_account_entry() {
   esac
 }
 
+cleanup_background_downloads() {
+  local pid
+  for pid in "${slow_download_pids[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+  done
+  for pid in "${slow_download_pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+  slow_download_pids=()
+}
+
+cleanup_public_port_is_unbound() {
+  local listener_count
+  local command_status
+
+  listener_count="$(
+    sudo ss -H -ltn 'sport = :39777' |
+      awk 'END { print NR + 0 }'
+  )"
+  command_status=$?
+  if [[ "$command_status" != 0 ]]; then
+    cleanup_problem \
+      "could not inspect TCP port 39777 before destructive cleanup (status $command_status)"
+    return 1
+  fi
+  if [[ ! "$listener_count" =~ ^[0-9]+$ ]]; then
+    cleanup_problem \
+      "received an invalid TCP port 39777 listener count: ${listener_count:-empty}"
+    return 1
+  fi
+  if [[ "$listener_count" != 0 ]]; then
+    cleanup_problem \
+      "TCP port 39777 remains bound by $listener_count listener(s)"
+    sudo ss -H -ltnp 'sport = :39777' >&2 || true
+    return 1
+  fi
+  return 0
+}
+
 cleanup() {
   status=$?
   cleanup_failed=0
   workspace_removal_safe=1
+  cleanup_state_safe=1
+  declare -A cleanup_control_groups=()
   trap - EXIT
   set +e
 
+  cleanup_background_downloads
   for unit in "$socket_unit" "$service_unit" "$sentinel_unit"; do
-    cleanup_stop_unit "$unit"
+    cleanup_control_groups["$unit"]="$(
+      sudo systemctl show --property=ControlGroup --value "$unit"
+    )"
+    command_status=$?
+    if [[ "$command_status" != 0 ]]; then
+      cleanup_problem \
+        "could not record $unit cgroup before stopping it (status $command_status)"
+      cleanup_state_safe=0
+      cleanup_control_groups["$unit"]=
+    fi
   done
+  for unit in "$socket_unit" "$service_unit" "$sentinel_unit"; do
+    if ! cleanup_stop_unit "$unit"; then
+      cleanup_state_safe=0
+    fi
+  done
+  for unit in "$socket_unit" "$service_unit" "$sentinel_unit"; do
+    if ! cleanup_unit_cgroup_is_empty \
+      "$unit" "${cleanup_control_groups[$unit]}"; then
+      cleanup_state_safe=0
+    fi
+  done
+  if ! cleanup_public_port_is_unbound; then
+    cleanup_state_safe=0
+  fi
+  if [[ "$cleanup_state_safe" != 1 ]]; then
+    cleanup_problem \
+      "retaining units, mounts, workspace, and account because stopped state, empty cgroups, and an unbound TCP port were not all proven"
+    exit 1
+  fi
 
   for unit_path in \
     "$override_path" \
@@ -457,6 +618,38 @@ require_unit_property() {
   actual="$(sudo systemctl show --property="$property" --value "$unit")"
   [[ "$actual" == "$expected" ]] ||
     fail "$unit property $property is $actual, want $expected"
+}
+
+assert_service_cgroup_limits() {
+  local control_group
+  local cgroup_path
+  local controllers
+  local memory_max
+  local memory_swap_max
+  local pids_max
+
+  control_group="$(
+    sudo systemctl show --property=ControlGroup --value "$service_unit"
+  )"
+  [[ "$control_group" == "/system.slice/$service_unit" ]] ||
+    fail "service is in unexpected cgroup: $control_group"
+  cgroup_path="/sys/fs/cgroup${control_group}"
+  [[ -f "$cgroup_path/cgroup.controllers" ]] ||
+    fail "service cgroup has no v2 controller file"
+  controllers=" $(<"$cgroup_path/cgroup.controllers") "
+  [[ "$controllers" == *" memory "* ]] ||
+    fail "memory controller is unavailable to the service cgroup"
+  [[ "$controllers" == *" pids "* ]] ||
+    fail "pids controller is unavailable to the service cgroup"
+  memory_max="$(<"$cgroup_path/memory.max")"
+  memory_swap_max="$(<"$cgroup_path/memory.swap.max")"
+  pids_max="$(<"$cgroup_path/pids.max")"
+  [[ "$memory_max" == 536870912 ]] ||
+    fail "effective memory.max is $memory_max, want 536870912"
+  [[ "$memory_swap_max" == 0 ]] ||
+    fail "effective memory.swap.max is $memory_swap_max, want 0"
+  [[ "$pids_max" == 256 ]] ||
+    fail "effective pids.max is $pids_max, want 256"
 }
 
 assert_systemd_credential_for_pid() {
@@ -644,6 +837,39 @@ service_has_new_pid() {
     "$current_pid" != "$portal_pid" ]]
 }
 
+storage_worker_pids() {
+  sudo pgrep -P "$portal_pid" -f -- \
+    '--internal-public-files-storage-worker (list|file)' 2>/dev/null || true
+}
+
+storage_worker_count() {
+  local pids
+  pids="$(storage_worker_pids)"
+  if [[ -z "$pids" ]]; then
+    printf '0\n'
+  else
+    printf '%s\n' "$pids" | awk 'NF { count++ } END { print count + 0 }'
+  fi
+}
+
+storage_worker_count_is() {
+  local expected=$1
+  [[ "$(storage_worker_count)" == "$expected" ]]
+}
+
+start_slow_download() {
+  printf 'Authorization: Bearer %s\n' "$test_bearer" |
+    curl -q -sS --http1.1 --limit-rate 1K --max-time 120 \
+      -H @- \
+      'http://127.0.0.1:39777/public-files/api/file?path=worker-load.bin' \
+      -o /dev/null 2>/dev/null &
+  slow_download_pids+=("$!")
+}
+
+process_is_gone() {
+  [[ ! -e "/proc/$1" ]]
+}
+
 sentinel_is_unchanged() {
   current_pid="$(sudo systemctl show --property=MainPID --value "$sentinel_unit")"
   current_invocation="$(
@@ -668,6 +894,12 @@ sudo install -d -o root -g root -m 0755 \
   "$rootfs" "$rootfs/usr" "$rootfs/usr/bin" "$rootfs/srv" \
   "$rootfs/proc" "$rootfs/sys" "$rootfs/dev" "$rootfs/run" \
   "$rootfs/tmp" "$rootfs/var" "$rootfs/var/tmp"
+sudo install -d -o root -g root -m 0555 \
+  "$rootfs/run/recasaos-cgroup"
+for cgroup_limit_file in memory.max memory.swap.max pids.max; do
+  sudo install -o root -g root -m 0000 /dev/null \
+    "$rootfs/run/recasaos-cgroup/$cgroup_limit_file"
+done
 
 sudo systemd-sysusers \
   "$repo_root/build/sysroot/usr/lib/sysusers.d/recasaos-public-files.conf"
@@ -680,16 +912,19 @@ sudo install -d -o root -g recasaos-public -m 0750 \
   "$share" "$nested_backing" "$nested_mount" "$rootfs/srv/public"
 printf 'systemd isolation fixture\n' |
   sudo tee "$share/report.txt" >/dev/null
+sudo truncate -s 67108864 "$share/worker-load.bin"
 printf 'must remain covered by the nested mount\n' |
   sudo tee "$nested_mount/must-remain-covered.txt" >/dev/null
 printf 'nested mount content must be rejected\n' |
   sudo tee "$nested_backing/nested-mount.txt" >/dev/null
 sudo chown root:recasaos-public \
   "$share/report.txt" \
+  "$share/worker-load.bin" \
   "$nested_mount/must-remain-covered.txt" \
   "$nested_backing/nested-mount.txt"
 sudo chmod 0640 \
   "$share/report.txt" \
+  "$share/worker-load.bin" \
   "$nested_mount/must-remain-covered.txt" \
   "$nested_backing/nested-mount.txt"
 nested_mount_cleanup_required=1
@@ -734,6 +969,10 @@ printf '%s\n' \
   '[Unit]' \
   'ConditionPathIsDirectory=' \
   "ConditionPathIsDirectory=$share" \
+  'ConditionPathExists=/sys/fs/cgroup/cgroup.controllers' \
+  'ConditionPathExists=/sys/fs/cgroup/memory.max' \
+  'ConditionPathExists=/sys/fs/cgroup/memory.swap.max' \
+  'ConditionPathExists=/sys/fs/cgroup/pids.max' \
   "ConditionFileNotEmpty=$verifier" \
   "ConditionPathIsSymbolicLink=!$verifier" \
   'StartLimitIntervalSec=15s' \
@@ -743,6 +982,9 @@ printf '%s\n' \
   "RootDirectory=$rootfs" \
   'BindReadOnlyPaths=' \
   "BindReadOnlyPaths=$share:/srv/public:rbind" \
+  'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.max:/run/recasaos-cgroup/memory.max:norbind' \
+  'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.swap.max:/run/recasaos-cgroup/memory.swap.max:norbind' \
+  'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/pids.max:/run/recasaos-cgroup/pids.max:norbind' \
   'LoadCredential=' \
   "LoadCredential=recasaos-public-file-verifier:$verifier" \
   'RestartSec=1s' |
@@ -753,6 +995,10 @@ printf '%s\n' \
   '[Unit]' \
   'ConditionPathIsDirectory=' \
   "ConditionPathIsDirectory=$share" \
+  'ConditionPathExists=/sys/fs/cgroup/cgroup.controllers' \
+  'ConditionPathExists=/sys/fs/cgroup/memory.max' \
+  'ConditionPathExists=/sys/fs/cgroup/memory.swap.max' \
+  'ConditionPathExists=/sys/fs/cgroup/pids.max' \
   "ConditionFileNotEmpty=$verifier" \
   "ConditionPathIsSymbolicLink=!$verifier" |
   sudo tee "$socket_override_path" >/dev/null
@@ -766,6 +1012,8 @@ sudo systemctl daemon-reload
   "$workspace/recasaos-public-files" \
   "$override_path" \
   "$socket_override_path"
+require_unit_property "$service_unit" Type notify
+require_unit_property "$service_unit" NotifyAccess main
 require_unit_property "$service_unit" User recasaos-public
 require_unit_property "$service_unit" Group recasaos-public
 require_unit_property "$service_unit" RootDirectory "$rootfs"
@@ -777,6 +1025,11 @@ require_unit_property "$service_unit" ProcSubset pid
 require_unit_property "$service_unit" ProtectSystem strict
 require_unit_property "$service_unit" ProtectHome yes
 require_unit_property "$service_unit" NoNewPrivileges yes
+require_unit_property "$service_unit" LimitNOFILE 512
+require_unit_property "$service_unit" TasksMax 256
+require_unit_property "$service_unit" MemoryMax 536870912
+require_unit_property "$service_unit" MemorySwapMax 0
+require_unit_property "$service_unit" KillMode control-group
 
 service_fragment="$(
   sudo systemctl show --property=FragmentPath --value "$service_unit"
@@ -851,6 +1104,59 @@ sudo systemctl is-active --quiet "$service_unit"
 portal_pid="$(sudo systemctl show --property=MainPID --value "$service_unit")"
 [[ "$portal_pid" =~ ^[0-9]+$ && "$portal_pid" -gt 1 ]] ||
   fail "public-files service has no process"
+assert_service_cgroup_limits
+cgroup_limit_view="/proc/$portal_pid/root/run/recasaos-cgroup"
+sudo test -d "$cgroup_limit_view" ||
+  fail "service cgroup limit view is missing or linked"
+sudo test ! -L "$cgroup_limit_view" ||
+  fail "service cgroup limit view is missing or linked"
+for cgroup_limit_spec in \
+  memory.max:536870912 \
+  memory.swap.max:0 \
+  pids.max:256
+do
+  cgroup_limit_name=${cgroup_limit_spec%%:*}
+  cgroup_limit_expected=${cgroup_limit_spec#*:}
+  cgroup_limit_path="$cgroup_limit_view/$cgroup_limit_name"
+  sudo test -f "$cgroup_limit_path" ||
+    fail "jailed runtime cgroup limit is missing or linked: $cgroup_limit_name"
+  sudo test ! -L "$cgroup_limit_path" ||
+    fail "jailed runtime cgroup limit is missing or linked: $cgroup_limit_name"
+  [[ "$(sudo stat -fc %T "$cgroup_limit_path")" == cgroup2fs ]] ||
+    fail "jailed runtime cgroup limit is not backed by cgroup v2: $cgroup_limit_name"
+  [[ "$(sudo cat "$cgroup_limit_path")" == "$cgroup_limit_expected" ]] ||
+    fail "jailed runtime sees an unexpected $cgroup_limit_name"
+  sudo awk \
+    -v expected_root="/system.slice/$service_unit/$cgroup_limit_name" \
+    -v expected_target="/run/recasaos-cgroup/$cgroup_limit_name" '
+      function has_option(options, wanted, count, values, option_index) {
+        count = split(options, values, ",")
+        for (option_index = 1; option_index <= count; option_index++)
+          if (values[option_index] == wanted)
+            return 1
+        return 0
+      }
+      {
+        separator = 0
+        for (field_index = 7; field_index <= NF; field_index++)
+          if ($field_index == "-") {
+            separator = field_index
+            break
+          }
+        if ($5 != expected_target)
+          next
+        matches++
+        if ($4 != expected_root ||
+            !has_option($6, "ro") ||
+            has_option($6, "rw") ||
+            separator == 0 ||
+            $(separator + 1) != "cgroup2")
+          invalid = 1
+      }
+      END { exit !(matches == 1 && !invalid) }
+    ' "/proc/$portal_pid/mountinfo" ||
+    fail "jailed runtime has an unexpected cgroup mount: $cgroup_limit_name"
+done
 sudo awk -v uid="$service_uid" -v gid="$service_gid" '
   BEGIN {
     uid_ok = gid_ok = groups_ok = umask_ok = caps_ok = nnp_ok = seccomp_ok = 0
@@ -885,6 +1191,12 @@ sudo awk -v uid="$service_uid" -v gid="$service_gid" '
   }
 ' "/proc/$portal_pid/status" ||
   fail "runtime UID/GID/capability/seccomp invariants are not satisfied"
+[[ "$(sudo stat -Lc %u "/proc/$portal_pid/mem")" == 0 ]] ||
+  fail "portal process memory remains owned by the service identity"
+if sudo -u recasaos-public -- /bin/bash -c \
+  'exec 3<"$1"' bash "/proc/$portal_pid/mem" 2>/dev/null; then
+  fail "same-UID process can open the portal process memory"
+fi
 
 root_net_ns="$(sudo stat -Lc %i /proc/1/ns/net)"
 portal_net_ns="$(sudo stat -Lc %i "/proc/$portal_pid/ns/net")"
@@ -969,6 +1281,86 @@ printf '%s\n' 'systemd isolation fixture' |
   cmp - "$response_file" ||
   fail "downloaded bytes differ from the approved file"
 
+for _ in {1..8}; do
+  start_slow_download
+done
+wait_until "eight bounded storage workers" storage_worker_count_is 8
+
+ninth_status="$(
+  printf 'Authorization: Bearer %s\n' "$test_bearer" |
+    curl -q -sS --max-time 5 -H @- -o /dev/null -w '%{http_code}' \
+      'http://127.0.0.1:39777/public-files/api/file?path=worker-load.bin'
+)"
+[[ "$ninth_status" == 503 ]] ||
+  fail "ninth concurrent storage request returned $ninth_status, want 503"
+
+tasks_current="$(
+  sudo systemctl show --property=TasksCurrent --value "$service_unit"
+)"
+memory_current="$(
+  sudo systemctl show --property=MemoryCurrent --value "$service_unit"
+)"
+memory_peak="$(
+  sudo systemctl show --property=MemoryPeak --value "$service_unit"
+)"
+[[ "$tasks_current" =~ ^[0-9]+$ && "$tasks_current" -le 224 ]] ||
+  fail "eight-worker TasksCurrent=$tasks_current leaves insufficient headroom"
+[[ "$memory_current" =~ ^[0-9]+$ && "$memory_current" -le 469762048 ]] ||
+  fail "eight-worker MemoryCurrent=$memory_current leaves insufficient headroom"
+[[ "$memory_peak" =~ ^[0-9]+$ && "$memory_peak" -le 469762048 ]] ||
+  fail "eight-worker MemoryPeak=$memory_peak leaves insufficient headroom"
+
+listener_inode="$(
+  sudo awk \
+    '$2 == "0100007F:9B61" && $4 == "0A" { print $10; exit }' \
+    /proc/net/tcp
+)"
+[[ "$listener_inode" =~ ^[0-9]+$ ]] ||
+  fail "could not resolve the public listener inode"
+while IFS= read -r worker_pid; do
+  [[ "$worker_pid" =~ ^[0-9]+$ && "$worker_pid" -gt 1 ]] ||
+    fail "invalid storage worker PID: $worker_pid"
+  worker_command="$(
+    sudo cat "/proc/$worker_pid/cmdline" | tr '\0' ' '
+  )"
+  [[ "$worker_command" == *"--internal-public-files-storage-worker file"* ]] ||
+    fail "unexpected storage worker command line"
+  if printf '%s' "$worker_command" | grep -Fq "$test_bearer"; then
+    fail "raw bearer is present in a storage worker command line"
+  fi
+  if sudo cat "/proc/$worker_pid/environ" |
+    tr '\0' '\n' |
+    grep -F -- "$test_bearer" >/dev/null; then
+    fail "raw bearer is present in a storage worker environment"
+  fi
+  [[ "$(sudo stat -Lc %u "/proc/$worker_pid/mem")" == 0 ]] ||
+    fail "storage worker process memory remains dumpable"
+  while IFS= read -r descriptor_path; do
+    descriptor="${descriptor_path##*/}"
+    [[ "$descriptor" =~ ^[0-9]+$ ]] ||
+      fail "storage worker exposed a nonnumeric descriptor"
+    descriptor_target="$(sudo readlink "$descriptor_path")"
+    [[ "$descriptor_target" != "socket:[$listener_inode]" ]] ||
+      fail "storage worker inherited the AF_INET listener"
+    if [[ "$descriptor" -gt 2 ]]; then
+      descriptor_flags="$(
+        sudo awk '$1 == "flags:" { print $2; exit }' \
+          "/proc/$worker_pid/fdinfo/$descriptor"
+      )"
+      [[ "$descriptor_flags" =~ ^[0-7]+$ ]] ||
+        fail "storage worker descriptor $descriptor has invalid flags"
+      descriptor_flags_value=$((8#$descriptor_flags))
+      (( (descriptor_flags_value & 02000000) != 0 )) ||
+        fail "storage worker descriptor $descriptor is not close-on-exec"
+    fi
+  done < <(
+    sudo find "/proc/$worker_pid/fd" -mindepth 1 -maxdepth 1 -print
+  )
+done < <(storage_worker_pids)
+
+cleanup_background_downloads
+wait_until "storage worker reap after bounded load" storage_worker_count_is 0
+
 for blocked_file in \
   covered/must-remain-covered.txt \
   covered/nested-mount.txt
@@ -992,11 +1384,20 @@ for management_path in /v1 /v2 /v3 /debug /swagger /public-files/../v1; do
 done
 wait_until "unchanged management sentinel" sentinel_is_unchanged
 
+start_slow_download
+wait_until "active worker before coordinator SIGKILL" storage_worker_count_is 1
+worker_before_coordinator_kill="$(storage_worker_pids)"
+[[ "$worker_before_coordinator_kill" =~ ^[0-9]+$ ]] ||
+  fail "could not capture the worker before coordinator SIGKILL"
 sudo kill -KILL "$portal_pid"
 wait_until "public service restart after SIGKILL" service_has_new_pid
+wait_until "old worker cgroup cleanup after coordinator SIGKILL" \
+  process_is_gone "$worker_before_coordinator_kill"
+cleanup_background_downloads
 wait_until "public portal after SIGKILL" page_is_ready
 wait_until "unchanged management sentinel after SIGKILL" sentinel_is_unchanged
 portal_pid="$(sudo systemctl show --property=MainPID --value "$service_unit")"
+assert_service_cgroup_limits
 assert_systemd_credential_for_pid "$portal_pid"
 assert_service_api_vfs_isolation "$portal_pid"
 
@@ -1028,6 +1429,7 @@ wait_until "unchanged management sentinel after recovery" sentinel_is_unchanged
 sudo systemctl is-active --quiet "$socket_unit"
 sudo systemctl is-active --quiet "$service_unit"
 portal_pid="$(sudo systemctl show --property=MainPID --value "$service_unit")"
+assert_service_cgroup_limits
 assert_systemd_credential_for_pid "$portal_pid"
 assert_service_api_vfs_isolation "$portal_pid"
 

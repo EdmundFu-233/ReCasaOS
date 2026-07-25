@@ -33,7 +33,8 @@ The first hardening milestone includes:
 - bounded, traversal-resistant multipart uploads and safer streaming downloads;
 - an opt-in, read-only `/public-files` portal confined with Linux `openat2`,
   served by a separate non-root, systemd-activated process with an isolated
-  network and root filesystem, and authenticated by a header-only bearer whose
+  network and root filesystem, with share filesystem work delegated to bounded
+  disposable workers, and authenticated by a header-only bearer whose
   server-side configuration contains only a versioned SHA-256 verifier;
 - bounded root file/SSH WebSockets, verified local SSH host keys, one-use SSH
   login tickets, and removal of an SSH infinite retry path;
@@ -64,11 +65,19 @@ is an intentional 404 tombstone for stale-route cleanup and is never the portal
 upstream.
 
 A particular host is not public-ready until the guide's deployment, restore,
-scanning, and independent-review gates pass. The first process split prevents a
-portal crash or restart from stopping the management daemon, but the portal
-service still performs potentially blocking filesystem calls in its long-lived
-process. [Issue #25](https://github.com/EdmundFu-233/ReCasaOS/issues/25) remains
-open for the killable worker and hung-storage acceptance boundary.
+scanning, and independent-review gates pass. The standalone coordinator now
+keeps share open, classification, list, and read syscalls in same-binary
+disposable workers. It admits at most eight active workers, applies fixed IPC
+deadlines, kills timed-out children through pidfds, and stops admitting work
+when killed children cannot be reaped. A non-ESRCH pidfd signaling failure
+closes all further worker admission and retains that slot until the child is
+reaped. The packaged service reports readiness only after bootstrap succeeds
+and the HTTP server enters its accept loop.
+[Issue #25](https://github.com/EdmundFu-233/ReCasaOS/issues/25) remains open
+until exact-head Linux CI and real hung-storage/D-state tests prove those bounds
+on the supported deployment stack. The declared systemd 247 floor is
+source-reviewed but is not yet execution-qualified; the Ubuntu 24.04/systemd
+255 integration job is not evidence for that floor.
 
 The portal's large-file browser stream is still a candidate tracked in
 [Issue #20](https://github.com/EdmundFu-233/ReCasaOS/issues/20). Its client does
@@ -87,8 +96,10 @@ boundary; it does not certify the health or locality of an allowlisted
 filesystem's block device.
 [Issue #22](https://github.com/EdmundFu-233/ReCasaOS/issues/22) remains open
 until the compatibility and blocking-I/O boundary is independently verified.
-Killable filesystem workers and bounded hung-I/O containment remain tracked in
-[Issue #25](https://github.com/EdmundFu-233/ReCasaOS/issues/25).
+The worker protocol limits coordinator exposure, but SIGKILL cannot complete a
+kernel syscall already stuck in uninterruptible sleep. Admission quarantine and
+the service cgroup provide finite containment; hostile-storage evidence remains
+tracked in [Issue #25](https://github.com/EdmundFu-233/ReCasaOS/issues/25).
 
 The supported credential candidate is verifier-only. Generate the 47-character
 `rc1_` bearer from 32 random bytes on an independent administrator workstation,
@@ -119,7 +130,13 @@ Every configured root must already exist, `/` is forbidden, and ReCasaOS pins
 the roots at startup before it registers file routes. Changing the setting or
 replacing a configured mount requires a service restart.
 
-This boundary requires Linux 5.8 or newer for `openat2` and mount-ID checks.
+This boundary requires Linux 5.8 or newer for `openat2` and mount-ID checks,
+plus the unified cgroup v2 hierarchy with effective memory and pids controllers
+for the worker task, memory, and no-swap limits. The service and socket fail
+their conditions before activation when those cgroup v2 files are unavailable.
+Before loading the verifier, the standalone service also proves its exact
+`system.slice` membership and validates three individually bound, read-only
+cgroup2 files for the effective 512 MiB memory, zero-swap, and 256-task limits.
 Reads and writes may cross operator-configured mounts below `/mnt` or `/media`
 for CasaOS storage compatibility, but recursive deletion refuses to cross a
 mount boundary. Treat the host mount namespace and `CAP_SYS_ADMIN` as trusted

@@ -53,24 +53,68 @@ type Entry struct {
 
 // Portal is a read-only http.Handler rooted at a directory descriptor.
 type Portal struct {
-	root           *secureRoot
+	storage        storageBackend
 	bearerVerifier [sha256.Size]byte
 	maxEntries     int
 	downloadSlots  chan struct{}
 }
 
-// New validates the configured paths, securely opens the root directory and
-// loads the bearer verifier. It does not provide a non-openat2 or unrestricted
-// filesystem fallback because weaker path and root checks would reintroduce
-// symlink, TOCTOU, and blocking-network-filesystem risks.
+// New preserves the embeddable portal API and performs descriptor-relative
+// share operations in the calling process. It is suitable for trusted,
+// in-process integrations but not for the Internet-facing standalone service,
+// where a stalled filesystem syscall must not block the long-lived HTTP
+// coordinator. That service must use NewIsolated.
 func New(config Config) (*Portal, error) {
+	validated, err := validatePortalConfig(config)
+	if err != nil {
+		return nil, err
+	}
+	bearerVerifier, err := readVerifierFileSecure(validated.verifierPath)
+	if err != nil {
+		return nil, fmt.Errorf("public file verifier file is unsafe: %w", err)
+	}
+	storage, err := newLocalStorageBackend(validated.rootPath)
+	if err != nil {
+		return nil, fmt.Errorf("public file root is unsafe: %w", err)
+	}
+	return newPortalWithStorage(validated, storage, bearerVerifier), nil
+}
+
+// NewIsolated creates the standalone Internet-facing portal. On Linux it
+// keeps every share open, stat, list and read in disposable subprocesses.
+// The embedding executable must dispatch InternalStorageWorkerArgument to
+// RunInternalStorageWorker before performing any normal application startup.
+func NewIsolated(config Config) (*Portal, error) {
+	validated, err := validatePortalConfig(config)
+	if err != nil {
+		return nil, err
+	}
+	storage, bearerVerifier, err := newIsolatedStorage(
+		validated.rootPath,
+		validated.verifierPath,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return newPortalWithStorage(validated, storage, bearerVerifier), nil
+}
+
+type validatedPortalConfig struct {
+	rootPath     string
+	verifierPath string
+	maxEntries   int
+	maxDownloads int
+}
+
+func validatePortalConfig(config Config) (validatedPortalConfig, error) {
+	var validated validatedPortalConfig
 	rootPath, err := validateAbsoluteConfigPath(config.Root, false)
 	if err != nil {
-		return nil, fmt.Errorf("public file root is invalid: %w", err)
+		return validated, fmt.Errorf("public file root is invalid: %w", err)
 	}
 	verifierPath, err := validateAbsoluteConfigPath(config.VerifierFile, true)
 	if err != nil {
-		return nil, fmt.Errorf("public file verifier file is invalid: %w", err)
+		return validated, fmt.Errorf("public file verifier file is invalid: %w", err)
 	}
 
 	maxEntries := config.MaxEntries
@@ -78,35 +122,42 @@ func New(config Config) (*Portal, error) {
 		maxEntries = DefaultMaxDirectoryEntries
 	}
 	if maxEntries < 1 || maxEntries > DefaultMaxDirectoryEntries {
-		return nil, fmt.Errorf("public file directory limit must be between 1 and %d", DefaultMaxDirectoryEntries)
+		return validated, fmt.Errorf("public file directory limit must be between 1 and %d", DefaultMaxDirectoryEntries)
 	}
 	maxDownloads := config.MaxDownloads
 	if maxDownloads == 0 {
 		maxDownloads = DefaultMaxActiveDownloads
 	}
 	if maxDownloads < 1 || maxDownloads > DefaultMaxActiveDownloads {
-		return nil, fmt.Errorf("public file download limit must be between 1 and %d", DefaultMaxActiveDownloads)
+		return validated, fmt.Errorf("public file download limit must be between 1 and %d", DefaultMaxActiveDownloads)
 	}
 
-	bearerVerifier, err := readVerifierFileSecure(verifierPath)
-	if err != nil {
-		return nil, fmt.Errorf("public file verifier file is unsafe: %w", err)
-	}
-	root, err := openSecureRoot(rootPath)
-	if err != nil {
-		return nil, fmt.Errorf("public file root is unsafe: %w", err)
-	}
-
-	return &Portal{
-		root:           root,
-		bearerVerifier: bearerVerifier,
-		maxEntries:     maxEntries,
-		downloadSlots:  make(chan struct{}, maxDownloads),
+	return validatedPortalConfig{
+		rootPath:     rootPath,
+		verifierPath: verifierPath,
+		maxEntries:   maxEntries,
+		maxDownloads: maxDownloads,
 	}, nil
 }
 
+func newPortalWithStorage(
+	config validatedPortalConfig,
+	storage storageBackend,
+	bearerVerifier [sha256.Size]byte,
+) *Portal {
+	return &Portal{
+		storage:        storage,
+		bearerVerifier: bearerVerifier,
+		maxEntries:     config.maxEntries,
+		downloadSlots:  make(chan struct{}, config.maxDownloads),
+	}
+}
+
 func validateAbsoluteConfigPath(value string, allowFile bool) (string, error) {
-	if value == "" || strings.IndexByte(value, 0) >= 0 || !filepath.IsAbs(value) {
+	if value == "" ||
+		strings.IndexByte(value, 0) >= 0 ||
+		!utf8.ValidString(value) ||
+		!filepath.IsAbs(value) {
 		return "", errors.New("an absolute path is required")
 	}
 	clean := filepath.Clean(value)
@@ -122,13 +173,13 @@ func validateAbsoluteConfigPath(value string, allowFile bool) (string, error) {
 	return clean, nil
 }
 
-// Close releases the pinned root directory descriptor. Call it only after the
-// HTTP server has stopped accepting requests.
+// Close releases the storage manager and its pinned root descriptor. Call it
+// only after the HTTP server has stopped accepting requests.
 func (p *Portal) Close() error {
-	if p == nil || p.root == nil {
+	if p == nil || p.storage == nil {
 		return nil
 	}
-	return p.root.close()
+	return p.storage.close()
 }
 
 func (p *Portal) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -229,8 +280,13 @@ func (p *Portal) serveList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entries, err := p.root.list(relativePath, p.maxEntries)
+	entries, err := p.storage.list(r.Context(), relativePath, p.maxEntries)
 	if err != nil {
+		if errors.Is(err, errStorageCapacity) || errors.Is(err, errStorageTimeout) {
+			w.Header().Set("Retry-After", "5")
+			writeError(w, r, http.StatusServiceUnavailable, "storage capacity unavailable")
+			return
+		}
 		if errors.Is(err, errEntryLimit) {
 			writeError(w, r, http.StatusRequestEntityTooLarge, "directory entry limit exceeded")
 			return
@@ -295,8 +351,13 @@ func (p *Portal) serveFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	file, info, err := p.root.openRegular(relativePath)
+	file, info, err := p.storage.openRegular(r.Context(), relativePath)
 	if err != nil {
+		if errors.Is(err, errStorageCapacity) || errors.Is(err, errStorageTimeout) {
+			w.Header().Set("Retry-After", "5")
+			writeError(w, r, http.StatusServiceUnavailable, "storage capacity unavailable")
+			return
+		}
 		if isHiddenFilesystemError(err) {
 			writeError(w, r, http.StatusNotFound, "not found")
 			return
@@ -319,6 +380,9 @@ func (p *Portal) serveFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Accept-Ranges", "bytes")
 	http.ServeContent(w, r, filename, info.ModTime(), file)
+	if source, ok := file.(storageSourceError); ok && source.sourceError() != nil {
+		panic(http.ErrAbortHandler)
+	}
 }
 
 func parseSafeQuery(rawQuery string) (url.Values, error) {

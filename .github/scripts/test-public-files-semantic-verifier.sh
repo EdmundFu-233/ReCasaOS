@@ -68,6 +68,28 @@ printf '%s\n' \
   '! grep -q "^ExecStart=/usr/bin/recasaos-public-files " "$service"' \
   '[[ "$(grep -c "^ExecStart=" "$service")" == 1 ]]' \
   'grep -Eq '"'"'^ExecStart=/tmp/recasaos-systemd-verify\.[^/]+/recasaos-public-files serve --activation-name=public-files --listen=127\.0\.0\.1:39777 --root=/srv/public --verifier-file=\$\{CREDENTIALS_DIRECTORY\}/recasaos-public-file-verifier$'"'"' "$service"' \
+  '[[ "$(grep -Fxc "Type=notify" "$service")" == 1 ]]' \
+  '[[ "$(grep -Fxc "NotifyAccess=main" "$service")" == 1 ]]' \
+  '[[ "$(grep -Fxc "ConditionPathExists=/sys/fs/cgroup/cgroup.controllers" "$service")" == 1 ]]' \
+  '[[ "$(grep -Fxc "ConditionPathExists=/sys/fs/cgroup/memory.max" "$service")" == 1 ]]' \
+  '[[ "$(grep -Fxc "ConditionPathExists=/sys/fs/cgroup/memory.swap.max" "$service")" == 1 ]]' \
+  '[[ "$(grep -Fxc "ConditionPathExists=/sys/fs/cgroup/pids.max" "$service")" == 1 ]]' \
+  '[[ "$(grep -Fxc "ConditionPathExists=/sys/fs/cgroup/cgroup.controllers" "$socket")" == 1 ]]' \
+  '[[ "$(grep -Fxc "ConditionPathExists=/sys/fs/cgroup/memory.max" "$socket")" == 1 ]]' \
+  '[[ "$(grep -Fxc "ConditionPathExists=/sys/fs/cgroup/memory.swap.max" "$socket")" == 1 ]]' \
+  '[[ "$(grep -Fxc "ConditionPathExists=/sys/fs/cgroup/pids.max" "$socket")" == 1 ]]' \
+  '[[ "$(grep -Fxc "BindReadOnlyPaths=/srv/recasaos-public:/srv/public:rbind" "$service")" == 1 ]]' \
+  '[[ "$(grep -Fxc "BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.max:/run/recasaos-cgroup/memory.max:norbind" "$service")" == 1 ]]' \
+  '[[ "$(grep -Fxc "BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.swap.max:/run/recasaos-cgroup/memory.swap.max:norbind" "$service")" == 1 ]]' \
+  '[[ "$(grep -Fxc "BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/pids.max:/run/recasaos-cgroup/pids.max:norbind" "$service")" == 1 ]]' \
+  '[[ "$(grep -Fxc "LimitNOFILE=512" "$service")" == 1 ]]' \
+  '[[ "$(grep -Fxc "TasksMax=256" "$service")" == 1 ]]' \
+  '[[ "$(grep -Fxc "MemoryMax=512M" "$service")" == 1 ]]' \
+  '[[ "$(grep -Fxc "MemorySwapMax=0" "$service")" == 1 ]]' \
+  '[[ "$(grep -Fxc "KillMode=control-group" "$service")" == 1 ]]' \
+  '[[ "$(grep -Fxc "TimeoutStartSec=30s" "$service")" == 1 ]]' \
+  '[[ "$(grep -Fxc "SystemCallFilter=@system-service" "$service")" == 1 ]]' \
+  '[[ "$(grep -Fxc "SystemCallFilter=~@clock @cpu-emulation @debug @keyring @module @mount @obsolete @privileged @raw-io @reboot @swap clone3 memfd_create" "$service")" == 1 ]]' \
   '[[ "$(grep -Fxc "InaccessiblePaths=+/sys -+/dev/shm" "$service")" == 1 ]]' \
   '[[ "$(grep -Fxc "ReadOnlyPaths=+/tmp +/var/tmp" "$service")" == 1 ]]' \
   '! grep -q "^TemporaryFileSystem=" "$service"' \

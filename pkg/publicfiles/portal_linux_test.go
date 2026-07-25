@@ -320,6 +320,9 @@ func TestListExposesOnlySafeMinimalEntries(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(fixture.root, ".hidden"), []byte("hidden"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(fixture.root, `windows\name.txt`), []byte("unaddressable"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Mkdir(filepath.Join(fixture.root, "folder"), 0o700); err != nil {
 		t.Fatal(err)
 	}
