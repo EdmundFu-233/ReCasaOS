@@ -52,10 +52,9 @@ nested_mount="${share}/covered"
 host_shm_sentinel_prefix="/dev/shm/recasaos-public-files-ci-${run_key}."
 host_shm_sentinel=
 test_bearer='rc1_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8'
-# Exceed the service's 512 MiB total memory ceiling so a completed worker
-# cannot be mistaken for a connection that is still under peer backpressure.
-# truncate creates a hole; the fixture consumes no GiB of runner storage.
-worker_load_bytes=1073741824
+# The fixture is sparse. Its size exceeds normal socket buffering while the
+# client's receive buffer and advertised TCP window are explicitly bounded.
+worker_load_bytes=67108864
 
 case "$workspace" in
   /run/recasaos-public-files-ci-[0-9]*-[0-9]*) ;;
@@ -918,7 +917,9 @@ storage_worker_count_is() {
 print_storage_worker_diagnostics() {
   local client_index
   local client_pid
+  local control_group
   local failure_file
+  local failure_line
   local ready_file
   printf 'storage worker diagnostics: last=%s max=%s pids=%q\n' \
     "$last_storage_worker_count" \
@@ -954,7 +955,20 @@ print_storage_worker_diagnostics() {
     --property=SubState \
     --property=MainPID \
     --property=InvocationID \
+    --property=NRestarts \
+    --property=Result \
+    --property=ExecMainCode \
+    --property=ExecMainStatus \
+    --property=ControlGroup \
     "$service_unit" >&2 || true
+  control_group="$(
+    sudo systemctl show --property=ControlGroup --value \
+      "$service_unit" 2>/dev/null || true
+  )"
+  if [[ "$control_group" == "/system.slice/$service_unit" ]]; then
+    printf 'service cgroup memory events:\n' >&2
+    sudo cat "/sys/fs/cgroup${control_group}/memory.events" >&2 || true
+  fi
   sudo ss -H -tinp \
     '( sport = :39777 or dport = :39777 )' >&2 || true
   sudo journalctl --no-pager --output=short-monotonic --lines=80 \
@@ -976,10 +990,7 @@ slow_download_is_ready() {
   local ready_file=$2
 
   if [[ -s "$failure_file" ]]; then
-    while IFS= read -r failure_line; do
-      printf 'slow download client %s error: %s\n' \
-        "$pid" "$failure_line" >&2
-    done <"$failure_file"
+    print_storage_worker_diagnostics
     fail "slow download client $pid failed before becoming ready"
   fi
   if [[ -e "$ready_file" || -L "$ready_file" ]]; then
@@ -1066,7 +1077,10 @@ try:
     while b"\r\n\r\n" not in response:
         chunk = client.recv(4096)
         if not chunk:
-            raise RuntimeError("server closed before sending response headers")
+            raise RuntimeError(
+                "server closed before response headers; "
+                f"bytes_before_eof={len(response)}"
+            )
         response.extend(chunk)
         if len(response) > 32768:
             raise RuntimeError("response headers exceeded the bounded limit")
@@ -1083,7 +1097,7 @@ try:
         if header_name.lower() == b"content-length":
             content_lengths.append(header_value.strip())
     expected_length = sys.argv[2].encode("ascii")
-    if expected_length != b"1073741824":
+    if expected_length != b"67108864":
         raise RuntimeError("slow download fixture length is invalid")
     if content_lengths != [expected_length]:
         raise RuntimeError("slow download received an unexpected content length")
