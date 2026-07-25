@@ -24,6 +24,21 @@ const (
 
 	storageWorkerIPCFileDescriptor = uintptr(3)
 	storageWorkerChildIdleTimeout  = 45 * time.Second
+
+	storageWorkerStatmPath     = "/proc/self/statm"
+	storageWorkerStatmMaxBytes = int64(256)
+
+	// The Go runtime reserves architecture- and toolchain-dependent virtual
+	// address ranges before main starts. Bound only subsequent growth so a
+	// reviewed toolchain cannot begin above a fixed whole-process limit.
+	//
+	// 256 MiB provides four additional 64 MiB heap arenas on 64-bit Go and is
+	// deliberately much larger than the worker's 24 MiB soft Go memory budget.
+	// The post-set check keeps at least half of it available. The 2 GiB ceiling
+	// remains a finite, portable per-process bound on supported 32-bit Linux.
+	storageWorkerAddressSpaceHeadroom       = uint64(256 << 20)
+	storageWorkerAddressSpaceMinimumReserve = uint64(128 << 20)
+	storageWorkerAddressSpaceCeiling        = uint64(2 << 30)
 )
 
 // RunInternalStorageWorker is called only by the standalone binary's hidden
@@ -41,7 +56,7 @@ func RunInternalStorageWorker(mode string) error {
 	if err := ValidateServiceRuntime(); err != nil {
 		return err
 	}
-	if err := applyStorageWorkerResourceLimits(); err != nil {
+	if err := applyStorageWorkerFixedResourceLimits(); err != nil {
 		return err
 	}
 
@@ -51,6 +66,12 @@ func RunInternalStorageWorker(mode string) error {
 	}
 	defer connection.Close()
 	if err := validateStorageWorkerConnection(connection, os.Getppid()); err != nil {
+		return err
+	}
+	// net.FileConn and SO_PEERCRED validation may initialize lazy runtime
+	// mappings. Include them in the address-space baseline, but still apply the
+	// hard limit before reading the first IPC request.
+	if err := applyStorageWorkerAddressSpaceLimit(); err != nil {
 		return err
 	}
 
@@ -91,12 +112,11 @@ func validateStorageWorkerEnvironment() error {
 	return nil
 }
 
-func applyStorageWorkerResourceLimits() error {
+func applyStorageWorkerFixedResourceLimits() error {
 	limits := []struct {
 		resource int
 		value    uint64
 	}{
-		{unix.RLIMIT_AS, 1 << 30},
 		{unix.RLIMIT_CPU, 300},
 		{unix.RLIMIT_NOFILE, 16},
 		{unix.RLIMIT_CORE, 0},
@@ -115,6 +135,157 @@ func applyStorageWorkerResourceLimits() error {
 		return err
 	}
 	return unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
+}
+
+func applyStorageWorkerAddressSpaceLimit() error {
+	pageSize := os.Getpagesize()
+	if pageSize <= 0 {
+		return errStorageProtocol
+	}
+	pageSizeBytes := uint64(pageSize)
+	before, err := currentStorageWorkerVirtualMemory(pageSizeBytes)
+	if err != nil {
+		return err
+	}
+	target, err := calculateStorageWorkerAddressSpaceLimit(before, pageSizeBytes)
+	if err != nil {
+		return err
+	}
+
+	var inherited unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_AS, &inherited); err != nil {
+		return err
+	}
+	if err := validateStorageWorkerInheritedAddressSpaceLimit(inherited, target); err != nil {
+		return err
+	}
+	if err := unix.Setrlimit(unix.RLIMIT_AS, &unix.Rlimit{
+		Cur: target,
+		Max: target,
+	}); err != nil {
+		return err
+	}
+
+	var applied unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_AS, &applied); err != nil {
+		return err
+	}
+	after, err := currentStorageWorkerVirtualMemory(pageSizeBytes)
+	if err != nil {
+		return err
+	}
+	return validateStorageWorkerAppliedAddressSpaceLimit(applied, target, after)
+}
+
+func currentStorageWorkerVirtualMemory(pageSize uint64) (uint64, error) {
+	content, err := readServiceRuntimeFile(
+		storageWorkerStatmPath,
+		storageWorkerStatmMaxBytes,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return parseStorageWorkerVirtualMemory(content, pageSize)
+}
+
+func parseStorageWorkerVirtualMemory(content []byte, pageSize uint64) (uint64, error) {
+	if pageSize == 0 ||
+		len(content) == 0 ||
+		int64(len(content)) > storageWorkerStatmMaxBytes ||
+		content[len(content)-1] != '\n' {
+		return 0, errStorageProtocol
+	}
+	var (
+		fieldCount int
+		inField    bool
+		lineFeeds  int
+		pages      uint64
+		value      uint64
+	)
+	for _, character := range content {
+		switch {
+		case character >= '0' && character <= '9':
+			digit := uint64(character - '0')
+			if !inField {
+				fieldCount++
+				inField = true
+				value = 0
+			}
+			if value > (^uint64(0)-digit)/10 {
+				return 0, errStorageProtocol
+			}
+			value = value*10 + digit
+		case character == ' ', character == '\t':
+			if inField {
+				if fieldCount == 1 {
+					pages = value
+				}
+				inField = false
+			}
+		case character == '\n':
+			lineFeeds++
+			if inField {
+				if fieldCount == 1 {
+					pages = value
+				}
+				inField = false
+			}
+		default:
+			return 0, errStorageProtocol
+		}
+	}
+	if lineFeeds != 1 || inField || fieldCount != 7 {
+		return 0, errStorageProtocol
+	}
+	if pages == 0 || pages > ^uint64(0)/pageSize {
+		return 0, errStorageProtocol
+	}
+	return pages * pageSize, nil
+}
+
+func calculateStorageWorkerAddressSpaceLimit(
+	current uint64,
+	pageSize uint64,
+) (uint64, error) {
+	if current == 0 ||
+		pageSize == 0 ||
+		current%pageSize != 0 ||
+		storageWorkerAddressSpaceHeadroom%pageSize != 0 ||
+		storageWorkerAddressSpaceMinimumReserve%pageSize != 0 ||
+		storageWorkerAddressSpaceCeiling%pageSize != 0 ||
+		storageWorkerAddressSpaceMinimumReserve > storageWorkerAddressSpaceHeadroom ||
+		current > storageWorkerAddressSpaceCeiling-storageWorkerAddressSpaceHeadroom {
+		return 0, errStorageProtocol
+	}
+	return current + storageWorkerAddressSpaceHeadroom, nil
+}
+
+func validateStorageWorkerInheritedAddressSpaceLimit(
+	inherited unix.Rlimit,
+	target uint64,
+) error {
+	if target == 0 ||
+		inherited.Cur > inherited.Max ||
+		inherited.Cur < target ||
+		inherited.Max < target {
+		return errStorageProtocol
+	}
+	return nil
+}
+
+func validateStorageWorkerAppliedAddressSpaceLimit(
+	applied unix.Rlimit,
+	target uint64,
+	current uint64,
+) error {
+	if target == 0 ||
+		applied.Cur != target ||
+		applied.Max != target ||
+		current > target ||
+		target-current < storageWorkerAddressSpaceMinimumReserve {
+		return errStorageProtocol
+	}
+	return nil
 }
 
 func runStorageBootstrapWorker(connection *net.UnixConn) error {

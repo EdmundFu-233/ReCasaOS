@@ -50,6 +50,7 @@ systemd_test_binary="${workspace}/recasaos-public-files-systemd-test"
 management_dir="${workspace}/management"
 response_file="${workspace}/response"
 ninth_response_headers="${workspace}/ninth-response.headers"
+capacity_events="${workspace}/capacity-events"
 nested_backing="${workspace}/nested-backing"
 nested_mount="${share}/covered"
 host_shm_sentinel_prefix="/dev/shm/recasaos-public-files-ci-${run_key}."
@@ -59,6 +60,8 @@ test_bearer='rc1_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8'
 # chunk, then stops itself only for this exact file so the HTTP client can
 # validate committed response headers before worker-capacity checks begin.
 worker_load_bytes=67108864
+storage_worker_address_space_ceiling=2147483648
+storage_worker_address_space_minimum_reserve=134217728
 
 case "$workspace" in
   /run/recasaos-public-files-ci-[0-9]*-[0-9]*) ;;
@@ -80,13 +83,43 @@ if getent passwd recasaos-public >/dev/null ||
   fail "the recasaos-public account unexpectedly already exists"
 fi
 for required_tool in \
-  cmp find getfacl mktemp mount mountpoint pgrep ps ss systemctl truncate umount
+  cmp find getfacl mktemp mount mountpoint pgrep ps sort ss systemctl truncate umount
 do
   command -v "$required_tool" >/dev/null 2>&1 ||
     fail "required mount test tool is unavailable: $required_tool"
 done
 [[ -x /usr/bin/python3 ]] ||
   fail "required Python interpreter is unavailable: /usr/bin/python3"
+/usr/bin/python3 - \
+  "$repo_root/.github/scripts/test-public-files-systemd.sh" <<'PYTHON'
+from pathlib import Path
+import sys
+
+script = Path(sys.argv[1]).read_text(encoding="utf-8")
+start = "    /usr/bin/python3 -c '\n"
+end = "\n' \"$ready_file\" \"$worker_load_bytes\" 2>\"$failure_file\" &"
+if script.count(start) != 1 or script.count(end) != 1:
+    raise SystemExit("slow download holder sentinels are not unique")
+source = script.split(start, 1)[1].split(end, 1)[0]
+if "'" in source:
+    raise SystemExit(
+        "slow download holder contains a shell-breaking single quote"
+    )
+compile(source, "start_slow_download.py", "exec")
+
+limit_start = (
+    "    \"$storage_worker_address_space_minimum_reserve\" <<'PYTHON'\n"
+)
+limit_end = "\nPYTHON\n}\n\nprint_capacity_journal_diagnostics()"
+if script.count(limit_start) != 1 or script.count(limit_end) != 1:
+    raise SystemExit("address-space evidence sentinels are not unique")
+limit_source = script.split(limit_start, 1)[1].split(limit_end, 1)[0]
+compile(
+    limit_source,
+    "assert_storage_worker_address_space_limit.py",
+    "exec",
+)
+PYTHON
 /usr/bin/python3 -c '
 import os
 import signal
@@ -126,6 +159,7 @@ latest_slow_download_start_time=
 last_storage_worker_count=0
 max_storage_worker_count=0
 portal_invocation=
+capacity_journal_cursor=
 
 cleanup_problem() {
   printf 'public-files systemd test cleanup: %s\n' "$*" >&2
@@ -1130,7 +1164,253 @@ storage_workers_are_stopped() {
   [[ "$count" == "$expected" ]]
 }
 
+assert_storage_worker_address_space_limit() {
+  local build_label=$3
+  local expected_start_time=$2
+  local worker_pid=$1
+
+  [[ "$worker_pid" =~ ^[0-9]+$ && "$worker_pid" -gt 1 &&
+    "$expected_start_time" =~ ^[0-9]+$ ]] ||
+    fail "cannot inspect unsafe storage worker identity"
+  [[ "$build_label" == production || "$build_label" == systemd-test ]] ||
+    fail "cannot inspect storage worker with unsafe build label"
+  sudo /usr/bin/python3 - \
+    "$worker_pid" \
+    "$expected_start_time" \
+    "$portal_pid" \
+    "$build_label" \
+    "$storage_worker_address_space_ceiling" \
+    "$storage_worker_address_space_minimum_reserve" <<'PYTHON'
+import os
+from pathlib import Path
+import re
+import sys
+
+pid = int(sys.argv[1])
+expected_start = sys.argv[2].encode("ascii")
+expected_parent = int(sys.argv[3])
+build_label = sys.argv[4]
+ceiling = int(sys.argv[5])
+minimum_reserve = int(sys.argv[6])
+
+if (
+    pid <= 1
+    or expected_parent <= 1
+    or build_label not in {"production", "systemd-test"}
+    or ceiling != 2 * 1024 * 1024 * 1024
+    or minimum_reserve != 128 * 1024 * 1024
+):
+    raise SystemExit("unsafe address-space evidence arguments")
+
+proc = Path(f"/proc/{pid}")
+portal_proc = Path(f"/proc/{expected_parent}")
+expected_command = (
+    b"/proc/self/exe\0"
+    b"--internal-public-files-storage-worker\0"
+    b"file\0"
+)
+
+
+def identity():
+    stat_data = (proc / "stat").read_bytes()
+    marker = stat_data.rfind(b") ")
+    fields = stat_data[marker + 2:].split() if marker >= 0 else []
+    if len(fields) <= 19 or not fields[19].isdigit():
+        raise RuntimeError("could not parse storage worker start time")
+    status = (proc / "status").read_text(encoding="ascii")
+    parents = re.findall(r"^PPid:\s*([0-9]+)\s*$", status, re.MULTILINE)
+    if len(parents) != 1:
+        raise RuntimeError("could not parse storage worker parent")
+    return fields[19], int(parents[0]), (proc / "cmdline").read_bytes(), status
+
+
+start_before, parent_before, command_before, _ = identity()
+if (
+    start_before != expected_start
+    or parent_before != expected_parent
+    or command_before != expected_command
+):
+    raise RuntimeError("storage worker identity changed before limit inspection")
+
+worker_executable = os.stat(proc / "exe")
+portal_executable = os.stat(portal_proc / "exe")
+if (
+    worker_executable.st_dev != portal_executable.st_dev
+    or worker_executable.st_ino != portal_executable.st_ino
+):
+    raise RuntimeError("storage worker does not share the reviewed portal image")
+
+address_limits = []
+for line in (proc / "limits").read_text(encoding="ascii").splitlines():
+    fields = line.split()
+    if fields[:3] == ["Max", "address", "space"]:
+        if (
+            len(fields) != 6
+            or fields[5] != "bytes"
+            or not fields[3].isdigit()
+            or not fields[4].isdigit()
+        ):
+            raise RuntimeError("storage worker address-space limit is malformed")
+        address_limits.append((int(fields[3]), int(fields[4])))
+if len(address_limits) != 1:
+    raise RuntimeError("could not parse one storage worker address-space limit")
+soft, hard = address_limits[0]
+
+start_after, parent_after, command_after, status_after = identity()
+if (
+    start_after != start_before
+    or parent_after != parent_before
+    or command_after != command_before
+):
+    raise RuntimeError("storage worker identity changed during limit inspection")
+
+vm_sizes = re.findall(
+    r"^VmSize:\s*([0-9]+)\s+kB\s*$",
+    status_after,
+    re.MULTILINE,
+)
+if len(vm_sizes) != 1:
+    raise RuntimeError("could not parse one storage worker VmSize")
+vm_size_kib = int(vm_sizes[0])
+if vm_size_kib <= 0 or vm_size_kib > ceiling // 1024:
+    raise RuntimeError("storage worker VmSize is outside the reviewed ceiling")
+vm_size_bytes = vm_size_kib * 1024
+if soft != hard or soft <= vm_size_bytes or soft > ceiling:
+    raise RuntimeError("storage worker address-space limit is unsafe")
+reserve = soft - vm_size_bytes
+if reserve < minimum_reserve:
+    raise RuntimeError("storage worker address-space reserve is too small")
+
+print(
+    "storage worker address-space evidence: "
+    f"build={build_label} pid={pid} vm-size-kib={vm_size_kib} "
+    f"soft-bytes={soft} hard-bytes={hard} reserve-bytes={reserve}"
+)
+PYTHON
+}
+
+print_capacity_journal_diagnostics() {
+  local diagnostics
+
+  if [[ -z "$capacity_journal_cursor" ||
+    "$capacity_journal_cursor" == *$'\n'* ||
+    "${#capacity_journal_cursor}" -gt 4096 ]]; then
+    printf 'capacity journal diagnostics: cursor unavailable\n' >&2
+    return
+  fi
+  if ! diagnostics="$(
+    sudo journalctl \
+      --unit="$service_unit" \
+      --no-pager \
+      --after-cursor="$capacity_journal_cursor" \
+      --lines=2048 \
+      --output=cat 2>/dev/null |
+      awk '
+        BEGIN {
+          allowed["recasaos-systemd-test-event=handler-entered"] = 1
+          allowed["recasaos-systemd-test-event=handler-download-slot-acquired"] = 1
+          allowed["recasaos-systemd-test-event=handler-download-slot-rejected"] = 1
+          allowed["recasaos-systemd-test-event=coordinator-context-rejected"] = 1
+          allowed["recasaos-systemd-test-event=coordinator-pre-slot-rejected"] = 1
+          allowed["recasaos-systemd-test-event=coordinator-manager-unavailable"] = 1
+          allowed["recasaos-systemd-test-event=coordinator-signal-failure"] = 1
+          allowed["recasaos-systemd-test-event=coordinator-quarantine-limit"] = 1
+          allowed["recasaos-systemd-test-event=coordinator-slots-full"] = 1
+          allowed["recasaos-systemd-test-event=coordinator-slot-acquired"] = 1
+          allowed["recasaos-systemd-test-event=worker-start-capacity-failure"] = 1
+          allowed["recasaos-systemd-test-event=worker-start-protocol-failure"] = 1
+          allowed["recasaos-systemd-test-event=worker-post-start-rejected"] = 1
+          allowed["recasaos-systemd-test-event=worker-process-registered"] = 1
+          allowed["recasaos-systemd-test-event=coordinator-open-response"] = 1
+          allowed["recasaos-systemd-test-event=coordinator-read-response"] = 1
+          allowed["recasaos-systemd-test-event=child-first-read-sent"] = 1
+        }
+        {
+          if ($0 in allowed) {
+            print "capacity journal event: " $0
+            event_count++
+          } else if ($0 ~ /^recasaos-systemd-test-event=[a-z0-9-]+$/) {
+            unknown_event = 1
+          }
+
+          known_fatal = 0
+          if (index($0, "runtime: failed to create new OS thread") ||
+            index($0, "fatal error: newosproc")) {
+            new_thread = 1
+            if (index($0, "errno=11)")) {
+              new_thread_eagain = 1
+            }
+            if (index($0, "errno=12)")) {
+              new_thread_enomem = 1
+            }
+            known_fatal = 1
+          }
+          if (index($0, "runtime: may need to increase max user processes")) {
+            new_thread = 1
+            new_thread_eagain = 1
+            known_fatal = 1
+          }
+          if (index($0, "runtime: failed to allocate stack for the new OS thread")) {
+            thread_stack_allocation = 1
+            known_fatal = 1
+          }
+          if (index($0, "out of memory (stackalloc)")) {
+            thread_stack_allocation = 1
+            known_fatal = 1
+          }
+          if (index($0, "failed to reserve page summary memory")) {
+            page_summary_reservation = 1
+            known_fatal = 1
+          }
+          if (index($0, "out of memory") ||
+            index($0, "cannot allocate memory")) {
+            out_of_memory = 1
+            known_fatal = 1
+          }
+          if (index($0, "cannot map pages in arena address space")) {
+            arena_map_failure = 1
+            known_fatal = 1
+          }
+          if (index($0, "memory reservation exceeds address space limit")) {
+            arena_address_range = 1
+            known_fatal = 1
+          }
+          if (index($0, "unexpected fault address") ||
+            $0 == "fatal error: fault" ||
+            index($0, "fatal error: unexpected signal during runtime execution")) {
+            unexpected_fault = 1
+            known_fatal = 1
+          }
+          if (index($0, "fatal error:") && !known_fatal) {
+            other_fatal = 1
+          }
+        }
+        END {
+          printf "capacity journal summary: events=%d unknown-event=%s new-thread=%s new-thread-eagain=%s new-thread-enomem=%s thread-stack-allocation=%s page-summary-reservation=%s out-of-memory=%s arena-map-failure=%s arena-address-range=%s unexpected-fault=%s other-runtime-fatal=%s\n",
+            event_count + 0,
+            unknown_event ? "yes" : "no",
+            new_thread ? "yes" : "no",
+            new_thread_eagain ? "yes" : "no",
+            new_thread_enomem ? "yes" : "no",
+            thread_stack_allocation ? "yes" : "no",
+            page_summary_reservation ? "yes" : "no",
+            out_of_memory ? "yes" : "no",
+            arena_map_failure ? "yes" : "no",
+            arena_address_range ? "yes" : "no",
+            unexpected_fault ? "yes" : "no",
+            other_fatal ? "yes" : "no"
+        }
+      '
+  )"; then
+    printf 'capacity journal diagnostics: query failed\n' >&2
+    return
+  fi
+  printf '%s\n' "$diagnostics" >&2
+}
+
 print_storage_worker_diagnostics() {
+  local actual_worker_count
+  local cgroup_file
   local client_index
   local client_pid
   local control_group
@@ -1138,11 +1418,130 @@ print_storage_worker_diagnostics() {
   local failure_line
   local ready_file
   local start_time
-  printf 'storage worker diagnostics: last=%s max=%s pids=%q\n' \
+  local worker_command
+  local worker_end_command
+  local worker_end_parent
+  local worker_end_start_time
+  local worker_limit_diagnostics
+  local worker_parent
+  local worker_pid
+  local worker_pids
+  local worker_resource_diagnostics
+  local worker_start_time
+  if worker_pids="$(storage_worker_pids 2>/dev/null)"; then
+    if [[ -z "$worker_pids" ]]; then
+      actual_worker_count=0
+    elif ! actual_worker_count="$(
+      printf '%s\n' "$worker_pids" |
+        awk '
+          NF != 1 || $1 !~ /^[0-9]+$/ || $1 <= 1 { exit 1 }
+          { count++ }
+          END { print count + 0 }
+        '
+    )"; then
+      actual_worker_count=unknown
+      worker_pids=unknown
+    fi
+  else
+    actual_worker_count=unknown
+    worker_pids=unknown
+  fi
+  printf 'storage worker diagnostics: actual=%s cached-last=%s cached-max=%s pids=%q\n' \
+    "$actual_worker_count" \
     "$last_storage_worker_count" \
     "$max_storage_worker_count" \
-    "$(storage_worker_pids)" >&2
+    "$worker_pids" >&2
   sudo ps -o pid=,ppid=,stat=,etime=,args= --ppid "$portal_pid" >&2 || true
+  while IFS= read -r worker_pid; do
+    [[ "$worker_pid" =~ ^[0-9]+$ && "$worker_pid" -gt 1 ]] || continue
+    worker_start_time="$(
+      process_start_time "$worker_pid" 2>/dev/null || true
+    )"
+    worker_parent="$(
+      sudo ps -o ppid= -p "$worker_pid" 2>/dev/null |
+        awk 'NR == 1 { gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print }' ||
+        true
+    )"
+    worker_command="$(
+      sudo cat "/proc/${worker_pid}/cmdline" 2>/dev/null |
+        tr '\0' ' ' || true
+    )"
+    if [[ ! "$worker_start_time" =~ ^[0-9]+$ ||
+      "$worker_parent" != "$portal_pid" ||
+      "$worker_command" != '/proc/self/exe --internal-public-files-storage-worker file ' ]]; then
+      printf 'storage worker resource diagnostics: identity unavailable\n' >&2
+      continue
+    fi
+    if ! worker_resource_diagnostics="$(
+      sudo awk '
+        $1 == "VmSize:" { vm_size = $2 }
+        $1 == "VmPeak:" { vm_peak = $2 }
+        $1 == "VmRSS:" { vm_rss = $2 }
+        $1 == "Threads:" { threads = $2 }
+        END {
+          if (vm_size == "") vm_size = "unknown"
+          if (vm_peak == "") vm_peak = "unknown"
+          if (vm_rss == "") vm_rss = "unknown"
+          if (threads == "") threads = "unknown"
+          printf "vm-size-kib=%s vm-peak-kib=%s vm-rss-kib=%s threads=%s\n",
+            vm_size, vm_peak, vm_rss, threads
+        }
+      ' "/proc/${worker_pid}/status" 2>/dev/null
+    )"; then
+      printf 'storage worker resource diagnostics: identity unavailable\n' >&2
+      continue
+    fi
+    if ! worker_limit_diagnostics="$(
+      sudo awk '
+        $1 == "Max" && $2 == "processes" {
+          nproc_soft = $3
+          nproc_hard = $4
+        }
+        $1 == "Max" && $2 == "address" && $3 == "space" {
+          address_soft = $4
+          address_hard = $5
+        }
+        END {
+          if (nproc_soft == "") nproc_soft = "unknown"
+          if (nproc_hard == "") nproc_hard = "unknown"
+          if (address_soft == "") address_soft = "unknown"
+          if (address_hard == "") address_hard = "unknown"
+          printf "nproc-soft=%s nproc-hard=%s address-soft=%s address-hard=%s\n",
+            nproc_soft, nproc_hard, address_soft, address_hard
+        }
+      ' "/proc/${worker_pid}/limits" 2>/dev/null
+    )"; then
+      printf 'storage worker resource diagnostics: identity unavailable\n' >&2
+      continue
+    fi
+    worker_end_start_time="$(
+      process_start_time "$worker_pid" 2>/dev/null || true
+    )"
+    worker_end_parent="$(
+      sudo ps -o ppid= -p "$worker_pid" 2>/dev/null |
+        awk 'NR == 1 { gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print }' ||
+        true
+    )"
+    worker_end_command="$(
+      sudo cat "/proc/${worker_pid}/cmdline" 2>/dev/null |
+        tr '\0' ' ' || true
+    )"
+    if [[ ! "$worker_end_start_time" =~ ^[0-9]+$ ||
+      "$worker_end_start_time" != "$worker_start_time" ||
+      "$worker_end_parent" != "$portal_pid" ||
+      "$worker_end_parent" != "$worker_parent" ||
+      "$worker_end_command" != "$worker_command" ||
+      "$worker_end_command" != '/proc/self/exe --internal-public-files-storage-worker file ' ||
+      ! "$worker_resource_diagnostics" =~ ^vm-size-kib=([0-9]+|unknown)\ vm-peak-kib=([0-9]+|unknown)\ vm-rss-kib=([0-9]+|unknown)\ threads=([0-9]+|unknown)$ ||
+      ! "$worker_limit_diagnostics" =~ ^nproc-soft=([0-9]+|unlimited|unknown)\ nproc-hard=([0-9]+|unlimited|unknown)\ address-soft=([0-9]+|unlimited|unknown)\ address-hard=([0-9]+|unlimited|unknown)$ ]]; then
+      printf 'storage worker resource diagnostics: identity unavailable\n' >&2
+      continue
+    fi
+    printf 'storage worker resource diagnostics: pid=%s %s\n' \
+      "$worker_pid" "$worker_resource_diagnostics" >&2
+    printf 'storage worker limit diagnostics: pid=%s %s\n' \
+      "$worker_pid" "$worker_limit_diagnostics" >&2
+  done <<<"$worker_pids"
   for client_index in "${!slow_download_pids[@]}"; do
     client_pid="${slow_download_pids[$client_index]}"
     ready_file="${slow_download_ready_files[$client_index]}"
@@ -1178,19 +1577,126 @@ print_storage_worker_diagnostics() {
     --property=ExecMainCode \
     --property=ExecMainStatus \
     --property=ControlGroup \
+    --property=TasksCurrent \
+    --property=TasksMax \
+    --property=MemoryCurrent \
+    --property=MemoryMax \
     "$service_unit" >&2 || true
+  sudo systemctl show \
+    --property=MemoryPeak \
+    "$service_unit" >&2 2>/dev/null || true
   control_group="$(
     sudo systemctl show --property=ControlGroup --value \
       "$service_unit" 2>/dev/null || true
   )"
   if [[ "$control_group" == "/system.slice/$service_unit" ]]; then
-    printf 'service cgroup memory events:\n' >&2
-    sudo cat "/sys/fs/cgroup${control_group}/memory.events" >&2 || true
+    for cgroup_file in \
+      memory.current \
+      memory.peak \
+      memory.max \
+      memory.events \
+      pids.current \
+      pids.max \
+      pids.events
+    do
+      if sudo test -f \
+        "/sys/fs/cgroup${control_group}/${cgroup_file}"; then
+        printf 'service cgroup %s:\n' "$cgroup_file" >&2
+        sudo cat \
+          "/sys/fs/cgroup${control_group}/${cgroup_file}" >&2 || true
+      fi
+    done
   fi
   sudo ss -H -tinp \
     '( sport = :39777 or dport = :39777 )' >&2 || true
+  print_capacity_journal_diagnostics
   sudo journalctl --no-pager --output=short-monotonic --lines=80 \
     --unit="$socket_unit" --unit="$service_unit" >&2 || true
+}
+
+capture_capacity_journal_cursor() {
+  local cursor
+
+  [[ "$capacity_events" =~ ^/run/recasaos-public-files-ci-[0-9]+-[0-9]+/capacity-events$ ]] ||
+    fail "refusing unsafe capacity event path: $capacity_events"
+  [[ ! -e "$capacity_events" && ! -L "$capacity_events" ]] ||
+    fail "capacity event path already exists"
+  install -m 0600 /dev/null "$capacity_events"
+  cursor="$(
+    sudo journalctl \
+      --unit="$service_unit" \
+      --no-pager \
+      --lines=1 \
+      --show-cursor \
+      --output=cat |
+      awk '
+        /^-- cursor: / {
+          count++
+          sub(/^-- cursor: /, "")
+          cursor = $0
+        }
+        END {
+          if (count != 1 || cursor == "")
+            exit 1
+          print cursor
+        }
+      '
+  )" || fail "could not capture the capacity-phase journal cursor"
+  [[ -n "$cursor" && "$cursor" != *$'\n'* &&
+    "${#cursor}" -le 4096 ]] ||
+    fail "capacity-phase journal cursor is unsafe"
+  capacity_journal_cursor=$cursor
+}
+
+capacity_phase_events_are_complete() {
+  [[ -n "$capacity_journal_cursor" &&
+    "$capacity_journal_cursor" != *$'\n'* &&
+    "${#capacity_journal_cursor}" -le 4096 ]] || return 1
+  [[ -f "$capacity_events" && ! -L "$capacity_events" ]] || return 1
+  sudo journalctl \
+    --unit="$service_unit" \
+    --no-pager \
+    --after-cursor="$capacity_journal_cursor" \
+    --output=cat |
+    awk '
+      /^recasaos-systemd-test-event=[a-z0-9-]+$/ &&
+        length($0) <= 96 {
+        print
+      }
+    ' >"$capacity_events" || return 1
+  awk '
+    BEGIN {
+      # Eight successful holders emit seven events each. The ninth request
+      # enters the handler, acquires one of 64 download slots, then reaches the
+      # independently bounded eight-worker coordinator and is rejected there.
+      expected["recasaos-systemd-test-event=handler-entered"] = 9
+      expected["recasaos-systemd-test-event=handler-download-slot-acquired"] = 9
+      expected["recasaos-systemd-test-event=handler-download-slot-rejected"] = 0
+      expected["recasaos-systemd-test-event=coordinator-context-rejected"] = 0
+      expected["recasaos-systemd-test-event=coordinator-pre-slot-rejected"] = 0
+      expected["recasaos-systemd-test-event=coordinator-manager-unavailable"] = 0
+      expected["recasaos-systemd-test-event=coordinator-signal-failure"] = 0
+      expected["recasaos-systemd-test-event=coordinator-quarantine-limit"] = 0
+      expected["recasaos-systemd-test-event=coordinator-slots-full"] = 1
+      expected["recasaos-systemd-test-event=coordinator-slot-acquired"] = 8
+      expected["recasaos-systemd-test-event=worker-start-capacity-failure"] = 0
+      expected["recasaos-systemd-test-event=worker-start-protocol-failure"] = 0
+      expected["recasaos-systemd-test-event=worker-post-start-rejected"] = 0
+      expected["recasaos-systemd-test-event=worker-process-registered"] = 8
+      expected["recasaos-systemd-test-event=coordinator-open-response"] = 8
+      expected["recasaos-systemd-test-event=coordinator-read-response"] = 8
+      expected["recasaos-systemd-test-event=child-first-read-sent"] = 8
+    }
+    { observed[$0]++ }
+    END {
+      for (event in observed)
+        if (!(event in expected))
+          exit 1
+      for (event in expected)
+        if (observed[event] + 0 != expected[event])
+          exit 1
+    }
+  ' "$capacity_events"
 }
 
 slow_download_marker_is_valid() {
@@ -1297,13 +1803,17 @@ try:
         response.extend(chunk)
         if len(response) > 32768:
             raise RuntimeError("response headers exceeded the bounded limit")
-    header_block = bytes(response).split(b"\r\n\r\n", 1)[0]
+    header_block, initial_body = bytes(response).split(b"\r\n\r\n", 1)
     header_lines = header_block.split(b"\r\n")
-    if header_lines[0] != b"HTTP/1.1 200 OK":
-        raise RuntimeError(
-            "slow download did not receive exact HTTP/1.1 200 OK"
-        )
+    status_match = re.fullmatch(
+        rb"HTTP/1\.1 ([1-5][0-9]{2}) [\x20-\x7e]{1,64}",
+        header_lines[0],
+    )
+    if status_match is None:
+        raise RuntimeError("slow download received an invalid status line")
+    status_code = int(status_match.group(1))
     content_lengths = []
+    retry_after_values = []
     transfer_encodings = []
     for header_line in header_lines[1:]:
         if b":" not in header_line:
@@ -1314,8 +1824,45 @@ try:
         header_name = header_name.lower()
         if header_name == b"content-length":
             content_lengths.append(header_value.strip())
+        elif header_name == b"retry-after":
+            retry_after_values.append(header_value.strip())
         elif header_name == b"transfer-encoding":
             transfer_encodings.append(header_value.strip())
+    if header_lines[0] != b"HTTP/1.1 200 OK":
+        error_class = "unclassified"
+        if (
+            len(content_lengths) == 1
+            and re.fullmatch(rb"[0-9]{1,3}", content_lengths[0])
+            and not transfer_encodings
+        ):
+            body_length = int(content_lengths[0])
+            if body_length <= 512 and len(initial_body) <= body_length:
+                body = bytearray(initial_body)
+                while len(body) < body_length:
+                    chunk = client.recv(body_length - len(body))
+                    if not chunk:
+                        break
+                    body.extend(chunk)
+                if len(body) != body_length:
+                    error_class = "truncated-bounded-error"
+                else:
+                    error_class = {
+                        b"{\"error\":\"storage capacity unavailable\"}":
+                            "storage-capacity-unavailable",
+                        b"{\"error\":\"download capacity reached\"}":
+                            "download-capacity-reached",
+                        b"{\"error\":\"unable to open file\"}":
+                            "unable-to-open-file",
+                    }.get(bytes(body), "unrecognized-bounded-error")
+        retry_after_5 = (
+            "yes" if retry_after_values == [b"5"] else "no"
+        )
+        raise RuntimeError(
+            "slow download rejected: "
+            f"status={status_code} "
+            f"retry_after_5={retry_after_5} "
+            f"error={error_class}"
+        )
     expected_length = sys.argv[2].encode("ascii")
     if expected_length != b"67108864":
         raise RuntimeError("slow download fixture length is invalid")
@@ -1474,26 +2021,86 @@ CGO_ENABLED=0 GOOS=linux go build -trimpath \
   -tags 'netgo osusergo recasaos_publicfiles_systemd_test' \
   -o "$systemd_test_binary" \
   ./cmd/recasaos-public-files
-production_gate_files="$(
+build_input_template=
+build_input_template+='{{range .GoFiles}}{{$.ImportPath}} GoFiles {{.}}{{"\n"}}{{end}}'
+build_input_template+='{{range .CgoFiles}}{{$.ImportPath}} CgoFiles {{.}}{{"\n"}}{{end}}'
+build_input_template+='{{range .CFiles}}{{$.ImportPath}} CFiles {{.}}{{"\n"}}{{end}}'
+build_input_template+='{{range .CXXFiles}}{{$.ImportPath}} CXXFiles {{.}}{{"\n"}}{{end}}'
+build_input_template+='{{range .MFiles}}{{$.ImportPath}} MFiles {{.}}{{"\n"}}{{end}}'
+build_input_template+='{{range .HFiles}}{{$.ImportPath}} HFiles {{.}}{{"\n"}}{{end}}'
+build_input_template+='{{range .FFiles}}{{$.ImportPath}} FFiles {{.}}{{"\n"}}{{end}}'
+build_input_template+='{{range .SFiles}}{{$.ImportPath}} SFiles {{.}}{{"\n"}}{{end}}'
+build_input_template+='{{range .SwigFiles}}{{$.ImportPath}} SwigFiles {{.}}{{"\n"}}{{end}}'
+build_input_template+='{{range .SwigCXXFiles}}{{$.ImportPath}} SwigCXXFiles {{.}}{{"\n"}}{{end}}'
+build_input_template+='{{range .SysoFiles}}{{$.ImportPath}} SysoFiles {{.}}{{"\n"}}{{end}}'
+build_input_template+='{{range .EmbedFiles}}{{$.ImportPath}} EmbedFiles {{.}}{{"\n"}}{{end}}'
+production_build_inputs="$(
   CGO_ENABLED=0 GOOS=linux go list \
+    -deps \
     -tags 'netgo osusergo' \
-    -f '{{range .GoFiles}}{{println .}}{{end}}' \
-    ./pkg/publicfiles |
-    awk '/^worker_systemd_test_gate_(disabled|enabled)_linux\.go$/ { print }'
-)" || fail "could not inspect production public-files gate selection"
+    -f "$build_input_template" \
+    ./cmd/recasaos-public-files |
+    LC_ALL=C sort -u
+)" || fail "could not inspect production public-files build inputs"
+production_gate_files="$(
+  printf '%s\n' "$production_build_inputs" |
+    awk '
+      $1 == "github.com/IceWhaleTech/CasaOS/pkg/publicfiles" &&
+        $2 == "GoFiles" &&
+        $3 ~ /^worker_systemd_test_gate_(disabled|enabled)_linux\.go$/ {
+        print $3
+      }
+    '
+)"
 [[ "$production_gate_files" == \
   worker_systemd_test_gate_disabled_linux.go ]] ||
   fail "production build selected unsafe systemd test gates: $production_gate_files"
-systemd_test_gate_files="$(
+systemd_test_build_inputs="$(
   CGO_ENABLED=0 GOOS=linux go list \
+    -deps \
     -tags 'netgo osusergo recasaos_publicfiles_systemd_test' \
-    -f '{{range .GoFiles}}{{println .}}{{end}}' \
-    ./pkg/publicfiles |
-    awk '/^worker_systemd_test_gate_(disabled|enabled)_linux\.go$/ { print }'
-)" || fail "could not inspect tagged public-files gate selection"
+    -f "$build_input_template" \
+    ./cmd/recasaos-public-files |
+    LC_ALL=C sort -u
+)" || fail "could not inspect tagged public-files build inputs"
+systemd_test_gate_files="$(
+  printf '%s\n' "$systemd_test_build_inputs" |
+    awk '
+      $1 == "github.com/IceWhaleTech/CasaOS/pkg/publicfiles" &&
+        $2 == "GoFiles" &&
+        $3 ~ /^worker_systemd_test_gate_(disabled|enabled)_linux\.go$/ {
+        print $3
+      }
+    '
+)"
 [[ "$systemd_test_gate_files" == \
   worker_systemd_test_gate_enabled_linux.go ]] ||
   fail "tagged build selected unexpected systemd test gates: $systemd_test_gate_files"
+production_shared_build_inputs="$(
+  printf '%s\n' "$production_build_inputs" |
+    awk '
+      $1 == "github.com/IceWhaleTech/CasaOS/pkg/publicfiles" &&
+        $2 == "GoFiles" &&
+        $3 ~ /^worker_systemd_test_gate_(disabled|enabled)_linux\.go$/ {
+        next
+      }
+      { print }
+    '
+)"
+systemd_test_shared_build_inputs="$(
+  printf '%s\n' "$systemd_test_build_inputs" |
+    awk '
+      $1 == "github.com/IceWhaleTech/CasaOS/pkg/publicfiles" &&
+        $2 == "GoFiles" &&
+        $3 ~ /^worker_systemd_test_gate_(disabled|enabled)_linux\.go$/ {
+        next
+      }
+      { print }
+    '
+)"
+[[ -n "$production_shared_build_inputs" &&
+  "$production_shared_build_inputs" == "$systemd_test_shared_build_inputs" ]] ||
+  fail "production and tagged binaries select different shared build inputs"
 for built_binary in "$production_binary" "$systemd_test_binary"; do
   file "$built_binary" | grep -q 'statically linked' ||
     fail "public-files binary is not static: $built_binary"
@@ -1501,6 +2108,13 @@ done
 if cmp -s -- "$production_binary" "$systemd_test_binary"; then
   fail "systemd capacity binary is identical to the production build"
 fi
+if LC_ALL=C grep -aFq -- \
+  'recasaos-systemd-test-event=' "$production_binary"; then
+  fail "production binary contains CI-only systemd event diagnostics"
+fi
+LC_ALL=C grep -aFq -- \
+  'recasaos-systemd-test-event=' "$systemd_test_binary" ||
+  fail "tagged binary omitted CI-only systemd event diagnostics"
 sudo install -o root -g root -m 0755 \
   "$production_binary" \
   "$rootfs/usr/bin/recasaos-public-files"
@@ -1833,10 +2447,48 @@ printf '%s\n' 'systemd isolation fixture' |
   cmp - "$response_file" ||
   fail "downloaded bytes differ from the approved file"
 
+sudo cmp -s -- "/proc/$portal_pid/exe" "$production_binary" ||
+  fail "running production portal bytes differ from the reviewed binary"
+production_worker_deadline=$((SECONDS + 15))
+start_slow_download
+wait_until_before "production slow download response" \
+  "$production_worker_deadline" \
+  slow_download_is_ready \
+  "$latest_slow_download_pid" \
+  "$latest_slow_download_ready_file" \
+  "$latest_slow_download_failure_file" \
+  "$latest_slow_download_start_time"
+wait_until_before "one production storage worker" \
+  "$production_worker_deadline" \
+  storage_worker_count_is 1
+production_worker_pid="$(storage_worker_pids)"
+[[ "$production_worker_pid" =~ ^[0-9]+$ && "$production_worker_pid" -gt 1 ]] ||
+  fail "production probe did not retain exactly one storage worker"
+production_worker_start_time="$(
+  process_start_time "$production_worker_pid"
+)" || fail "could not capture production storage worker identity"
+assert_storage_worker_address_space_limit \
+  "$production_worker_pid" \
+  "$production_worker_start_time" \
+  production
+cleanup_background_downloads
+production_cleanup_deadline=$((SECONDS + 10))
+wait_until_before "production storage worker pidfd cancellation" \
+  "$production_cleanup_deadline" \
+  process_identity_is_gone \
+  "$production_worker_pid" \
+  "$production_worker_start_time"
+wait_until_before "production storage worker reap" \
+  "$production_cleanup_deadline" \
+  storage_worker_count_is 0
+
 activate_public_binary \
   "$systemd_test_binary" \
   "systemd capacity binary activation"
+sudo cmp -s -- "/proc/$portal_pid/exe" "$systemd_test_binary" ||
+  fail "running systemd-test portal bytes differ from the reviewed binary"
 wait_until "storage workers before bounded load" storage_worker_count_is 0
+capture_capacity_journal_cursor
 worker_capacity_deadline=$((SECONDS + 15))
 for expected_worker_count in {1..8}; do
   start_slow_download
@@ -1900,6 +2552,15 @@ ninth_status="$(
   ' "$ninth_response_headers"
 )" == 1:0 ]] ||
   fail "ninth concurrent storage request lacked one exact Retry-After value 5"
+wait_until_before "storage worker capacity event chain" \
+  "$worker_capacity_deadline" \
+  capacity_phase_events_are_complete
+for bounded_worker_index in "${!bounded_worker_pids[@]}"; do
+  assert_storage_worker_address_space_limit \
+    "${bounded_worker_pids[$bounded_worker_index]}" \
+    "${bounded_worker_start_times[$bounded_worker_index]}" \
+    systemd-test
+done
 
 tasks_current="$(
   sudo systemctl show --property=TasksCurrent --value "$service_unit"

@@ -93,8 +93,9 @@ LimitNOFILE=512
 # One coordinator generation can retain eight active plus three previously
 # quarantined workers before admission closes. TasksMax and MemoryMax are the
 # final unit-wide bounds, including any unkillable remnants from an older
-# restart generation. Each child has RLIMIT_AS=1GiB and GOMAXPROCS=1, while
-# GOMEMLIMIT=24MiB remains only a soft runtime budget.
+# restart generation. Each child has a finite RLIMIT_AS covering its
+# post-runtime baseline plus 256MiB and GOMAXPROCS=1, while GOMEMLIMIT=24MiB
+# remains only a soft runtime budget.
 TasksMax=256
 MemoryMax=512M
 MemorySwapMax=0
