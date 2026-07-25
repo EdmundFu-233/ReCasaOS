@@ -52,6 +52,10 @@ nested_mount="${share}/covered"
 host_shm_sentinel_prefix="/dev/shm/recasaos-public-files-ci-${run_key}."
 host_shm_sentinel=
 test_bearer='rc1_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8'
+# Exceed the service's 512 MiB total memory ceiling so a completed worker
+# cannot be mistaken for a connection that is still under peer backpressure.
+# truncate creates a hole; the fixture consumes no GiB of runner storage.
+worker_load_bytes=1073741824
 
 case "$workspace" in
   /run/recasaos-public-files-ci-[0-9]*-[0-9]*) ;;
@@ -860,8 +864,20 @@ service_has_new_pid() {
 }
 
 storage_worker_pids() {
-  sudo pgrep -P "$portal_pid" -f -- \
-    '--internal-public-files-storage-worker (list|file)' 2>/dev/null || true
+  local command_status
+  local pids
+
+  if pids="$(
+    sudo pgrep -P "$portal_pid" -f -- \
+      '--internal-public-files-storage-worker (list|file)' 2>/dev/null
+  )"; then
+    printf '%s\n' "$pids"
+    return 0
+  else
+    command_status=$?
+  fi
+  [[ "$command_status" == 1 ]] ||
+    fail "storage worker enumeration failed with status $command_status"
 }
 
 storage_worker_count() {
@@ -933,6 +949,14 @@ print_storage_worker_diagnostics() {
       done <"$failure_file"
     fi
   done
+  sudo systemctl show \
+    --property=ActiveState \
+    --property=SubState \
+    --property=MainPID \
+    --property=InvocationID \
+    "$service_unit" >&2 || true
+  sudo ss -H -tinp \
+    '( sport = :39777 or dport = :39777 )' >&2 || true
   sudo journalctl --no-pager --output=short-monotonic --lines=80 \
     --unit="$socket_unit" --unit="$service_unit" >&2 || true
 }
@@ -1023,6 +1047,11 @@ try:
     client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
     if client.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF) > 16384:
         raise RuntimeError("kernel did not preserve the bounded receive buffer")
+    if not hasattr(socket, "TCP_WINDOW_CLAMP"):
+        raise RuntimeError("kernel TCP window clamp support is unavailable")
+    client.setsockopt(socket.IPPROTO_TCP, socket.TCP_WINDOW_CLAMP, 4096)
+    if client.getsockopt(socket.IPPROTO_TCP, socket.TCP_WINDOW_CLAMP) > 16384:
+        raise RuntimeError("kernel did not preserve the bounded TCP window")
     client.settimeout(10)
     client.connect(("127.0.0.1", 39777))
     client.sendall(
@@ -1053,7 +1082,10 @@ try:
         header_name, header_value = header_line.split(b":", 1)
         if header_name.lower() == b"content-length":
             content_lengths.append(header_value.strip())
-    if content_lengths != [b"67108864"]:
+    expected_length = sys.argv[2].encode("ascii")
+    if expected_length != b"1073741824":
+        raise RuntimeError("slow download fixture length is invalid")
+    if content_lengths != [expected_length]:
         raise RuntimeError("slow download received an unexpected content length")
 
     marker_path = sys.argv[1]
@@ -1073,7 +1105,19 @@ try:
     os.unlink(marker_temp_path)
 
     client.settimeout(None)
-    time.sleep(120)
+    if not hasattr(socket, "TCP_INFO"):
+        raise RuntimeError("kernel TCP connection state is unavailable")
+    for _ in range(1200):
+        tcp_state = client.getsockopt(
+            socket.IPPROTO_TCP,
+            socket.TCP_INFO,
+            1,
+        )[0]
+        if tcp_state != 1:
+            raise RuntimeError(
+                "slow download connection closed before holder release"
+            )
+        time.sleep(0.1)
 except Exception as error:
     print(
         "slow download holder failed: "
@@ -1082,7 +1126,7 @@ except Exception as error:
         flush=True,
     )
     raise SystemExit(1)
-' "$ready_file" 2>"$failure_file" &
+' "$ready_file" "$worker_load_bytes" 2>"$failure_file" &
   pid=$!
   slow_download_pids+=("$pid")
   slow_download_ready_files+=("$ready_file")
@@ -1138,7 +1182,7 @@ sudo install -d -o root -g recasaos-public -m 0750 \
   "$share" "$nested_backing" "$nested_mount" "$rootfs/srv/public"
 printf 'systemd isolation fixture\n' |
   sudo tee "$share/report.txt" >/dev/null
-sudo truncate -s 67108864 "$share/worker-load.bin"
+sudo truncate -s "$worker_load_bytes" "$share/worker-load.bin"
 printf 'must remain covered by the nested mount\n' |
   sudo tee "$nested_mount/must-remain-covered.txt" >/dev/null
 printf 'nested mount content must be rejected\n' |
