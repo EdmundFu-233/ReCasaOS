@@ -28,7 +28,7 @@ const portalHTML = `<!doctype html>
 </html>
 `
 
-const portalCSS = `:root{color-scheme:light dark;font:16px/1.5 system-ui,sans-serif}body{margin:0;padding:2rem;background:#10151d;color:#edf2f7}main{max-width:58rem;margin:auto}form,nav{display:flex;gap:.75rem;align-items:center;flex-wrap:wrap}input,button{font:inherit;padding:.55rem .75rem;border-radius:.4rem;border:1px solid #778;background:#182231;color:inherit}button{cursor:pointer}button:disabled{cursor:not-allowed;opacity:.6}button:focus,input:focus,a:focus{outline:3px solid #69b7ff;outline-offset:2px}ul{list-style:none;padding:0;border-top:1px solid #445}li{display:flex;justify-content:space-between;gap:1rem;padding:.7rem;border-bottom:1px solid #334}a{color:#80c7ff}code{overflow-wrap:anywhere}#status{min-height:1.5rem}.size,.help{color:#aab}.help{font-size:.9rem}`
+const portalCSS = `:root{color-scheme:light dark;font:16px/1.5 system-ui,sans-serif}body{margin:0;padding:2rem;background:#10151d;color:#edf2f7}main{max-width:58rem;margin:auto}[hidden]{display:none!important}form,nav{display:flex;gap:.75rem;align-items:center;flex-wrap:wrap}input,button{font:inherit;padding:.55rem .75rem;border-radius:.4rem;border:1px solid #778;background:#182231;color:inherit}button{cursor:pointer}button:disabled{cursor:not-allowed;opacity:.6}button:focus,input:focus,a:focus{outline:3px solid #69b7ff;outline-offset:2px}ul{list-style:none;padding:0;border-top:1px solid #445}li{display:flex;justify-content:space-between;gap:1rem;padding:.7rem;border-bottom:1px solid #334}a{color:#80c7ff}code{overflow-wrap:anywhere}#status{min-height:1.5rem}.size,.help{color:#aab}.help{font-size:.9rem}`
 
 const portalJavaScript = `'use strict';
 const protocolVersion=1;
