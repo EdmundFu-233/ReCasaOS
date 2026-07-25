@@ -314,6 +314,9 @@ func testStorageWorkerCommandFactory(
 			testStorageWorkerModeEnvironment + "=" + mode,
 			testStorageWorkerActionEnvironment + "=" + action(mode),
 			"GOMAXPROCS=1",
+			// The race runtime otherwise sleeps for one second at process exit,
+			// which is exactly the production worker exit budget.
+			"GORACE=atexit_sleep_ms=0",
 			"GOTRACEBACK=none",
 		}
 		command.ExtraFiles = []*os.File{childSocket}

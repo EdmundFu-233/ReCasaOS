@@ -334,10 +334,10 @@ Check the actual target before installing anything:
   kernel_minor="${BASH_REMATCH[2]}"
   (( kernel_major > 5 || (kernel_major == 5 && kernel_minor >= 8) ))
   [[ "$(stat -fc %T /sys/fs/cgroup)" == cgroup2fs ]]
-  for controller_file in \
-    cgroup.controllers memory.max memory.swap.max pids.max
+  [[ -f /sys/fs/cgroup/cgroup.controllers ]]
+  for controller_file in memory.max memory.swap.max pids.max
   do
-    [[ -f "/sys/fs/cgroup/$controller_file" ]]
+    [[ -f "/sys/fs/cgroup/system.slice/$controller_file" ]]
   done
   controllers=" $(< /sys/fs/cgroup/cgroup.controllers) "
   [[ "$controllers" == *" memory "* ]]

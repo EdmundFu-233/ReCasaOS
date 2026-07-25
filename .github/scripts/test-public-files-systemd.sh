@@ -970,9 +970,9 @@ printf '%s\n' \
   'ConditionPathIsDirectory=' \
   "ConditionPathIsDirectory=$share" \
   'ConditionPathExists=/sys/fs/cgroup/cgroup.controllers' \
-  'ConditionPathExists=/sys/fs/cgroup/memory.max' \
-  'ConditionPathExists=/sys/fs/cgroup/memory.swap.max' \
-  'ConditionPathExists=/sys/fs/cgroup/pids.max' \
+  'ConditionPathExists=/sys/fs/cgroup/system.slice/memory.max' \
+  'ConditionPathExists=/sys/fs/cgroup/system.slice/memory.swap.max' \
+  'ConditionPathExists=/sys/fs/cgroup/system.slice/pids.max' \
   "ConditionFileNotEmpty=$verifier" \
   "ConditionPathIsSymbolicLink=!$verifier" \
   'StartLimitIntervalSec=15s' \
@@ -996,9 +996,9 @@ printf '%s\n' \
   'ConditionPathIsDirectory=' \
   "ConditionPathIsDirectory=$share" \
   'ConditionPathExists=/sys/fs/cgroup/cgroup.controllers' \
-  'ConditionPathExists=/sys/fs/cgroup/memory.max' \
-  'ConditionPathExists=/sys/fs/cgroup/memory.swap.max' \
-  'ConditionPathExists=/sys/fs/cgroup/pids.max' \
+  'ConditionPathExists=/sys/fs/cgroup/system.slice/memory.max' \
+  'ConditionPathExists=/sys/fs/cgroup/system.slice/memory.swap.max' \
+  'ConditionPathExists=/sys/fs/cgroup/system.slice/pids.max' \
   "ConditionFileNotEmpty=$verifier" \
   "ConditionPathIsSymbolicLink=!$verifier" |
   sudo tee "$socket_override_path" >/dev/null

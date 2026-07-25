@@ -168,7 +168,7 @@ expect_rejected() {
       mv -f -- "$service.next" "$service"
       ;;
     missing-socket-cgroup-v2-gate)
-      sed '/^ConditionPathExists=\/sys\/fs\/cgroup\/memory.swap.max$/d' \
+      sed '/^ConditionPathExists=\/sys\/fs\/cgroup\/system.slice\/memory.swap.max$/d' \
         "$socket" >"$socket.next"
       mv -f -- "$socket.next" "$socket"
       ;;

@@ -5,11 +5,12 @@ ConditionFileNotEmpty=/etc/recasaos/public-file.verifier
 ConditionPathIsSymbolicLink=!/etc/recasaos/public-file.verifier
 # MemorySwapMax is effective only on the unified hierarchy. Refuse to start or
 # bind the public listener unless the host exposes the exact cgroup-v2 memory
-# and pids controller files required by the worker-containment boundary.
+# and pids controller files in the service's parent slice. The hierarchy root
+# need not expose limit files even when delegated child cgroups do.
 ConditionPathExists=/sys/fs/cgroup/cgroup.controllers
-ConditionPathExists=/sys/fs/cgroup/memory.max
-ConditionPathExists=/sys/fs/cgroup/memory.swap.max
-ConditionPathExists=/sys/fs/cgroup/pids.max
+ConditionPathExists=/sys/fs/cgroup/system.slice/memory.max
+ConditionPathExists=/sys/fs/cgroup/system.slice/memory.swap.max
+ConditionPathExists=/sys/fs/cgroup/system.slice/pids.max
 StartLimitIntervalSec=2min
 StartLimitBurst=5
 

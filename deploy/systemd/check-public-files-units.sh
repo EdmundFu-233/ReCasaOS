@@ -179,9 +179,9 @@ require_exact_sectioned_active_lines "$service" \
   'ConditionFileNotEmpty=/etc/recasaos/public-file.verifier' \
   'ConditionPathIsSymbolicLink=!/etc/recasaos/public-file.verifier' \
   'ConditionPathExists=/sys/fs/cgroup/cgroup.controllers' \
-  'ConditionPathExists=/sys/fs/cgroup/memory.max' \
-  'ConditionPathExists=/sys/fs/cgroup/memory.swap.max' \
-  'ConditionPathExists=/sys/fs/cgroup/pids.max' \
+  'ConditionPathExists=/sys/fs/cgroup/system.slice/memory.max' \
+  'ConditionPathExists=/sys/fs/cgroup/system.slice/memory.swap.max' \
+  'ConditionPathExists=/sys/fs/cgroup/system.slice/pids.max' \
   'StartLimitIntervalSec=2min' \
   'StartLimitBurst=5' \
   '[Service]' \
@@ -252,9 +252,9 @@ require_exact_sectioned_active_lines "$socket" \
   'ConditionFileNotEmpty=/etc/recasaos/public-file.verifier' \
   'ConditionPathIsSymbolicLink=!/etc/recasaos/public-file.verifier' \
   'ConditionPathExists=/sys/fs/cgroup/cgroup.controllers' \
-  'ConditionPathExists=/sys/fs/cgroup/memory.max' \
-  'ConditionPathExists=/sys/fs/cgroup/memory.swap.max' \
-  'ConditionPathExists=/sys/fs/cgroup/pids.max' \
+  'ConditionPathExists=/sys/fs/cgroup/system.slice/memory.max' \
+  'ConditionPathExists=/sys/fs/cgroup/system.slice/memory.swap.max' \
+  'ConditionPathExists=/sys/fs/cgroup/system.slice/pids.max' \
   '[Socket]' \
   'ListenStream=127.0.0.1:39777' \
   'Accept=no' \
