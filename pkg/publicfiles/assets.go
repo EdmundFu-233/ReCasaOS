@@ -174,7 +174,6 @@ async function startNativeDownload(path,entry){
     if(pendingNative!==state)return;
     cancelNativeTransport(state);
     pendingNative=null;
-    try{window.stop();}catch(_error){}
     boundedDownload(path,entry).catch(showError);
   },workerReplyTimeoutMs);
   statusNode.textContent='Handing '+entry.name+' to the browser…';

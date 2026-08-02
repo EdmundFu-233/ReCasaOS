@@ -324,6 +324,7 @@ func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *test
 		"recasaos-download-prepare",
 		"recasaos-download-cancel",
 		"window.location.assign(state.requestURL)",
+		"boundedDownload(path,entry).catch(showError);",
 		"Token forgotten after page restore",
 		"const bearerPattern=/^rc1_[A-Za-z0-9_-]{43}$/",
 		"bearerPattern.test(candidate)",
