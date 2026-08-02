@@ -72,6 +72,8 @@ type requestSnapshot struct {
 	CanceledFileRequests     int64 `json:"canceled_file_requests"`
 	AuthorizedListRequests   int64 `json:"authorized_list_requests"`
 	AuthorizedFileRequests   int64 `json:"authorized_file_requests"`
+	AuthorizedRangeRequests  int64 `json:"authorized_range_file_requests"`
+	PartialFileResponses     int64 `json:"partial_file_responses"`
 	AuthorizationOnOtherPath int64 `json:"authorization_on_other_path"`
 	CredentialQueryRequests  int64 `json:"credential_query_requests"`
 }
@@ -82,6 +84,8 @@ type requestCounters struct {
 	canceledFileRequests     atomic.Int64
 	authorizedListRequests   atomic.Int64
 	authorizedFileRequests   atomic.Int64
+	authorizedRangeRequests  atomic.Int64
+	partialFileResponses     atomic.Int64
 	authorizationOnOtherPath atomic.Int64
 	credentialQueryRequests  atomic.Int64
 }
@@ -113,6 +117,8 @@ func (c *requestCounters) snapshot() requestSnapshot {
 		CanceledFileRequests:     c.canceledFileRequests.Load(),
 		AuthorizedListRequests:   c.authorizedListRequests.Load(),
 		AuthorizedFileRequests:   c.authorizedFileRequests.Load(),
+		AuthorizedRangeRequests:  c.authorizedRangeRequests.Load(),
+		PartialFileResponses:     c.partialFileResponses.Load(),
 		AuthorizationOnOtherPath: c.authorizationOnOtherPath.Load(),
 		CredentialQueryRequests:  c.credentialQueryRequests.Load(),
 	}
@@ -145,10 +151,16 @@ func (h *instrumentedPortal) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.counters.authorizedFileRequests.Add(1)
+	if ranges := r.Header.Values("Range"); len(ranges) == 1 && strings.TrimSpace(ranges[0]) != "" {
+		h.counters.authorizedRangeRequests.Add(1)
+	}
 	h.counters.activeFileRequests.Add(1)
 	trackedWriter := &cancelTrackingWriter{ResponseWriter: w}
 	defer func() {
 		h.counters.activeFileRequests.Add(-1)
+		if trackedWriter.statusCode.Load() == http.StatusPartialContent {
+			h.counters.partialFileResponses.Add(1)
+		}
 		if recovered := recover(); recovered != nil {
 			h.counters.canceledFileRequests.Add(1)
 			panic(recovered)
@@ -169,14 +181,26 @@ func (h *instrumentedPortal) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 type cancelTrackingWriter struct {
 	http.ResponseWriter
-	failed atomic.Bool
+	failed     atomic.Bool
+	statusCode atomic.Int64
 }
 
 func (w *cancelTrackingWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
+func (w *cancelTrackingWriter) WriteHeader(statusCode int) {
+	if statusCode >= 100 && statusCode < 200 {
+		w.ResponseWriter.WriteHeader(statusCode)
+		return
+	}
+	if w.statusCode.CompareAndSwap(0, int64(statusCode)) {
+		w.ResponseWriter.WriteHeader(statusCode)
+	}
+}
+
 func (w *cancelTrackingWriter) Write(payload []byte) (int, error) {
+	w.statusCode.CompareAndSwap(0, http.StatusOK)
 	written, err := w.ResponseWriter.Write(payload)
 	if err != nil || written != len(payload) {
 		w.failed.Store(true)

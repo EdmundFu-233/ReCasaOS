@@ -394,7 +394,16 @@ func (p *Portal) serveFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", formatDownloadContentDisposition(filename))
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Accept-Ranges", "bytes")
-	http.ServeContent(w, r, filename, info.ModTime(), file)
+	// The storage protocol does not provide a strong representation
+	// validator. Passing the filesystem modification time to ServeContent
+	// would make it accept date-based If-Range values at one-second
+	// precision. A same-second replacement could then let a client splice a
+	// cached prefix from one representation onto a 206 suffix from another.
+	//
+	// A zero modification time keeps ordinary single-range requests working,
+	// but makes every If-Range request fall back to a complete 200 response
+	// until the portal can prove an immutable representation identity.
+	http.ServeContent(w, r, filename, time.Time{}, file)
 	if source, ok := file.(storageSourceError); ok && source.sourceError() != nil {
 		panic(http.ErrAbortHandler)
 	}

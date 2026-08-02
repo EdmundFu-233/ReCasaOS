@@ -79,8 +79,11 @@ function fileRequestState(snapshot) {
   return {
     active_file_requests: snapshot.active_file_requests,
     authorized_file_requests: snapshot.authorized_file_requests,
+    authorized_range_file_requests:
+      snapshot.authorized_range_file_requests,
     canceled_file_requests: snapshot.canceled_file_requests,
     completed_file_requests: snapshot.completed_file_requests,
+    partial_file_responses: snapshot.partial_file_responses,
   };
 }
 
@@ -322,6 +325,66 @@ test('native browser download preserves bytes and leaves no bearer residue', asy
     after.authorized_file_requests - before.authorized_file_requests,
     'native download must use exactly one authenticated file request',
   ).toBe(1);
+  expect(after.authorization_on_other_path).toBe(0);
+  expect(after.credential_query_requests).toBe(0);
+  await expectFileRequestStateToRemainQuiescent(portal, after);
+});
+
+test('initial byte range downloads exactly the requested representation', async ({
+  context,
+  page,
+  portal,
+}) => {
+  await loginAndWaitForNativeStreaming(page, portal);
+  const before = await readSnapshot(portal);
+  const expectedPayload = Buffer.from('public-file');
+
+  await page.setExtraHTTPHeaders({ Range: 'bytes=9-19' });
+  const downloadPromise = page.waitForEvent('download');
+  await page.locator('#entries a', { hasText: 'report.txt' }).click();
+  const download = await downloadPromise;
+
+  expect(
+    download.suggestedFilename() === 'report.txt',
+    'range download must use the reviewed filename',
+  ).toBe(true);
+  expect(
+    await download.failure(),
+    'range download must complete without browser failure',
+  ).toBeNull();
+  const downloaded = await hashDownload(download);
+  expect(downloaded).toEqual({
+    sha256: createHash('sha256').update(expectedPayload).digest('hex'),
+    size: expectedPayload.length,
+  });
+
+  expect(
+    !download.url().includes(portal.bearer),
+    'range download URL must remain credential-free',
+  ).toBe(true);
+  expect(await context.cookies()).toEqual([]);
+  expect(JSON.stringify(await context.storageState())).not.toContain(
+    portal.bearer,
+  );
+  assertNoBrowserStorageResidue(
+    await browserStorageResidue(page, portal.bearer),
+  );
+
+  const after = await waitForSnapshot(
+    portal,
+    (snapshot) =>
+      snapshot.active_file_requests === 0 &&
+      snapshot.authorized_file_requests -
+        before.authorized_file_requests ===
+        1 &&
+      snapshot.authorized_range_file_requests -
+        before.authorized_range_file_requests ===
+        1 &&
+      snapshot.partial_file_responses - before.partial_file_responses === 1 &&
+      snapshot.canceled_file_requests - before.canceled_file_requests === 0 &&
+      snapshot.completed_file_requests - before.completed_file_requests === 1,
+    'completed initial range download',
+  );
   expect(after.authorization_on_other_path).toBe(0);
   expect(after.credential_query_requests).toBe(0);
   await expectFileRequestStateToRemainQuiescent(portal, after);
