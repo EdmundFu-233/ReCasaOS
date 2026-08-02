@@ -1,7 +1,5 @@
 name: Trusted privileged exact-SHA
 
-# Rollout probe: a changed policy blob must require explicit manual promotion.
-
 on:
   workflow_run:
     workflows:
