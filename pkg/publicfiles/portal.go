@@ -318,13 +318,15 @@ func (p *Portal) serveFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !p.authorized(r) {
-		// A controlled top-level download navigation normally receives its
-		// Authorization header from the scoped Service Worker. If that Worker is
-		// replaced or bypassed after the page has prepared the navigation, keep
-		// the existing portal document in place instead of rendering an error
-		// document. Sec-Fetch-* is only a UX/fail-closed signal here; it never
-		// grants access and non-navigation clients retain the normal 401.
-		if r.Method == http.MethodGet && r.Header.Get("Sec-Fetch-Mode") == "navigate" && r.Header.Get("Sec-Fetch-Dest") == "document" {
+		// A controlled portal or same-origin child-frame download navigation
+		// normally receives its Authorization header from the scoped Service Worker.
+		// If that Worker is
+		// replaced or bypassed after the page has prepared the navigation, return
+		// an empty response instead of rendering an error document in either
+		// context. Sec-Fetch-* is only a UX/fail-closed signal here; it never grants
+		// access and non-navigation clients retain the normal 401.
+		destination := r.Header.Get("Sec-Fetch-Dest")
+		if r.Method == http.MethodGet && r.Header.Get("Sec-Fetch-Mode") == "navigate" && (destination == "document" || destination == "iframe") {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}

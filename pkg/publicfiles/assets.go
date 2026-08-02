@@ -314,7 +314,8 @@ function handleProtocolMessage(event){
 }
 function parseDownload(request){
   const url=new URL(request.url);
-  if(url.origin!==self.location.origin||url.pathname!==filePath||request.method!=='GET'||request.mode!=='navigate'||request.destination!=='document')return null;
+  const supportedNavigation=request.mode==='navigate'&&(request.destination==='document'||request.destination==='iframe');
+  if(url.origin!==self.location.origin||url.pathname!==filePath||request.method!=='GET'||!supportedNavigation)return null;
   const keys=Array.from(url.searchParams.keys());const nonce=url.hash.slice(1);
   if(keys.length!==1||keys[0]!=='path'||url.searchParams.getAll('path').length!==1||!validNonce(nonce))return {error:true};
   const path=url.searchParams.get('path');

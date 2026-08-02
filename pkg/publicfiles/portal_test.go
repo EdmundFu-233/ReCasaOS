@@ -384,8 +384,8 @@ func TestDownloadWorkerIsNarrowNoStoreAsset(t *testing.T) {
 	for _, required := range []string{
 		"const filePath=basePath+'/api/file'",
 		"request.method!=='GET'",
-		"request.mode!=='navigate'",
-		"request.destination!=='document'",
+		"request.mode==='navigate'",
+		"request.destination==='document'||request.destination==='iframe'",
 		"pendingDownloads.get(download.nonce)",
 		"activeDownloads.get(data.nonce)",
 		"activeDownloads.has(data.nonce)",
@@ -439,32 +439,34 @@ func TestDownloadWorkerChecksNavigationClientBeforeConsumingReservation(t *testi
 	}
 }
 
-func TestUnauthenticatedTopLevelFileNavigationFailsClosedWithoutReplacingPortal(t *testing.T) {
+func TestUnauthenticatedFileNavigationFailsClosedWithoutReplacingPortal(t *testing.T) {
 	portal := &Portal{}
-	request := httptest.NewRequest(http.MethodGet, BasePath+"/api/file?path=report.pdf", nil)
-	request.Header.Set("Sec-Fetch-Mode", "navigate")
-	request.Header.Set("Sec-Fetch-Dest", "document")
-	recorder := httptest.NewRecorder()
-	portal.ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusNoContent {
-		t.Fatalf("top-level navigation status = %d, want 204", recorder.Code)
-	}
-	if recorder.Body.Len() != 0 {
-		t.Fatalf("top-level navigation failure returned a body: %q", recorder.Body.String())
-	}
-	if recorder.Header().Get("WWW-Authenticate") != "" {
-		t.Fatal("empty navigation failure unexpectedly requested browser authentication")
-	}
-	if recorder.Header().Get("Cache-Control") != "no-store" {
-		t.Fatal("empty navigation failure is cacheable")
+	for _, destination := range []string{"document", "iframe"} {
+		request := httptest.NewRequest(http.MethodGet, BasePath+"/api/file?path=report.pdf", nil)
+		request.Header.Set("Sec-Fetch-Mode", "navigate")
+		request.Header.Set("Sec-Fetch-Dest", destination)
+		recorder := httptest.NewRecorder()
+		portal.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusNoContent {
+			t.Fatalf("%s navigation status = %d, want 204", destination, recorder.Code)
+		}
+		if recorder.Body.Len() != 0 {
+			t.Fatalf("%s navigation failure returned a body: %q", destination, recorder.Body.String())
+		}
+		if recorder.Header().Get("WWW-Authenticate") != "" {
+			t.Fatalf("%s navigation failure unexpectedly requested browser authentication", destination)
+		}
+		if recorder.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("%s navigation failure is cacheable", destination)
+		}
 	}
 
-	request = httptest.NewRequest(http.MethodGet, BasePath+"/api/file?path=report.pdf", nil)
+	request := httptest.NewRequest(http.MethodGet, BasePath+"/api/file?path=report.pdf", nil)
 	request.Header.Set("Sec-Fetch-Mode", "navigate")
-	request.Header.Set("Sec-Fetch-Dest", "iframe")
-	recorder = httptest.NewRecorder()
+	request.Header.Set("Sec-Fetch-Dest", "object")
+	recorder := httptest.NewRecorder()
 	portal.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusUnauthorized {
-		t.Fatalf("non-top-level navigation status = %d, want 401", recorder.Code)
+		t.Fatalf("unsupported navigation destination status = %d, want 401", recorder.Code)
 	}
 }
