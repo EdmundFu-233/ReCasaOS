@@ -44,12 +44,32 @@ The first hardening milestone includes:
 - maintained archive/OpenAPI implementations and upgraded vulnerable
   dependencies;
 - secret-safe request/OAuth logging, restrictive file permissions, CodeQL,
-  Dependabot, and reachable-vulnerability CI;
+  Dependabot, reachable-vulnerability CI, and a default-branch-controlled
+  exact-SHA promotion path for trusted-only privileged tests;
 - reviewed Caddy/Nginx edge examples, a threat model, and explicit component
   release gates.
 
 See [the threat model](docs/THREAT_MODEL.md) for the remaining blockers and
 [the component lock policy](RECASAOS_COMPONENTS.md) for the full-stack boundary.
+
+## Contribution CI trust boundary
+
+GitHub-hosted runners provide passwordless `sudo`; the normal fork-PR workflow
+is therefore not a sandbox for arbitrary contributor code. ReCasaOS does not
+give fork or Dependabot code a write token or repository secrets. Trusted-only
+filesystem tests for those PRs must be promoted by a maintainer from the
+default branch, using the PR's complete immutable head SHA. The workflow pins
+that object to a one-time same-repository ref, proves the commit and tree before
+testing, runs with read-only contents permission and no persisted checkout
+credential or shared cache, then revalidates the still-current PR head before
+publishing `ReCasaOS / trusted privileged exact-SHA` on that SHA.
+
+See [the trusted privileged CI runbook](docs/operations/trusted-privileged-ci.md)
+for the review, dispatch, verification, branch-protection, and rollback gates.
+[Issue #27](https://github.com/EdmundFu-233/ReCasaOS/issues/27) remains open
+until the workflow is validated from `main`, the exact status provider is
+required by branch protection, and both stale-head and external-PR behavior are
+recorded. A skipped job is not privileged-test evidence.
 
 ## Public access
 

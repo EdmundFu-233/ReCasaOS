@@ -1,0 +1,647 @@
+name: Trusted privileged exact-SHA
+
+on:
+  workflow_run:
+    workflows:
+      - ReCasaOS CI and security
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: Open pull request number to promote
+        required: true
+        type: string
+      head_sha:
+        description: Exact 40-character lowercase pull request head SHA
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+  STATUS_CONTEXT: ReCasaOS / trusted privileged exact-SHA
+
+concurrency:
+  group: >-
+    trusted-privileged-${{ github.event_name }}-${{
+    github.event.workflow_run.id || inputs.pull_request }}-${{
+    github.event.workflow_run.head_sha || inputs.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  attest-trusted-run:
+    name: Attest trusted same-repository run
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      # This job runs only the default-branch workflow, never checks out the PR,
+      # and never consumes an artifact or cache produced by the triggering run.
+      - name: Publish evidence for an unchanged trusted workflow
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -Eeuo pipefail
+          IFS=$'\n\t'
+
+          skip() {
+            printf 'No trusted status published: %s\n' "$*"
+            exit 0
+          }
+
+          command -v gh >/dev/null 2>&1 || skip "gh is unavailable"
+          command -v jq >/dev/null 2>&1 || skip "jq is unavailable"
+          [[ "$RUN_ID" =~ ^[1-9][0-9]*$ ]] || skip "invalid run id"
+          [[ "$RUN_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] ||
+            skip "invalid run head SHA"
+
+          run_json="$(gh api "repos/$REPOSITORY/actions/runs/$RUN_ID")"
+          [[ "$(jq -r '.event' <<<"$run_json")" == pull_request ]] ||
+            skip "triggering run was not a pull_request run"
+          [[ "$(jq -r '.head_sha' <<<"$run_json")" == "$RUN_HEAD_SHA" ]] ||
+            skip "run head SHA changed"
+          [[ "$(jq -r '.head_repository.full_name' <<<"$run_json")" == \
+            "$REPOSITORY" ]] || skip "run head is not in this repository"
+          [[ "$(jq -r '.path' <<<"$run_json")" == \
+            .github/workflows/recasaos-ci-security.yml ]] ||
+            skip "unexpected triggering workflow path"
+          [[ "$(jq -r '.conclusion' <<<"$run_json")" == success ]] ||
+            skip "triggering workflow did not succeed"
+
+          # workflow_run.pull_requests is not stable evidence: GitHub may return
+          # an empty array even for a PR run. Resolve the immutable run head
+          # through the commit association endpoint and accept exactly one
+          # currently open PR with the same repository, base, and head SHA.
+          associated_prs="$(
+            gh api -H 'Accept: application/vnd.github+json' \
+              "repos/$REPOSITORY/commits/$RUN_HEAD_SHA/pulls"
+          )"
+          mapfile -t pull_requests < <(
+            jq -r \
+              --arg repository "$REPOSITORY" \
+              --arg default_branch "$DEFAULT_BRANCH" \
+              --arg head_sha "$RUN_HEAD_SHA" \
+              '[.[] | select(
+                .state == "open" and
+                .base.repo.full_name == $repository and
+                .base.ref == $default_branch and
+                .head.repo.full_name == $repository and
+                .head.sha == $head_sha
+              )] | unique_by(.number) | .[].number' <<<"$associated_prs"
+          )
+          [[ "${#pull_requests[@]}" == 1 ]] ||
+            skip "run is not bound to exactly one pull request"
+          pr_number="${pull_requests[0]}"
+          [[ "$pr_number" =~ ^[1-9][0-9]*$ ]] ||
+            skip "invalid pull request number"
+
+          pr_json="$(gh api "repos/$REPOSITORY/pulls/$pr_number")"
+          [[ "$(jq -r '.state' <<<"$pr_json")" == open ]] ||
+            skip "pull request is no longer open"
+          [[ "$(jq -r '.base.repo.full_name' <<<"$pr_json")" == \
+            "$REPOSITORY" ]] || skip "pull request targets another repository"
+          [[ "$(jq -r '.base.ref' <<<"$pr_json")" == "$DEFAULT_BRANCH" ]] ||
+            skip "pull request targets another branch"
+          [[ "$(jq -r '.head.repo.full_name' <<<"$pr_json")" == \
+            "$REPOSITORY" ]] || skip "pull request head is not in this repository"
+          [[ "$(jq -r '.head.sha' <<<"$pr_json")" == "$RUN_HEAD_SHA" ]] ||
+            skip "run is stale for the current pull request head"
+          [[ "$(jq -r '.user.login' <<<"$pr_json")" != dependabot\[bot\] ]] ||
+            skip "Dependabot requires manual exact-SHA promotion"
+
+          association="$(jq -r '.author_association' <<<"$pr_json")"
+          case "$association" in
+            OWNER | MEMBER | COLLABORATOR) ;;
+            *) skip "author association is not trusted" ;;
+          esac
+
+          for trusted_path in \
+            .github/workflows/recasaos-ci-security.yml \
+            .github/workflows/trusted-privileged-ci.yml \
+            .github/scripts/check-trusted-privileged-workflow.sh \
+            .github/scripts/test-trusted-privileged-workflow.sh
+          do
+            head_policy_blob="$(
+              gh api --method GET \
+                "repos/$REPOSITORY/contents/$trusted_path" \
+                -f "ref=$RUN_HEAD_SHA" --jq '.sha'
+            )"
+            default_policy_blob="$(
+              gh api --method GET \
+                "repos/$REPOSITORY/contents/$trusted_path" \
+                -f "ref=$DEFAULT_BRANCH" --jq '.sha'
+            )"
+            [[ "$head_policy_blob" =~ ^[0-9a-f]{40}$ ]] ||
+              skip "invalid head policy blob: $trusted_path"
+            [[ "$head_policy_blob" == "$default_policy_blob" ]] ||
+              skip "pull request changes trusted CI policy: $trusted_path"
+          done
+
+          jobs_json="$(
+            gh api --method GET \
+              "repos/$REPOSITORY/actions/runs/$RUN_ID/jobs" \
+              -f filter=latest -f per_page=100
+          )"
+          [[ "$(jq -r '.total_count' <<<"$jobs_json")" -le 100 ]] ||
+            skip "triggering run has too many jobs"
+
+          privileged_job='Privileged mount regressions (isolated namespace)'
+          ordinary_job='Generate, test, and vet'
+          [[ "$(
+            jq --arg name "$privileged_job" \
+              '[.jobs[] | select(.name == $name and .conclusion == "success")] | length' \
+              <<<"$jobs_json"
+          )" == 1 ]] || skip "privileged mount job did not pass exactly once"
+          [[ "$(
+            jq --arg name "$ordinary_job" \
+              '[.jobs[] | select(.name == $name and .conclusion == "success")] | length' \
+              <<<"$jobs_json"
+          )" == 1 ]] || skip "ordinary test job did not pass exactly once"
+
+          for step_name in \
+            'Verify isolated Samba probe privilege boundary' \
+            'Verify SQLite sticky-directory ownership boundary'
+          do
+            [[ "$(
+              jq --arg job "$ordinary_job" --arg step "$step_name" \
+                '[.jobs[] | select(.name == $job) | .steps[] |
+                  select(.name == $step and .conclusion == "success")] | length' \
+                <<<"$jobs_json"
+            )" == 1 ]] || skip "trusted step did not pass: $step_name"
+          done
+
+          # Re-read the PR immediately before publishing. A later push receives
+          # a different SHA and therefore cannot inherit this status.
+          current_head="$(
+            gh api "repos/$REPOSITORY/pulls/$pr_number" --jq '.head.sha'
+          )"
+          [[ "$current_head" == "$RUN_HEAD_SHA" ]] ||
+            skip "pull request head moved before attestation"
+
+          gh api --method POST \
+            "repos/$REPOSITORY/statuses/$RUN_HEAD_SHA" \
+            -f state=success \
+            -f "context=$STATUS_CONTEXT" \
+            -f description='Trusted privileged checks passed for this exact PR head' \
+            -f "target_url=$RUN_URL" >/dev/null
+          printf 'Published trusted exact-SHA status for %s\n' "$RUN_HEAD_SHA"
+
+  prepare-promotion:
+    name: Validate and pin manual promotion
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: read
+      statuses: write
+    outputs:
+      head_sha: ${{ steps.prepare.outputs.head_sha }}
+      tree_sha: ${{ steps.prepare.outputs.tree_sha }}
+      trusted_branch: ${{ steps.prepare.outputs.trusted_branch }}
+      pull_request: ${{ steps.prepare.outputs.pull_request }}
+    steps:
+      # This write-capable job intentionally has no checkout step.
+      - name: Validate immutable PR identity and create same-repository ref
+        id: prepare
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PR_NUMBER: ${{ inputs.pull_request }}
+          EXPECTED_SHA: ${{ inputs.head_sha }}
+          RUN_URL: >-
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{
+            github.run_id }}
+        run: |
+          set -Eeuo pipefail
+          IFS=$'\n\t'
+
+          fail() {
+            printf 'manual promotion refused: %s\n' "$*" >&2
+            exit 1
+          }
+
+          command -v gh >/dev/null 2>&1 || fail "gh is unavailable"
+          command -v jq >/dev/null 2>&1 || fail "jq is unavailable"
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]{0,8}$ ]] ||
+            fail "pull request number is invalid"
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] ||
+            fail "head SHA must be 40 lowercase hexadecimal characters"
+
+          pr_json="$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER")"
+          [[ "$(jq -r '.state' <<<"$pr_json")" == open ]] ||
+            fail "pull request is not open"
+          [[ "$(jq -r '.base.repo.full_name' <<<"$pr_json")" == \
+            "$REPOSITORY" ]] || fail "pull request targets another repository"
+          [[ "$(jq -r '.base.ref' <<<"$pr_json")" == "$DEFAULT_BRANCH" ]] ||
+            fail "pull request does not target the default branch"
+          [[ "$(jq -r '.head.sha' <<<"$pr_json")" == "$EXPECTED_SHA" ]] ||
+            fail "supplied SHA is not the current pull request head"
+
+          trusted_ref="refs/heads/ci/trusted-pr-${PR_NUMBER}-${EXPECTED_SHA}"
+          trusted_branch="${trusted_ref#refs/heads/}"
+          matching_refs="$(
+            gh api \
+              "repos/$REPOSITORY/git/matching-refs/heads/$trusted_branch"
+          )"
+          mapfile -t existing_shas < <(
+            jq -r --arg ref "$trusted_ref" \
+              '.[] | select(.ref == $ref) | .object.sha' <<<"$matching_refs"
+          )
+          case "${#existing_shas[@]}" in
+            0)
+              gh api --method POST "repos/$REPOSITORY/git/refs" \
+                -f "ref=$trusted_ref" -f "sha=$EXPECTED_SHA" >/dev/null
+              ;;
+            1)
+              [[ "${existing_shas[0]}" == "$EXPECTED_SHA" ]] ||
+                fail "existing trusted ref points to another object"
+              ;;
+            *) fail "GitHub returned duplicate exact trusted refs" ;;
+          esac
+
+          pinned_sha="$(
+            gh api "repos/$REPOSITORY/git/ref/heads/$trusted_branch" \
+              --jq '.object.sha'
+          )"
+          [[ "$pinned_sha" == "$EXPECTED_SHA" ]] ||
+            fail "trusted ref did not pin the expected object"
+          tree_sha="$(
+            gh api "repos/$REPOSITORY/git/commits/$EXPECTED_SHA" --jq '.tree.sha'
+          )"
+          [[ "$tree_sha" =~ ^[0-9a-f]{40}$ ]] ||
+            fail "GitHub returned an invalid tree identity"
+
+          current_head="$(
+            gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq '.head.sha'
+          )"
+          [[ "$current_head" == "$EXPECTED_SHA" ]] ||
+            fail "pull request head moved while the trusted ref was created"
+
+          gh api --method POST "repos/$REPOSITORY/statuses/$EXPECTED_SHA" \
+            -f state=pending \
+            -f "context=$STATUS_CONTEXT" \
+            -f description='Trusted privileged checks are running for this SHA' \
+            -f "target_url=$RUN_URL" >/dev/null
+
+          {
+            printf 'head_sha=%s\n' "$EXPECTED_SHA"
+            printf 'tree_sha=%s\n' "$tree_sha"
+            printf 'trusted_branch=%s\n' "$trusted_branch"
+            printf 'pull_request=%s\n' "$PR_NUMBER"
+          } >>"$GITHUB_OUTPUT"
+
+  privileged-promotion:
+    name: Run promoted privileged matrix
+    needs:
+      - prepare-promotion
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    outputs:
+      verified_sha: ${{ steps.identity.outputs.verified_sha }}
+      verified_tree: ${{ steps.identity.outputs.verified_tree }}
+    steps:
+      - name: Check out the one-time trusted ref
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.prepare-promotion.outputs.trusted_branch }}
+          persist-credentials: false
+
+      - name: Prove exact commit and tree identity
+        id: identity
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.prepare-promotion.outputs.head_sha }}
+          EXPECTED_TREE: ${{ needs.prepare-promotion.outputs.tree_sha }}
+        run: |
+          set -Eeuo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          actual_tree="$(git show -s --format=%T HEAD)"
+          [[ "$actual_sha" == "$EXPECTED_SHA" ]]
+          [[ "$actual_tree" == "$EXPECTED_TREE" ]]
+          [[ -z "$(git status --short)" ]]
+          {
+            printf 'verified_sha=%s\n' "$actual_sha"
+            printf 'verified_tree=%s\n' "$actual_tree"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Set up Go 1.26.5 without a shared cache
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: "1.26.5"
+          cache: false
+
+      - name: Install filesystem compatibility tools
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          IFS=$'\n\t'
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive \
+            apt-get install --yes --no-install-recommends \
+              btrfs-progs \
+              e2fsprogs \
+              f2fs-tools \
+              kmod \
+              "linux-modules-extra-$(uname -r)" \
+              mount \
+              udev \
+              util-linux \
+              xfsprogs
+          for tool in losetup mkfs.btrfs mkfs.ext4 mkfs.f2fs mkfs.xfs mount udevadm umount; do
+            command -v "$tool" >/dev/null || {
+              printf 'required privileged filesystem tool is unavailable: %s\n' \
+                "$tool" >&2
+              exit 1
+            }
+          done
+          for module in loop xfs btrfs f2fs; do
+            sudo modprobe "$module"
+          done
+          [[ -c /dev/loop-control ]]
+
+      - name: Compile all trusted test binaries without root
+        timeout-minutes: 5
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.prepare-promotion.outputs.head_sha }}
+          EXPECTED_TREE: ${{ needs.prepare-promotion.outputs.tree_sha }}
+        run: |
+          set -Eeuo pipefail
+          IFS=$'\n\t'
+          umask 022
+          CGO_ENABLED=0 go test -c \
+            -o "$RUNNER_TEMP/recasaos-samba.test" \
+            ./pkg/samba
+          CGO_ENABLED=0 go test -c \
+            -o "$RUNNER_TEMP/recasaos-sqlite.test" \
+            ./pkg/sqlite
+          CGO_ENABLED=0 go test -c \
+            -o "$RUNNER_TEMP/recasaos-filesecurity.test" \
+            ./pkg/filesecurity
+          CGO_ENABLED=0 go test -c \
+            -o "$RUNNER_TEMP/recasaos-publicfiles.test" \
+            ./pkg/publicfiles
+          for test_binary in \
+            "$RUNNER_TEMP/recasaos-samba.test" \
+            "$RUNNER_TEMP/recasaos-sqlite.test" \
+            "$RUNNER_TEMP/recasaos-filesecurity.test" \
+            "$RUNNER_TEMP/recasaos-publicfiles.test"
+          do
+            test -x "$test_binary"
+          done
+          [[ "$(git rev-parse HEAD)" == "$EXPECTED_SHA" ]]
+          [[ "$(git show -s --format=%T HEAD)" == "$EXPECTED_TREE" ]]
+          [[ -z "$(git status --short)" ]]
+
+      - name: Exercise trusted-only Samba and SQLite boundaries
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          IFS=$'\n\t'
+          sudo env PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            "$RUNNER_TEMP/recasaos-samba.test" \
+              -test.count=1 \
+              -test.run '^TestRealProbeSandboxDropsIdentityAndAppliesLimitsBeforeReady$'
+          sudo env PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            "$RUNNER_TEMP/recasaos-sqlite.test" \
+              -test.count=1 \
+              -test.run '^TestPrepareSecureDatabaseDirectoryRejectsForeignOwnedChildInStickyAncestor$'
+
+      - name: Exercise management mount-boundary regressions
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          IFS=$'\n\t'
+          sudo unshare --mount --propagation private --fork --kill-child=KILL \
+            env \
+              PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+              RECASAOS_PRIVILEGED_MOUNT_TEST=1 \
+              "$RUNNER_TEMP/recasaos-filesecurity.test" \
+                -test.count=1 \
+                -test.run '^(TestManagedDirectDirectoryRenameRejectsNestedBindMount|TestManagedRemoveAllPreflightsNestedMountBeforeDeletingSibling|TestManagedRootsTreeSizeRejectsNestedBindMount|TestManagedDirectoryCopyRejectsBindMountAliasIntoSource|TestManagedRegularCopyRejectsDestinationBindAliasIntoAnotherConfiguredRoot|TestManagedReplaceCleanupRejectsBindAliasAncestorOfConfiguredRoot)$' \
+                -test.timeout=4m \
+                -test.v
+
+      - name: Exercise public-root mount and filesystem regressions
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          IFS=$'\n\t'
+          sudo unshare --mount --propagation private --fork --kill-child=KILL \
+            env \
+              PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+              RECASAOS_PRIVILEGED_MOUNT_TEST=1 \
+              "$RUNNER_TEMP/recasaos-publicfiles.test" \
+                -test.count=1 \
+                -test.run '^(TestPublicVerifierBindAliasDisclosureCannotAuthenticate|TestPinnedPublicRootSurvivesBindMountReplacement|TestPublicRootRejectsNestedBindMount|TestPublicRootAcceptsTmpfsInIsolatedNamespace|TestPublicRootAllowlistedFilesystemCompatibilityMatrix)$' \
+                -test.timeout=9m \
+                -test.v
+
+  publish-promotion:
+    name: Publish manual exact-SHA evidence
+    needs:
+      - prepare-promotion
+      - privileged-promotion
+    if: >-
+      always() &&
+      needs.prepare-promotion.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      # This write-capable job intentionally has no checkout step.
+      - name: Revalidate identity and publish the final status
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PR_NUMBER: ${{ needs.prepare-promotion.outputs.pull_request }}
+          EXPECTED_SHA: ${{ needs.prepare-promotion.outputs.head_sha }}
+          EXPECTED_TREE: ${{ needs.prepare-promotion.outputs.tree_sha }}
+          TRUSTED_BRANCH: ${{ needs.prepare-promotion.outputs.trusted_branch }}
+          PRIVILEGED_RESULT: ${{ needs.privileged-promotion.result }}
+          VERIFIED_SHA: ${{ needs.privileged-promotion.outputs.verified_sha }}
+          VERIFIED_TREE: ${{ needs.privileged-promotion.outputs.verified_tree }}
+          RUN_URL: >-
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{
+            github.run_id }}
+        run: |
+          set -Eeuo pipefail
+          IFS=$'\n\t'
+
+          mark_failure() {
+            printf 'manual attestation failed closed: %s\n' "$*" >&2
+            state=failure
+            description='Trusted privileged evidence failed identity validation'
+          }
+
+          command -v gh >/dev/null 2>&1 || {
+            printf 'manual attestation cannot publish: gh is unavailable\n' >&2
+            exit 1
+          }
+          command -v jq >/dev/null 2>&1 || {
+            printf 'manual attestation cannot publish: jq is unavailable\n' >&2
+            exit 1
+          }
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            printf 'manual attestation cannot identify a safe status SHA\n' >&2
+            exit 1
+          }
+          [[ "$EXPECTED_TREE" =~ ^[0-9a-f]{40}$ ]] || {
+            printf 'manual attestation has an invalid expected tree\n' >&2
+            exit 1
+          }
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]{0,8}$ ]] || {
+            printf 'manual attestation has an invalid pull request number\n' >&2
+            exit 1
+          }
+
+          state=success
+          description='Trusted privileged checks passed for this exact PR head'
+
+          if [[ "$state" == success ]]; then
+            if ! pr_json="$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER")"; then
+              mark_failure "pull request could not be re-read"
+            fi
+          fi
+          if [[ "$state" == success ]]; then
+            [[ "$(jq -r '.state' <<<"$pr_json")" == open ]] ||
+              mark_failure "pull request is no longer open"
+            [[ "$(jq -r '.base.repo.full_name' <<<"$pr_json")" == \
+              "$REPOSITORY" ]] ||
+              mark_failure "pull request targets another repository"
+            [[ "$(jq -r '.base.ref' <<<"$pr_json")" == \
+              "$DEFAULT_BRANCH" ]] ||
+              mark_failure "pull request targets another branch"
+            [[ "$(jq -r '.head.sha' <<<"$pr_json")" == "$EXPECTED_SHA" ]] ||
+              mark_failure "pull request head moved"
+          fi
+
+          if [[ "$state" == success ]]; then
+            if ! pinned_sha="$(
+              gh api "repos/$REPOSITORY/git/ref/heads/$TRUSTED_BRANCH" \
+                --jq '.object.sha' 2>/dev/null
+            )"; then
+              mark_failure "trusted ref is missing"
+            fi
+          fi
+          if [[ "$state" == success ]]; then
+            if ! actual_tree="$(
+              gh api "repos/$REPOSITORY/git/commits/$EXPECTED_SHA" \
+                --jq '.tree.sha'
+            )"; then
+              mark_failure "Git commit could not be re-read"
+            fi
+          fi
+          if [[ "$state" == success ]]; then
+            [[ "$pinned_sha" == "$EXPECTED_SHA" ]] ||
+              mark_failure "trusted ref moved"
+            [[ "$actual_tree" == "$EXPECTED_TREE" ]] ||
+              mark_failure "Git tree identity changed"
+            [[ "$PRIVILEGED_RESULT" == success ]] ||
+              mark_failure "privileged job did not succeed"
+            [[ "$VERIFIED_SHA" == "$EXPECTED_SHA" ]] ||
+              mark_failure "runner did not verify the expected commit"
+            [[ "$VERIFIED_TREE" == "$EXPECTED_TREE" ]] ||
+              mark_failure "runner did not verify the expected tree"
+          fi
+
+          gh api --method POST "repos/$REPOSITORY/statuses/$EXPECTED_SHA" \
+            -f "state=$state" \
+            -f "context=$STATUS_CONTEXT" \
+            -f "description=$description" \
+            -f "target_url=$RUN_URL" >/dev/null
+          [[ "$state" == success ]]
+
+  cleanup-promotion:
+    name: Remove one-time trusted ref
+    needs:
+      - prepare-promotion
+      - privileged-promotion
+      - publish-promotion
+    if: >-
+      always() &&
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      # This write-capable cleanup job also has no checkout step.
+      - name: Delete only the exact one-time ref
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pull_request }}
+          EXPECTED_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -Eeuo pipefail
+          IFS=$'\n\t'
+
+          command -v gh >/dev/null 2>&1 || {
+            printf 'trusted-ref cleanup cannot run: gh is unavailable\n' >&2
+            exit 1
+          }
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]{0,8}$ ]] || exit 0
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 0
+          trusted_branch="ci/trusted-pr-${PR_NUMBER}-${EXPECTED_SHA}"
+          trusted_ref="refs/heads/$trusted_branch"
+
+          matching_refs="$(
+            gh api \
+              "repos/$REPOSITORY/git/matching-refs/heads/$trusted_branch"
+          )"
+          mapfile -t exact_shas < <(
+            jq -r --arg ref "$trusted_ref" \
+              '.[] | select(.ref == $ref) | .object.sha' <<<"$matching_refs"
+          )
+          if [[ "${#exact_shas[@]}" == 0 ]]; then
+            printf 'Trusted ref is already absent\n'
+            exit 0
+          fi
+          [[ "${#exact_shas[@]}" == 1 ]] || {
+            printf 'GitHub returned duplicate exact trusted refs\n' >&2
+            exit 1
+          }
+          pinned_sha="${exact_shas[0]}"
+          [[ "$pinned_sha" == "$EXPECTED_SHA" ]] || {
+            printf 'Refuse to delete a trusted ref that moved: %s\n' \
+              "$trusted_branch" >&2
+            exit 1
+          }
+          gh api --method DELETE \
+            "repos/$REPOSITORY/git/refs/heads/$trusted_branch"
+          printf 'Removed trusted ref %s\n' "$trusted_branch"
