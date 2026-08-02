@@ -6,16 +6,9 @@ on:
       - ReCasaOS CI and security
     types:
       - completed
-  workflow_dispatch:
-    inputs:
-      pull_request:
-        description: Open pull request number to promote
-        required: true
-        type: string
-      head_sha:
-        description: Exact 40-character lowercase pull request head SHA
-        required: true
-        type: string
+  repository_dispatch:
+    types:
+      - trusted-privileged-promote
 
 permissions:
   contents: read
@@ -27,8 +20,8 @@ env:
 concurrency:
   group: >-
     trusted-privileged-${{ github.event_name }}-${{
-    github.event.workflow_run.id || inputs.pull_request }}-${{
-    github.event.workflow_run.head_sha || inputs.head_sha }}
+    github.event.workflow_run.id || github.event.client_payload.pull_request }}-${{
+    github.event.workflow_run.head_sha || github.event.client_payload.head_sha }}
   cancel-in-progress: false
 
 jobs:
@@ -205,7 +198,8 @@ jobs:
   prepare-promotion:
     name: Validate and pin manual promotion
     if: >-
-      github.event_name == 'workflow_dispatch' &&
+      github.event_name == 'repository_dispatch' &&
+      github.event.action == 'trusted-privileged-promote' &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -227,8 +221,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          PR_NUMBER: ${{ inputs.pull_request }}
-          EXPECTED_SHA: ${{ inputs.head_sha }}
+          PR_NUMBER: ${{ github.event.client_payload.pull_request }}
+          EXPECTED_SHA: ${{ github.event.client_payload.head_sha }}
           RUN_URL: >-
             ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{
             github.run_id }}
@@ -592,7 +586,8 @@ jobs:
       - publish-promotion
     if: >-
       always() &&
-      github.event_name == 'workflow_dispatch' &&
+      github.event_name == 'repository_dispatch' &&
+      github.event.action == 'trusted-privileged-promote' &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -605,8 +600,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ inputs.pull_request }}
-          EXPECTED_SHA: ${{ inputs.head_sha }}
+          PR_NUMBER: ${{ github.event.client_payload.pull_request }}
+          EXPECTED_SHA: ${{ github.event.client_payload.head_sha }}
         run: |
           set -Eeuo pipefail
           IFS=$'\n\t'

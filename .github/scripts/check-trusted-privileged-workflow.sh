@@ -67,7 +67,9 @@ forbid_block_text() {
 require_text 'name: Trusted privileged exact-SHA' \
   "workflow name changed"
 require_text '  workflow_run:' "workflow_run trigger is missing"
-require_text '  workflow_dispatch:' "manual promotion trigger is missing"
+require_text '  repository_dispatch:' "manual promotion trigger is missing"
+require_text '      - trusted-privileged-promote' \
+  "manual promotion event type changed"
 require_text '      - ReCasaOS CI and security' \
   "automatic attestation is not bound to the primary workflow"
 require_text '  STATUS_CONTEXT: ReCasaOS / trusted privileged exact-SHA' \
@@ -77,6 +79,8 @@ require_text '  cancel-in-progress: false' \
 
 forbid_text 'pull_request_target' \
   "pull_request_target must never enter the trusted workflow"
+forbid_text 'workflow_dispatch:' \
+  "manual promotion must not accept a caller-selected workflow ref"
 forbid_text 'secrets:' "the trusted workflow must not receive secrets"
 forbid_text 'id-token: write' "OIDC write permission is forbidden"
 forbid_text 'actions/cache' "shared caches are forbidden"
@@ -144,8 +148,20 @@ require_block_text "$prepare_block" '      contents: write' \
 require_block_text "$prepare_block" '      statuses: write' \
   "manual preparation cannot publish pending evidence"
 require_block_text "$prepare_block" \
+  "github.event_name == 'repository_dispatch'" \
+  "manual promotion is not bound to repository_dispatch"
+require_block_text "$prepare_block" \
+  "github.event.action == 'trusted-privileged-promote'" \
+  "manual promotion does not require the exact event type"
+require_block_text "$prepare_block" \
   "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)" \
   "manual promotion is not restricted to the default workflow ref"
+require_block_text "$prepare_block" \
+  'PR_NUMBER: ${{ github.event.client_payload.pull_request }}' \
+  "manual promotion does not read the repository event PR number"
+require_block_text "$prepare_block" \
+  'EXPECTED_SHA: ${{ github.event.client_payload.head_sha }}' \
+  "manual promotion does not read the repository event head SHA"
 require_block_text "$prepare_block" \
   '[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]' \
   "manual promotion does not validate the complete lowercase SHA"
@@ -241,6 +257,9 @@ require_block_text "$publish_block" \
 
 require_block_text "$cleanup_block" '      contents: write' \
   "cleanup cannot remove the one-time trusted ref"
+require_block_text "$cleanup_block" \
+  "github.event.action == 'trusted-privileged-promote'" \
+  "cleanup is not bound to the exact repository event type"
 require_block_text "$cleanup_block" \
   'trusted_branch="ci/trusted-pr-${PR_NUMBER}-${EXPECTED_SHA}"' \
   "cleanup does not derive the exact trusted ref"

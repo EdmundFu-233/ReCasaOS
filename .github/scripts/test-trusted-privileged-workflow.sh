@@ -52,6 +52,9 @@ expect_rejection() {
 expect_rejection pull-request-target \
   '  workflow_run:' \
   $'  pull_request_target:\n  workflow_run:'
+expect_rejection caller-selected-workflow-ref \
+  '  repository_dispatch:' \
+  $'  workflow_dispatch:\n  repository_dispatch:'
 expect_rejection persisted-checkout-credential \
   '          persist-credentials: false' \
   '          persist-credentials: true'

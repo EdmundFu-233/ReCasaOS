@@ -37,7 +37,9 @@ The workflow has two paths:
    to `main`, the current PR head equals the run SHA, the privileged job passed,
    and the two root-only Samba/SQLite steps each passed exactly once.
 2. A fork, Dependabot, workflow-changing, or otherwise untrusted PR requires a
-   maintainer-dispatched run from `main`. An API-only preparation job compares
+   maintainer-created `trusted-privileged-promote` repository event. GitHub
+   binds `repository_dispatch` to the default branch, so the caller cannot
+   select a PR version of this workflow. An API-only preparation job compares
    the supplied SHA to the open PR, creates a one-time
    `ci/trusted-pr-<PR>-<full-SHA>` ref without checking out code, and records the
    commit's tree. A separate runner checks out only that ref with
@@ -66,18 +68,20 @@ repo=EdmundFu-233/ReCasaOS
 pr=123
 sha="$(gh pr view "$pr" --repo "$repo" --json headRefOid --jq .headRefOid)"
 test "${#sha}" -eq 40
-gh workflow run trusted-privileged-ci.yml \
-  --repo "$repo" \
-  --ref main \
-  -f pull_request="$pr" \
-  -f head_sha="$sha"
+jq -n --arg pr "$pr" --arg sha "$sha" '{
+  event_type: "trusted-privileged-promote",
+  client_payload: {pull_request: $pr, head_sha: $sha}
+}' | gh api --method POST "repos/$repo/dispatches" --input -
 ```
 
-Do not choose the PR branch as `--ref`. GitHub documents that
-`workflow_dispatch` is available only when the workflow exists on the default
-branch; the jobs additionally refuse a dispatch whose workflow ref is not the
-repository default branch. No `.env` value or personal token belongs in an
-input, log, ref, or status.
+The repository-dispatch endpoint requires Contents write permission. GitHub
+sets this event's SHA and ref from the default branch and only triggers a
+workflow that exists there; no caller-selected workflow ref is accepted. The
+jobs verify that default ref again. See GitHub's
+[repository-dispatch event documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#repository_dispatch)
+and
+[dispatch API](https://docs.github.com/en/rest/repos/repos#create-a-repository-dispatch-event).
+No `.env` value or personal token belongs in a payload, log, ref, or status.
 
 Wait for all four manual jobs. The cleanup job must remove the one-time ref even
 when testing or publication fails. Then verify the latest status directly:
