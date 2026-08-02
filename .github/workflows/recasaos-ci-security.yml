@@ -42,6 +42,9 @@ jobs:
       - name: Enforce offline release and migration policy
         run: .github/scripts/check-release-policy.sh
 
+      - name: Verify trusted privileged exact-SHA policy
+        run: .github/scripts/test-trusted-privileged-workflow.sh
+
       - name: Validate GoReleaser configuration
         run: .github/scripts/check-goreleaser-config.sh
 
@@ -129,8 +132,9 @@ jobs:
   # This guard controls only ReCasaOS's dedicated mount mutations. Standard
   # GitHub-hosted runners themselves provide passwordless sudo, so it is not a
   # sandbox for arbitrary fork code. An untrusted PR must be reproduced at the
-  # exact commit on a trusted same-repository branch before this skipped matrix
-  # can be treated as merge evidence (tracked in Issue #27).
+  # exact commit on a one-time trusted same-repository ref before the dedicated
+  # exact-SHA status can be published. The default-branch trusted workflow is
+  # the only supported publisher; a skipped job is never that evidence.
   privileged-mount-tests:
     name: Privileged mount regressions (isolated namespace)
     if: >-

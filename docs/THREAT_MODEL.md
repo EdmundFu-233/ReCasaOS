@@ -151,6 +151,12 @@ must retain a written justification and a tracking issue where hardening remains
 The portal and positive-allowlist edge examples close the root repository's
 basic public route-separation requirement, but these release gates remain:
 
+- Issue #27 remains open until the default-branch exact-SHA promotion workflow
+  is exercised against a real pull request and its uniquely named status is
+  required from the verified GitHub Actions provider on `main`. Fork and
+  Dependabot code must receive no write token or repository secret. A skipped
+  privileged job is not evidence, and a successful status on an earlier head
+  cannot satisfy a later commit;
 - Issue #22 remains open until the staged filesystem gate has exact-HEAD Linux
   evidence and the residual blocking-storage boundary has an explicit reviewed
   disposition;
