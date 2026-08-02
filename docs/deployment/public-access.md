@@ -69,11 +69,14 @@ port to its controlling Worker. The
 Worker accepts that proof only for the existing reservation and records the
 opaque nested-frame client ID before the page can start the file navigation.
 The frame proof is never placed in the URL and is erased from page and Worker
-state as soon as the child is bound. The file URL fragment contains only the non-secret
-correlation nonce. Before consuming a reservation, the Worker requires
-`FetchEvent.replacesClientId` to equal the bound child-frame ID and, when the
-browser supplies an initiating client ID, accepts only the bound child or the
-top-level client that prepared it. It then consumes the reservation atomically,
+state as soon as the child is bound. The file URL fragment contains only the
+non-secret correlation nonce. The page then sends an origin-checked navigation
+command to the transport document, which initiates its own navigation. Before
+consuming a reservation, the Worker requires `FetchEvent.clientId` to equal the
+proven child-frame ID. If a browser also supplies a non-empty
+`replacesClientId`, it must identify that same frame; current browser support
+does not make this optional field a release prerequisite. The Worker then
+consumes the reservation atomically,
 challenges only the original portal page over a `MessageChannel`, receives the
 bearer once, removes the fragment, and makes one clean same-origin file request
 with the bearer in the `Authorization` header. Redirects fail, credentials are omitted, and the

@@ -327,8 +327,10 @@ func TestDownloadFrameIsSameOriginOnlyAndRelaysNoCredential(t *testing.T) {
 		"event.source!==parent",
 		"event.origin!==location.origin",
 		"recasaos-download-frame-bind",
+		"recasaos-download-frame-navigate",
 		"navigator.serviceWorker.controller",
-		"controller.postMessage(data,[port])",
+		"controller.postMessage({type:'recasaos-download-frame-bind'",
+		"location.replace(data.requestURL)",
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("download frame script is missing %q", required)
@@ -359,6 +361,7 @@ func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *test
 		"searchParams.set('frameProof'",
 		"window.location.assign(",
 		"window.stop()",
+		"state.frame.src=",
 	} {
 		if strings.Contains(script, forbidden) {
 			t.Errorf("app.js contains forbidden credential or buffering primitive %q", forbidden)
@@ -383,7 +386,7 @@ func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *test
 		"state.frameProof=''",
 		"state.frame=await nativeDownloadFrame()",
 		"bindNativeDownloadFrame(controller,state)",
-		"state.frame.src=state.requestURL",
+		"navigateNativeDownloadFrame(state)",
 		"frame.referrerPolicy='no-referrer'",
 		"boundedDownload(path,entry).catch(showError);",
 		"Token forgotten after page restore",
@@ -451,7 +454,8 @@ func TestDownloadWorkerIsNarrowNoStoreAsset(t *testing.T) {
 		"canonicalFrameClient(event.source)",
 		"prepared.frameClientId=event.source.id",
 		"prepared.frameProof=''",
-		"event.replacesClientId!==prepared.frameClientId",
+		"event.clientId!==prepared.frameClientId",
+		"event.replacesClientId!==''&&event.replacesClientId!==prepared.frameClientId",
 		"self.clients.get(prepared.clientId)",
 		"headers.set('Authorization','Bearer '+authorization.token)",
 		"const bearerPattern=/^rc1_[A-Za-z0-9_-]{43}$/",
@@ -491,7 +495,7 @@ func TestDownloadWorkerChecksBoundFrameBeforeConsumingReservation(t *testing.T) 
 	if preparedIndex < 0 {
 		t.Fatal("download worker does not look up the prepared reservation")
 	}
-	frameCheckIndex := strings.Index(script, "event.replacesClientId!==prepared.frameClientId")
+	frameCheckIndex := strings.Index(script, "event.clientId!==prepared.frameClientId")
 	if frameCheckIndex < preparedIndex {
 		t.Fatal("download worker frame binding is missing from the consume path")
 	}

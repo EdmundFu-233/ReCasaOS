@@ -44,15 +44,33 @@ const downloadFrameHTML = `<!doctype html>
 
 const downloadFrameJavaScript = `'use strict';
 const protocolVersion=1;
+const workerReplyTimeoutMs=3000;
+let binding=false;
+let boundDownload=null;
 function exactKeys(value,keys){if(!value||typeof value!=='object'||Array.isArray(value))return false;const actual=Object.keys(value).sort();const expected=keys.slice().sort();return actual.length===expected.length&&actual.every((key,index)=>key===expected[index]);}
 function deny(port){try{port.postMessage({type:'recasaos-download-denied',version:protocolVersion});}catch(_error){}try{port.close();}catch(_error){}}
+function validNonce(value){return typeof value==='string'&&/^[A-Za-z0-9_-]{32}$/.test(value);}
+function exactDownloadURL(value,nonce){let url;try{url=new URL(value);}catch(_error){return false;}const keys=Array.from(url.searchParams.keys());return url.origin===location.origin&&url.pathname==='/public-files/api/file'&&keys.length===1&&keys[0]==='path'&&url.searchParams.getAll('path').length===1&&url.searchParams.get('path')!==''&&url.hash==='#'+nonce;}
 window.addEventListener('message',event=>{
   const data=event.data;const port=event.ports&&event.ports.length===1?event.ports[0]:null;
-  if(!port)return;
-  if(event.source!==parent||event.origin!==location.origin||!exactKeys(data,['frameProof','nonce','type','version'])||data.type!=='recasaos-download-frame-bind'||data.version!==protocolVersion){deny(port);return;}
-  const controller='serviceWorker' in navigator?navigator.serviceWorker.controller:null;
-  if(!controller){deny(port);return;}
-  try{controller.postMessage(data,[port]);}catch(_error){deny(port);}
+  if(event.source!==parent||event.origin!==location.origin)return;
+  if(port&&exactKeys(data,['frameProof','nonce','requestURL','type','version'])&&data.type==='recasaos-download-frame-bind'&&data.version===protocolVersion&&validNonce(data.nonce)&&validNonce(data.frameProof)&&exactDownloadURL(data.requestURL,data.nonce)){
+    const controller='serviceWorker' in navigator?navigator.serviceWorker.controller:null;
+    if(!controller||binding||boundDownload){deny(port);return;}
+    binding=true;
+    const channel=new MessageChannel();let settled=false;
+    const finish=value=>{if(settled)return;settled=true;binding=false;clearTimeout(timer);channel.port1.close();if(value){boundDownload={nonce:data.nonce,requestURL:data.requestURL};try{port.postMessage({type:'recasaos-download-frame-bound',version:protocolVersion,nonce:data.nonce});}catch(_error){}try{port.close();}catch(_error){}}else deny(port);};
+    const timer=setTimeout(()=>finish(false),workerReplyTimeoutMs);
+    channel.port1.onmessage=status=>finish(exactKeys(status.data,['nonce','type','version'])&&status.data.type==='recasaos-download-frame-bound'&&status.data.version===protocolVersion&&status.data.nonce===data.nonce);
+    channel.port1.onmessageerror=()=>finish(false);channel.port1.start();
+    try{controller.postMessage({type:'recasaos-download-frame-bind',version:protocolVersion,nonce:data.nonce,frameProof:data.frameProof},[channel.port2]);}catch(_error){finish(false);}
+    return;
+  }
+  if(!port&&exactKeys(data,['nonce','requestURL','type','version'])&&data.type==='recasaos-download-frame-navigate'&&data.version===protocolVersion&&boundDownload&&data.nonce===boundDownload.nonce&&data.requestURL===boundDownload.requestURL&&exactDownloadURL(data.requestURL,data.nonce)){
+    boundDownload=null;location.replace(data.requestURL);
+    return;
+  }
+  if(port)deny(port);
 });
 `
 
@@ -203,9 +221,10 @@ function bindNativeDownloadFrame(controller,state){
     channel.port1.onmessageerror=()=>finish(false);
     channel.port1.start();
     if(!target){finish(false);return;}
-    try{target.postMessage({type:'recasaos-download-frame-bind',version:protocolVersion,nonce:state.nonce,frameProof:state.frameProof},location.origin,[channel.port2]);}catch(_error){finish(false);}
+    try{target.postMessage({type:'recasaos-download-frame-bind',version:protocolVersion,nonce:state.nonce,frameProof:state.frameProof,requestURL:state.requestURL},location.origin,[channel.port2]);}catch(_error){finish(false);}
   });
 }
+function navigateNativeDownloadFrame(state){const target=state.frame&&state.frame.contentWindow;if(!target)return false;try{target.postMessage({type:'recasaos-download-frame-navigate',version:protocolVersion,nonce:state.nonce,requestURL:state.requestURL},location.origin);return true;}catch(_error){return false;}}
 async function startNativeDownload(path,entry){
   if(pendingNative||activeNative||activeFallback)throw new Error('Another download is already being prepared');
   const controller=currentWorker();
@@ -236,7 +255,7 @@ async function startNativeDownload(path,entry){
     boundedDownload(path,entry).catch(showError);
   },workerReplyTimeoutMs);
   statusNode.textContent='Handing '+entry.name+' to the browser…';
-  try{state.frame.src=state.requestURL;}catch(_error){
+  if(!navigateNativeDownloadFrame(state)){
     clearTimeout(state.timer);cancelNativeTransport(state);pendingNative=null;
     await boundedDownload(path,entry);
   }
@@ -423,9 +442,8 @@ async function handleDownload(download,event){
   purgePending();
   const prepared=pendingDownloads.get(download.nonce);
   if(!prepared||prepared.expiresAt<Date.now()||prepared.path!==download.path||prepared.requestURL!==download.requestURL||prepared.frameClientId==='')throw new TypeError('download was not prepared by this client');
-  const clientMatches=event.clientId===''||event.clientId===prepared.clientId||event.clientId===prepared.frameClientId;
-  if(!clientMatches)throw new TypeError('download navigation initiator changed');
-  if(event.replacesClientId!==prepared.frameClientId)throw new TypeError('download navigation frame changed');
+  if(event.clientId!==prepared.frameClientId)throw new TypeError('download navigation initiator changed');
+  if(typeof event.replacesClientId==='string'&&event.replacesClientId!==''&&event.replacesClientId!==prepared.frameClientId)throw new TypeError('download navigation frame changed');
   pendingDownloads.delete(download.nonce);
   const controller=new AbortController();
   const active={nonce:prepared.nonce,path:prepared.path,requestURL:prepared.requestURL,clientId:prepared.clientId,controller:controller,timer:null};

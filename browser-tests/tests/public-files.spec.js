@@ -75,24 +75,6 @@ async function loginAndWaitForNativeStreaming(page, portal) {
     .toBe(true);
 }
 
-async function ensureWorkerControl(page) {
-  await page.evaluate(async () => {
-    await navigator.serviceWorker.register('download-worker.js', {
-      scope: '/public-files/',
-      updateViaCache: 'none',
-    });
-    await navigator.serviceWorker.ready;
-  });
-  if (!(await page.evaluate(() => navigator.serviceWorker.controller !== null))) {
-    await page.reload({ waitUntil: 'domcontentloaded' });
-  }
-  await expect
-    .poll(() =>
-      page.evaluate(() => navigator.serviceWorker.controller !== null),
-    )
-    .toBe(true);
-}
-
 async function prepareManualDownload(page, bearer, path) {
   return page.evaluate(
     async ({ bearerValue, relativePath }) => {
@@ -204,6 +186,7 @@ async function prepareManualDownload(page, bearer, path) {
         frame,
         frameProof,
         nonce,
+        requestURL: requestURL.href,
       });
       if (!bound) {
         navigator.serviceWorker.removeEventListener('message', onChallenge);
@@ -234,7 +217,16 @@ async function navigateBoundHiddenFrame(page, requestURL) {
     if (!(frame instanceof HTMLIFrameElement)) {
       throw new Error('bound download frame is unavailable');
     }
-    frame.src = url;
+    const requestURL = new URL(url);
+    if (
+      !navigateNativeDownloadFrame({
+        frame,
+        nonce: requestURL.hash.slice(1),
+        requestURL: requestURL.href,
+      })
+    ) {
+      throw new Error('bound download frame rejected navigation');
+    }
   }, requestURL);
 }
 
@@ -399,11 +391,19 @@ test('a different tab cannot consume another tab download reservation', async ({
   page,
   portal,
 }) => {
-  await loginAndWaitForNativeStreaming(page, portal);
   const attacker = await context.newPage();
   try {
     await openPortal(attacker, portal);
-    await ensureWorkerControl(attacker);
+    await loginAndWaitForNativeStreaming(page, portal);
+    await expect
+      .poll(() =>
+        attacker.evaluate(
+          () =>
+            'serviceWorker' in navigator &&
+            navigator.serviceWorker.controller !== null,
+        ),
+      )
+      .toBe(true);
 
     const before = await readSnapshot(portal);
     const prepared = await prepareManualDownload(
