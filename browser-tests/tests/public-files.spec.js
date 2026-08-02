@@ -39,8 +39,7 @@ async function submitBearer(page, bearer) {
   }
 }
 
-async function loginAndWaitForNativeStreaming(page, portal) {
-  await openPortal(page, portal);
+async function loginLoadedPortalAndWaitForNativeStreaming(page, portal) {
   await submitBearer(page, portal.bearer);
 
   await expect(page.locator('#login')).toBeHidden();
@@ -73,6 +72,11 @@ async function loginAndWaitForNativeStreaming(page, portal) {
       ),
     )
     .toBe(true);
+}
+
+async function loginAndWaitForNativeStreaming(page, portal) {
+  await openPortal(page, portal);
+  await loginLoadedPortalAndWaitForNativeStreaming(page, portal);
 }
 
 async function prepareManualDownload(page, bearer, path) {
@@ -393,8 +397,9 @@ test('a different tab cannot consume another tab download reservation', async ({
 }) => {
   const attacker = await context.newPage();
   try {
+    await openPortal(page, portal);
     await openPortal(attacker, portal);
-    await loginAndWaitForNativeStreaming(page, portal);
+    await loginLoadedPortalAndWaitForNativeStreaming(page, portal);
     await expect
       .poll(() =>
         attacker.evaluate(

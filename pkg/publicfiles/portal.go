@@ -245,7 +245,7 @@ func (w *securityResponseWriter) Write(payload []byte) (int, error) {
 func setSecurityHeaders(header http.Header, allowSameOriginFraming bool) {
 	header.Set("Cache-Control", "no-store")
 	if allowSameOriginFraming {
-		header.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; base-uri 'none'; frame-ancestors 'self'; form-action 'none'")
+		header.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; base-uri 'none'; frame-ancestors 'self'; form-action 'self'")
 		header.Set("X-Frame-Options", "SAMEORIGIN")
 	} else {
 		header.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; worker-src 'self'; style-src 'self'; connect-src 'self'; frame-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")

@@ -299,7 +299,7 @@ func TestDownloadFrameIsSameOriginOnlyAndRelaysNoCredential(t *testing.T) {
 		t.Fatalf("download frame X-Frame-Options = %q, want SAMEORIGIN", got)
 	}
 	csp := recorder.Header().Get("Content-Security-Policy")
-	if strings.Contains(csp, "unsafe-inline") || !strings.Contains(csp, "default-src 'none'") || !strings.Contains(csp, "script-src 'self'") || !strings.Contains(csp, "frame-ancestors 'self'") || strings.Contains(csp, "frame-ancestors 'none'") {
+	if strings.Contains(csp, "unsafe-inline") || !strings.Contains(csp, "default-src 'none'") || !strings.Contains(csp, "script-src 'self'") || !strings.Contains(csp, "frame-ancestors 'self'") || !strings.Contains(csp, "form-action 'self'") || strings.Contains(csp, "frame-ancestors 'none'") {
 		t.Fatalf("download frame CSP is unsafe: %q", csp)
 	}
 
@@ -330,7 +330,11 @@ func TestDownloadFrameIsSameOriginOnlyAndRelaysNoCredential(t *testing.T) {
 		"recasaos-download-frame-navigate",
 		"navigator.serviceWorker.controller",
 		"controller.postMessage({type:'recasaos-download-frame-bind'",
-		"location.replace(data.requestURL)",
+		"form.method='post'",
+		"form.action=download.requestURL",
+		"proof.name='proof'",
+		"proof.value=download.frameProof",
+		"form.submit()",
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("download frame script is missing %q", required)
@@ -445,7 +449,7 @@ func TestDownloadWorkerIsNarrowNoStoreAsset(t *testing.T) {
 	for _, required := range []string{
 		"const filePath=basePath+'/api/file'",
 		"const framePath=basePath+'/download-frame'",
-		"request.method!=='GET'",
+		"request.method!=='POST'",
 		"request.mode==='navigate'",
 		"request.destination==='document'||request.destination==='iframe'",
 		"pendingDownloads.get(download.nonce)",
@@ -453,9 +457,9 @@ func TestDownloadWorkerIsNarrowNoStoreAsset(t *testing.T) {
 		"activeDownloads.has(data.nonce)",
 		"canonicalFrameClient(event.source)",
 		"prepared.frameClientId=event.source.id",
+		"exactNavigationProof(event.request,prepared)",
+		"request.text()",
 		"prepared.frameProof=''",
-		"event.clientId!==prepared.frameClientId",
-		"event.replacesClientId!==''&&event.replacesClientId!==prepared.frameClientId",
 		"self.clients.get(prepared.clientId)",
 		"headers.set('Authorization','Bearer '+authorization.token)",
 		"const bearerPattern=/^rc1_[A-Za-z0-9_-]{43}$/",
@@ -485,7 +489,7 @@ func TestDownloadWorkerIsNarrowNoStoreAsset(t *testing.T) {
 	}
 }
 
-func TestDownloadWorkerChecksBoundFrameBeforeConsumingReservation(t *testing.T) {
+func TestDownloadWorkerChecksNavigationProofBeforeConsumingReservation(t *testing.T) {
 	portal := &Portal{}
 	recorder := httptest.NewRecorder()
 	portal.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, BasePath+"/download-worker.js", nil))
@@ -495,13 +499,13 @@ func TestDownloadWorkerChecksBoundFrameBeforeConsumingReservation(t *testing.T) 
 	if preparedIndex < 0 {
 		t.Fatal("download worker does not look up the prepared reservation")
 	}
-	frameCheckIndex := strings.Index(script, "event.clientId!==prepared.frameClientId")
-	if frameCheckIndex < preparedIndex {
-		t.Fatal("download worker frame binding is missing from the consume path")
+	proofCheckIndex := strings.Index(script, "exactNavigationProof(event.request,prepared)")
+	if proofCheckIndex < preparedIndex {
+		t.Fatal("download worker navigation proof is missing from the consume path")
 	}
 	deleteIndex := strings.Index(script, "pendingDownloads.delete(download.nonce);")
-	if deleteIndex < 0 || frameCheckIndex > deleteIndex {
-		t.Fatal("download worker consumes a reservation before validating its bound frame")
+	if deleteIndex < 0 || proofCheckIndex > deleteIndex {
+		t.Fatal("download worker consumes a reservation before validating its navigation proof")
 	}
 }
 

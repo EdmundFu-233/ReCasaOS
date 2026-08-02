@@ -59,7 +59,7 @@ window.addEventListener('message',event=>{
     if(!controller||binding||boundDownload){deny(port);return;}
     binding=true;
     const channel=new MessageChannel();let settled=false;
-    const finish=value=>{if(settled)return;settled=true;binding=false;clearTimeout(timer);channel.port1.close();if(value){boundDownload={nonce:data.nonce,requestURL:data.requestURL};try{port.postMessage({type:'recasaos-download-frame-bound',version:protocolVersion,nonce:data.nonce});}catch(_error){}try{port.close();}catch(_error){}}else deny(port);};
+    const finish=value=>{if(settled)return;settled=true;binding=false;clearTimeout(timer);channel.port1.close();if(value){boundDownload={nonce:data.nonce,requestURL:data.requestURL,frameProof:data.frameProof};try{port.postMessage({type:'recasaos-download-frame-bound',version:protocolVersion,nonce:data.nonce});}catch(_error){}try{port.close();}catch(_error){}}else deny(port);};
     const timer=setTimeout(()=>finish(false),workerReplyTimeoutMs);
     channel.port1.onmessage=status=>finish(exactKeys(status.data,['nonce','type','version'])&&status.data.type==='recasaos-download-frame-bound'&&status.data.version===protocolVersion&&status.data.nonce===data.nonce);
     channel.port1.onmessageerror=()=>finish(false);channel.port1.start();
@@ -67,7 +67,9 @@ window.addEventListener('message',event=>{
     return;
   }
   if(!port&&exactKeys(data,['nonce','requestURL','type','version'])&&data.type==='recasaos-download-frame-navigate'&&data.version===protocolVersion&&boundDownload&&data.nonce===boundDownload.nonce&&data.requestURL===boundDownload.requestURL&&exactDownloadURL(data.requestURL,data.nonce)){
-    boundDownload=null;location.replace(data.requestURL);
+    const download=boundDownload;boundDownload=null;
+    const form=document.createElement('form');form.method='post';form.action=download.requestURL;form.enctype='application/x-www-form-urlencoded';form.hidden=true;
+    const proof=document.createElement('input');proof.type='hidden';proof.name='proof';proof.value=download.frameProof;form.append(proof);document.body.append(form);form.submit();
     return;
   }
   if(port)deny(port);
@@ -367,6 +369,12 @@ function exactPreparedURL(value,path,nonce){
   const keys=Array.from(url.searchParams.keys());
   return url.origin===self.location.origin&&url.pathname===filePath&&keys.length===1&&keys[0]==='path'&&url.searchParams.getAll('path').length===1&&url.searchParams.get('path')===path&&url.hash==='#'+nonce;
 }
+async function exactNavigationProof(request,prepared){
+  const contentType=(request.headers.get('Content-Type')||'').split(';',1)[0].trim().toLowerCase();
+  if(contentType!=='application/x-www-form-urlencoded')return false;
+  let body='';try{body=await request.text();}catch(_error){return false;}
+  return body==='proof='+prepared.frameProof;
+}
 function purgePending(){const now=Date.now();for(const [nonce,state] of pendingDownloads){if(state.expiresAt<now)pendingDownloads.delete(nonce);}}
 function reply(port,value){try{port.postMessage(value);}catch(_error){}try{port.close();}catch(_error){}}
 function sameDownloadState(state,data,clientId){return state&&state.clientId===clientId&&state.nonce===data.nonce&&state.path===data.path&&state.requestURL===data.requestURL;}
@@ -382,7 +390,7 @@ function bindDownloadFrame(event,data,port){
   purgePending();
   const prepared=pendingDownloads.get(data.nonce);
   if(!prepared||prepared.expiresAt<Date.now()||prepared.frameClientId!==''||prepared.frameProof!==data.frameProof){reply(port,{type:'recasaos-download-denied',version:protocolVersion});return;}
-  prepared.frameClientId=event.source.id;prepared.frameProof='';
+  prepared.frameClientId=event.source.id;
   reply(port,{type:'recasaos-download-frame-bound',version:protocolVersion,nonce:data.nonce});
 }
 function handleProtocolMessage(event){
@@ -403,7 +411,8 @@ function handleProtocolMessage(event){
 function parseDownload(request){
   const url=new URL(request.url);
   const supportedNavigation=request.mode==='navigate'&&(request.destination==='document'||request.destination==='iframe');
-  if(url.origin!==self.location.origin||url.pathname!==filePath||request.method!=='GET'||!supportedNavigation)return null;
+  if(url.origin!==self.location.origin||url.pathname!==filePath||!supportedNavigation)return null;
+  if(request.method!=='POST')return {error:true};
   const keys=Array.from(url.searchParams.keys());const nonce=url.hash.slice(1);
   if(keys.length!==1||keys[0]!=='path'||url.searchParams.getAll('path').length!==1||!validNonce(nonce))return {error:true};
   const path=url.searchParams.get('path');
@@ -442,8 +451,8 @@ async function handleDownload(download,event){
   purgePending();
   const prepared=pendingDownloads.get(download.nonce);
   if(!prepared||prepared.expiresAt<Date.now()||prepared.path!==download.path||prepared.requestURL!==download.requestURL||prepared.frameClientId==='')throw new TypeError('download was not prepared by this client');
-  if(event.clientId!==prepared.frameClientId)throw new TypeError('download navigation initiator changed');
-  if(typeof event.replacesClientId==='string'&&event.replacesClientId!==''&&event.replacesClientId!==prepared.frameClientId)throw new TypeError('download navigation frame changed');
+  if(!(await exactNavigationProof(event.request,prepared)))throw new TypeError('download navigation proof changed');
+  prepared.frameProof='';
   pendingDownloads.delete(download.nonce);
   const controller=new AbortController();
   const active={nonce:prepared.nonce,path:prepared.path,requestURL:prepared.requestURL,clientId:prepared.clientId,controller:controller,timer:null};
