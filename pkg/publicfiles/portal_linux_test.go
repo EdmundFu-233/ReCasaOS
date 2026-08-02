@@ -515,7 +515,7 @@ func TestPortalAssetsUseStrictCSPAndPageMemory(t *testing.T) {
 
 func TestMutatingMethodsAreRejected(t *testing.T) {
 	fixture := newPortalFixture(t, 0)
-	for _, endpoint := range []string{BasePath + "/api/list", BasePath + "/api/file?path=x", BasePath + "/", BasePath + "/download-worker.js"} {
+	for _, endpoint := range []string{BasePath + "/api/list", BasePath + "/api/file?path=x", BasePath + "/", BasePath + "/download-frame", BasePath + "/download-frame.js", BasePath + "/download-worker.js"} {
 		response := serve(fixture.portal, authorizedRequest(t, http.MethodPost, endpoint))
 		if response.Code != http.StatusMethodNotAllowed {
 			t.Errorf("POST %s returned %d, want 405", endpoint, response.Code)

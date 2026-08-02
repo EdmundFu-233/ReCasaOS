@@ -285,6 +285,57 @@ func TestPublicStylesHonorHiddenState(t *testing.T) {
 	}
 }
 
+func TestDownloadFrameIsSameOriginOnlyAndRelaysNoCredential(t *testing.T) {
+	portal := &Portal{}
+	recorder := httptest.NewRecorder()
+	portal.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, BasePath+"/download-frame", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("download frame status = %d, want 200", recorder.Code)
+	}
+	if strings.Contains(recorder.Body.String(), "<script>") || !strings.Contains(recorder.Body.String(), `src="download-frame.js"`) {
+		t.Fatal("download frame must load only its same-origin external script")
+	}
+	if got := recorder.Header().Get("X-Frame-Options"); got != "SAMEORIGIN" {
+		t.Fatalf("download frame X-Frame-Options = %q, want SAMEORIGIN", got)
+	}
+	csp := recorder.Header().Get("Content-Security-Policy")
+	if strings.Contains(csp, "unsafe-inline") || !strings.Contains(csp, "default-src 'none'") || !strings.Contains(csp, "script-src 'self'") || !strings.Contains(csp, "frame-ancestors 'self'") || strings.Contains(csp, "frame-ancestors 'none'") {
+		t.Fatalf("download frame CSP is unsafe: %q", csp)
+	}
+
+	recorder = httptest.NewRecorder()
+	portal.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, BasePath+"/download-frame.js", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("download frame script status = %d, want 200", recorder.Code)
+	}
+	script := recorder.Body.String()
+	for _, forbidden := range []string{
+		"Authorization",
+		"Bearer ",
+		"fetch(",
+		"localStorage",
+		"sessionStorage",
+		"indexedDB",
+		"document.cookie",
+		"console.",
+	} {
+		if strings.Contains(script, forbidden) {
+			t.Errorf("download frame script contains forbidden primitive %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		"event.source!==parent",
+		"event.origin!==location.origin",
+		"recasaos-download-frame-bind",
+		"navigator.serviceWorker.controller",
+		"controller.postMessage(data,[port])",
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("download frame script is missing %q", required)
+		}
+	}
+}
+
 func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *testing.T) {
 	portal := &Portal{}
 	recorder := httptest.NewRecorder()
@@ -305,6 +356,7 @@ func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *test
 		"response.blob(",
 		"response.arrayBuffer(",
 		"searchParams.set('token'",
+		"searchParams.set('frameProof'",
 		"window.location.assign(",
 		"window.stop()",
 	} {
@@ -324,7 +376,13 @@ func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *test
 		"referrerPolicy:'no-referrer'",
 		"Download handed to the browser",
 		"recasaos-download-prepare",
+		"recasaos-download-frame-bind",
+		"recasaos-download-frame-bound",
 		"recasaos-download-cancel",
+		"state.frameProof",
+		"state.frameProof=''",
+		"state.frame=await nativeDownloadFrame()",
+		"bindNativeDownloadFrame(controller,state)",
 		"state.frame.src=state.requestURL",
 		"frame.referrerPolicy='no-referrer'",
 		"boundedDownload(path,entry).catch(showError);",
@@ -383,13 +441,17 @@ func TestDownloadWorkerIsNarrowNoStoreAsset(t *testing.T) {
 	}
 	for _, required := range []string{
 		"const filePath=basePath+'/api/file'",
+		"const framePath=basePath+'/download-frame'",
 		"request.method!=='GET'",
 		"request.mode==='navigate'",
 		"request.destination==='document'||request.destination==='iframe'",
 		"pendingDownloads.get(download.nonce)",
 		"activeDownloads.get(data.nonce)",
 		"activeDownloads.has(data.nonce)",
-		"event.replacesClientId!==''&&event.replacesClientId!==prepared.clientId",
+		"canonicalFrameClient(event.source)",
+		"prepared.frameClientId=event.source.id",
+		"prepared.frameProof=''",
+		"event.replacesClientId!==prepared.frameClientId",
 		"self.clients.get(prepared.clientId)",
 		"headers.set('Authorization','Bearer '+authorization.token)",
 		"const bearerPattern=/^rc1_[A-Za-z0-9_-]{43}$/",
@@ -419,7 +481,7 @@ func TestDownloadWorkerIsNarrowNoStoreAsset(t *testing.T) {
 	}
 }
 
-func TestDownloadWorkerChecksNavigationClientBeforeConsumingReservation(t *testing.T) {
+func TestDownloadWorkerChecksBoundFrameBeforeConsumingReservation(t *testing.T) {
 	portal := &Portal{}
 	recorder := httptest.NewRecorder()
 	portal.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, BasePath+"/download-worker.js", nil))
@@ -429,13 +491,13 @@ func TestDownloadWorkerChecksNavigationClientBeforeConsumingReservation(t *testi
 	if preparedIndex < 0 {
 		t.Fatal("download worker does not look up the prepared reservation")
 	}
-	clientCheckIndex := strings.Index(script, "event.clientId!==prepared.clientId")
-	if clientCheckIndex < preparedIndex {
-		t.Fatal("download worker client binding is missing from the consume path")
+	frameCheckIndex := strings.Index(script, "event.replacesClientId!==prepared.frameClientId")
+	if frameCheckIndex < preparedIndex {
+		t.Fatal("download worker frame binding is missing from the consume path")
 	}
 	deleteIndex := strings.Index(script, "pendingDownloads.delete(download.nonce);")
-	if deleteIndex < 0 || clientCheckIndex > deleteIndex {
-		t.Fatal("download worker consumes a reservation before validating its navigation client")
+	if deleteIndex < 0 || frameCheckIndex > deleteIndex {
+		t.Fatal("download worker consumes a reservation before validating its bound frame")
 	}
 }
 

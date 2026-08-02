@@ -60,17 +60,23 @@ reference, but static source tests cannot prove that a browser, extension,
 DevTools session, proxy, operating system, or crash reporter retained no copy.
 
 For a large file, a scoped Service Worker first records a 192-bit random,
-single-use correlation nonce bound to the exact portal client, relative path,
-and same-origin file URL for at most 10 seconds. The page then starts a hidden
-same-origin child-frame navigation whose fragment contains that non-secret
-nonce. Unlike a top-level navigation, this request retains the portal page as
-its initiating Service Worker client. Before consuming a reservation, the
-worker requires the navigation's `FetchEvent.clientId` to equal the client that
-prepared it; a non-empty `replacesClientId` is an additional consistency check.
-It then consumes the reservation atomically, challenges only the original
-portal page over a `MessageChannel`, receives the bearer once, removes the
-fragment, and makes one clean same-origin file request with the bearer in the
-`Authorization` header. Redirects fail, credentials are omitted, and the
+single-use correlation nonce and a separate 192-bit frame proof bound to the
+exact top-level portal client, relative path, and same-origin file URL for at
+most 10 seconds. The page loads a minimal same-origin transport document in a
+hidden child frame and sends the proof in an origin-checked message accompanied
+by a one-use `MessageChannel` port; the document only relays that message and
+port to its controlling Worker. The
+Worker accepts that proof only for the existing reservation and records the
+opaque nested-frame client ID before the page can start the file navigation.
+The frame proof is never placed in the URL and is erased from page and Worker
+state as soon as the child is bound. The file URL fragment contains only the non-secret
+correlation nonce. Before consuming a reservation, the Worker requires
+`FetchEvent.replacesClientId` to equal the bound child-frame ID and, when the
+browser supplies an initiating client ID, accepts only the bound child or the
+top-level client that prepared it. It then consumes the reservation atomically,
+challenges only the original portal page over a `MessageChannel`, receives the
+bearer once, removes the fragment, and makes one clean same-origin file request
+with the bearer in the `Authorization` header. Redirects fail, credentials are omitted, and the
 worker requires the exact clean URL, 200/206 status, attachment disposition,
 octet-stream type, `no-store`, `nosniff`, and byte-range policy before returning
 the upstream streaming response without calling `blob()`, `arrayBuffer()`,

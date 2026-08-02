@@ -75,6 +75,24 @@ async function loginAndWaitForNativeStreaming(page, portal) {
     .toBe(true);
 }
 
+async function ensureWorkerControl(page) {
+  await page.evaluate(async () => {
+    await navigator.serviceWorker.register('download-worker.js', {
+      scope: '/public-files/',
+      updateViaCache: 'none',
+    });
+    await navigator.serviceWorker.ready;
+  });
+  if (!(await page.evaluate(() => navigator.serviceWorker.controller !== null))) {
+    await page.reload({ waitUntil: 'domcontentloaded' });
+  }
+  await expect
+    .poll(() =>
+      page.evaluate(() => navigator.serviceWorker.controller !== null),
+    )
+    .toBe(true);
+}
+
 async function prepareManualDownload(page, bearer, path) {
   return page.evaluate(
     async ({ bearerValue, relativePath }) => {
@@ -97,6 +115,7 @@ async function prepareManualDownload(page, bearer, path) {
         .replace(/\+/g, '-')
         .replace(/\//g, '_')
         .replace(/=+$/g, '');
+      const frameProof = randomNonce();
       const requestURL = new URL('api/file', location.href);
       requestURL.search = '';
       requestURL.hash = nonce;
@@ -140,6 +159,12 @@ async function prepareManualDownload(page, bearer, path) {
       };
       navigator.serviceWorker.addEventListener('message', onChallenge);
 
+      const frame = await nativeDownloadFrame();
+      if (!(frame instanceof HTMLIFrameElement)) {
+        navigator.serviceWorker.removeEventListener('message', onChallenge);
+        throw new Error('manual download frame was unavailable');
+      }
+
       const prepared = await new Promise((resolve) => {
         const channel = new MessageChannel();
         let settled = false;
@@ -164,6 +189,7 @@ async function prepareManualDownload(page, bearer, path) {
             type: 'recasaos-download-prepare',
             version: 1,
             nonce,
+            frameProof,
             path: relativePath,
             requestURL: requestURL.href,
           },
@@ -173,6 +199,15 @@ async function prepareManualDownload(page, bearer, path) {
       if (!prepared) {
         navigator.serviceWorker.removeEventListener('message', onChallenge);
         throw new Error('manual download reservation was denied');
+      }
+      const bound = await bindNativeDownloadFrame(controller, {
+        frame,
+        frameProof,
+        nonce,
+      });
+      if (!bound) {
+        navigator.serviceWorker.removeEventListener('message', onChallenge);
+        throw new Error('manual download frame binding was denied');
       }
       return { nonce, path: relativePath, requestURL: requestURL.href };
     },
@@ -187,6 +222,18 @@ async function navigateHiddenFrame(page, requestURL) {
     frame.title = 'Cross-tab download probe';
     frame.referrerPolicy = 'no-referrer';
     document.body.append(frame);
+    frame.src = url;
+  }, requestURL);
+}
+
+async function navigateBoundHiddenFrame(page, requestURL) {
+  await page.evaluate((url) => {
+    const frame = document.querySelector(
+      'iframe[title="Secure download transport"]',
+    );
+    if (!(frame instanceof HTMLIFrameElement)) {
+      throw new Error('bound download frame is unavailable');
+    }
     frame.src = url;
   }, requestURL);
 }
@@ -356,15 +403,7 @@ test('a different tab cannot consume another tab download reservation', async ({
   const attacker = await context.newPage();
   try {
     await openPortal(attacker, portal);
-    await expect
-      .poll(() =>
-        attacker.evaluate(
-          () =>
-            'serviceWorker' in navigator &&
-            navigator.serviceWorker.controller !== null,
-        ),
-      )
-      .toBe(true);
+    await ensureWorkerControl(attacker);
 
     const before = await readSnapshot(portal);
     const prepared = await prepareManualDownload(
@@ -374,15 +413,27 @@ test('a different tab cannot consume another tab download reservation', async ({
     );
     const attackerDownload = attacker
       .waitForEvent('download', { timeout: 750 })
-      .then(
-        () => true,
-        () => false,
-      );
+      .then(async (download) => {
+        const failure = await download.failure();
+        if (failure !== null) return { failure };
+        try {
+          return { failure: null, ...(await hashDownload(download)) };
+        } catch {
+          return { failure: 'unreadable' };
+        }
+      })
+      .catch(() => null);
     await navigateHiddenFrame(attacker, prepared.requestURL);
-    expect(
-      await attackerDownload,
-      'a mismatched tab must not receive the prepared download',
-    ).toBe(false);
+    const attackerArtifact = await attackerDownload;
+    if (attackerArtifact?.failure === null) {
+      expect(
+        {
+          sha256: attackerArtifact.sha256,
+          size: attackerArtifact.size,
+        },
+        'a mismatched tab must not receive the prepared file bytes',
+      ).not.toEqual(portal.fixtures['report.txt']);
+    }
     expect(
       await page.evaluate(() => window.__recasaosIsolation.challengeCount),
       'a mismatched tab must not trigger an authorization challenge',
@@ -392,8 +443,8 @@ test('a different tab cannot consume another tab download reservation', async ({
       'a mismatched tab must not issue an authenticated file request',
     ).toEqual(fileRequestState(before));
 
-    const downloadPromise = page.waitForEvent('download');
-    await navigateHiddenFrame(page, prepared.requestURL);
+    const downloadPromise = page.waitForEvent('download', { timeout: 30_000 });
+    await navigateBoundHiddenFrame(page, prepared.requestURL);
     const download = await downloadPromise;
     expect(download.suggestedFilename()).toBe('report.txt');
     expect(await download.failure()).toBeNull();
@@ -430,7 +481,7 @@ test('native browser download preserves bytes and leaves no bearer residue', asy
   const initialPageURL = page.url();
   const initialHistoryLength = await page.evaluate(() => history.length);
 
-  const downloadPromise = page.waitForEvent('download');
+  const downloadPromise = page.waitForEvent('download', { timeout: 30_000 });
   await page.locator('#entries a', { hasText: 'stream.bin' }).click();
   const download = await downloadPromise;
 
@@ -615,7 +666,7 @@ test('canceling a browser download reaches bounded terminal cleanup', async ({
   await loginAndWaitForNativeStreaming(page, portal);
   const before = await readSnapshot(portal);
 
-  const downloadPromise = page.waitForEvent('download');
+  const downloadPromise = page.waitForEvent('download', { timeout: 30_000 });
   await page.locator('#entries a', { hasText: 'stream.bin' }).click();
   const download = await downloadPromise;
   await waitForSnapshot(

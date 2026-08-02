@@ -183,8 +183,12 @@ func (p *Portal) Close() error {
 }
 
 func (p *Portal) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w = &securityResponseWriter{ResponseWriter: w}
-	setSecurityHeaders(w.Header())
+	allowSameOriginFraming := r.URL.Path == BasePath+"/download-frame"
+	w = &securityResponseWriter{
+		ResponseWriter:         w,
+		allowSameOriginFraming: allowSameOriginFraming,
+	}
+	setSecurityHeaders(w.Header(), allowSameOriginFraming)
 
 	switch r.URL.Path {
 	case BasePath:
@@ -198,6 +202,10 @@ func (p *Portal) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.serveAsset(w, r, "text/html; charset=utf-8", portalHTML)
 	case BasePath + "/app.js":
 		p.serveAsset(w, r, "text/javascript; charset=utf-8", portalJavaScript)
+	case BasePath + "/download-frame":
+		p.serveAsset(w, r, "text/html; charset=utf-8", downloadFrameHTML)
+	case BasePath + "/download-frame.js":
+		p.serveAsset(w, r, "text/javascript; charset=utf-8", downloadFrameJavaScript)
 	case BasePath + "/download-worker.js":
 		w.Header().Set("Service-Worker-Allowed", BasePath+"/")
 		p.serveAsset(w, r, "text/javascript; charset=utf-8", downloadWorkerJavaScript)
@@ -217,6 +225,7 @@ func (p *Portal) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // may delete caching headers while constructing an error response.
 type securityResponseWriter struct {
 	http.ResponseWriter
+	allowSameOriginFraming bool
 }
 
 func (w *securityResponseWriter) Unwrap() http.ResponseWriter {
@@ -224,24 +233,29 @@ func (w *securityResponseWriter) Unwrap() http.ResponseWriter {
 }
 
 func (w *securityResponseWriter) WriteHeader(status int) {
-	setSecurityHeaders(w.Header())
+	setSecurityHeaders(w.Header(), w.allowSameOriginFraming)
 	w.ResponseWriter.WriteHeader(status)
 }
 
 func (w *securityResponseWriter) Write(payload []byte) (int, error) {
-	setSecurityHeaders(w.Header())
+	setSecurityHeaders(w.Header(), w.allowSameOriginFraming)
 	return w.ResponseWriter.Write(payload)
 }
 
-func setSecurityHeaders(header http.Header) {
+func setSecurityHeaders(header http.Header, allowSameOriginFraming bool) {
 	header.Set("Cache-Control", "no-store")
-	header.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; worker-src 'self'; style-src 'self'; connect-src 'self'; frame-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+	if allowSameOriginFraming {
+		header.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; base-uri 'none'; frame-ancestors 'self'; form-action 'none'")
+		header.Set("X-Frame-Options", "SAMEORIGIN")
+	} else {
+		header.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; worker-src 'self'; style-src 'self'; connect-src 'self'; frame-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+		header.Set("X-Frame-Options", "DENY")
+	}
 	header.Set("Cross-Origin-Opener-Policy", "same-origin")
 	header.Set("Cross-Origin-Resource-Policy", "same-origin")
 	header.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
 	header.Set("Referrer-Policy", "no-referrer")
 	header.Set("X-Content-Type-Options", "nosniff")
-	header.Set("X-Frame-Options", "DENY")
 }
 
 func (p *Portal) serveAsset(w http.ResponseWriter, r *http.Request, contentType, content string) {
