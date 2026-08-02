@@ -72,7 +72,7 @@ jobs:
             --memory 1g \
             --cpus 2 \
             --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/repo,readonly" \
-            --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+            --tmpfs /tmp:rw,nosuid,nodev,exec,size=64m \
             "$image" \
             /bin/bash -ceu '
               export DEBIAN_FRONTEND=noninteractive
