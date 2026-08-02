@@ -504,7 +504,7 @@ func TestPortalAssetsUseStrictCSPAndPageMemory(t *testing.T) {
 		t.Fatalf("HTML response is unsafe: %d %s", html.Code, html.Body.String())
 	}
 	csp := html.Header().Get("Content-Security-Policy")
-	if !strings.Contains(csp, "default-src 'none'") || !strings.Contains(csp, "frame-ancestors 'none'") || !strings.Contains(csp, "worker-src 'self'") || !strings.Contains(csp, "frame-src 'self'") || strings.Contains(csp, "unsafe-inline") {
+	if !strings.Contains(csp, "default-src 'none'") || !strings.Contains(csp, "frame-ancestors 'none'") || !strings.Contains(csp, "worker-src 'self'") || !strings.Contains(csp, "form-action 'self'") || strings.Contains(csp, "unsafe-inline") {
 		t.Fatalf("unexpected CSP: %q", csp)
 	}
 	javascript := serve(fixture.portal, httptest.NewRequest(http.MethodGet, BasePath+"/app.js", nil))
@@ -515,7 +515,7 @@ func TestPortalAssetsUseStrictCSPAndPageMemory(t *testing.T) {
 
 func TestMutatingMethodsAreRejected(t *testing.T) {
 	fixture := newPortalFixture(t, 0)
-	for _, endpoint := range []string{BasePath + "/api/list", BasePath + "/api/file?path=x", BasePath + "/", BasePath + "/download-frame", BasePath + "/download-frame.js", BasePath + "/download-worker.js"} {
+	for _, endpoint := range []string{BasePath + "/api/list", BasePath + "/api/file?path=x", BasePath + "/", BasePath + "/download-worker.js"} {
 		response := serve(fixture.portal, authorizedRequest(t, http.MethodPost, endpoint))
 		if response.Code != http.StatusMethodNotAllowed {
 			t.Errorf("POST %s returned %d, want 405", endpoint, response.Code)

@@ -268,7 +268,7 @@ func TestPublicAssetsRequireNoCredentialAndContainNoInlineScript(t *testing.T) {
 			t.Errorf("HTML bearer input is missing %q", required)
 		}
 	}
-	if csp := recorder.Header().Get("Content-Security-Policy"); strings.Contains(csp, "unsafe-inline") || !strings.Contains(csp, "default-src 'none'") || !strings.Contains(csp, "worker-src 'self'") || !strings.Contains(csp, "frame-src 'self'") {
+	if csp := recorder.Header().Get("Content-Security-Policy"); strings.Contains(csp, "unsafe-inline") || !strings.Contains(csp, "default-src 'none'") || !strings.Contains(csp, "worker-src 'self'") || !strings.Contains(csp, "frame-ancestors 'none'") || !strings.Contains(csp, "form-action 'self'") {
 		t.Fatalf("unsafe CSP: %q", csp)
 	}
 }
@@ -282,63 +282,6 @@ func TestPublicStylesHonorHiddenState(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), "[hidden]{display:none!important}") {
 		t.Fatal("portal CSS can override the hidden attribute")
-	}
-}
-
-func TestDownloadFrameIsSameOriginOnlyAndRelaysNoCredential(t *testing.T) {
-	portal := &Portal{}
-	recorder := httptest.NewRecorder()
-	portal.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, BasePath+"/download-frame", nil))
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("download frame status = %d, want 200", recorder.Code)
-	}
-	if strings.Contains(recorder.Body.String(), "<script>") || !strings.Contains(recorder.Body.String(), `src="download-frame.js"`) {
-		t.Fatal("download frame must load only its same-origin external script")
-	}
-	if got := recorder.Header().Get("X-Frame-Options"); got != "SAMEORIGIN" {
-		t.Fatalf("download frame X-Frame-Options = %q, want SAMEORIGIN", got)
-	}
-	csp := recorder.Header().Get("Content-Security-Policy")
-	if strings.Contains(csp, "unsafe-inline") || !strings.Contains(csp, "default-src 'none'") || !strings.Contains(csp, "script-src 'self'") || !strings.Contains(csp, "frame-ancestors 'self'") || !strings.Contains(csp, "form-action 'self'") || strings.Contains(csp, "frame-ancestors 'none'") {
-		t.Fatalf("download frame CSP is unsafe: %q", csp)
-	}
-
-	recorder = httptest.NewRecorder()
-	portal.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, BasePath+"/download-frame.js", nil))
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("download frame script status = %d, want 200", recorder.Code)
-	}
-	script := recorder.Body.String()
-	for _, forbidden := range []string{
-		"Authorization",
-		"Bearer ",
-		"fetch(",
-		"localStorage",
-		"sessionStorage",
-		"indexedDB",
-		"document.cookie",
-		"console.",
-	} {
-		if strings.Contains(script, forbidden) {
-			t.Errorf("download frame script contains forbidden primitive %q", forbidden)
-		}
-	}
-	for _, required := range []string{
-		"event.source!==parent",
-		"event.origin!==location.origin",
-		"recasaos-download-frame-bind",
-		"recasaos-download-frame-navigate",
-		"navigator.serviceWorker.controller",
-		"controller.postMessage({type:'recasaos-download-frame-bind'",
-		"form.method='post'",
-		"form.action=download.requestURL",
-		"proof.name='proof'",
-		"proof.value=download.frameProof",
-		"form.submit()",
-	} {
-		if !strings.Contains(script, required) {
-			t.Errorf("download frame script is missing %q", required)
-		}
 	}
 }
 
@@ -362,7 +305,9 @@ func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *test
 		"response.blob(",
 		"response.arrayBuffer(",
 		"searchParams.set('token'",
-		"searchParams.set('frameProof'",
+		"searchParams.set('navigationProof'",
+		"frameProof",
+		"download-frame",
 		"window.location.assign(",
 		"window.stop()",
 		"state.frame.src=",
@@ -383,15 +328,15 @@ func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *test
 		"referrerPolicy:'no-referrer'",
 		"Download handed to the browser",
 		"recasaos-download-prepare",
-		"recasaos-download-frame-bind",
-		"recasaos-download-frame-bound",
 		"recasaos-download-cancel",
-		"state.frameProof",
-		"state.frameProof=''",
-		"state.frame=await nativeDownloadFrame()",
-		"bindNativeDownloadFrame(controller,state)",
-		"navigateNativeDownloadFrame(state)",
-		"frame.referrerPolicy='no-referrer'",
+		"state.navigationProof",
+		"state.navigationProof=''",
+		"submitNativeDownload(state)",
+		"form.method='post'",
+		"form.action=state.requestURL",
+		"proof.name='proof'",
+		"proof.value=state.navigationProof",
+		"form.submit()",
 		"boundedDownload(path,entry).catch(showError);",
 		"Token forgotten after page restore",
 		"const bearerPattern=/^rc1_[A-Za-z0-9_-]{43}$/",
@@ -441,6 +386,12 @@ func TestDownloadWorkerIsNarrowNoStoreAsset(t *testing.T) {
 		".arrayBuffer(",
 		".clone(",
 		".tee(",
+		"frameProof",
+		"frameClientId",
+		"download-frame",
+		"canonicalFrameClient",
+		"event.clientId",
+		"replacesClientId",
 	} {
 		if strings.Contains(script, forbidden) {
 			t.Errorf("download worker contains persistent storage or logging primitive %q", forbidden)
@@ -448,18 +399,16 @@ func TestDownloadWorkerIsNarrowNoStoreAsset(t *testing.T) {
 	}
 	for _, required := range []string{
 		"const filePath=basePath+'/api/file'",
-		"const framePath=basePath+'/download-frame'",
 		"request.method!=='POST'",
 		"request.mode==='navigate'",
 		"request.destination==='document'||request.destination==='iframe'",
 		"pendingDownloads.get(download.nonce)",
 		"activeDownloads.get(data.nonce)",
 		"activeDownloads.has(data.nonce)",
-		"canonicalFrameClient(event.source)",
-		"prepared.frameClientId=event.source.id",
+		"navigationProof:data.navigationProof",
 		"exactNavigationProof(event.request,prepared)",
 		"request.text()",
-		"prepared.frameProof=''",
+		"prepared.navigationProof=''",
 		"self.clients.get(prepared.clientId)",
 		"headers.set('Authorization','Bearer '+authorization.token)",
 		"const bearerPattern=/^rc1_[A-Za-z0-9_-]{43}$/",
@@ -511,23 +460,25 @@ func TestDownloadWorkerChecksNavigationProofBeforeConsumingReservation(t *testin
 
 func TestUnauthenticatedFileNavigationFailsClosedWithoutReplacingPortal(t *testing.T) {
 	portal := &Portal{}
-	for _, destination := range []string{"document", "iframe"} {
-		request := httptest.NewRequest(http.MethodGet, BasePath+"/api/file?path=report.pdf", nil)
-		request.Header.Set("Sec-Fetch-Mode", "navigate")
-		request.Header.Set("Sec-Fetch-Dest", destination)
-		recorder := httptest.NewRecorder()
-		portal.ServeHTTP(recorder, request)
-		if recorder.Code != http.StatusNoContent {
-			t.Fatalf("%s navigation status = %d, want 204", destination, recorder.Code)
-		}
-		if recorder.Body.Len() != 0 {
-			t.Fatalf("%s navigation failure returned a body: %q", destination, recorder.Body.String())
-		}
-		if recorder.Header().Get("WWW-Authenticate") != "" {
-			t.Fatalf("%s navigation failure unexpectedly requested browser authentication", destination)
-		}
-		if recorder.Header().Get("Cache-Control") != "no-store" {
-			t.Fatalf("%s navigation failure is cacheable", destination)
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		for _, destination := range []string{"document", "iframe"} {
+			request := httptest.NewRequest(method, BasePath+"/api/file?path=report.pdf", strings.NewReader("proof=untrusted"))
+			request.Header.Set("Sec-Fetch-Mode", "navigate")
+			request.Header.Set("Sec-Fetch-Dest", destination)
+			recorder := httptest.NewRecorder()
+			portal.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusNoContent {
+				t.Fatalf("%s %s navigation status = %d, want 204", method, destination, recorder.Code)
+			}
+			if recorder.Body.Len() != 0 {
+				t.Fatalf("%s %s navigation failure returned a body: %q", method, destination, recorder.Body.String())
+			}
+			if recorder.Header().Get("WWW-Authenticate") != "" {
+				t.Fatalf("%s %s navigation failure unexpectedly requested browser authentication", method, destination)
+			}
+			if recorder.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("%s %s navigation failure is cacheable", method, destination)
+			}
 		}
 	}
 

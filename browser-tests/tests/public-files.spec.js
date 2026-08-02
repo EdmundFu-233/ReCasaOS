@@ -101,7 +101,7 @@ async function prepareManualDownload(page, bearer, path) {
         .replace(/\+/g, '-')
         .replace(/\//g, '_')
         .replace(/=+$/g, '');
-      const frameProof = randomNonce();
+      const navigationProof = randomNonce();
       const requestURL = new URL('api/file', location.href);
       requestURL.search = '';
       requestURL.hash = nonce;
@@ -145,12 +145,6 @@ async function prepareManualDownload(page, bearer, path) {
       };
       navigator.serviceWorker.addEventListener('message', onChallenge);
 
-      const frame = await nativeDownloadFrame();
-      if (!(frame instanceof HTMLIFrameElement)) {
-        navigator.serviceWorker.removeEventListener('message', onChallenge);
-        throw new Error('manual download frame was unavailable');
-      }
-
       const prepared = await new Promise((resolve) => {
         const channel = new MessageChannel();
         let settled = false;
@@ -175,7 +169,7 @@ async function prepareManualDownload(page, bearer, path) {
             type: 'recasaos-download-prepare',
             version: 1,
             nonce,
-            frameProof,
+            navigationProof,
             path: relativePath,
             requestURL: requestURL.href,
           },
@@ -186,51 +180,50 @@ async function prepareManualDownload(page, bearer, path) {
         navigator.serviceWorker.removeEventListener('message', onChallenge);
         throw new Error('manual download reservation was denied');
       }
-      const bound = await bindNativeDownloadFrame(controller, {
-        frame,
-        frameProof,
+      window.__recasaosManualDownload = {
+        navigationProof,
         nonce,
+        path: relativePath,
         requestURL: requestURL.href,
-      });
-      if (!bound) {
-        navigator.serviceWorker.removeEventListener('message', onChallenge);
-        throw new Error('manual download frame binding was denied');
-      }
+      };
       return { nonce, path: relativePath, requestURL: requestURL.href };
     },
     { bearerValue: bearer, relativePath: path },
   );
 }
 
-async function navigateHiddenFrame(page, requestURL) {
+async function submitUntrustedDownload(page, requestURL) {
   await page.evaluate((url) => {
     const frame = document.createElement('iframe');
     frame.hidden = true;
     frame.title = 'Cross-tab download probe';
     frame.referrerPolicy = 'no-referrer';
+    frame.name = 'cross-tab-download-probe';
     document.body.append(frame);
-    frame.src = url;
+    const form = document.createElement('form');
+    form.hidden = true;
+    form.method = 'post';
+    form.action = url;
+    form.target = frame.name;
+    form.enctype = 'application/x-www-form-urlencoded';
+    const proof = document.createElement('input');
+    proof.type = 'hidden';
+    proof.name = 'proof';
+    proof.value = randomNonce();
+    form.append(proof);
+    document.body.append(form);
+    form.submit();
+    form.remove();
   }, requestURL);
 }
 
-async function navigateBoundHiddenFrame(page, requestURL) {
+async function submitManualDownload(page, requestURL) {
   await page.evaluate((url) => {
-    const frame = document.querySelector(
-      'iframe[title="Secure download transport"]',
-    );
-    if (!(frame instanceof HTMLIFrameElement)) {
-      throw new Error('bound download frame is unavailable');
+    const state = window.__recasaosManualDownload;
+    if (!state || state.requestURL !== url || !submitNativeDownload(state)) {
+      throw new Error('prepared download submission was rejected');
     }
-    const requestURL = new URL(url);
-    if (
-      !navigateNativeDownloadFrame({
-        frame,
-        nonce: requestURL.hash.slice(1),
-        requestURL: requestURL.href,
-      })
-    ) {
-      throw new Error('bound download frame rejected navigation');
-    }
+    window.__recasaosManualDownload = null;
   }, requestURL);
 }
 
@@ -428,7 +421,7 @@ test('a different tab cannot consume another tab download reservation', async ({
         }
       })
       .catch(() => null);
-    await navigateHiddenFrame(attacker, prepared.requestURL);
+    await submitUntrustedDownload(attacker, prepared.requestURL);
     const attackerArtifact = await attackerDownload;
     if (attackerArtifact?.failure === null) {
       expect(
@@ -449,7 +442,7 @@ test('a different tab cannot consume another tab download reservation', async ({
     ).toEqual(fileRequestState(before));
 
     const downloadPromise = page.waitForEvent('download', { timeout: 30_000 });
-    await navigateBoundHiddenFrame(page, prepared.requestURL);
+    await submitManualDownload(page, prepared.requestURL);
     const download = await downloadPromise;
     expect(download.suggestedFilename()).toBe('report.txt');
     expect(await download.failure()).toBeNull();

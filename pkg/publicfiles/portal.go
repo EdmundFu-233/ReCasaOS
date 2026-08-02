@@ -183,12 +183,8 @@ func (p *Portal) Close() error {
 }
 
 func (p *Portal) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	allowSameOriginFraming := r.URL.Path == BasePath+"/download-frame"
-	w = &securityResponseWriter{
-		ResponseWriter:         w,
-		allowSameOriginFraming: allowSameOriginFraming,
-	}
-	setSecurityHeaders(w.Header(), allowSameOriginFraming)
+	w = &securityResponseWriter{ResponseWriter: w}
+	setSecurityHeaders(w.Header())
 
 	switch r.URL.Path {
 	case BasePath:
@@ -202,10 +198,6 @@ func (p *Portal) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.serveAsset(w, r, "text/html; charset=utf-8", portalHTML)
 	case BasePath + "/app.js":
 		p.serveAsset(w, r, "text/javascript; charset=utf-8", portalJavaScript)
-	case BasePath + "/download-frame":
-		p.serveAsset(w, r, "text/html; charset=utf-8", downloadFrameHTML)
-	case BasePath + "/download-frame.js":
-		p.serveAsset(w, r, "text/javascript; charset=utf-8", downloadFrameJavaScript)
 	case BasePath + "/download-worker.js":
 		w.Header().Set("Service-Worker-Allowed", BasePath+"/")
 		p.serveAsset(w, r, "text/javascript; charset=utf-8", downloadWorkerJavaScript)
@@ -225,7 +217,6 @@ func (p *Portal) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // may delete caching headers while constructing an error response.
 type securityResponseWriter struct {
 	http.ResponseWriter
-	allowSameOriginFraming bool
 }
 
 func (w *securityResponseWriter) Unwrap() http.ResponseWriter {
@@ -233,24 +224,19 @@ func (w *securityResponseWriter) Unwrap() http.ResponseWriter {
 }
 
 func (w *securityResponseWriter) WriteHeader(status int) {
-	setSecurityHeaders(w.Header(), w.allowSameOriginFraming)
+	setSecurityHeaders(w.Header())
 	w.ResponseWriter.WriteHeader(status)
 }
 
 func (w *securityResponseWriter) Write(payload []byte) (int, error) {
-	setSecurityHeaders(w.Header(), w.allowSameOriginFraming)
+	setSecurityHeaders(w.Header())
 	return w.ResponseWriter.Write(payload)
 }
 
-func setSecurityHeaders(header http.Header, allowSameOriginFraming bool) {
+func setSecurityHeaders(header http.Header) {
 	header.Set("Cache-Control", "no-store")
-	if allowSameOriginFraming {
-		header.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; base-uri 'none'; frame-ancestors 'self'; form-action 'self'")
-		header.Set("X-Frame-Options", "SAMEORIGIN")
-	} else {
-		header.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; worker-src 'self'; style-src 'self'; connect-src 'self'; frame-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
-		header.Set("X-Frame-Options", "DENY")
-	}
+	header.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; worker-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+	header.Set("X-Frame-Options", "DENY")
 	header.Set("Cross-Origin-Opener-Policy", "same-origin")
 	header.Set("Cross-Origin-Resource-Policy", "same-origin")
 	header.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
@@ -325,22 +311,29 @@ func (p *Portal) serveList(w http.ResponseWriter, r *http.Request) {
 	}{Path: relativePath, Entries: entries})
 }
 
+func isFileNavigation(r *http.Request) bool {
+	destination := r.Header.Get("Sec-Fetch-Dest")
+	return r.Header.Get("Sec-Fetch-Mode") == "navigate" &&
+		(destination == "document" || destination == "iframe")
+}
+
 func (p *Portal) serveFile(w http.ResponseWriter, r *http.Request) {
+	// A proof-bearing POST is expected to be consumed by the scoped Service
+	// Worker. If the Worker was replaced or bypassed, deny the request without
+	// replacing the portal document or reflecting the proof in a response.
+	if r.Method == http.MethodPost && isFileNavigation(r) && !p.authorized(r) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		writeError(w, r, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	if !p.authorized(r) {
-		// A controlled portal or same-origin child-frame download navigation
-		// normally receives its Authorization header from the scoped Service Worker.
-		// If that Worker is
-		// replaced or bypassed after the page has prepared the navigation, return
-		// an empty response instead of rendering an error document in either
-		// context. Sec-Fetch-* is only a UX/fail-closed signal here; it never grants
-		// access and non-navigation clients retain the normal 401.
-		destination := r.Header.Get("Sec-Fetch-Dest")
-		if r.Method == http.MethodGet && r.Header.Get("Sec-Fetch-Mode") == "navigate" && (destination == "document" || destination == "iframe") {
+		// Sec-Fetch-* is only a UX/fail-closed signal here; it never grants
+		// access, and non-navigation clients retain the normal 401.
+		if r.Method == http.MethodGet && isFileNavigation(r) {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}

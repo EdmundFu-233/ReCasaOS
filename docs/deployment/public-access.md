@@ -60,38 +60,34 @@ reference, but static source tests cannot prove that a browser, extension,
 DevTools session, proxy, operating system, or crash reporter retained no copy.
 
 For a large file, a scoped Service Worker first records a 192-bit random,
-single-use correlation nonce and a separate 192-bit frame proof bound to the
-exact top-level portal client, relative path, and same-origin file URL for at
-most 10 seconds. The page loads a minimal same-origin transport document in a
-hidden child frame and sends the proof in an origin-checked message accompanied
-by a one-use `MessageChannel` port; the document only relays that message and
-port to its controlling Worker. The
-Worker accepts that proof only for the existing reservation and records the
-opaque nested-frame client ID before the page can start the file navigation.
-The frame proof is never placed in the URL and is erased from page and Worker
-state as soon as the child is bound. The file URL fragment contains only the
-non-secret correlation nonce. The page then sends an origin-checked navigation
-command to the transport document, which initiates its own navigation. Before
-consuming a reservation, the Worker requires `FetchEvent.clientId` to equal the
-proven child-frame ID. If a browser also supplies a non-empty
-`replacesClientId`, it must identify that same frame; current browser support
-does not make this optional field a release prerequisite. The Worker then
-consumes the reservation atomically,
-challenges only the original portal page over a `MessageChannel`, receives the
-bearer once, removes the fragment, and makes one clean same-origin file request
-with the bearer in the `Authorization` header. Redirects fail, credentials are omitted, and the
+single-use correlation nonce and a separate 192-bit navigation proof bound to
+the exact top-level portal client, relative path, and same-origin file URL for
+at most 10 seconds. The page then submits a same-origin top-level POST. Its URL
+contains only the non-secret correlation nonce in the fragment; its body
+contains only the navigation proof. Neither value is the bearer. Before
+consuming the reservation, the Worker requires the exact POST navigation,
+form content type, path, URL, nonce, and proof. A copied URL, raw GET, invalid
+proof, expired reservation, or replay therefore fails without challenging the
+original page, making an authenticated upstream request, or consuming a valid
+reservation. This proof avoids relying on navigation client-ID fields whose
+behavior is not portable across current browser engines.
+
+After validation, the Worker consumes the reservation atomically, erases the
+proof, challenges only the original portal page over a `MessageChannel`,
+receives the bearer once, removes the fragment, and makes one clean same-origin
+file request with the bearer in the `Authorization` header. Redirects fail,
+credentials are omitted, and the
 worker requires the exact clean URL, 200/206 status, attachment disposition,
 octet-stream type, `no-store`, `nosniff`, and byte-range policy before returning
 the upstream streaming response without calling `blob()`, `arrayBuffer()`,
 cloning, or teeing the body. A restart loses all transient reservations and
 therefore fails closed. Cancellation before response handoff aborts the worker
 fetch; browser download cancellation after handoff must still be verified end
-to end. If the child-frame request has no matching client binding, the Worker
-returns an empty 204 inside that disposable frame without consuming the
-reservation or replacing the portal document. The still-running page can then
-enter the reviewed 32 MiB fallback. If a controlled navigation reaches the
-server without Worker-added authorization, its browser-generated navigation
-metadata also selects an empty 204; ordinary API clients still receive 401.
+to end. Invalid controlled navigations receive an empty `204` without
+consuming a valid reservation. If the POST reaches the server because the
+Worker was replaced or bypassed, its browser-generated navigation metadata also
+selects an empty `204`, so the portal document remains in place and access stays
+denied. Ordinary non-navigation API clients retain `401`/`405` behavior.
 
 The portal does not publish `Last-Modified` or a strong `ETag` for a file. It
 passes a zero modification time to `http.ServeContent`, so a request carrying
