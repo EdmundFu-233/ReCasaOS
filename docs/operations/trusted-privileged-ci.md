@@ -138,6 +138,11 @@ and
 [commit-status API documentation](https://docs.github.com/en/rest/commits/statuses)
 define the relevant controls.
 
+Record the test PR number, every exercised head SHA, the automatic and manual
+run URLs, the status creator, the temporary-ref cleanup result, and the final
+read-back of required contexts. Evidence attached to an older head is useful
+for the audit trail but must never be treated as evidence for the current head.
+
 If the trusted workflow itself becomes unavailable, remove only this one
 required context after recording the incident and opening a security issue:
 
