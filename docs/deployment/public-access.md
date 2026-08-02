@@ -61,25 +61,28 @@ DevTools session, proxy, operating system, or crash reporter retained no copy.
 
 For a large file, a scoped Service Worker first records a 192-bit random,
 single-use correlation nonce bound to the exact portal client, relative path,
-and same-origin file URL for at most 10 seconds. The page then starts an
-ordinary top-level navigation whose fragment contains that non-secret nonce.
-Before consuming a reservation, the worker requires the navigation's
-`FetchEvent.clientId` to equal the client that prepared it; a non-empty
-`replacesClientId` is an additional consistency check. It then consumes the
-reservation atomically, challenges only the original portal page over a
-`MessageChannel`, receives the bearer once, removes the fragment, and makes
-one clean same-origin file request with the bearer in the `Authorization`
-header. Redirects fail, credentials are omitted, and the worker requires the
-exact clean URL, 200/206 status, attachment disposition,
+and same-origin file URL for at most 10 seconds. The page then starts a hidden
+same-origin child-frame navigation whose fragment contains that non-secret
+nonce. Unlike a top-level navigation, this request retains the portal page as
+its initiating Service Worker client. Before consuming a reservation, the
+worker requires the navigation's `FetchEvent.clientId` to equal the client that
+prepared it; a non-empty `replacesClientId` is an additional consistency check.
+It then consumes the reservation atomically, challenges only the original
+portal page over a `MessageChannel`, receives the bearer once, removes the
+fragment, and makes one clean same-origin file request with the bearer in the
+`Authorization` header. Redirects fail, credentials are omitted, and the
+worker requires the exact clean URL, 200/206 status, attachment disposition,
 octet-stream type, `no-store`, `nosniff`, and byte-range policy before returning
 the upstream streaming response without calling `blob()`, `arrayBuffer()`,
 cloning, or teeing the body. A restart loses all transient reservations and
 therefore fails closed. Cancellation before response handoff aborts the worker
 fetch; browser download cancellation after handoff must still be verified end
-to end. If the controlled top-level request reaches the server without
-Worker-added authorization, its browser-generated navigation metadata selects
-an empty 204 response, so access remains denied without replacing the portal
-document; ordinary API clients still receive 401.
+to end. If the child-frame request has no matching client binding, the Worker
+returns an empty 204 inside that disposable frame without consuming the
+reservation or replacing the portal document. The still-running page can then
+enter the reviewed 32 MiB fallback. If a controlled navigation reaches the
+server without Worker-added authorization, its browser-generated navigation
+metadata also selects an empty 204; ordinary API clients still receive 401.
 
 The portal does not publish `Last-Modified` or a strong `ETag` for a file. It
 passes a zero modification time to `http.ServeContent`, so a request carrying

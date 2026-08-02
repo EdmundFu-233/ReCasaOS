@@ -51,6 +51,7 @@ let pendingNative=null;
 let activeNative=null;
 let activeFallback=null;
 let fallbackObjectURL='';
+let nativeFrame=null;
 
 function token(){return accessToken;}
 function apiURL(endpoint,path){const u=new URL(endpoint,window.location.href);u.search='';u.hash='';u.searchParams.set('path',path);return u;}
@@ -68,12 +69,16 @@ function cancelNativeTransport(state){
   if(!state)return;
   if(state.port){try{state.port.close();}catch(_error){}}
   try{state.controller.postMessage({type:'recasaos-download-cancel',version:protocolVersion,nonce:state.nonce,path:state.path,requestURL:state.requestURL});}catch(_error){}
+  if(state.frame&&state.frame===nativeFrame){state.frame.remove();nativeFrame=null;}
 }
-function clearNativeState(stopNavigation=true){
-  let canceled=false;
-  if(pendingNative){clearTimeout(pendingNative.timer);cancelNativeTransport(pendingNative);pendingNative=null;canceled=true;}
-  if(activeNative){clearTimeout(activeNative.timer);cancelNativeTransport(activeNative);activeNative=null;canceled=true;}
-  if(canceled&&stopNavigation)try{window.stop();}catch(_error){}
+function clearNativeState(){
+  if(pendingNative){clearTimeout(pendingNative.timer);cancelNativeTransport(pendingNative);pendingNative=null;}
+  if(activeNative){clearTimeout(activeNative.timer);cancelNativeTransport(activeNative);activeNative=null;}
+}
+function nativeDownloadFrame(){
+  if(nativeFrame&&nativeFrame.isConnected)return nativeFrame;
+  const frame=document.createElement('iframe');frame.hidden=true;frame.title='Secure download transport';frame.referrerPolicy='no-referrer';
+  document.body.append(frame);nativeFrame=frame;return frame;
 }
 function revokeFallbackObjectURL(value){const target=value||fallbackObjectURL;if(!target)return;if(fallbackObjectURL===target)fallbackObjectURL='';URL.revokeObjectURL(target);}
 function forgetAuthorization(message){
@@ -159,7 +164,7 @@ async function startNativeDownload(path,entry){
   const controller=currentWorker();
   if(!controller||controller!==workerController)throw new Error('Secure browser streaming is not ready');
   const nonce=randomNonce();
-  const state={nonce:nonce,path:path,name:entry.name,requestURL:nativeURL(path,nonce),controller:controller,expiresAt:Date.now()+nativeRequestLifetimeMs,timer:null};
+  const state={nonce:nonce,path:path,name:entry.name,requestURL:nativeURL(path,nonce),controller:controller,expiresAt:Date.now()+nativeRequestLifetimeMs,timer:null,frame:null};
   pendingNative=state;
   statusNode.textContent='Preparing secure browser stream for '+entry.name+'…';
   const prepared=await reserveNativeDownload(controller,state);
@@ -170,6 +175,7 @@ async function startNativeDownload(path,entry){
     await boundedDownload(path,entry);
     return;
   }
+  state.frame=nativeDownloadFrame();
   state.timer=setTimeout(()=>{
     if(pendingNative!==state)return;
     cancelNativeTransport(state);
@@ -177,7 +183,7 @@ async function startNativeDownload(path,entry){
     boundedDownload(path,entry).catch(showError);
   },workerReplyTimeoutMs);
   statusNode.textContent='Handing '+entry.name+' to the browser…';
-  try{window.location.assign(state.requestURL);}catch(_error){
+  try{state.frame.src=state.requestURL;}catch(_error){
     clearTimeout(state.timer);cancelNativeTransport(state);pendingNative=null;
     await boundedDownload(path,entry);
   }
@@ -225,19 +231,19 @@ function handleWorkerChallenge(event){
   if(!port)return;
   if(!pending||!exactKeys(data,['nonce','path','requestURL','type','version'])||data.type!=='recasaos-download-auth'||data.version!==protocolVersion||event.source!==pending.controller||currentWorker()!==pending.controller||Date.now()>pending.expiresAt||data.nonce!==pending.nonce||data.path!==pending.path||data.requestURL!==pending.requestURL||!accessToken){denyPort(port);return;}
   clearTimeout(pending.timer);pendingNative=null;
-  const state={nonce:pending.nonce,path:pending.path,name:pending.name,requestURL:pending.requestURL,controller:pending.controller,port:port,timer:null};
-  state.timer=setTimeout(()=>{if(activeNative===state){cancelNativeTransport(state);activeNative=null;try{window.stop();}catch(_error){}showError(new Error('The browser did not accept the download in time'));}},nativeRequestLifetimeMs);
+  const state={nonce:pending.nonce,path:pending.path,name:pending.name,requestURL:pending.requestURL,controller:pending.controller,port:port,timer:null,frame:pending.frame};
+  state.timer=setTimeout(()=>{if(activeNative===state){cancelNativeTransport(state);activeNative=null;showError(new Error('The browser did not accept the download in time'));}},nativeRequestLifetimeMs);
   activeNative=state;
   port.onmessage=statusEvent=>{
     const status=statusEvent.data;
     if(activeNative!==state||!exactKeys(status,['httpStatus','nonce','path','status','type','version'])||status.type!=='recasaos-download-status'||status.version!==protocolVersion||status.nonce!==state.nonce||status.path!==state.path)return;
     clearTimeout(state.timer);activeNative=null;port.close();
     if(status.status==='handed'&&(status.httpStatus===200||status.httpStatus===206)){statusNode.textContent='Download handed to the browser: '+state.name;return;}
-    cancelNativeTransport(state);try{window.stop();}catch(_error){}
+    cancelNativeTransport(state);
     if(status.httpStatus===401){forgetAuthorization('Authorization failed');return;}
     showError(new Error('The browser download was rejected'));
   };
-  port.onmessageerror=()=>{if(activeNative===state){clearTimeout(state.timer);cancelNativeTransport(state);activeNative=null;try{window.stop();}catch(_error){}showError(new Error('Secure download authorization failed'));}};
+  port.onmessageerror=()=>{if(activeNative===state){clearTimeout(state.timer);cancelNativeTransport(state);activeNative=null;showError(new Error('Secure download authorization failed'));}};
   port.start();
   port.postMessage({type:'recasaos-download-auth-response',version:protocolVersion,nonce:pending.nonce,path:pending.path,token:accessToken});
 }
@@ -249,7 +255,7 @@ if('serviceWorker' in navigator){
   navigator.serviceWorker.addEventListener('message',handleWorkerChallenge);
   navigator.serviceWorker.addEventListener('controllerchange',()=>{clearNativeState();workerReady=false;workerController=null;prepareWorker();});
 }
-window.addEventListener('pagehide',()=>{accessToken='';clearNativeState(false);if(activeFallback)activeFallback.abort();revokeFallbackObjectURL();});
+window.addEventListener('pagehide',()=>{accessToken='';clearNativeState();if(nativeFrame){nativeFrame.remove();nativeFrame=null;}if(activeFallback)activeFallback.abort();revokeFallbackObjectURL();});
 window.addEventListener('pageshow',event=>{if(event.persisted&&!accessToken)showLogin('Token forgotten after page restore');});
 showLogin('');
 `

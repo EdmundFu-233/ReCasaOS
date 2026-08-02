@@ -268,7 +268,7 @@ func TestPublicAssetsRequireNoCredentialAndContainNoInlineScript(t *testing.T) {
 			t.Errorf("HTML bearer input is missing %q", required)
 		}
 	}
-	if csp := recorder.Header().Get("Content-Security-Policy"); strings.Contains(csp, "unsafe-inline") || !strings.Contains(csp, "default-src 'none'") || !strings.Contains(csp, "worker-src 'self'") {
+	if csp := recorder.Header().Get("Content-Security-Policy"); strings.Contains(csp, "unsafe-inline") || !strings.Contains(csp, "default-src 'none'") || !strings.Contains(csp, "worker-src 'self'") || !strings.Contains(csp, "frame-src 'self'") {
 		t.Fatalf("unsafe CSP: %q", csp)
 	}
 }
@@ -305,6 +305,8 @@ func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *test
 		"response.blob(",
 		"response.arrayBuffer(",
 		"searchParams.set('token'",
+		"window.location.assign(",
+		"window.stop()",
 	} {
 		if strings.Contains(script, forbidden) {
 			t.Errorf("app.js contains forbidden credential or buffering primitive %q", forbidden)
@@ -323,7 +325,8 @@ func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *test
 		"Download handed to the browser",
 		"recasaos-download-prepare",
 		"recasaos-download-cancel",
-		"window.location.assign(state.requestURL)",
+		"state.frame.src=state.requestURL",
+		"frame.referrerPolicy='no-referrer'",
 		"boundedDownload(path,entry).catch(showError);",
 		"Token forgotten after page restore",
 		"const bearerPattern=/^rc1_[A-Za-z0-9_-]{43}$/",
