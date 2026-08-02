@@ -15,9 +15,11 @@ const snapshotKeys = [
   'authorization_on_other_path',
   'authorized_file_requests',
   'authorized_list_requests',
+  'authorized_range_file_requests',
   'canceled_file_requests',
   'completed_file_requests',
   'credential_query_requests',
+  'partial_file_responses',
 ];
 
 function exactKeys(value, expected) {

@@ -1,6 +1,7 @@
 package publicfiles
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -11,6 +12,80 @@ import (
 	"testing"
 	"time"
 )
+
+func TestPortalDoesNotUseModificationTimeAsRangeValidator(t *testing.T) {
+	t.Parallel()
+
+	const (
+		oldContent = "old representation"
+		newContent = "new representation"
+	)
+	sharedModTime := time.Unix(1_700_000_000, 0).UTC()
+	content := []byte(oldContent)
+	backend := &scriptedStorageBackend{
+		openFn: func(context.Context, string) (storageFile, fileInfo, error) {
+			payload := append([]byte(nil), content...)
+			return &memoryStorageFile{Reader: bytes.NewReader(payload)}, testStorageFileInfo{
+				name:    "report.txt",
+				size:    int64(len(payload)),
+				modTime: sharedModTime,
+			}, nil
+		},
+	}
+	bearer := testPublicBearer(19)
+	portal := testPortalWithStorage(backend, bearer)
+	endpoint := "https://files.example.test" + BasePath + "/api/file?path=report.txt"
+
+	prior := httptest.NewRequest(http.MethodGet, endpoint, nil)
+	prior.Header.Set("Authorization", "Bearer "+bearer)
+	prior.Header.Set("Range", "bytes=0-3")
+	priorResponse := httptest.NewRecorder()
+	portal.ServeHTTP(priorResponse, prior)
+	if priorResponse.Code != http.StatusPartialContent || priorResponse.Body.String() != "old " {
+		t.Fatalf(
+			"prior range = status %d, body %q; want 206 and old prefix",
+			priorResponse.Code,
+			priorResponse.Body.String(),
+		)
+	}
+
+	content = []byte(newContent)
+	resume := httptest.NewRequest(http.MethodGet, endpoint, nil)
+	resume.Header.Set("Authorization", "Bearer "+bearer)
+	resume.Header.Set("Range", "bytes=4-")
+	resume.Header.Set("If-Range", sharedModTime.Format(http.TimeFormat))
+	resumeResponse := httptest.NewRecorder()
+	portal.ServeHTTP(resumeResponse, resume)
+
+	if resumeResponse.Code != http.StatusOK {
+		t.Fatalf("date-based If-Range status = %d, want 200", resumeResponse.Code)
+	}
+	if got := resumeResponse.Body.String(); got != newContent {
+		t.Fatalf("date-based If-Range body = %q, want complete new representation", got)
+	}
+	if got := resumeResponse.Header().Get("Content-Range"); got != "" {
+		t.Fatalf("date-based If-Range Content-Range = %q, want empty", got)
+	}
+	if got := resumeResponse.Header().Get("Last-Modified"); got != "" {
+		t.Fatalf("Last-Modified = %q, want no weak range validator", got)
+	}
+
+	initial := httptest.NewRequest(http.MethodGet, endpoint, nil)
+	initial.Header.Set("Authorization", "Bearer "+bearer)
+	initial.Header.Set("Range", "bytes=4-")
+	initialResponse := httptest.NewRecorder()
+	portal.ServeHTTP(initialResponse, initial)
+
+	if initialResponse.Code != http.StatusPartialContent {
+		t.Fatalf("initial range status = %d, want 206", initialResponse.Code)
+	}
+	if got, want := initialResponse.Body.String(), newContent[4:]; got != want {
+		t.Fatalf("initial range body = %q, want %q", got, want)
+	}
+	if got := initialResponse.Header().Get("Content-Range"); got != "bytes 4-17/18" {
+		t.Fatalf("initial range Content-Range = %q, want bytes 4-17/18", got)
+	}
+}
 
 func TestPortalMapsStorageWorkerPressureToServiceUnavailable(t *testing.T) {
 	t.Parallel()
@@ -216,6 +291,14 @@ func (f *failingStorageFile) Close() error {
 
 func (f *failingStorageFile) sourceError() error {
 	return f.sourceErr
+}
+
+type memoryStorageFile struct {
+	*bytes.Reader
+}
+
+func (f *memoryStorageFile) Close() error {
+	return nil
 }
 
 type testStorageFileInfo struct {

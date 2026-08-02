@@ -79,8 +79,11 @@ function fileRequestState(snapshot) {
   return {
     active_file_requests: snapshot.active_file_requests,
     authorized_file_requests: snapshot.authorized_file_requests,
+    authorized_range_file_requests:
+      snapshot.authorized_range_file_requests,
     canceled_file_requests: snapshot.canceled_file_requests,
     completed_file_requests: snapshot.completed_file_requests,
+    partial_file_responses: snapshot.partial_file_responses,
   };
 }
 
@@ -322,6 +325,94 @@ test('native browser download preserves bytes and leaves no bearer residue', asy
     after.authorized_file_requests - before.authorized_file_requests,
     'native download must use exactly one authenticated file request',
   ).toBe(1);
+  expect(after.authorization_on_other_path).toBe(0);
+  expect(after.credential_query_requests).toBe(0);
+  await expectFileRequestStateToRemainQuiescent(portal, after);
+});
+
+test('browser HTTPS fetch preserves an initial byte range', async ({
+  context,
+  page,
+  portal,
+}) => {
+  await loginAndWaitForNativeStreaming(page, portal);
+  const before = await readSnapshot(portal);
+  const expectedPayload = Buffer.from('public-file');
+  const fileURL = new URL(
+    '/public-files/api/file?path=report.txt',
+    portal.origin,
+  ).href;
+
+  // Chromium's fresh-download manager rejects an explicitly ranged top-level
+  // attachment as an invalid partial save. Exercise the browser transport
+  // with fetch instead; the native full-download path is covered separately.
+  const rangedResponse = await page.evaluate(
+    async ({ bearer, url }) => {
+      const response = await fetch(url, {
+        cache: 'no-store',
+        headers: {
+          Authorization: `Bearer ${bearer}`,
+          Range: 'bytes=9-19',
+        },
+        redirect: 'error',
+      });
+      return {
+        acceptRanges: response.headers.get('Accept-Ranges'),
+        contentDisposition: response.headers.get('Content-Disposition'),
+        contentLength: response.headers.get('Content-Length'),
+        contentRange: response.headers.get('Content-Range'),
+        contentType: response.headers.get('Content-Type'),
+        lastModified: response.headers.get('Last-Modified'),
+        status: response.status,
+        url: response.url,
+        bytes: Array.from(new Uint8Array(await response.arrayBuffer())),
+      };
+    },
+    { bearer: portal.bearer, url: fileURL },
+  );
+
+  expect(rangedResponse.status).toBe(206);
+  expect(rangedResponse.url).toBe(fileURL);
+  expect(rangedResponse.acceptRanges).toBe('bytes');
+  expect(rangedResponse.contentDisposition).toMatch(
+    /^attachment(?:\s*;|$)/i,
+  );
+  expect(rangedResponse.contentLength).toBe(String(expectedPayload.length));
+  expect(rangedResponse.contentRange).toBe('bytes 9-19/50');
+  expect(rangedResponse.contentType).toBe('application/octet-stream');
+  expect(rangedResponse.lastModified).toBeNull();
+  const downloaded = Buffer.from(rangedResponse.bytes);
+  expect({
+    sha256: createHash('sha256').update(downloaded).digest('hex'),
+    size: downloaded.length,
+  }).toEqual({
+    sha256: createHash('sha256').update(expectedPayload).digest('hex'),
+    size: expectedPayload.length,
+  });
+
+  expect(await context.cookies()).toEqual([]);
+  expect(JSON.stringify(await context.storageState())).not.toContain(
+    portal.bearer,
+  );
+  assertNoBrowserStorageResidue(
+    await browserStorageResidue(page, portal.bearer),
+  );
+
+  const after = await waitForSnapshot(
+    portal,
+    (snapshot) =>
+      snapshot.active_file_requests === 0 &&
+      snapshot.authorized_file_requests -
+        before.authorized_file_requests ===
+        1 &&
+      snapshot.authorized_range_file_requests -
+        before.authorized_range_file_requests ===
+        1 &&
+      snapshot.partial_file_responses - before.partial_file_responses === 1 &&
+      snapshot.canceled_file_requests - before.canceled_file_requests === 0 &&
+      snapshot.completed_file_requests - before.completed_file_requests === 1,
+    'completed initial range fetch',
+  );
   expect(after.authorization_on_other_path).toBe(0);
   expect(after.credential_query_requests).toBe(0);
   await expectFileRequestStateToRemainQuiescent(portal, after);

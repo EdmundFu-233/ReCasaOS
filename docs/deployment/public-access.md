@@ -78,6 +78,14 @@ Worker-added authorization, its browser-generated navigation metadata selects
 an empty 204 response, so access remains denied without replacing the portal
 document; ordinary API clients still receive 401.
 
+The portal does not publish `Last-Modified` or a strong `ETag` for a file. It
+passes a zero modification time to `http.ServeContent`, so a request carrying
+`If-Range` cannot resume from a weak or unknown representation and instead
+receives the complete current representation with `200`. A plain, single
+initial `Range` request still receives `206`. This prevents a same-second file
+replacement from splicing a cached prefix onto a new suffix; it does not claim
+that transparent retry/resume is supported.
+
 This uses a top-level attachment navigation because the HTML navigation model
 keeps the existing document when an attachment is handed to the download
 manager, while `frame-ancestors 'none'` deliberately blocks an iframe before
@@ -100,7 +108,7 @@ This is a candidate implementation for
 cross-browser readiness. Stable Chromium, Firefox, and WebKit still require
 real HTTPS tests covering saved-file contents and names, large/slow-transfer
 memory, two tabs, nonce replay, Worker restart, logout, token rotation,
-redirects, initial Range, transparent retry/resume, and cancellation. The
+redirects, transparent retry/resume, and cancellation. The
 current nonce is deliberately one-shot, so a later automatic retry with the
 same URL fails closed rather than silently reusing authorization.
 
@@ -112,7 +120,9 @@ WebKit engines. The job receives no production credential and retains no
 trace, HAR, video, browser profile, or HTML-report artifact. This does not
 exercise the production `NewIsolated` coordinator, systemd/cgroup sandbox,
 Caddy/Nginx, public DNS, HSTS, retail Chrome/Firefox, Safari/iOS, or a target
-host. It is not sufficient to close Issue #20 or enable public routing.
+host. Its initial-Range case is limited to the bundled engines and does not
+prove transparent retry/resume. It is not sufficient to close Issue #20 or
+enable public routing.
 The cancel smoke requires all three engines to report the local download as
 canceled to Playwright, and exactly one authorized upstream request to reach a
 terminal state within the 40-second test-harness deadline. Chromium and WebKit

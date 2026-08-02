@@ -90,16 +90,19 @@ The portal's large-file browser stream is still a candidate tracked in
 not intentionally persist the bearer in browser storage or a URL. During an
 authorized request the bearer necessarily passes through page, Worker,
 Authorization-header, edge, and server request memory. Stable
-Chromium/Firefox/WebKit HTTPS storage, log, crash, download, memory, retry,
-Range, cancellation, and filename tests remain release gates.
+Chromium/Firefox/WebKit HTTPS storage, log, crash, download, memory,
+transparent retry/resume, cancellation, and filename tests remain release
+gates; stable initial-Range behavior is also not yet a release claim.
 The repository's browser smoke job is deliberately narrower: it runs the
 bundled Playwright Chromium, Firefox, and WebKit engines on Ubuntu 24.04
 against the real portal handler over loopback HTTPS, using an ephemeral CA
 installed into that disposable runner's trust stores. It does not disable TLS
 verification, record traces/HAR/video, receive production credentials, or run
 the production systemd service. Passing that job is useful frontend protocol
-evidence, but it is not stable Chrome/Firefox/Safari, proxy, target-host, or
-Internet-readiness evidence and does not close Issue #20.
+evidence. It also makes one explicit initial byte-range request per bundled
+engine and checks the authenticated upstream counter and `206` response, but
+that is not stable Chrome/Firefox/Safari, proxy, target-host, transparent
+retry/resume, or Internet-readiness evidence and does not close Issue #20.
 Its cancel smoke has a deliberately narrower meaning: all three engines must
 report the local download as canceled to Playwright, and exactly one authorized
 upstream request must reach a terminal state within the 40-second test-harness
