@@ -415,6 +415,26 @@ func TestDownloadWorkerIsNarrowNoStoreAsset(t *testing.T) {
 	}
 }
 
+func TestDownloadWorkerChecksNavigationClientBeforeConsumingReservation(t *testing.T) {
+	portal := &Portal{}
+	recorder := httptest.NewRecorder()
+	portal.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, BasePath+"/download-worker.js", nil))
+	script := recorder.Body.String()
+
+	preparedIndex := strings.Index(script, "const prepared=pendingDownloads.get(download.nonce);")
+	if preparedIndex < 0 {
+		t.Fatal("download worker does not look up the prepared reservation")
+	}
+	clientCheckIndex := strings.Index(script, "event.clientId!==prepared.clientId")
+	if clientCheckIndex < preparedIndex {
+		t.Fatal("download worker client binding is missing from the consume path")
+	}
+	deleteIndex := strings.Index(script, "pendingDownloads.delete(download.nonce);")
+	if deleteIndex < 0 || clientCheckIndex > deleteIndex {
+		t.Fatal("download worker consumes a reservation before validating its navigation client")
+	}
+}
+
 func TestUnauthenticatedTopLevelFileNavigationFailsClosedWithoutReplacingPortal(t *testing.T) {
 	portal := &Portal{}
 	request := httptest.NewRequest(http.MethodGet, BasePath+"/api/file?path=report.pdf", nil)

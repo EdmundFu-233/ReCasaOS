@@ -63,11 +63,14 @@ For a large file, a scoped Service Worker first records a 192-bit random,
 single-use correlation nonce bound to the exact portal client, relative path,
 and same-origin file URL for at most 10 seconds. The page then starts an
 ordinary top-level navigation whose fragment contains that non-secret nonce.
-The worker consumes the reservation atomically, challenges only the original
-portal page over a `MessageChannel`, receives the bearer once, removes the
-fragment, and makes one clean same-origin file request with the bearer in the
-`Authorization` header. Redirects fail, credentials are omitted, and the
-worker requires the exact clean URL, 200/206 status, attachment disposition,
+Before consuming a reservation, the worker requires the navigation's
+`FetchEvent.clientId` to equal the client that prepared it; a non-empty
+`replacesClientId` is an additional consistency check. It then consumes the
+reservation atomically, challenges only the original portal page over a
+`MessageChannel`, receives the bearer once, removes the fragment, and makes
+one clean same-origin file request with the bearer in the `Authorization`
+header. Redirects fail, credentials are omitted, and the worker requires the
+exact clean URL, 200/206 status, attachment disposition,
 octet-stream type, `no-store`, `nosniff`, and byte-range policy before returning
 the upstream streaming response without calling `blob()`, `arrayBuffer()`,
 cloning, or teeing the body. A restart loses all transient reservations and

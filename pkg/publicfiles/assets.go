@@ -346,9 +346,10 @@ function safeDownloadResponse(response,cleanURL,requestedRange){
 async function handleDownload(download,event){
   if(download.error)throw new TypeError('invalid download request');
   purgePending();
-  const prepared=pendingDownloads.get(download.nonce);pendingDownloads.delete(download.nonce);
-  if(!prepared||prepared.expiresAt<Date.now()||prepared.path!==download.path||prepared.requestURL!==download.requestURL)throw new TypeError('download was not prepared');
+  const prepared=pendingDownloads.get(download.nonce);
+  if(!prepared||prepared.expiresAt<Date.now()||prepared.path!==download.path||prepared.requestURL!==download.requestURL||event.clientId!==prepared.clientId)throw new TypeError('download was not prepared by this client');
   if(typeof event.replacesClientId==='string'&&event.replacesClientId!==''&&event.replacesClientId!==prepared.clientId)throw new TypeError('download navigation client changed');
+  pendingDownloads.delete(download.nonce);
   const controller=new AbortController();
   const active={nonce:prepared.nonce,path:prepared.path,requestURL:prepared.requestURL,clientId:prepared.clientId,controller:controller,timer:null};
   const abortFromNavigation=()=>controller.abort();
