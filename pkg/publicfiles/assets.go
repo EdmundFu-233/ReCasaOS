@@ -69,11 +69,9 @@ function cancelNativeTransport(state){
   if(state.port){try{state.port.close();}catch(_error){}}
   try{state.controller.postMessage({type:'recasaos-download-cancel',version:protocolVersion,nonce:state.nonce,path:state.path,requestURL:state.requestURL});}catch(_error){}
 }
-function clearNativeState(stopNavigation=true){
-  let canceled=false;
-  if(pendingNative){clearTimeout(pendingNative.timer);cancelNativeTransport(pendingNative);pendingNative=null;canceled=true;}
-  if(activeNative){clearTimeout(activeNative.timer);cancelNativeTransport(activeNative);activeNative=null;canceled=true;}
-  if(canceled&&stopNavigation)try{window.stop();}catch(_error){}
+function clearNativeState(){
+  if(pendingNative){clearTimeout(pendingNative.timer);cancelNativeTransport(pendingNative);pendingNative=null;}
+  if(activeNative){clearTimeout(activeNative.timer);cancelNativeTransport(activeNative);activeNative=null;}
 }
 function revokeFallbackObjectURL(value){const target=value||fallbackObjectURL;if(!target)return;if(fallbackObjectURL===target)fallbackObjectURL='';URL.revokeObjectURL(target);}
 function forgetAuthorization(message){
@@ -151,15 +149,21 @@ function reserveNativeDownload(controller,state){
     channel.port1.onmessage=event=>finish(exactKeys(event.data,['nonce','type','version'])&&event.data.type==='recasaos-download-prepared'&&event.data.version===protocolVersion&&event.data.nonce===state.nonce);
     channel.port1.onmessageerror=()=>finish(false);
     channel.port1.start();
-    try{controller.postMessage({type:'recasaos-download-prepare',version:protocolVersion,nonce:state.nonce,path:state.path,requestURL:state.requestURL},[channel.port2]);}catch(_error){finish(false);}
+    try{controller.postMessage({type:'recasaos-download-prepare',version:protocolVersion,nonce:state.nonce,path:state.path,requestURL:state.requestURL,navigationProof:state.navigationProof},[channel.port2]);}catch(_error){finish(false);}
   });
+}
+function submitNativeDownload(state){
+  if(!state||!state.navigationProof)return false;
+  const form=document.createElement('form');form.method='post';form.action=state.requestURL;form.enctype='application/x-www-form-urlencoded';form.hidden=true;
+  const proof=document.createElement('input');proof.type='hidden';proof.name='proof';proof.value=state.navigationProof;form.append(proof);document.body.append(form);
+  try{form.submit();state.navigationProof='';form.remove();return true;}catch(_error){form.remove();return false;}
 }
 async function startNativeDownload(path,entry){
   if(pendingNative||activeNative||activeFallback)throw new Error('Another download is already being prepared');
   const controller=currentWorker();
   if(!controller||controller!==workerController)throw new Error('Secure browser streaming is not ready');
   const nonce=randomNonce();
-  const state={nonce:nonce,path:path,name:entry.name,requestURL:nativeURL(path,nonce),controller:controller,expiresAt:Date.now()+nativeRequestLifetimeMs,timer:null};
+  const state={nonce:nonce,navigationProof:randomNonce(),path:path,name:entry.name,requestURL:nativeURL(path,nonce),controller:controller,expiresAt:Date.now()+nativeRequestLifetimeMs,timer:null};
   pendingNative=state;
   statusNode.textContent='Preparing secure browser stream for '+entry.name+'…';
   const prepared=await reserveNativeDownload(controller,state);
@@ -174,11 +178,10 @@ async function startNativeDownload(path,entry){
     if(pendingNative!==state)return;
     cancelNativeTransport(state);
     pendingNative=null;
-    try{window.stop();}catch(_error){}
     boundedDownload(path,entry).catch(showError);
   },workerReplyTimeoutMs);
   statusNode.textContent='Handing '+entry.name+' to the browser…';
-  try{window.location.assign(state.requestURL);}catch(_error){
+  if(!submitNativeDownload(state)){
     clearTimeout(state.timer);cancelNativeTransport(state);pendingNative=null;
     await boundedDownload(path,entry);
   }
@@ -227,18 +230,18 @@ function handleWorkerChallenge(event){
   if(!pending||!exactKeys(data,['nonce','path','requestURL','type','version'])||data.type!=='recasaos-download-auth'||data.version!==protocolVersion||event.source!==pending.controller||currentWorker()!==pending.controller||Date.now()>pending.expiresAt||data.nonce!==pending.nonce||data.path!==pending.path||data.requestURL!==pending.requestURL||!accessToken){denyPort(port);return;}
   clearTimeout(pending.timer);pendingNative=null;
   const state={nonce:pending.nonce,path:pending.path,name:pending.name,requestURL:pending.requestURL,controller:pending.controller,port:port,timer:null};
-  state.timer=setTimeout(()=>{if(activeNative===state){cancelNativeTransport(state);activeNative=null;try{window.stop();}catch(_error){}showError(new Error('The browser did not accept the download in time'));}},nativeRequestLifetimeMs);
+  state.timer=setTimeout(()=>{if(activeNative===state){cancelNativeTransport(state);activeNative=null;showError(new Error('The browser did not accept the download in time'));}},nativeRequestLifetimeMs);
   activeNative=state;
   port.onmessage=statusEvent=>{
     const status=statusEvent.data;
     if(activeNative!==state||!exactKeys(status,['httpStatus','nonce','path','status','type','version'])||status.type!=='recasaos-download-status'||status.version!==protocolVersion||status.nonce!==state.nonce||status.path!==state.path)return;
     clearTimeout(state.timer);activeNative=null;port.close();
     if(status.status==='handed'&&(status.httpStatus===200||status.httpStatus===206)){statusNode.textContent='Download handed to the browser: '+state.name;return;}
-    cancelNativeTransport(state);try{window.stop();}catch(_error){}
+    cancelNativeTransport(state);
     if(status.httpStatus===401){forgetAuthorization('Authorization failed');return;}
     showError(new Error('The browser download was rejected'));
   };
-  port.onmessageerror=()=>{if(activeNative===state){clearTimeout(state.timer);cancelNativeTransport(state);activeNative=null;try{window.stop();}catch(_error){}showError(new Error('Secure download authorization failed'));}};
+  port.onmessageerror=()=>{if(activeNative===state){clearTimeout(state.timer);cancelNativeTransport(state);activeNative=null;showError(new Error('Secure download authorization failed'));}};
   port.start();
   port.postMessage({type:'recasaos-download-auth-response',version:protocolVersion,nonce:pending.nonce,path:pending.path,token:accessToken});
 }
@@ -250,7 +253,7 @@ if('serviceWorker' in navigator){
   navigator.serviceWorker.addEventListener('message',handleWorkerChallenge);
   navigator.serviceWorker.addEventListener('controllerchange',()=>{clearNativeState();workerReady=false;workerController=null;prepareWorker();});
 }
-window.addEventListener('pagehide',()=>{accessToken='';clearNativeState(false);if(activeFallback)activeFallback.abort();revokeFallbackObjectURL();});
+window.addEventListener('pagehide',()=>{accessToken='';clearNativeState();if(activeFallback)activeFallback.abort();revokeFallbackObjectURL();});
 window.addEventListener('pageshow',event=>{if(event.persisted&&!accessToken)showLogin('Token forgotten after page restore');});
 showLogin('');
 `
@@ -284,6 +287,12 @@ function exactPreparedURL(value,path,nonce){
   const keys=Array.from(url.searchParams.keys());
   return url.origin===self.location.origin&&url.pathname===filePath&&keys.length===1&&keys[0]==='path'&&url.searchParams.getAll('path').length===1&&url.searchParams.get('path')===path&&url.hash==='#'+nonce;
 }
+async function exactNavigationProof(request,prepared){
+  const contentType=(request.headers.get('Content-Type')||'').split(';',1)[0].trim().toLowerCase();
+  if(contentType!=='application/x-www-form-urlencoded')return false;
+  let body='';try{body=await request.text();}catch(_error){return false;}
+  return body==='proof='+prepared.navigationProof;
+}
 function purgePending(){const now=Date.now();for(const [nonce,state] of pendingDownloads){if(state.expiresAt<now)pendingDownloads.delete(nonce);}}
 function reply(port,value){try{port.postMessage(value);}catch(_error){}try{port.close();}catch(_error){}}
 function sameDownloadState(state,data,clientId){return state&&state.clientId===clientId&&state.nonce===data.nonce&&state.path===data.path&&state.requestURL===data.requestURL;}
@@ -299,17 +308,19 @@ function handleProtocolMessage(event){
   if(exactKeys(data,['nonce','path','requestURL','type','version'])&&data.type==='recasaos-download-cancel'&&data.version===protocolVersion&&validNonce(data.nonce)&&validRelativePath(data.path)&&exactPreparedURL(data.requestURL,data.path,data.nonce)){cancelDownload(event,data);if(port)reply(port,{type:'recasaos-download-canceled',version:protocolVersion,nonce:data.nonce});return;}
   if(!port)return;
   if(exactKeys(data,['type','version'])&&data.type==='recasaos-download-protocol'&&data.version===protocolVersion){reply(port,{type:'recasaos-download-protocol',version:protocolVersion});return;}
-  if(!exactKeys(data,['nonce','path','requestURL','type','version'])||data.type!=='recasaos-download-prepare'||data.version!==protocolVersion||!validNonce(data.nonce)||!validRelativePath(data.path)||!exactPreparedURL(data.requestURL,data.path,data.nonce)){reply(port,{type:'recasaos-download-denied',version:protocolVersion});return;}
+  if(!exactKeys(data,['navigationProof','nonce','path','requestURL','type','version'])||data.type!=='recasaos-download-prepare'||data.version!==protocolVersion||!validNonce(data.nonce)||!validNonce(data.navigationProof)||!validRelativePath(data.path)||!exactPreparedURL(data.requestURL,data.path,data.nonce)){reply(port,{type:'recasaos-download-denied',version:protocolVersion});return;}
   purgePending();
   if(pendingDownloads.size+activeDownloads.size>=pendingLimit||pendingDownloads.has(data.nonce)||activeDownloads.has(data.nonce)){reply(port,{type:'recasaos-download-denied',version:protocolVersion});return;}
-  const state={nonce:data.nonce,path:data.path,requestURL:data.requestURL,clientId:event.source.id,expiresAt:Date.now()+pendingLifetimeMs};
+  const state={nonce:data.nonce,path:data.path,requestURL:data.requestURL,clientId:event.source.id,navigationProof:data.navigationProof,expiresAt:Date.now()+pendingLifetimeMs};
   pendingDownloads.set(data.nonce,state);
   setTimeout(()=>{if(pendingDownloads.get(data.nonce)===state)pendingDownloads.delete(data.nonce);},pendingLifetimeMs);
   reply(port,{type:'recasaos-download-prepared',version:protocolVersion,nonce:data.nonce});
 }
 function parseDownload(request){
   const url=new URL(request.url);
-  if(url.origin!==self.location.origin||url.pathname!==filePath||request.method!=='GET'||request.mode!=='navigate'||request.destination!=='document')return null;
+  const supportedNavigation=request.mode==='navigate'&&(request.destination==='document'||request.destination==='iframe');
+  if(url.origin!==self.location.origin||url.pathname!==filePath||!supportedNavigation)return null;
+  if(request.method!=='POST')return {error:true};
   const keys=Array.from(url.searchParams.keys());const nonce=url.hash.slice(1);
   if(keys.length!==1||keys[0]!=='path'||url.searchParams.getAll('path').length!==1||!validNonce(nonce))return {error:true};
   const path=url.searchParams.get('path');
@@ -346,9 +357,11 @@ function safeDownloadResponse(response,cleanURL,requestedRange){
 async function handleDownload(download,event){
   if(download.error)throw new TypeError('invalid download request');
   purgePending();
-  const prepared=pendingDownloads.get(download.nonce);pendingDownloads.delete(download.nonce);
-  if(!prepared||prepared.expiresAt<Date.now()||prepared.path!==download.path||prepared.requestURL!==download.requestURL)throw new TypeError('download was not prepared');
-  if(typeof event.replacesClientId==='string'&&event.replacesClientId!==''&&event.replacesClientId!==prepared.clientId)throw new TypeError('download navigation client changed');
+  const prepared=pendingDownloads.get(download.nonce);
+  if(!prepared||prepared.expiresAt<Date.now()||prepared.path!==download.path||prepared.requestURL!==download.requestURL||!validNonce(prepared.navigationProof))throw new TypeError('download was not prepared by this client');
+  if(!(await exactNavigationProof(event.request,prepared)))throw new TypeError('download navigation proof changed');
+  prepared.navigationProof='';
+  pendingDownloads.delete(download.nonce);
   const controller=new AbortController();
   const active={nonce:prepared.nonce,path:prepared.path,requestURL:prepared.requestURL,clientId:prepared.clientId,controller:controller,timer:null};
   const abortFromNavigation=()=>controller.abort();

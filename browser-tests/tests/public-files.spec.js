@@ -39,8 +39,7 @@ async function submitBearer(page, bearer) {
   }
 }
 
-async function loginAndWaitForNativeStreaming(page, portal) {
-  await openPortal(page, portal);
+async function loginLoadedPortalAndWaitForNativeStreaming(page, portal) {
   await submitBearer(page, portal.bearer);
 
   await expect(page.locator('#login')).toBeHidden();
@@ -73,6 +72,159 @@ async function loginAndWaitForNativeStreaming(page, portal) {
       ),
     )
     .toBe(true);
+}
+
+async function loginAndWaitForNativeStreaming(page, portal) {
+  await openPortal(page, portal);
+  await loginLoadedPortalAndWaitForNativeStreaming(page, portal);
+}
+
+async function prepareManualDownload(page, bearer, path) {
+  return page.evaluate(
+    async ({ bearerValue, relativePath }) => {
+      const controller = navigator.serviceWorker.controller;
+      if (controller === null) {
+        throw new Error('service worker controller is unavailable');
+      }
+      navigator.serviceWorker.removeEventListener(
+        'message',
+        handleWorkerChallenge,
+      );
+
+      const bytes = new Uint8Array(24);
+      crypto.getRandomValues(bytes);
+      let rawNonce = '';
+      for (const byte of bytes) {
+        rawNonce += String.fromCharCode(byte);
+      }
+      const nonce = btoa(rawNonce)
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/g, '');
+      const navigationProof = randomNonce();
+      const requestURL = new URL('api/file', location.href);
+      requestURL.search = '';
+      requestURL.hash = nonce;
+      requestURL.searchParams.set('path', relativePath);
+
+      window.__recasaosIsolation = {
+        challengeCount: 0,
+        httpStatus: 0,
+        status: '',
+      };
+      const onChallenge = (event) => {
+        const data = event.data;
+        const port = event.ports?.length === 1 ? event.ports[0] : null;
+        if (
+          port === null ||
+          event.source !== controller ||
+          data?.type !== 'recasaos-download-auth' ||
+          data?.version !== 1 ||
+          data?.nonce !== nonce ||
+          data?.path !== relativePath ||
+          data?.requestURL !== requestURL.href
+        ) {
+          return;
+        }
+        window.__recasaosIsolation.challengeCount += 1;
+        port.onmessage = (statusEvent) => {
+          const status = statusEvent.data;
+          window.__recasaosIsolation.httpStatus = status?.httpStatus ?? 0;
+          window.__recasaosIsolation.status = status?.status ?? '';
+          navigator.serviceWorker.removeEventListener('message', onChallenge);
+          port.close();
+        };
+        port.start();
+        port.postMessage({
+          type: 'recasaos-download-auth-response',
+          version: 1,
+          nonce,
+          path: relativePath,
+          token: bearerValue,
+        });
+      };
+      navigator.serviceWorker.addEventListener('message', onChallenge);
+
+      const prepared = await new Promise((resolve) => {
+        const channel = new MessageChannel();
+        let settled = false;
+        const finish = (value) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          channel.port1.close();
+          resolve(value);
+        };
+        const timer = setTimeout(() => finish(false), 3_000);
+        channel.port1.onmessage = (event) =>
+          finish(
+            event.data?.type === 'recasaos-download-prepared' &&
+              event.data?.version === 1 &&
+              event.data?.nonce === nonce,
+          );
+        channel.port1.onmessageerror = () => finish(false);
+        channel.port1.start();
+        controller.postMessage(
+          {
+            type: 'recasaos-download-prepare',
+            version: 1,
+            nonce,
+            navigationProof,
+            path: relativePath,
+            requestURL: requestURL.href,
+          },
+          [channel.port2],
+        );
+      });
+      if (!prepared) {
+        navigator.serviceWorker.removeEventListener('message', onChallenge);
+        throw new Error('manual download reservation was denied');
+      }
+      window.__recasaosManualDownload = {
+        navigationProof,
+        nonce,
+        path: relativePath,
+        requestURL: requestURL.href,
+      };
+      return { nonce, path: relativePath, requestURL: requestURL.href };
+    },
+    { bearerValue: bearer, relativePath: path },
+  );
+}
+
+async function submitUntrustedDownload(page, requestURL) {
+  await page.evaluate((url) => {
+    const frame = document.createElement('iframe');
+    frame.hidden = true;
+    frame.title = 'Cross-tab download probe';
+    frame.referrerPolicy = 'no-referrer';
+    frame.name = 'cross-tab-download-probe';
+    document.body.append(frame);
+    const form = document.createElement('form');
+    form.hidden = true;
+    form.method = 'post';
+    form.action = url;
+    form.target = frame.name;
+    form.enctype = 'application/x-www-form-urlencoded';
+    const proof = document.createElement('input');
+    proof.type = 'hidden';
+    proof.name = 'proof';
+    proof.value = randomNonce();
+    form.append(proof);
+    document.body.append(form);
+    form.submit();
+    form.remove();
+  }, requestURL);
+}
+
+async function submitManualDownload(page, requestURL) {
+  await page.evaluate((url) => {
+    const state = window.__recasaosManualDownload;
+    if (!state || state.requestURL !== url || !submitNativeDownload(state)) {
+      throw new Error('prepared download submission was rejected');
+    }
+    window.__recasaosManualDownload = null;
+  }, requestURL);
 }
 
 function fileRequestState(snapshot) {
@@ -231,6 +383,92 @@ test('an incorrect bearer fails closed', async ({ page, portal }) => {
   ).toBe(true);
 });
 
+test('a different tab cannot consume another tab download reservation', async ({
+  context,
+  page,
+  portal,
+}) => {
+  const attacker = await context.newPage();
+  try {
+    await openPortal(page, portal);
+    await openPortal(attacker, portal);
+    await loginLoadedPortalAndWaitForNativeStreaming(page, portal);
+    await expect
+      .poll(() =>
+        attacker.evaluate(
+          () =>
+            'serviceWorker' in navigator &&
+            navigator.serviceWorker.controller !== null,
+        ),
+      )
+      .toBe(true);
+
+    const before = await readSnapshot(portal);
+    const prepared = await prepareManualDownload(
+      page,
+      portal.bearer,
+      'report.txt',
+    );
+    const attackerDownload = attacker
+      .waitForEvent('download', { timeout: 750 })
+      .then(async (download) => {
+        const failure = await download.failure();
+        if (failure !== null) return { failure };
+        try {
+          return { failure: null, ...(await hashDownload(download)) };
+        } catch {
+          return { failure: 'unreadable' };
+        }
+      })
+      .catch(() => null);
+    await submitUntrustedDownload(attacker, prepared.requestURL);
+    const attackerArtifact = await attackerDownload;
+    if (attackerArtifact?.failure === null) {
+      expect(
+        {
+          sha256: attackerArtifact.sha256,
+          size: attackerArtifact.size,
+        },
+        'a mismatched tab must not receive the prepared file bytes',
+      ).not.toEqual(portal.fixtures['report.txt']);
+    }
+    expect(
+      await page.evaluate(() => window.__recasaosIsolation.challengeCount),
+      'a mismatched tab must not trigger an authorization challenge',
+    ).toBe(0);
+    expect(
+      fileRequestState(await readSnapshot(portal)),
+      'a mismatched tab must not issue an authenticated file request',
+    ).toEqual(fileRequestState(before));
+
+    const downloadPromise = page.waitForEvent('download', { timeout: 30_000 });
+    await submitManualDownload(page, prepared.requestURL);
+    const download = await downloadPromise;
+    expect(download.suggestedFilename()).toBe('report.txt');
+    expect(await download.failure()).toBeNull();
+    expect(await hashDownload(download)).toEqual(portal.fixtures['report.txt']);
+    await expect
+      .poll(() => page.evaluate(() => window.__recasaosIsolation))
+      .toEqual({ challengeCount: 1, httpStatus: 200, status: 'handed' });
+
+    const after = await waitForSnapshot(
+      portal,
+      (snapshot) =>
+        snapshot.active_file_requests === 0 &&
+        snapshot.authorized_file_requests - before.authorized_file_requests ===
+          1 &&
+        snapshot.canceled_file_requests - before.canceled_file_requests === 0 &&
+        snapshot.completed_file_requests - before.completed_file_requests === 1,
+      'original tab download after cross-tab rejection',
+    );
+    expect(after.authorization_on_other_path).toBe(0);
+    expect(after.credential_query_requests).toBe(0);
+    await expectFileRequestStateToRemainQuiescent(portal, after);
+  } finally {
+    await attacker.close();
+  }
+});
+
 test('native browser download preserves bytes and leaves no bearer residue', async ({
   context,
   page,
@@ -241,7 +479,7 @@ test('native browser download preserves bytes and leaves no bearer residue', asy
   const initialPageURL = page.url();
   const initialHistoryLength = await page.evaluate(() => history.length);
 
-  const downloadPromise = page.waitForEvent('download');
+  const downloadPromise = page.waitForEvent('download', { timeout: 30_000 });
   await page.locator('#entries a', { hasText: 'stream.bin' }).click();
   const download = await downloadPromise;
 
@@ -426,7 +664,7 @@ test('canceling a browser download reaches bounded terminal cleanup', async ({
   await loginAndWaitForNativeStreaming(page, portal);
   const before = await readSnapshot(portal);
 
-  const downloadPromise = page.waitForEvent('download');
+  const downloadPromise = page.waitForEvent('download', { timeout: 30_000 });
   await page.locator('#entries a', { hasText: 'stream.bin' }).click();
   const download = await downloadPromise;
   await waitForSnapshot(

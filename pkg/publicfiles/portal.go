@@ -235,13 +235,13 @@ func (w *securityResponseWriter) Write(payload []byte) (int, error) {
 
 func setSecurityHeaders(header http.Header) {
 	header.Set("Cache-Control", "no-store")
-	header.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; worker-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+	header.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; worker-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+	header.Set("X-Frame-Options", "DENY")
 	header.Set("Cross-Origin-Opener-Policy", "same-origin")
 	header.Set("Cross-Origin-Resource-Policy", "same-origin")
 	header.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
 	header.Set("Referrer-Policy", "no-referrer")
 	header.Set("X-Content-Type-Options", "nosniff")
-	header.Set("X-Frame-Options", "DENY")
 }
 
 func (p *Portal) serveAsset(w http.ResponseWriter, r *http.Request, contentType, content string) {
@@ -311,20 +311,29 @@ func (p *Portal) serveList(w http.ResponseWriter, r *http.Request) {
 	}{Path: relativePath, Entries: entries})
 }
 
+func isFileNavigation(r *http.Request) bool {
+	destination := r.Header.Get("Sec-Fetch-Dest")
+	return r.Header.Get("Sec-Fetch-Mode") == "navigate" &&
+		(destination == "document" || destination == "iframe")
+}
+
 func (p *Portal) serveFile(w http.ResponseWriter, r *http.Request) {
+	// A proof-bearing POST is expected to be consumed by the scoped Service
+	// Worker. If the Worker was replaced or bypassed, deny the request without
+	// replacing the portal document or reflecting the proof in a response.
+	if r.Method == http.MethodPost && isFileNavigation(r) && !p.authorized(r) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		writeError(w, r, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	if !p.authorized(r) {
-		// A controlled top-level download navigation normally receives its
-		// Authorization header from the scoped Service Worker. If that Worker is
-		// replaced or bypassed after the page has prepared the navigation, keep
-		// the existing portal document in place instead of rendering an error
-		// document. Sec-Fetch-* is only a UX/fail-closed signal here; it never
-		// grants access and non-navigation clients retain the normal 401.
-		if r.Method == http.MethodGet && r.Header.Get("Sec-Fetch-Mode") == "navigate" && r.Header.Get("Sec-Fetch-Dest") == "document" {
+		// Sec-Fetch-* is only a UX/fail-closed signal here; it never grants
+		// access, and non-navigation clients retain the normal 401.
+		if r.Method == http.MethodGet && isFileNavigation(r) {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}

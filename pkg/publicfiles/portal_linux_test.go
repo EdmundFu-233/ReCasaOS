@@ -504,7 +504,7 @@ func TestPortalAssetsUseStrictCSPAndPageMemory(t *testing.T) {
 		t.Fatalf("HTML response is unsafe: %d %s", html.Code, html.Body.String())
 	}
 	csp := html.Header().Get("Content-Security-Policy")
-	if !strings.Contains(csp, "default-src 'none'") || !strings.Contains(csp, "frame-ancestors 'none'") || !strings.Contains(csp, "worker-src 'self'") || strings.Contains(csp, "unsafe-inline") {
+	if !strings.Contains(csp, "default-src 'none'") || !strings.Contains(csp, "frame-ancestors 'none'") || !strings.Contains(csp, "worker-src 'self'") || !strings.Contains(csp, "form-action 'self'") || strings.Contains(csp, "unsafe-inline") {
 		t.Fatalf("unexpected CSP: %q", csp)
 	}
 	javascript := serve(fixture.portal, httptest.NewRequest(http.MethodGet, BasePath+"/app.js", nil))
