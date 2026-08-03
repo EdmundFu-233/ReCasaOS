@@ -272,10 +272,14 @@ packages:
   - acl
   - ca-certificates
   - curl
+  - dmsetup
+  - e2fsprogs
   - file
   - iproute2
+  - kmod
   - procps
   - sudo
+  - udev
   - util-linux
 EOF
 cat >"$meta_data" <<EOF
@@ -443,6 +447,7 @@ timeout --signal=TERM --kill-after=120s 22m \
       GITHUB_WORKSPACE=/opt/recasaos-src \
       RUNNER_OS=Linux \
       RECASAOS_TRUSTED_SYSTEMD_CI=1 \
+      RECASAOS_HOSTILE_STORAGE_VM_CI=1 \
       RECASAOS_RUNNER_ENVIRONMENT=github-hosted-vm \
       RECASAOS_SYSTEMD_TEST_TARGET=debian-11-systemd-247-qemu \
       /bin/bash --noprofile --norc \
