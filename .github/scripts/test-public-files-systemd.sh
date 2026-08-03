@@ -45,6 +45,7 @@ case "${RECASAOS_SYSTEMD_TEST_TARGET:-}" in
       fail "GitHub did not identify this as a hosted runner"
     [[ -d /opt/hostedtoolcache ]] ||
       fail "the GitHub-hosted runner marker is missing"
+    workspace_parent=/run
     ;;
   debian-11-systemd-247-qemu)
     [[ "${RECASAOS_RUNNER_ENVIRONMENT:-}" == github-hosted-vm ]] ||
@@ -62,6 +63,9 @@ case "${RECASAOS_SYSTEMD_TEST_TARGET:-}" in
     fi
     [[ "$(systemd-detect-virt --vm)" == qemu ]] ||
       fail "the Debian qualification target is not an isolated QEMU VM"
+    # Debian mounts /run with noexec. Keep the disposable RootDirectory and
+    # both reviewed binaries below a root-owned executable filesystem instead.
+    workspace_parent=/var/lib
     ;;
   *)
     fail "the exact systemd integration target is not authorized"
@@ -71,7 +75,7 @@ esac
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 cd -- "$repo_root"
 run_key="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-workspace="/run/recasaos-public-files-ci-${run_key}"
+workspace="${workspace_parent}/recasaos-public-files-ci-${run_key}"
 service_unit="recasaos-public-files.service"
 socket_unit="recasaos-public-files.socket"
 sentinel_unit="recasaos-ci-management-${run_key}.service"
@@ -107,10 +111,9 @@ worker_load_bytes=67108864
 storage_worker_address_space_ceiling=2147483648
 storage_worker_address_space_minimum_reserve=134217728
 
-case "$workspace" in
-  /run/recasaos-public-files-ci-[0-9]*-[0-9]*) ;;
-  *) fail "refusing unsafe workspace path: $workspace" ;;
-esac
+[[ "$workspace" =~ ^/(run|var/lib)/recasaos-public-files-ci-[0-9]+-[0-9]+$ &&
+  "$workspace" == "$workspace_parent/recasaos-public-files-ci-$run_key" ]] ||
+  fail "refusing unsafe workspace path: $workspace"
 [[ "$host_shm_sentinel_prefix" =~ ^/dev/shm/recasaos-public-files-ci-[0-9]+-[0-9]+\.$ ]] ||
   fail "refusing unsafe shared-memory sentinel prefix: $host_shm_sentinel_prefix"
 
@@ -127,7 +130,7 @@ if getent passwd recasaos-public >/dev/null ||
   fail "the recasaos-public account unexpectedly already exists"
 fi
 for required_tool in \
-  cmp find getfacl go mktemp mount mountpoint pgrep ps sort ss systemctl truncate umount
+  cmp find getfacl go mktemp mount pgrep ps sort ss systemctl truncate umount
 do
   command -v "$required_tool" >/dev/null 2>&1 ||
     fail "required mount test tool is unavailable: $required_tool"
@@ -884,42 +887,45 @@ cleanup() {
   fi
 
   if [[ "$nested_mount_cleanup_required" == 1 ]]; then
-    sudo mountpoint -q -- "$nested_mount" >/dev/null 2>&1
-    mountpoint_status=$?
-    case "$mountpoint_status" in
-      0)
-        sudo umount -- "$nested_mount"
-        command_status=$?
-        if [[ "$command_status" != 0 ]]; then
-          cleanup_problem \
-            "could not unmount $nested_mount (status $command_status)"
-          workspace_removal_safe=0
-        else
-          sudo mountpoint -q -- "$nested_mount" >/dev/null 2>&1
-          mountpoint_status=$?
-          case "$mountpoint_status" in
-            0)
-              cleanup_problem "nested mount remains active: $nested_mount"
-              workspace_removal_safe=0
-              ;;
-            32)
-              ;;
-            *)
-              cleanup_problem \
-                "could not verify nested mount removal (status $mountpoint_status)"
-              workspace_removal_safe=0
-              ;;
-          esac
-        fi
-        ;;
-      32)
-        ;;
-      *)
+    nested_mount_count="$(
+      awk -v target="$nested_mount" '
+        $5 == target { count++ }
+        END { print count + 0 }
+      ' /proc/self/mountinfo
+    )"
+    command_status=$?
+    if [[ "$command_status" != 0 ||
+      ! "$nested_mount_count" =~ ^[0-9]+$ ]]; then
+      cleanup_problem \
+        "could not determine nested mount count (status $command_status)"
+      workspace_removal_safe=0
+    elif [[ "$nested_mount_count" -gt 1 ]]; then
+      cleanup_problem \
+        "nested mount has ambiguous mountinfo count: $nested_mount_count"
+      workspace_removal_safe=0
+    elif [[ "$nested_mount_count" == 1 ]]; then
+      sudo umount -- "$nested_mount"
+      command_status=$?
+      if [[ "$command_status" != 0 ]]; then
         cleanup_problem \
-          "could not determine nested mount state (status $mountpoint_status)"
+          "could not unmount $nested_mount (status $command_status)"
         workspace_removal_safe=0
-        ;;
-    esac
+      else
+        nested_mount_count="$(
+          awk -v target="$nested_mount" '
+            $5 == target { count++ }
+            END { print count + 0 }
+          ' /proc/self/mountinfo
+        )"
+        command_status=$?
+        if [[ "$command_status" != 0 ||
+          "$nested_mount_count" != 0 ]]; then
+          cleanup_problem \
+            "nested mount remains after cleanup: count=${nested_mount_count:-invalid} status=$command_status"
+          workspace_removal_safe=0
+        fi
+      fi
+    fi
   fi
 
   if [[ "$workspace_removal_safe" == 1 ]]; then
@@ -1840,7 +1846,7 @@ print_storage_worker_diagnostics() {
 capture_capacity_journal_cursor() {
   local cursor
 
-  [[ "$capacity_events" =~ ^/run/recasaos-public-files-ci-[0-9]+-[0-9]+/capacity-events$ ]] ||
+  [[ "$capacity_events" == "$workspace/capacity-events" ]] ||
     fail "refusing unsafe capacity event path: $capacity_events"
   [[ ! -e "$capacity_events" && ! -L "$capacity_events" ]] ||
     fail "capacity event path already exists"
@@ -1978,9 +1984,9 @@ start_slow_download() {
   ready_file="${workspace}/slow-download-${slow_download_sequence}.ready"
   ready_temp_file="${ready_file}.tmp"
   failure_file="${workspace}/slow-download-${slow_download_sequence}.failure"
-  [[ "$ready_file" =~ ^/run/recasaos-public-files-ci-[0-9]+-[0-9]+/slow-download-[0-9]+\.ready$ ]] ||
+  [[ "$ready_file" == "$workspace/slow-download-${slow_download_sequence}.ready" ]] ||
     fail "refusing unsafe slow download ready path: $ready_file"
-  [[ "$failure_file" =~ ^/run/recasaos-public-files-ci-[0-9]+-[0-9]+/slow-download-[0-9]+\.failure$ ]] ||
+  [[ "$failure_file" == "$workspace/slow-download-${slow_download_sequence}.failure" ]] ||
     fail "refusing unsafe slow download failure path: $failure_file"
   [[ ! -e "$ready_file" && ! -L "$ready_file" &&
     ! -e "$ready_temp_file" && ! -L "$ready_temp_file" &&
@@ -2325,6 +2331,8 @@ systemd_test_shared_build_inputs="$(
   "$production_shared_build_inputs" == "$systemd_test_shared_build_inputs" ]] ||
   fail "production and tagged binaries select different shared build inputs"
 for built_binary in "$production_binary" "$systemd_test_binary"; do
+  [[ -x "$built_binary" ]] ||
+    fail "public-files build filesystem does not permit execution: $built_binary"
   file "$built_binary" | grep -q 'statically linked' ||
     fail "public-files binary is not static: $built_binary"
 done
@@ -2619,7 +2627,7 @@ if sudo find "/proc/$portal_pid/root/dev" -xdev -type b -print -quit |
 fi
 sudo test ! -e "/proc/$portal_pid/root/var/lib/casaos" ||
   fail "CasaOS state is visible in the service root"
-sudo test ! -e "/proc/$portal_pid/root/run/recasaos-public-files-ci-$run_key" ||
+sudo test ! -e "/proc/$portal_pid/root$workspace" ||
   fail "host CI management workspace is visible in the service root"
 sudo test -d "/proc/$portal_pid/root/proc/self/fd" ||
   fail "procfd is unavailable in the service root"

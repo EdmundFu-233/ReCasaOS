@@ -91,6 +91,9 @@ expect_rejection hardware-acceleration vm \
 expect_rejection stale-sha vm \
   '[[ "$actual_sha" == "$RECASAOS_EXPECTED_SHA" ]]' \
   '[[ -n "$actual_sha" ]]'
+expect_rejection debian-noexec-workspace systemd \
+  '    workspace_parent=/var/lib' \
+  '    workspace_parent=/run'
 expect_rejection memory-peak-fail-open systemd \
   'elif [[ "${RECASAOS_SYSTEMD_TEST_TARGET:-}" != \' \
   'elif [[ -z "${RECASAOS_SYSTEMD_TEST_TARGET:-}" && \'

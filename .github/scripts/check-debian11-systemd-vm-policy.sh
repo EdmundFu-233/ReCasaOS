@@ -184,6 +184,9 @@ require_text "$systemd_script" \
   'debian-11-systemd-247-qemu)' \
   "systemd integration does not recognize the exact Debian VM target"
 require_text "$systemd_script" \
+  'workspace_parent=/var/lib' \
+  "Debian test workspace is not on the reviewed executable filesystem"
+require_text "$systemd_script" \
   '[[ "$manager_version" == "$systemd_version" ]]' \
   "systemd integration does not compare binary and manager versions"
 require_text "$systemd_script" \
