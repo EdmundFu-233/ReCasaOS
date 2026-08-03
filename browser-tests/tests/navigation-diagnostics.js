@@ -11,6 +11,8 @@ const execFileAsync = promisify(execFile);
 const bearerPattern = /rc1_[A-Za-z0-9_-]{43}/;
 const bearerPatternGlobal = /rc1_[A-Za-z0-9_-]{43}/g;
 const genericBearerPattern = /\bBearer\s+[A-Za-z0-9._~+/-]{8,}/gi;
+const sensitiveTraceDataPattern =
+  /(?:"name"\s*:\s*"(?:proxy-authorization|authorization|set-cookie|cookie)"|"(?:proxy-authorization|authorization|set-cookie|cookie)"\s*:|"cookies"\s*:\s*\[\s*\{)/i;
 const navigationTimeoutMs = 20_000;
 const diagnosticOperationTimeoutMs = 3_000;
 const maximumDiagnosticEvents = 96;
@@ -28,6 +30,11 @@ function errorSummary(error) {
 export function diagnosticBytesContainBearer(payload) {
   const bytes = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
   return bearerPattern.test(bytes.toString('latin1'));
+}
+
+export function diagnosticBytesContainSensitiveTraceData(payload) {
+  const bytes = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
+  return sensitiveTraceDataPattern.test(bytes.toString('latin1'));
 }
 
 export function redactDiagnosticText(value) {
@@ -333,6 +340,9 @@ async function validateTraceArchive(tracePath) {
   if (diagnosticBytesContainBearer(archive)) {
     throw new Error('navigation trace archive contains a bearer');
   }
+  if (diagnosticBytesContainSensitiveTraceData(archive)) {
+    throw new Error('navigation trace archive contains credential metadata');
+  }
   const { stdout } = await execFileAsync('unzip', ['-p', tracePath], {
     encoding: null,
     maxBuffer: maximumExpandedTraceBytes,
@@ -340,6 +350,9 @@ async function validateTraceArchive(tracePath) {
   });
   if (diagnosticBytesContainBearer(stdout)) {
     throw new Error('expanded navigation trace contains a bearer');
+  }
+  if (diagnosticBytesContainSensitiveTraceData(stdout)) {
+    throw new Error('expanded navigation trace contains credential metadata');
   }
 }
 
@@ -387,11 +400,17 @@ async function persistDiagnostics(context, diagnostic, testInfo, traceStarted) {
     trace,
   };
   const serialized = `${JSON.stringify(payload, null, 2)}\n`;
-  if (diagnosticBytesContainBearer(serialized)) {
+  if (
+    diagnosticBytesContainBearer(serialized) ||
+    diagnosticBytesContainSensitiveTraceData(serialized)
+  ) {
     await rm(tracePath, { force: true });
     return {
       preserved: false,
-      reason: { name: 'Error', message: 'diagnostics contained a bearer' },
+      reason: {
+        name: 'Error',
+        message: 'diagnostics contained credential material',
+      },
     };
   }
   try {

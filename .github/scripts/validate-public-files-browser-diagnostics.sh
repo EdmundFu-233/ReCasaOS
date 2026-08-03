@@ -20,6 +20,7 @@ fail() {
 
 command -v node >/dev/null 2>&1 || fail "node is unavailable"
 command -v unzip >/dev/null 2>&1 || fail "unzip is unavailable"
+sensitive_trace_pattern='"name"[[:space:]]*:[[:space:]]*"(proxy-authorization|authorization|set-cookie|cookie)"|"(proxy-authorization|authorization|set-cookie|cookie)"[[:space:]]*:|"cookies"[[:space:]]*:[[:space:]]*\[[[:space:]]*\{'
 
 runner_temp="$(realpath -e -- "$RUNNER_TEMP")"
 [[ "$runner_temp" == /home/runner/work/_temp ]] ||
@@ -62,6 +63,9 @@ for entry in "${entries[@]}"; do
   if LC_ALL=C grep -aqE 'rc1_[A-Za-z0-9_-]{43}' "$entry"; then
     fail "diagnostic file contains a ReCasaOS bearer"
   fi
+  if LC_ALL=C grep -aqEi "$sensitive_trace_pattern" "$entry"; then
+    fail "diagnostic file contains credential metadata"
+  fi
 
   size="$(stat -c %s "$entry")"
   case "$name" in
@@ -96,6 +100,11 @@ for entry in "${entries[@]}"; do
         LC_ALL=C grep -aE 'rc1_[A-Za-z0-9_-]{43}' >/dev/null
       then
         fail "expanded trace contains a ReCasaOS bearer"
+      fi
+      if unzip -p "$entry" |
+        LC_ALL=C grep -aEi "$sensitive_trace_pattern" >/dev/null
+      then
+        fail "expanded trace contains credential metadata"
       fi
       companion="${entry%-trace.zip}-diagnostics.json"
       [[ -f "$companion" && ! -L "$companion" ]] ||

@@ -66,6 +66,13 @@ require_text "$workflow" \
 require_text "$diagnostics" \
   'const bearerPattern = /rc1_[A-Za-z0-9_-]{43}/;' \
   "in-process bearer scanner is missing"
+require_text "$diagnostics" 'const sensitiveTraceDataPattern =' \
+  "in-process credential-metadata scanner is missing"
+for credential_scan_target in archive stdout serialized; do
+  require_text "$diagnostics" \
+    "diagnosticBytesContainSensitiveTraceData($credential_scan_target)" \
+    "in-process credential-metadata scan is missing: $credential_scan_target"
+done
 require_text "$diagnostics" 'const navigationTimeoutMs = 20_000;' \
   "bounded navigation deadline changed"
 require_text "$diagnostics" 'sources: false' \
@@ -79,6 +86,12 @@ require_text "$validator" \
 require_text "$validator" \
   "grep -aE 'rc1_[A-Za-z0-9_-]{43}'" \
   "independent expanded-trace bearer scan is missing"
+require_text "$validator" 'sensitive_trace_pattern=' \
+  "independent credential-metadata scanner is missing"
+require_text "$validator" 'grep -aqEi "$sensitive_trace_pattern"' \
+  "independent raw credential-metadata scan is missing"
+require_text "$validator" 'grep -aEi "$sensitive_trace_pattern"' \
+  "independent expanded credential-metadata scan is missing"
 
 require_text "$playwright" "preserveOutput: 'never'" \
   "ordinary Playwright output retention changed"

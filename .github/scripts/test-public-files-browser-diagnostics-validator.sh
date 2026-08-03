@@ -18,6 +18,7 @@ fail() {
   fail "run attempt is unsafe"
 [[ -n "${RUNNER_TEMP:-}" && -d "$RUNNER_TEMP" && ! -L "$RUNNER_TEMP" ]] ||
   fail "RUNNER_TEMP is unsafe"
+command -v zip >/dev/null 2>&1 || fail "zip is unavailable"
 
 runner_temp="$(realpath -e -- "$RUNNER_TEMP")"
 [[ "$runner_temp" == /home/runner/work/_temp ]] ||
@@ -26,6 +27,8 @@ test_key="${GITHUB_RUN_ID}9-${GITHUB_RUN_ATTEMPT}9"
 directory="${runner_temp}/recasaos-browser-diagnostics-${test_key}"
 json="${directory}/firefox-0123456789ab-diagnostics.json"
 symlink="${directory}/firefox-0123456789ab-trace.zip"
+trace="${directory}/firefox-0123456789ab-trace.zip"
+trace_source="${directory}/trace.network"
 validator=".github/scripts/validate-public-files-browser-diagnostics.sh"
 
 case "$directory" in
@@ -60,6 +63,24 @@ write_safe_json() {
   chmod 0600 "$json"
 }
 
+write_trace_json() {
+  printf '%s\n' \
+    '{"browser":{},"github":{},"navigation":{},"pages":{},"schema":"recasaos-browser-navigation-diagnostics-v1","service":{},"trace":{"filename":"firefox-0123456789ab-trace.zip","preserved":true},"trace_start_error":null}' \
+    >"$json"
+  chmod 0600 "$json"
+}
+
+write_trace_archive() {
+  local payload="$1"
+  printf '%s\n' "$payload" >"$trace_source"
+  (
+    cd -- "$directory"
+    zip -q "$(basename -- "$trace")" "$(basename -- "$trace_source")"
+  )
+  rm -- "$trace_source"
+  chmod 0600 "$trace"
+}
+
 write_safe_json
 bash "$validator" "$directory" >/dev/null
 
@@ -78,4 +99,25 @@ if bash "$validator" "$directory" >/dev/null 2>&1; then
 fi
 rm -- "$symlink"
 
+write_trace_json
+write_trace_archive \
+  '{"request":{"headers":[{"name":"Host","value":"127.0.0.1"}]}}'
+bash "$validator" "$directory" >/dev/null
+rm -- "$trace"
+
+write_trace_archive \
+  '{"request":{"headers":[{"name":"Authorization","value":"redacted"}]}}'
+if bash "$validator" "$directory" >/dev/null 2>&1; then
+  fail "validator accepted an expanded credential header"
+fi
+rm -- "$trace"
+
+write_trace_archive \
+  '{"request":{"cookies":[{"name":"session","value":"redacted"}]}}'
+if bash "$validator" "$directory" >/dev/null 2>&1; then
+  fail "validator accepted expanded cookie metadata"
+fi
+rm -- "$trace"
+
+write_safe_json
 bash "$validator" "$directory" >/dev/null

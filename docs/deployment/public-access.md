@@ -132,10 +132,13 @@ retains no trace, HAR, video, browser profile, or HTML-report artifact. If a
 trusted same-repository run stalls during the cross-tab portal navigation
 *before either page receives a bearer*, it may retain one narrowly scoped
 Playwright trace plus structured page, TLS, and loopback-server diagnostics
-for one day. The bundle excludes trace sources, request headers, query and
-fragment values, browser profiles, HAR, video, and HTML reports; both the test
-and an independent pre-upload gate delete or reject any file containing the
-`rc1_` bearer format. Untrusted fork PRs cannot upload this bundle. This
+for one day. Structured events exclude header and query/fragment values. The
+trace can contain ordinary pre-authorization browser request/response headers,
+but both the test and an independent pre-upload gate delete or reject any file
+containing the `rc1_` bearer format or an `Authorization`,
+`Proxy-Authorization`, `Cookie`, or `Set-Cookie` header, or non-empty parsed
+cookie metadata. Trace sources, browser profiles, HAR, video, and HTML reports
+remain excluded, and untrusted fork PRs cannot upload this bundle. This
 failure-only evidence does not exercise the production `NewIsolated`
 coordinator, systemd/cgroup sandbox, Caddy/Nginx, public DNS, HSTS, retail
 Chrome/Firefox, Safari/iOS, or a target host. Its initial-Range case is limited

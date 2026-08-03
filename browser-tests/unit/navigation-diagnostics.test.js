@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   diagnosticBytesContainBearer,
+  diagnosticBytesContainSensitiveTraceData,
   redactDiagnosticText,
   summarizeDiagnosticURL,
 } from '../tests/navigation-diagnostics.js';
@@ -46,6 +47,44 @@ test('diagnostic byte scanning detects an embedded bearer', () => {
   );
   assert.equal(
     diagnosticBytesContainBearer(Buffer.from('public pre-auth evidence')),
+    false,
+  );
+});
+
+test('diagnostic byte scanning rejects credential-bearing trace metadata', () => {
+  for (const header of [
+    'Authorization',
+    'Cookie',
+    'Proxy-Authorization',
+    'Set-Cookie',
+  ]) {
+    assert.equal(
+      diagnosticBytesContainSensitiveTraceData(
+        Buffer.from(`{"headers":[{"name":"${header}","value":"redacted"}]}`),
+      ),
+      true,
+    );
+    assert.equal(
+      diagnosticBytesContainSensitiveTraceData(
+        Buffer.from(`{"headers":{"${header}":"redacted"}}`),
+      ),
+      true,
+    );
+  }
+  assert.equal(
+    diagnosticBytesContainSensitiveTraceData(
+      Buffer.from('{"headers":[{"name":"User-Agent","value":"test"}]}'),
+    ),
+    false,
+  );
+  assert.equal(
+    diagnosticBytesContainSensitiveTraceData(
+      Buffer.from('{"cookies":[{"name":"session","value":"redacted"}]}'),
+    ),
+    true,
+  );
+  assert.equal(
+    diagnosticBytesContainSensitiveTraceData(Buffer.from('{"cookies":[]}')),
     false,
   );
 });

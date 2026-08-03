@@ -349,10 +349,12 @@ jobs:
             apt-get install --yes --no-install-recommends \
               libnss3-tools \
               openssl \
-              unzip
+              unzip \
+              zip
           command -v certutil
           command -v openssl
           command -v unzip
+          command -v zip
 
       - name: Exercise browser diagnostic validator negative cases
         env:
