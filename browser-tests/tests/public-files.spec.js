@@ -9,18 +9,56 @@ import {
 } from './harness.js';
 import { navigatePortalWithDiagnostics } from './navigation-diagnostics.js';
 
+async function readReconciledPortalState(page) {
+  return page.evaluate(() => {
+    const browser = document.getElementById('browser');
+    const login = document.getElementById('login');
+    const token = document.getElementById('token');
+    return {
+      browser_hidden:
+        browser instanceof HTMLElement && browser.hidden === true,
+      document_ready_state: document.readyState,
+      document_url: window.location.href,
+      login_visible:
+        login instanceof HTMLFormElement && login.hidden === false,
+      secure_context: window.isSecureContext,
+      token_empty: token instanceof HTMLInputElement && token.value === '',
+    };
+  });
+}
+
 async function openPortal(page, portal, diagnostics = null) {
-  const response =
+  const navigation =
     diagnostics === null
-      ? await page.goto(portal.origin, { waitUntil: 'domcontentloaded' })
+      ? {
+          response: await page.goto(portal.origin, {
+            waitUntil: 'domcontentloaded',
+          }),
+          verifiedFirefoxDocumentState: false,
+        }
       : await navigatePortalWithDiagnostics({
           ...diagnostics,
           page,
           portal,
         });
+  const { response } = navigation;
   expect(response !== null && response.ok(), 'portal document must load').toBe(
     true,
   );
+  if (navigation.verifiedFirefoxDocumentState === true) {
+    expect(
+      await readReconciledPortalState(page),
+      'reconciled Firefox portal state must remain pre-authorization',
+    ).toEqual({
+      browser_hidden: true,
+      document_ready_state: 'complete',
+      document_url: portal.origin,
+      login_visible: true,
+      secure_context: true,
+      token_empty: true,
+    });
+    return;
+  }
   await expect(page.locator('#login')).toBeVisible();
   await expect(page.locator('#browser')).toBeHidden();
   await expect(page.locator('#token')).toHaveValue('');

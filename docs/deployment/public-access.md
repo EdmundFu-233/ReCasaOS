@@ -156,6 +156,16 @@ error, and a separate trusted TLS 1.3 probe returns `200`. The full cross-tab
 authorization and download-reservation assertions still run. Any mismatch
 remains a test failure and follows the diagnostic path above.
 
+This verified Firefox state leaves Playwright's locator auto-wait attached to
+the stale external navigation lifecycle even though direct in-document
+evaluation succeeds. The diagnostic helper therefore repeats the complete
+pre-authorization page proof immediately before returning, and the caller
+rechecks the exact URL, ready state, secure context, login visibility, hidden
+browser panel, and empty token through direct in-document evaluation. Only
+that exact verified path bypasses the three equivalent locator checks; all
+later cross-tab authorization, Service Worker, request-count, and downloaded
+byte assertions are unchanged.
+
 The cancel smoke requires all three engines to report the local download as
 canceled to Playwright, and exactly one authorized upstream request to reach a
 terminal state within the 40-second test-harness deadline. Chromium and WebKit

@@ -196,6 +196,7 @@ async function inspectPage(page) {
         registrations = await navigator.serviceWorker.getRegistrations();
       }
       return {
+        browser_hidden: document.getElementById('browser')?.hidden === true,
         controlled:
           'serviceWorker' in navigator &&
           navigator.serviceWorker.controller !== null,
@@ -482,6 +483,7 @@ function exactPreAuthorizationPage(state, portalOrigin, staleDriverURL) {
   return (
     driverURLMatches &&
     exactPortalURL(value.document_url, portalOrigin) &&
+    value.browser_hidden === true &&
     value.controlled === false &&
     value.document_ready_state === 'complete' &&
     value.login_visible === true &&
@@ -583,7 +585,10 @@ export async function navigatePortalWithDiagnostics({
     if (traceStarted) {
       await context.tracing.stop();
     }
-    return response;
+    return {
+      response,
+      verifiedFirefoxDocumentState: false,
+    };
   } catch (error) {
     const navigationError = errorSummary(error);
     const afterNavigationServer = await capture(readServerDiagnostics(portal));
@@ -619,6 +624,20 @@ export async function navigatePortalWithDiagnostics({
         targetPageState,
         tlsProbe,
       });
+    let reconciliationRecheck = null;
+    if (lifecycleDesynchronization) {
+      const [finalFirstPageState, finalTargetPageState] = await Promise.all([
+        capture(inspectPage(firstPage)),
+        capture(inspectPage(page)),
+      ]);
+      reconciliationRecheck = {
+        first: finalFirstPageState,
+        target: finalTargetPageState,
+      };
+      lifecycleDesynchronization =
+        exactPreAuthorizationPage(finalFirstPageState, portal.origin, false) &&
+        exactPreAuthorizationPage(finalTargetPageState, portal.origin, true);
+    }
     if (lifecycleDesynchronization && traceStarted) {
       try {
         await context.tracing.stop();
@@ -631,9 +650,13 @@ export async function navigatePortalWithDiagnostics({
       recorder.stop();
       console.warn(
         'ReCasaOS verified a Firefox navigation lifecycle desynchronization; ' +
-          'continuing with the full cross-tab isolation assertions',
+          'validating the loaded document directly before continuing with ' +
+          'the full cross-tab isolation assertions',
       );
-      return navigationResponse;
+      return {
+        response: navigationResponse,
+        verifiedFirefoxDocumentState: true,
+      };
     }
     recorder.stop();
 
@@ -660,6 +683,7 @@ export async function navigatePortalWithDiagnostics({
       pages: {
         first_after_failure: firstPageState,
         first_before_trace: preflightFirstPage,
+        reconciliation_recheck: reconciliationRecheck,
         target: targetPageState,
       },
       service: {

@@ -106,6 +106,7 @@ function preAuthorizationPage(driverURL, driverURLIsAboutBlank = false) {
   return {
     ok: true,
     value: {
+      browser_hidden: true,
       closed: false,
       controlled: false,
       document_ready_state: 'complete',
@@ -271,6 +272,9 @@ test('Firefox lifecycle reconciliation requires every independent proof', () => 
     },
     (value) => {
       value.targetPageState.value.controlled = true;
+    },
+    (value) => {
+      value.targetPageState.value.browser_hidden = false;
     },
     (value) => {
       value.targetPageState.value.document_ready_state = 'loading';
