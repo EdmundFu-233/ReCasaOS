@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+fail() {
+  printf 'Debian 11 systemd VM policy check failed: %s\n' "$*" >&2
+  exit 1
+}
+
+script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+repository="$(cd -- "$script_directory/../.." && pwd -P)"
+workflow="${1:-$repository/.github/workflows/recasaos-ci-security.yml}"
+vm_script="${2:-$repository/.github/scripts/test-public-files-debian11-vm.sh}"
+systemd_script="${3:-$repository/.github/scripts/test-public-files-systemd.sh}"
+sampler="${4:-$repository/.github/scripts/sample-cgroup-memory.py}"
+
+for file in "$workflow" "$vm_script" "$systemd_script" "$sampler"; do
+  [[ -f "$file" && ! -L "$file" ]] ||
+    fail "required policy file is missing or symbolic: $file"
+done
+
+require_text() {
+  local file=$1
+  local value=$2
+  local reason=$3
+
+  grep -Fq -- "$value" "$file" || fail "$reason"
+}
+
+require_exact_line() {
+  local file=$1
+  local value=$2
+  local reason=$3
+
+  grep -Fxq -- "$value" "$file" || fail "$reason"
+}
+
+forbid_text() {
+  local file=$1
+  local value=$2
+  local reason=$3
+
+  if grep -Fq -- "$value" "$file"; then
+    fail "$reason"
+  fi
+}
+
+job_block() {
+  local job=$1
+
+  awk -v header="  ${job}:" '
+    $0 == header {
+      found = 1
+      capture = 1
+    }
+    capture && $0 != header && $0 ~ /^  [A-Za-z0-9_-]+:$/ {
+      exit
+    }
+    capture {
+      print
+    }
+    END {
+      if (!found) {
+        exit 2
+      }
+    }
+  ' "$workflow" || fail "workflow job is missing: $job"
+}
+
+require_block_text() {
+  local block=$1
+  local value=$2
+  local reason=$3
+
+  grep -Fq -- "$value" <<<"$block" || fail "$reason"
+}
+
+forbid_block_text() {
+  local block=$1
+  local value=$2
+  local reason=$3
+
+  if grep -Fq -- "$value" <<<"$block"; then
+    fail "$reason"
+  fi
+}
+
+vm_job="$(job_block debian11-systemd247-pid1)"
+require_block_text "$vm_job" 'name: Debian 11 systemd 247 PID1 VM' \
+  "VM job name changed"
+require_block_text "$vm_job" "github.event_name != 'pull_request' ||" \
+  "default-branch VM runs are not required"
+require_block_text "$vm_job" \
+  "github.event.pull_request.head.repo.full_name == github.repository" \
+  "fork pull requests are not excluded"
+for association in OWNER MEMBER COLLABORATOR; do
+  require_block_text "$vm_job" \
+    "github.event.pull_request.author_association == '$association'" \
+    "trusted author association is missing: $association"
+done
+require_block_text "$vm_job" "github.actor != 'dependabot[bot]'" \
+  "Dependabot is not excluded"
+require_block_text "$vm_job" \
+  'ref: ${{ github.event.pull_request.head.sha || github.sha }}' \
+  "checkout is not bound to the exact event head"
+require_block_text "$vm_job" 'persist-credentials: false' \
+  "checkout credentials may persist"
+require_block_text "$vm_job" 'cache: false' \
+  "VM job must not use a shared setup-go cache"
+require_block_text "$vm_job" 'RECASAOS_DEBIAN11_VM_CI: "1"' \
+  "VM job explicit opt-in is missing"
+require_block_text "$vm_job" \
+  'RECASAOS_EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}' \
+  "VM script is not given the exact event head"
+require_block_text "$vm_job" \
+  'RECASAOS_RUNNER_ENVIRONMENT: ${{ runner.environment }}' \
+  "hosted-runner identity is not forwarded"
+require_block_text "$vm_job" \
+  'run: .github/scripts/test-public-files-debian11-vm.sh' \
+  "reviewed VM script is not invoked"
+for package in cloud-image-utils qemu-system-x86 qemu-utils; do
+  require_block_text "$vm_job" "$package" \
+    "VM job package is missing: $package"
+done
+for forbidden in \
+  'contents: write' \
+  'id-token: write' \
+  'secrets:' \
+  'actions/cache' \
+  'actions/upload-artifact' \
+  'actions/download-artifact'
+do
+  forbid_block_text "$vm_job" "$forbidden" \
+    "VM job contains forbidden capability: $forbidden"
+done
+
+require_text "$vm_script" \
+  "[[ \"\$actual_sha\" == \"\$RECASAOS_EXPECTED_SHA\" ]]" \
+  "VM script does not verify the exact checkout SHA"
+require_text "$vm_script" \
+  'git status --porcelain=v1 --untracked-files=all' \
+  "VM script does not require a clean checkout"
+require_text "$vm_script" \
+  '--output="$repo_archive" "$RECASAOS_EXPECTED_SHA"' \
+  "guest source archive is not bound to the exact SHA"
+require_text "$vm_script" \
+  "image_url='https://cloud.debian.org/images/cloud/bullseye/20260728-2553/debian-11-generic-amd64-20260728-2553.qcow2'" \
+  "Debian cloud image URL drifted"
+require_text "$vm_script" \
+  "image_sha512='67dcf10dc67b807596c21b36fcd0a752838c124420774737d4badc46cb115b88cc879fac91a22d149d74b2ecd9600a7b4761690900348726e718f501a8564131'" \
+  "Debian cloud image checksum drifted"
+require_text "$vm_script" 'sha512sum --check --status' \
+  "Debian cloud image checksum is not enforced"
+require_text "$vm_script" 'info.get("backing-filename") is not None' \
+  "base image backing-file rejection is missing"
+require_text "$vm_script" '-accel tcg,thread=multi' \
+  "QEMU is not forced to use software TCG"
+require_text "$vm_script" \
+  '-netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${ssh_port}-:22"' \
+  "guest SSH is not loopback-forwarded"
+require_text "$vm_script" \
+  'RECASAOS_SYSTEMD_TEST_TARGET=debian-11-systemd-247-qemu' \
+  "guest is not bound to the Debian 11 qualification target"
+for identity_proof in \
+  '[[ "$guest_release" == debian:11 ]]' \
+  '[[ "$guest_pid1" == systemd ]]' \
+  '[[ "$guest_systemd" == systemd\ 247* ]]' \
+  '[[ "$guest_manager" == 247* ]]' \
+  '[[ "$guest_virt" == qemu ]]' \
+  '[[ "$guest_cgroup" == cgroup2fs ]]' \
+  '"$guest_root_bytes" -ge 6442450944'
+do
+  require_text "$vm_script" "$identity_proof" \
+    "guest identity proof is missing: $identity_proof"
+done
+for forbidden in \
+  /dev/kvm \
+  -enable-kvm \
+  '-accel kvm' \
+  -virtfs \
+  -fsdev \
+  --privileged \
+  'docker run' \
+  'podman run' \
+  'eval '
+do
+  forbid_text "$vm_script" "$forbidden" \
+    "VM script contains forbidden host escape or indirection: $forbidden"
+done
+
+require_text "$systemd_script" \
+  'debian-11-systemd-247-qemu)' \
+  "systemd integration does not recognize the exact Debian VM target"
+require_text "$systemd_script" \
+  'workspace_parent=/var/lib' \
+  "Debian test workspace is not on the reviewed executable filesystem"
+require_text "$systemd_script" \
+  '    worker_capacity_window_seconds=15' \
+  "native hosted capacity window drifted"
+require_text "$systemd_script" \
+  '    worker_capacity_window_seconds=30' \
+  "Debian TCG capacity window drifted"
+require_text "$systemd_script" \
+  'worker_capacity_deadline=$((SECONDS + worker_capacity_window_seconds))' \
+  "capacity phase does not use the reviewed target-specific window"
+require_text "$systemd_script" \
+  'worker_capacity_evidence_window_seconds=10' \
+  "capacity evidence window drifted"
+require_text "$systemd_script" \
+  '  SECONDS + worker_capacity_evidence_window_seconds' \
+  "capacity evidence does not use its reviewed bounded window"
+require_text "$systemd_script" \
+  'for _ in {1..8}; do' \
+  "capacity holders are not launched without per-worker serialization"
+require_text "$systemd_script" \
+  '  slow_downloads_are_healthy' \
+  "capacity phase does not require all eight clients to become ready"
+require_exact_line "$systemd_script" \
+  'assert_bounded_storage_worker_runtime_boundaries' \
+  "bounded workers do not receive one fail-closed runtime inspection"
+require_text "$systemd_script" \
+  'bounded worker evidence sentinels are not unique' \
+  "bounded worker Python source is not self-validated"
+require_text "$systemd_script" \
+  '    or len(worker_pairs) != 8' \
+  "bounded runtime inspection does not require eight worker identities"
+require_text "$systemd_script" \
+  '    if contains_secret(command_before) or contains_secret(environment):' \
+  "bounded runtime inspection does not scan command and environment bytes"
+require_text "$systemd_script" \
+  '        if os.readlink(descriptor_path) == listener_target:' \
+  "bounded runtime inspection does not reject the AF_INET listener"
+require_text "$systemd_script" \
+  '        if len(flags) != 1 or (int(flags[0], 8) & os.O_CLOEXEC) == 0:' \
+  "bounded runtime inspection does not enforce close-on-exec"
+require_text "$systemd_script" \
+  '[[ "$manager_version" == "$systemd_version" ]]' \
+  "systemd integration does not compare binary and manager versions"
+require_text "$systemd_script" \
+  'start_cgroup_memory_sampler' \
+  "systemd integration does not start reviewed memory sampling"
+require_text "$systemd_script" \
+  'stop_cgroup_memory_sampler' \
+  "systemd integration does not stop reviewed memory sampling"
+require_text "$systemd_script" \
+  'systemd MemoryPeak is unavailable on a target that requires it' \
+  "MemoryPeak fallback does not fail closed on newer targets"
+require_text "$systemd_script" \
+  'elif [[ "${RECASAOS_SYSTEMD_TEST_TARGET:-}" != \' \
+  "MemoryPeak fallback does not reject every other target"
+require_text "$systemd_script" \
+  '  debian-11-systemd-247-qemu ]]; then' \
+  "MemoryPeak fallback does not name the exact legacy target"
+
+for sampler_proof in \
+  'MAX_RUNTIME_SECONDS = 30.0' \
+  'SAMPLE_INTERVAL_SECONDS = 0.01' \
+  'source_flags |= os.O_NOFOLLOW' \
+  'stat.S_IMODE(metadata.st_mode) != 0o600' \
+  'os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC'
+do
+  require_text "$sampler" "$sampler_proof" \
+    "memory sampler proof is missing: $sampler_proof"
+done
+
+printf 'Debian 11 systemd VM policy check passed\n'

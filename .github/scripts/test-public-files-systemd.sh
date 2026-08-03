@@ -15,10 +15,6 @@ fail() {
   fail "the repository identity is not the trusted ReCasaOS repository"
 [[ "${RUNNER_OS:-}" == Linux ]] ||
   fail "the runner is not Linux"
-[[ "${RECASAOS_RUNNER_ENVIRONMENT:-}" == github-hosted ]] ||
-  fail "GitHub did not identify this as a hosted runner"
-[[ -d /opt/hostedtoolcache ]] ||
-  fail "the GitHub-hosted runner marker is missing"
 [[ "${GITHUB_RUN_ID:-}" =~ ^[0-9]+$ ]] ||
   fail "GITHUB_RUN_ID is missing or unsafe"
 [[ "${GITHUB_RUN_ATTEMPT:-}" =~ ^[0-9]+$ ]] ||
@@ -27,11 +23,69 @@ fail() {
   fail "PID 1 is not systemd"
 [[ "$(stat -fc %T /sys/fs/cgroup)" == cgroup2fs ]] ||
   fail "the runner is not using cgroup v2"
+systemd_version_output="$(systemd --version)" ||
+  fail "could not inspect the systemd manager version"
+systemd_version_line="${systemd_version_output%%$'\n'*}"
+IFS=' ' read -r systemd_command systemd_version _ <<<"$systemd_version_line"
+[[ "$systemd_command" == systemd && "$systemd_version" =~ ^[0-9]+$ ]] ||
+  fail "systemd reported an invalid version: $systemd_version_line"
+manager_version_output="$(
+  systemctl show --property=Version --value
+)" || fail "could not inspect the running systemd manager version"
+[[ "$manager_version_output" =~ ^([0-9]+) ]] ||
+  fail "systemd manager reported an invalid version: $manager_version_output"
+manager_version="${BASH_REMATCH[1]}"
+[[ "$manager_version" == "$systemd_version" ]] ||
+  fail "systemd binary version $systemd_version differs from manager $manager_version"
+printf 'verified systemd manager version: %s\n' "$manager_version_output"
+
+case "${RECASAOS_SYSTEMD_TEST_TARGET:-}" in
+  github-hosted-ubuntu)
+    [[ "${RECASAOS_RUNNER_ENVIRONMENT:-}" == github-hosted ]] ||
+      fail "GitHub did not identify this as a hosted runner"
+    [[ -d /opt/hostedtoolcache ]] ||
+      fail "the GitHub-hosted runner marker is missing"
+    workspace_parent=/run
+    worker_capacity_window_seconds=15
+    ;;
+  debian-11-systemd-247-qemu)
+    [[ "${RECASAOS_RUNNER_ENVIRONMENT:-}" == github-hosted-vm ]] ||
+      fail "the Debian qualification target is not the expected hosted VM"
+    [[ "$systemd_version" == 247 ]] ||
+      fail "the Debian qualification VM is not running systemd 247"
+    guest_release="$(
+      . /etc/os-release
+      printf '%s:%s\n' "${ID:-}" "${VERSION_ID:-}"
+    )" || fail "could not inspect the Debian qualification release"
+    [[ "$guest_release" == debian:11 ]] ||
+      fail "the qualification VM release is $guest_release, want debian:11"
+    if systemd-detect-virt --container >/dev/null 2>&1; then
+      fail "the Debian qualification target is a container"
+    fi
+    [[ "$(systemd-detect-virt --vm)" == qemu ]] ||
+      fail "the Debian qualification target is not an isolated QEMU VM"
+    # Debian mounts /run with noexec. Keep the disposable RootDirectory and
+    # both reviewed binaries below a root-owned executable filesystem instead.
+    workspace_parent=/var/lib
+    # QEMU TCG serializes enough CPU work that eight individually bounded
+    # worker admissions do not reliably fit the native runner's aggregate
+    # 15-second orchestration window. This changes only the test harness's
+    # aggregate deadline; application IPC and service timeouts remain fixed.
+    worker_capacity_window_seconds=30
+    ;;
+  *)
+    fail "the exact systemd integration target is not authorized"
+    ;;
+esac
+# Journal visibility is evidence collection after admission, not additional
+# worker-start budget. Keep it separately and identically bounded on both
+# targets so a slow journal cannot silently widen the capacity requirement.
+worker_capacity_evidence_window_seconds=10
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 cd -- "$repo_root"
 run_key="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-workspace="/run/recasaos-public-files-ci-${run_key}"
+workspace="${workspace_parent}/recasaos-public-files-ci-${run_key}"
 service_unit="recasaos-public-files.service"
 socket_unit="recasaos-public-files.socket"
 sentinel_unit="recasaos-ci-management-${run_key}.service"
@@ -51,6 +105,10 @@ management_dir="${workspace}/management"
 response_file="${workspace}/response"
 ninth_response_headers="${workspace}/ninth-response.headers"
 capacity_events="${workspace}/capacity-events"
+memory_sampler_output="${workspace}/memory-current-sampled-peak"
+memory_sampler_ready="${workspace}/memory-current-sampler-ready"
+memory_sampler_stop="${workspace}/memory-current-sampler-stop"
+memory_sampler_failure="${workspace}/memory-current-sampler-failure"
 nested_backing="${workspace}/nested-backing"
 nested_mount="${share}/covered"
 host_shm_sentinel_prefix="/dev/shm/recasaos-public-files-ci-${run_key}."
@@ -63,10 +121,9 @@ worker_load_bytes=67108864
 storage_worker_address_space_ceiling=2147483648
 storage_worker_address_space_minimum_reserve=134217728
 
-case "$workspace" in
-  /run/recasaos-public-files-ci-[0-9]*-[0-9]*) ;;
-  *) fail "refusing unsafe workspace path: $workspace" ;;
-esac
+[[ "$workspace" =~ ^/(run|var/lib)/recasaos-public-files-ci-[0-9]+-[0-9]+$ &&
+  "$workspace" == "$workspace_parent/recasaos-public-files-ci-$run_key" ]] ||
+  fail "refusing unsafe workspace path: $workspace"
 [[ "$host_shm_sentinel_prefix" =~ ^/dev/shm/recasaos-public-files-ci-[0-9]+-[0-9]+\.$ ]] ||
   fail "refusing unsafe shared-memory sentinel prefix: $host_shm_sentinel_prefix"
 
@@ -83,11 +140,14 @@ if getent passwd recasaos-public >/dev/null ||
   fail "the recasaos-public account unexpectedly already exists"
 fi
 for required_tool in \
-  cmp find getfacl mktemp mount mountpoint pgrep ps sort ss systemctl truncate umount
+  cmp find getfacl go mktemp mount pgrep ps sort ss systemctl truncate umount
 do
   command -v "$required_tool" >/dev/null 2>&1 ||
     fail "required mount test tool is unavailable: $required_tool"
 done
+go_version="$(go version)" || fail "could not inspect the Go toolchain"
+[[ "$go_version" == "go version go1.26.5 linux/amd64" ]] ||
+  fail "unexpected Go toolchain: $go_version"
 [[ -x /usr/bin/python3 ]] ||
   fail "required Python interpreter is unavailable: /usr/bin/python3"
 /usr/bin/python3 - \
@@ -110,13 +170,37 @@ compile(source, "start_slow_download.py", "exec")
 limit_start = (
     "    \"$storage_worker_address_space_minimum_reserve\" <<'PYTHON'\n"
 )
-limit_end = "\nPYTHON\n}\n\nprint_capacity_journal_diagnostics()"
+limit_end = (
+    "\nPYTHON\n}\n\n"
+    "assert_bounded_storage_worker_runtime_boundaries()"
+)
 if script.count(limit_start) != 1 or script.count(limit_end) != 1:
     raise SystemExit("address-space evidence sentinels are not unique")
 limit_source = script.split(limit_start, 1)[1].split(limit_end, 1)[0]
 compile(
     limit_source,
     "assert_storage_worker_address_space_limit.py",
+    "exec",
+)
+
+bounded_start = (
+    '    "${worker_identity_arguments[@]}" '
+    "<<'BOUNDED_PYTHON'\n"
+)
+bounded_end = (
+    "\nBOUNDED_PYTHON\n"
+    "  then\n"
+    '    fail "bounded storage worker runtime evidence failed"\n'
+    "  fi\n"
+    "}\n\n"
+    "print_capacity_journal_diagnostics()"
+)
+if script.count(bounded_start) != 1 or script.count(bounded_end) != 1:
+    raise SystemExit("bounded worker evidence sentinels are not unique")
+bounded_source = script.split(bounded_start, 1)[1].split(bounded_end, 1)[0]
+compile(
+    bounded_source,
+    "assert_bounded_storage_worker_runtime_boundaries.py",
     "exec",
 )
 PYTHON
@@ -160,6 +244,9 @@ last_storage_worker_count=0
 max_storage_worker_count=0
 portal_invocation=
 capacity_journal_cursor=
+memory_sampler_pid=
+memory_sampler_start_time=
+sampled_memory_peak=
 
 cleanup_problem() {
   printf 'public-files systemd test cleanup: %s\n' "$*" >&2
@@ -459,12 +546,14 @@ process_start_time() {
   printf '%s\n' "${stat_fields[19]}"
 }
 
-terminate_exact_background_process() {
+signal_exact_background_process() {
   local pid=$1
   local start_time=$2
+  local signal_number=$3
 
   [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 &&
-    "$start_time" =~ ^[0-9]+$ ]] || return 1
+    "$start_time" =~ ^[0-9]+$ &&
+    ( "$signal_number" == 9 || "$signal_number" == 15 ) ]] || return 1
   /usr/bin/python3 -c '
 import os
 import signal
@@ -472,6 +561,7 @@ import sys
 
 pid = int(sys.argv[1])
 expected_start = sys.argv[2].encode("ascii")
+signal_number = int(sys.argv[3])
 try:
     pidfd = os.pidfd_open(pid, 0)
 except ProcessLookupError:
@@ -489,12 +579,181 @@ try:
     if fields[19] != expected_start:
         raise SystemExit(0)
     try:
-        signal.pidfd_send_signal(pidfd, signal.SIGTERM, None, 0)
+        signal.pidfd_send_signal(pidfd, signal_number, None, 0)
     except ProcessLookupError:
         pass
 finally:
     os.close(pidfd)
-' "$pid" "$start_time"
+' "$pid" "$start_time" "$signal_number"
+}
+
+terminate_exact_background_process() {
+  signal_exact_background_process "$1" "$2" 15
+}
+
+kill_exact_background_process() {
+  signal_exact_background_process "$1" "$2" 9
+}
+
+memory_sampler_process_is_live() {
+  local current_start_time
+
+  [[ "$memory_sampler_pid" =~ ^[0-9]+$ &&
+    "$memory_sampler_pid" -gt 1 &&
+    "$memory_sampler_start_time" =~ ^[0-9]+$ ]] || return 1
+  current_start_time="$(
+    process_start_time "$memory_sampler_pid" 2>/dev/null
+  )" || return 1
+  [[ "$current_start_time" == "$memory_sampler_start_time" ]]
+}
+
+memory_sampler_ready_is_valid() {
+  local metadata
+  local value
+
+  [[ -f "$memory_sampler_ready" && ! -L "$memory_sampler_ready" ]] ||
+    return 1
+  metadata="$(stat -c '%u:%a:%h' "$memory_sampler_ready")" || return 1
+  [[ "$metadata" == "$(id -u):600:1" ]] || return 1
+  value="$(<"$memory_sampler_ready")" || return 1
+  [[ "$value" =~ ^[0-9]+$ ]]
+}
+
+start_cgroup_memory_sampler() {
+  local cgroup_memory_current
+  local ready_deadline
+
+  [[ -z "$memory_sampler_pid" && -z "$memory_sampler_start_time" ]] ||
+    fail "cgroup memory sampler is already recorded"
+  for control_path in \
+    "$memory_sampler_output" \
+    "$memory_sampler_ready" \
+    "$memory_sampler_stop" \
+    "$memory_sampler_failure"
+  do
+    [[ ! -e "$control_path" && ! -L "$control_path" ]] ||
+      fail "cgroup memory sampler control path already exists: $control_path"
+  done
+  cgroup_memory_current="/sys/fs/cgroup/system.slice/${service_unit}/memory.current"
+  [[ "$cgroup_memory_current" == \
+    /sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.current ]] ||
+    fail "refusing unexpected cgroup memory source: $cgroup_memory_current"
+  [[ -f "$cgroup_memory_current" &&
+    ! -L "$cgroup_memory_current" &&
+    -r "$cgroup_memory_current" ]] ||
+    fail "service cgroup memory.current is not a readable regular file"
+  [[ -f "$repo_root/.github/scripts/sample-cgroup-memory.py" &&
+    ! -L "$repo_root/.github/scripts/sample-cgroup-memory.py" ]] ||
+    fail "reviewed cgroup memory sampler is unavailable"
+
+  install -m 0600 /dev/null "$memory_sampler_failure"
+  PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 \
+    "$repo_root/.github/scripts/sample-cgroup-memory.py" \
+    "$cgroup_memory_current" \
+    "$memory_sampler_output" \
+    "$memory_sampler_ready" \
+    "$memory_sampler_stop" \
+    2>"$memory_sampler_failure" &
+  memory_sampler_pid=$!
+  memory_sampler_start_time="$(
+    process_start_time "$memory_sampler_pid"
+  )" || fail "could not record the cgroup memory sampler identity"
+
+  ready_deadline=$((SECONDS + 5))
+  while ! memory_sampler_ready_is_valid; do
+    ((SECONDS < ready_deadline)) || {
+      sed -n '1,20p' "$memory_sampler_failure" >&2
+      fail "cgroup memory sampler did not become ready"
+    }
+    memory_sampler_process_is_live || {
+      sed -n '1,20p' "$memory_sampler_failure" >&2
+      fail "cgroup memory sampler exited before becoming ready"
+    }
+    sleep 0.02
+  done
+}
+
+stop_cgroup_memory_sampler() {
+  local metadata
+  local sampler_deadline
+
+  memory_sampler_process_is_live ||
+    fail "cgroup memory sampler identity disappeared before stop"
+  [[ ! -e "$memory_sampler_stop" && ! -L "$memory_sampler_stop" ]] ||
+    fail "cgroup memory sampler stop marker already exists"
+  install -m 0600 /dev/null "$memory_sampler_stop"
+
+  sampler_deadline=$((SECONDS + 5))
+  while memory_sampler_process_is_live; do
+    ((SECONDS < sampler_deadline)) || {
+      terminate_exact_background_process \
+        "$memory_sampler_pid" "$memory_sampler_start_time" || true
+      fail "cgroup memory sampler did not stop within the deadline"
+    }
+    sleep 0.02
+  done
+  if ! wait "$memory_sampler_pid"; then
+    sed -n '1,20p' "$memory_sampler_failure" >&2
+    fail "cgroup memory sampler exited unsuccessfully"
+  fi
+
+  [[ -f "$memory_sampler_output" && ! -L "$memory_sampler_output" ]] ||
+    fail "cgroup memory sampler output is unavailable"
+  metadata="$(stat -c '%u:%a:%h' "$memory_sampler_output")" ||
+    fail "could not inspect cgroup memory sampler output"
+  [[ "$metadata" == "$(id -u):600:1" ]] ||
+    fail "cgroup memory sampler output metadata is unsafe: $metadata"
+  sampled_memory_peak="$(<"$memory_sampler_output")" ||
+    fail "could not read cgroup memory sampler output"
+  [[ "$sampled_memory_peak" =~ ^[0-9]+$ ]] ||
+    fail "cgroup memory sampler output is invalid"
+
+  memory_sampler_pid=
+  memory_sampler_start_time=
+}
+
+cleanup_cgroup_memory_sampler() {
+  local sampler_deadline
+
+  if [[ ! "$memory_sampler_pid" =~ ^[0-9]+$ ||
+    "$memory_sampler_pid" -le 1 ||
+    ! "$memory_sampler_start_time" =~ ^[0-9]+$ ]]; then
+    memory_sampler_pid=
+    memory_sampler_start_time=
+    return
+  fi
+
+  if [[ ! -e "$memory_sampler_stop" && ! -L "$memory_sampler_stop" ]]; then
+    install -m 0600 /dev/null "$memory_sampler_stop" ||
+      cleanup_problem "could not create cgroup memory sampler stop marker"
+  fi
+  if memory_sampler_process_is_live; then
+    if ! terminate_exact_background_process \
+      "$memory_sampler_pid" "$memory_sampler_start_time"; then
+      cleanup_problem "could not terminate exact cgroup memory sampler identity"
+    fi
+  fi
+  sampler_deadline=$((SECONDS + 3))
+  while memory_sampler_process_is_live && ((SECONDS < sampler_deadline)); do
+    sleep 0.02
+  done
+  if memory_sampler_process_is_live; then
+    if ! kill_exact_background_process \
+      "$memory_sampler_pid" "$memory_sampler_start_time"; then
+      cleanup_problem "could not kill exact cgroup memory sampler identity"
+    fi
+    sampler_deadline=$((SECONDS + 2))
+    while memory_sampler_process_is_live && ((SECONDS < sampler_deadline)); do
+      sleep 0.02
+    done
+  fi
+  if memory_sampler_process_is_live; then
+    cleanup_problem "cgroup memory sampler remains live after exact SIGKILL"
+  else
+    wait "$memory_sampler_pid" 2>/dev/null || true
+  fi
+  memory_sampler_pid=
+  memory_sampler_start_time=
 }
 
 cleanup_background_downloads() {
@@ -565,6 +824,7 @@ cleanup() {
   trap - EXIT
   set +e
 
+  cleanup_cgroup_memory_sampler
   cleanup_background_downloads
   for unit in "$socket_unit" "$service_unit" "$sentinel_unit"; do
     cleanup_control_groups["$unit"]="$(
@@ -661,42 +921,45 @@ cleanup() {
   fi
 
   if [[ "$nested_mount_cleanup_required" == 1 ]]; then
-    sudo mountpoint -q -- "$nested_mount" >/dev/null 2>&1
-    mountpoint_status=$?
-    case "$mountpoint_status" in
-      0)
-        sudo umount -- "$nested_mount"
-        command_status=$?
-        if [[ "$command_status" != 0 ]]; then
-          cleanup_problem \
-            "could not unmount $nested_mount (status $command_status)"
-          workspace_removal_safe=0
-        else
-          sudo mountpoint -q -- "$nested_mount" >/dev/null 2>&1
-          mountpoint_status=$?
-          case "$mountpoint_status" in
-            0)
-              cleanup_problem "nested mount remains active: $nested_mount"
-              workspace_removal_safe=0
-              ;;
-            32)
-              ;;
-            *)
-              cleanup_problem \
-                "could not verify nested mount removal (status $mountpoint_status)"
-              workspace_removal_safe=0
-              ;;
-          esac
-        fi
-        ;;
-      32)
-        ;;
-      *)
+    nested_mount_count="$(
+      awk -v target="$nested_mount" '
+        $5 == target { count++ }
+        END { print count + 0 }
+      ' /proc/self/mountinfo
+    )"
+    command_status=$?
+    if [[ "$command_status" != 0 ||
+      ! "$nested_mount_count" =~ ^[0-9]+$ ]]; then
+      cleanup_problem \
+        "could not determine nested mount count (status $command_status)"
+      workspace_removal_safe=0
+    elif [[ "$nested_mount_count" -gt 1 ]]; then
+      cleanup_problem \
+        "nested mount has ambiguous mountinfo count: $nested_mount_count"
+      workspace_removal_safe=0
+    elif [[ "$nested_mount_count" == 1 ]]; then
+      sudo umount -- "$nested_mount"
+      command_status=$?
+      if [[ "$command_status" != 0 ]]; then
         cleanup_problem \
-          "could not determine nested mount state (status $mountpoint_status)"
+          "could not unmount $nested_mount (status $command_status)"
         workspace_removal_safe=0
-        ;;
-    esac
+      else
+        nested_mount_count="$(
+          awk -v target="$nested_mount" '
+            $5 == target { count++ }
+            END { print count + 0 }
+          ' /proc/self/mountinfo
+        )"
+        command_status=$?
+        if [[ "$command_status" != 0 ||
+          "$nested_mount_count" != 0 ]]; then
+          cleanup_problem \
+            "nested mount remains after cleanup: count=${nested_mount_count:-invalid} status=$command_status"
+          workspace_removal_safe=0
+        fi
+      fi
+    fi
   fi
 
   if [[ "$workspace_removal_safe" == 1 ]]; then
@@ -1289,6 +1552,207 @@ print(
 PYTHON
 }
 
+assert_bounded_storage_worker_runtime_boundaries() {
+  local index
+  local worker_identity_arguments=()
+
+  [[ "${#bounded_worker_pids[@]}" == 8 &&
+    "${#bounded_worker_start_times[@]}" == 8 ]] ||
+    fail "cannot inspect an incomplete bounded worker set"
+  [[ "$portal_pid" =~ ^[0-9]+$ && "$portal_pid" -gt 1 ]] ||
+    fail "cannot inspect bounded workers for an unsafe portal identity"
+  [[ "$listener_inode" =~ ^[0-9]+$ ]] ||
+    fail "cannot inspect bounded workers for an unsafe listener inode"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] ||
+    fail "cannot inspect bounded workers with an unsafe bearer digest"
+
+  for index in "${!bounded_worker_pids[@]}"; do
+    worker_identity_arguments+=(
+      "${bounded_worker_pids[$index]}:${bounded_worker_start_times[$index]}"
+    )
+  done
+
+  # One root process takes the same before/after identity snapshots and checks
+  # every stopped worker. Spawning dozens of sudo helpers under QEMU TCG would
+  # measure the observer rather than the service and can outlive the unchanged
+  # production write deadline.
+  if ! sudo /usr/bin/python3 - \
+    "$portal_pid" \
+    "$listener_inode" \
+    "$storage_worker_address_space_ceiling" \
+    "$storage_worker_address_space_minimum_reserve" \
+    "${#test_bearer}" \
+    "$digest" \
+    "${worker_identity_arguments[@]}" <<'BOUNDED_PYTHON'
+import hashlib
+import os
+from pathlib import Path
+import re
+import sys
+
+expected_parent = int(sys.argv[1])
+listener_inode = sys.argv[2]
+ceiling = int(sys.argv[3])
+minimum_reserve = int(sys.argv[4])
+secret_length = int(sys.argv[5])
+secret_digest = sys.argv[6]
+worker_pairs = sys.argv[7:]
+
+if (
+    expected_parent <= 1
+    or not listener_inode.isdigit()
+    or ceiling != 2 * 1024 * 1024 * 1024
+    or minimum_reserve != 128 * 1024 * 1024
+    or secret_length <= 0
+    or secret_length > 4096
+    or re.fullmatch(r"[0-9a-f]{64}", secret_digest) is None
+    or len(worker_pairs) != 8
+    or getattr(os, "O_CLOEXEC", 0) != 0o2000000
+):
+    raise SystemExit("unsafe bounded worker evidence arguments")
+
+expected_command = (
+    b"/proc/self/exe\0"
+    b"--internal-public-files-storage-worker\0"
+    b"file\0"
+)
+listener_target = f"socket:[{listener_inode}]"
+portal_executable = os.stat(f"/proc/{expected_parent}/exe")
+
+
+def contains_secret(data):
+    if len(data) < secret_length:
+        return False
+    for offset in range(len(data) - secret_length + 1):
+        candidate = data[offset : offset + secret_length]
+        if hashlib.sha256(candidate).hexdigest() == secret_digest:
+            return True
+    return False
+
+
+def identity(proc):
+    stat_data = (proc / "stat").read_bytes()
+    marker = stat_data.rfind(b") ")
+    fields = stat_data[marker + 2 :].split() if marker >= 0 else []
+    if (
+        len(fields) <= 19
+        or fields[0] != b"T"
+        or not fields[1].isdigit()
+        or not fields[19].isdigit()
+    ):
+        raise RuntimeError("could not parse one stopped worker identity")
+    return fields[19], int(fields[1]), (proc / "cmdline").read_bytes()
+
+
+seen_pids = set()
+for pair in worker_pairs:
+    match = re.fullmatch(r"([1-9][0-9]*):([1-9][0-9]*)", pair)
+    if match is None:
+        raise RuntimeError("malformed bounded worker identity")
+    pid = int(match.group(1))
+    expected_start = match.group(2).encode("ascii")
+    if pid <= 1 or pid in seen_pids:
+        raise RuntimeError("unsafe or duplicate bounded worker PID")
+    seen_pids.add(pid)
+    proc = Path(f"/proc/{pid}")
+
+    start_before, parent_before, command_before = identity(proc)
+    if (
+        start_before != expected_start
+        or parent_before != expected_parent
+        or command_before != expected_command
+    ):
+        raise RuntimeError("bounded worker identity changed before inspection")
+
+    worker_executable = os.stat(proc / "exe")
+    if (
+        worker_executable.st_dev != portal_executable.st_dev
+        or worker_executable.st_ino != portal_executable.st_ino
+    ):
+        raise RuntimeError("bounded worker does not share the reviewed image")
+
+    limits = (proc / "limits").read_text(encoding="ascii")
+    address_limits = []
+    for line in limits.splitlines():
+        fields = line.split()
+        if fields[:3] == ["Max", "address", "space"]:
+            if (
+                len(fields) != 6
+                or fields[5] != "bytes"
+                or not fields[3].isdigit()
+                or not fields[4].isdigit()
+            ):
+                raise RuntimeError("bounded worker address limit is malformed")
+            address_limits.append((int(fields[3]), int(fields[4])))
+    if len(address_limits) != 1:
+        raise RuntimeError("could not parse one bounded worker address limit")
+    soft, hard = address_limits[0]
+
+    status = (proc / "status").read_text(encoding="ascii")
+    vm_sizes = re.findall(
+        r"^VmSize:\s*([0-9]+)\s+kB\s*$",
+        status,
+        re.MULTILINE,
+    )
+    if len(vm_sizes) != 1:
+        raise RuntimeError("could not parse one bounded worker VmSize")
+    vm_size_kib = int(vm_sizes[0])
+    if vm_size_kib <= 0 or vm_size_kib > ceiling // 1024:
+        raise RuntimeError("bounded worker VmSize is outside the ceiling")
+    vm_size_bytes = vm_size_kib * 1024
+    if soft != hard or soft <= vm_size_bytes or soft > ceiling:
+        raise RuntimeError("bounded worker address-space limit is unsafe")
+    reserve = soft - vm_size_bytes
+    if reserve < minimum_reserve:
+        raise RuntimeError("bounded worker address-space reserve is too small")
+
+    environment = (proc / "environ").read_bytes()
+    if contains_secret(command_before) or contains_secret(environment):
+        raise RuntimeError("raw bearer is present in a bounded worker")
+    if os.stat(proc / "mem").st_uid != 0:
+        raise RuntimeError("bounded worker memory remains dumpable")
+
+    descriptor_directory = proc / "fd"
+    descriptor_names = os.listdir(descriptor_directory)
+    if any(not name.isdigit() for name in descriptor_names):
+        raise RuntimeError("bounded worker exposed a nonnumeric descriptor")
+    for descriptor_name in descriptor_names:
+        descriptor = int(descriptor_name)
+        descriptor_path = descriptor_directory / descriptor_name
+        if os.readlink(descriptor_path) == listener_target:
+            raise RuntimeError("bounded worker inherited the AF_INET listener")
+        if descriptor <= 2:
+            continue
+        descriptor_info = (
+            proc / "fdinfo" / descriptor_name
+        ).read_text(encoding="ascii")
+        flags = re.findall(
+            r"^flags:\s*([0-7]+)\s*$",
+            descriptor_info,
+            re.MULTILINE,
+        )
+        if len(flags) != 1 or (int(flags[0], 8) & os.O_CLOEXEC) == 0:
+            raise RuntimeError("bounded worker descriptor is not close-on-exec")
+
+    start_after, parent_after, command_after = identity(proc)
+    if (
+        start_after != start_before
+        or parent_after != parent_before
+        or command_after != command_before
+    ):
+        raise RuntimeError("bounded worker identity changed during inspection")
+
+    print(
+        "storage worker address-space evidence: "
+        f"build=systemd-test pid={pid} vm-size-kib={vm_size_kib} "
+        f"soft-bytes={soft} hard-bytes={hard} reserve-bytes={reserve}"
+    )
+BOUNDED_PYTHON
+  then
+    fail "bounded storage worker runtime evidence failed"
+  fi
+}
+
 print_capacity_journal_diagnostics() {
   local diagnostics
 
@@ -1322,7 +1786,7 @@ print_capacity_journal_diagnostics() {
           allowed["recasaos-systemd-test-event=worker-post-start-rejected"] = 1
           allowed["recasaos-systemd-test-event=worker-process-registered"] = 1
           allowed["recasaos-systemd-test-event=coordinator-open-response"] = 1
-          allowed["recasaos-systemd-test-event=coordinator-read-response"] = 1
+          allowed["recasaos-systemd-test-event=coordinator-first-read-response"] = 1
           allowed["recasaos-systemd-test-event=child-first-read-sent"] = 1
         }
         {
@@ -1617,7 +2081,7 @@ print_storage_worker_diagnostics() {
 capture_capacity_journal_cursor() {
   local cursor
 
-  [[ "$capacity_events" =~ ^/run/recasaos-public-files-ci-[0-9]+-[0-9]+/capacity-events$ ]] ||
+  [[ "$capacity_events" == "$workspace/capacity-events" ]] ||
     fail "refusing unsafe capacity event path: $capacity_events"
   [[ ! -e "$capacity_events" && ! -L "$capacity_events" ]] ||
     fail "capacity event path already exists"
@@ -1666,7 +2130,11 @@ capacity_phase_events_are_complete() {
     ' >"$capacity_events" || return 1
   awk '
     BEGIN {
-      # Eight successful holders emit seven events each. The ninth request
+      # Eight successful holders emit seven events each. The coordinator
+      # records only the first successful read for each holder: under slow
+      # emulation the child can complete already queued reads before its
+      # process-wide SIGSTOP is observed, and those extra reads are not new
+      # worker admissions. The ninth request
       # enters the handler, acquires one of 64 download slots, then reaches the
       # independently bounded eight-worker coordinator and is rejected there.
       expected["recasaos-systemd-test-event=handler-entered"] = 9
@@ -1684,7 +2152,7 @@ capacity_phase_events_are_complete() {
       expected["recasaos-systemd-test-event=worker-post-start-rejected"] = 0
       expected["recasaos-systemd-test-event=worker-process-registered"] = 8
       expected["recasaos-systemd-test-event=coordinator-open-response"] = 8
-      expected["recasaos-systemd-test-event=coordinator-read-response"] = 8
+      expected["recasaos-systemd-test-event=coordinator-first-read-response"] = 8
       expected["recasaos-systemd-test-event=child-first-read-sent"] = 8
     }
     { observed[$0]++ }
@@ -1755,9 +2223,9 @@ start_slow_download() {
   ready_file="${workspace}/slow-download-${slow_download_sequence}.ready"
   ready_temp_file="${ready_file}.tmp"
   failure_file="${workspace}/slow-download-${slow_download_sequence}.failure"
-  [[ "$ready_file" =~ ^/run/recasaos-public-files-ci-[0-9]+-[0-9]+/slow-download-[0-9]+\.ready$ ]] ||
+  [[ "$ready_file" == "$workspace/slow-download-${slow_download_sequence}.ready" ]] ||
     fail "refusing unsafe slow download ready path: $ready_file"
-  [[ "$failure_file" =~ ^/run/recasaos-public-files-ci-[0-9]+-[0-9]+/slow-download-[0-9]+\.failure$ ]] ||
+  [[ "$failure_file" == "$workspace/slow-download-${slow_download_sequence}.failure" ]] ||
     fail "refusing unsafe slow download failure path: $failure_file"
   [[ ! -e "$ready_file" && ! -L "$ready_file" &&
     ! -e "$ready_temp_file" && ! -L "$ready_temp_file" &&
@@ -1960,7 +2428,9 @@ sudo install -d -o root -g root -m 0755 \
   "$rootfs/proc" "$rootfs/sys" "$rootfs/dev" "$rootfs/run" \
   "$rootfs/tmp" "$rootfs/var" "$rootfs/var/tmp"
 sudo install -d -o root -g root -m 0555 \
-  "$rootfs/run/recasaos-cgroup"
+  "$rootfs/run/recasaos-cgroup" "$rootfs/run/systemd"
+sudo install -o root -g root -m 0000 /dev/null \
+  "$rootfs/run/systemd/notify"
 for cgroup_limit_file in memory.max memory.swap.max pids.max; do
   sudo install -o root -g root -m 0000 /dev/null \
     "$rootfs/run/recasaos-cgroup/$cgroup_limit_file"
@@ -2102,6 +2572,8 @@ systemd_test_shared_build_inputs="$(
   "$production_shared_build_inputs" == "$systemd_test_shared_build_inputs" ]] ||
   fail "production and tagged binaries select different shared build inputs"
 for built_binary in "$production_binary" "$systemd_test_binary"; do
+  [[ -x "$built_binary" ]] ||
+    fail "public-files build filesystem does not permit execution: $built_binary"
   file "$built_binary" | grep -q 'statically linked' ||
     fail "public-files binary is not static: $built_binary"
 done
@@ -2143,6 +2615,7 @@ printf '%s\n' \
   "RootDirectory=$rootfs" \
   'BindReadOnlyPaths=' \
   "BindReadOnlyPaths=$share:/srv/public:rbind" \
+  'BindReadOnlyPaths=/run/systemd/notify:/run/systemd/notify:norbind' \
   'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.max:/run/recasaos-cgroup/memory.max:norbind' \
   'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.swap.max:/run/recasaos-cgroup/memory.swap.max:norbind' \
   'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/pids.max:/run/recasaos-cgroup/pids.max:norbind' \
@@ -2323,6 +2796,41 @@ do
     ' "/proc/$portal_pid/mountinfo" ||
     fail "jailed runtime has an unexpected cgroup mount: $cgroup_limit_name"
 done
+notify_socket_view="/proc/$portal_pid/root/run/systemd/notify"
+jailed_systemd_runtime_metadata="$(
+  sudo stat -Lc '%u:%g:%a' "/proc/$portal_pid/root/run/systemd"
+)"
+case "$jailed_systemd_runtime_metadata" in
+  0:0:555 | 0:0:755) ;;
+  *)
+    fail \
+      "jailed systemd runtime directory metadata is unsafe: $jailed_systemd_runtime_metadata"
+    ;;
+esac
+sudo test -S /run/systemd/notify ||
+  fail "host systemd notification socket is missing"
+sudo test -S "$notify_socket_view" ||
+  fail "systemd notification socket is unavailable inside the service root"
+host_notify_socket_identity="$(sudo stat -Lc '%d:%i' /run/systemd/notify)"
+jailed_notify_socket_identity="$(sudo stat -Lc '%d:%i' "$notify_socket_view")"
+[[ "$host_notify_socket_identity" == "$jailed_notify_socket_identity" ]] ||
+  fail "jailed systemd notification socket does not match the host socket"
+sudo awk '
+  function has_option(options, wanted, count, values, option_index) {
+    count = split(options, values, ",")
+    for (option_index = 1; option_index <= count; option_index++)
+      if (values[option_index] == wanted)
+        return 1
+    return 0
+  }
+  $5 == "/run/systemd/notify" {
+    matches++
+    if (!has_option($6, "ro") || has_option($6, "rw"))
+      invalid = 1
+  }
+  END { exit !(matches == 1 && !invalid) }
+' "/proc/$portal_pid/mountinfo" ||
+  fail "jailed systemd notification socket is not one exact read-only mount"
 sudo awk -v uid="$service_uid" -v gid="$service_gid" '
   BEGIN {
     uid_ok = gid_ok = groups_ok = umask_ok = caps_ok = nnp_ok = seccomp_ok = 0
@@ -2396,7 +2904,7 @@ if sudo find "/proc/$portal_pid/root/dev" -xdev -type b -print -quit |
 fi
 sudo test ! -e "/proc/$portal_pid/root/var/lib/casaos" ||
   fail "CasaOS state is visible in the service root"
-sudo test ! -e "/proc/$portal_pid/root/run/recasaos-public-files-ci-$run_key" ||
+sudo test ! -e "/proc/$portal_pid/root$workspace" ||
   fail "host CI management workspace is visible in the service root"
 sudo test -d "/proc/$portal_pid/root/proc/self/fd" ||
   fail "procfd is unavailable in the service root"
@@ -2489,23 +2997,20 @@ sudo cmp -s -- "/proc/$portal_pid/exe" "$systemd_test_binary" ||
   fail "running systemd-test portal bytes differ from the reviewed binary"
 wait_until "storage workers before bounded load" storage_worker_count_is 0
 capture_capacity_journal_cursor
-worker_capacity_deadline=$((SECONDS + 15))
-for expected_worker_count in {1..8}; do
+start_cgroup_memory_sampler
+worker_capacity_deadline=$((SECONDS + worker_capacity_window_seconds))
+for _ in {1..8}; do
   start_slow_download
-  wait_until_before "slow download $expected_worker_count response" \
-    "$worker_capacity_deadline" \
-    slow_download_is_ready \
-    "$latest_slow_download_pid" \
-    "$latest_slow_download_ready_file" \
-    "$latest_slow_download_failure_file" \
-    "$latest_slow_download_start_time"
-  wait_until_before "$expected_worker_count bounded storage workers" \
-    "$worker_capacity_deadline" \
-    storage_worker_count_is "$expected_worker_count"
-  wait_until_before "$expected_worker_count stopped storage workers" \
-    "$worker_capacity_deadline" \
-    storage_workers_are_stopped "$expected_worker_count"
 done
+wait_until_before "eight slow download responses" \
+  "$worker_capacity_deadline" \
+  slow_downloads_are_healthy
+wait_until_before "eight bounded storage workers" \
+  "$worker_capacity_deadline" \
+  storage_worker_count_is 8
+wait_until_before "eight stopped storage workers" \
+  "$worker_capacity_deadline" \
+  storage_workers_are_stopped 8
 mapfile -t bounded_worker_pids < <(storage_worker_pids)
 [[ "${#bounded_worker_pids[@]}" == 8 ]] ||
   fail "bounded load did not retain exactly eight worker identities"
@@ -2552,32 +3057,12 @@ ninth_status="$(
   ' "$ninth_response_headers"
 )" == 1:0 ]] ||
   fail "ninth concurrent storage request lacked one exact Retry-After value 5"
+worker_capacity_evidence_deadline=$((
+  SECONDS + worker_capacity_evidence_window_seconds
+))
 wait_until_before "storage worker capacity event chain" \
-  "$worker_capacity_deadline" \
+  "$worker_capacity_evidence_deadline" \
   capacity_phase_events_are_complete
-for bounded_worker_index in "${!bounded_worker_pids[@]}"; do
-  assert_storage_worker_address_space_limit \
-    "${bounded_worker_pids[$bounded_worker_index]}" \
-    "${bounded_worker_start_times[$bounded_worker_index]}" \
-    systemd-test
-done
-
-tasks_current="$(
-  sudo systemctl show --property=TasksCurrent --value "$service_unit"
-)"
-memory_current="$(
-  sudo systemctl show --property=MemoryCurrent --value "$service_unit"
-)"
-memory_peak="$(
-  sudo systemctl show --property=MemoryPeak --value "$service_unit"
-)"
-[[ "$tasks_current" =~ ^[0-9]+$ && "$tasks_current" -le 224 ]] ||
-  fail "eight-worker TasksCurrent=$tasks_current leaves insufficient headroom"
-[[ "$memory_current" =~ ^[0-9]+$ && "$memory_current" -le 469762048 ]] ||
-  fail "eight-worker MemoryCurrent=$memory_current leaves insufficient headroom"
-[[ "$memory_peak" =~ ^[0-9]+$ && "$memory_peak" -le 469762048 ]] ||
-  fail "eight-worker MemoryPeak=$memory_peak leaves insufficient headroom"
-
 listener_inode="$(
   sudo awk \
     '$2 == "0100007F:9B61" && $4 == "0A" { print $10; exit }' \
@@ -2585,48 +3070,45 @@ listener_inode="$(
 )"
 [[ "$listener_inode" =~ ^[0-9]+$ ]] ||
   fail "could not resolve the public listener inode"
-while IFS= read -r worker_pid; do
-  [[ "$worker_pid" =~ ^[0-9]+$ && "$worker_pid" -gt 1 ]] ||
-    fail "invalid storage worker PID: $worker_pid"
-  worker_command="$(
-    sudo cat "/proc/$worker_pid/cmdline" | tr '\0' ' '
-  )"
-  [[ "$worker_command" == *"--internal-public-files-storage-worker file"* ]] ||
-    fail "unexpected storage worker command line"
-  if printf '%s' "$worker_command" | grep -Fq "$test_bearer"; then
-    fail "raw bearer is present in a storage worker command line"
-  fi
-  if sudo cat "/proc/$worker_pid/environ" |
-    tr '\0' '\n' |
-    grep -F -- "$test_bearer" >/dev/null; then
-    fail "raw bearer is present in a storage worker environment"
-  fi
-  [[ "$(sudo stat -Lc %u "/proc/$worker_pid/mem")" == 0 ]] ||
-    fail "storage worker process memory remains dumpable"
-  while IFS= read -r descriptor_path; do
-    descriptor="${descriptor_path##*/}"
-    [[ "$descriptor" =~ ^[0-9]+$ ]] ||
-      fail "storage worker exposed a nonnumeric descriptor"
-    descriptor_target="$(sudo readlink "$descriptor_path")"
-    [[ "$descriptor_target" != "socket:[$listener_inode]" ]] ||
-      fail "storage worker inherited the AF_INET listener"
-    if [[ "$descriptor" -gt 2 ]]; then
-      descriptor_flags="$(
-        sudo awk '$1 == "flags:" { print $2; exit }' \
-          "/proc/$worker_pid/fdinfo/$descriptor"
-      )"
-      [[ "$descriptor_flags" =~ ^[0-7]+$ ]] ||
-        fail "storage worker descriptor $descriptor has invalid flags"
-      descriptor_flags_value=$((8#$descriptor_flags))
-      (( (descriptor_flags_value & 02000000) != 0 )) ||
-        fail "storage worker descriptor $descriptor is not close-on-exec"
-    fi
-  done < <(
-    sudo find "/proc/$worker_pid/fd" -mindepth 1 -maxdepth 1 -print
-  )
-done < <(storage_worker_pids)
+assert_bounded_storage_worker_runtime_boundaries
+stop_cgroup_memory_sampler
+
+tasks_current="$(
+  sudo systemctl show --property=TasksCurrent --value "$service_unit"
+)"
+memory_current="$(
+  sudo systemctl show --property=MemoryCurrent --value "$service_unit"
+)"
+if ! memory_peak="$(
+  sudo systemctl show --property=MemoryPeak --value "$service_unit" \
+    2>/dev/null
+)"; then
+  memory_peak=
+fi
+[[ "$tasks_current" =~ ^[0-9]+$ && "$tasks_current" -le 224 ]] ||
+  fail "eight-worker TasksCurrent=$tasks_current leaves insufficient headroom"
+[[ "$memory_current" =~ ^[0-9]+$ && "$memory_current" -le 469762048 ]] ||
+  fail "eight-worker MemoryCurrent=$memory_current leaves insufficient headroom"
+[[ "$sampled_memory_peak" =~ ^[0-9]+$ &&
+  "$sampled_memory_peak" -le 469762048 ]] ||
+  fail "sampled eight-worker memory peak=$sampled_memory_peak leaves insufficient headroom"
+if [[ "$memory_peak" =~ ^[0-9]+$ ]]; then
+  [[ "$memory_peak" -le 469762048 ]] ||
+    fail "eight-worker MemoryPeak=$memory_peak leaves insufficient headroom"
+  [[ "$memory_peak" -ge "$sampled_memory_peak" ]] ||
+    fail "systemd MemoryPeak=$memory_peak is below sampled peak=$sampled_memory_peak"
+elif [[ "${RECASAOS_SYSTEMD_TEST_TARGET:-}" != \
+  debian-11-systemd-247-qemu ]]; then
+  fail "systemd MemoryPeak is unavailable on a target that requires it"
+else
+  printf 'systemd 247 MemoryPeak unavailable; reviewed memory.current sampler peak=%s\n' \
+    "$sampled_memory_peak"
+fi
+
+worker_pre_cancellation_budget=$((worker_capacity_window_seconds + 10))
 ((SECONDS < worker_capacity_deadline + 10)) ||
-  fail "bounded worker phase exceeded its 25-second cancellation budget"
+  fail \
+    "bounded worker phase exceeded its ${worker_pre_cancellation_budget}-second pre-cancellation budget"
 worker_cancellation_deadline=$((worker_capacity_deadline + 13))
 ((SECONDS < worker_cancellation_deadline)) ||
   fail "bounded worker phase left no pre-timeout cancellation window"

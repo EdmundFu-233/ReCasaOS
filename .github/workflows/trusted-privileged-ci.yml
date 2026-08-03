@@ -127,7 +127,13 @@ jobs:
           for trusted_path in \
             .github/workflows/recasaos-ci-security.yml \
             .github/workflows/trusted-privileged-ci.yml \
+            .github/scripts/check-debian11-systemd-vm-policy.sh \
             .github/scripts/check-trusted-privileged-workflow.sh \
+            .github/scripts/sample-cgroup-memory.py \
+            .github/scripts/test-cgroup-memory-sampler.sh \
+            .github/scripts/test-debian11-systemd-vm-policy.sh \
+            .github/scripts/test-public-files-debian11-vm.sh \
+            .github/scripts/test-public-files-systemd.sh \
             .github/scripts/test-trusted-privileged-workflow.sh
           do
             head_policy_blob="$(
@@ -156,6 +162,7 @@ jobs:
 
           privileged_job='Privileged mount regressions (isolated namespace)'
           ordinary_job='Generate, test, and vet'
+          compatibility_job='Debian 11 systemd 247 PID1 VM'
           [[ "$(
             jq --arg name "$privileged_job" \
               '[.jobs[] | select(.name == $name and .conclusion == "success")] | length' \
@@ -166,6 +173,11 @@ jobs:
               '[.jobs[] | select(.name == $name and .conclusion == "success")] | length' \
               <<<"$jobs_json"
           )" == 1 ]] || skip "ordinary test job did not pass exactly once"
+          [[ "$(
+            jq --arg name "$compatibility_job" \
+              '[.jobs[] | select(.name == $name and .conclusion == "success")] | length' \
+              <<<"$jobs_json"
+          )" == 1 ]] || skip "Debian 11 PID1 VM job did not pass exactly once"
 
           for step_name in \
             'Verify isolated Samba probe privilege boundary' \

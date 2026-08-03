@@ -195,6 +195,7 @@ require_exact_sectioned_active_lines "$service" \
   'WorkingDirectory=/' \
   'MountAPIVFS=yes' \
   'BindReadOnlyPaths=/srv/recasaos-public:/srv/public:rbind' \
+  'BindReadOnlyPaths=/run/systemd/notify:/run/systemd/notify:norbind' \
   'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.max:/run/recasaos-cgroup/memory.max:norbind' \
   'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.swap.max:/run/recasaos-cgroup/memory.swap.max:norbind' \
   'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/pids.max:/run/recasaos-cgroup/pids.max:norbind' \
@@ -280,6 +281,7 @@ require_exact_key_assignments Service RootDirectory "$service" \
   'RootDirectory=/usr/lib/recasaos-public-files/rootfs'
 require_exact_key_assignments Service BindReadOnlyPaths "$service" \
   'BindReadOnlyPaths=/srv/recasaos-public:/srv/public:rbind' \
+  'BindReadOnlyPaths=/run/systemd/notify:/run/systemd/notify:norbind' \
   'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.max:/run/recasaos-cgroup/memory.max:norbind' \
   'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.swap.max:/run/recasaos-cgroup/memory.swap.max:norbind' \
   'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/pids.max:/run/recasaos-cgroup/pids.max:norbind'
@@ -366,6 +368,8 @@ require_exact_active_lines "$tmpfiles" \
   'd /usr/lib/recasaos-public-files/rootfs/sys 0555 root root -' \
   'd /usr/lib/recasaos-public-files/rootfs/dev 0755 root root -' \
   'd /usr/lib/recasaos-public-files/rootfs/run 0755 root root -' \
+  'd /usr/lib/recasaos-public-files/rootfs/run/systemd 0555 root root -' \
+  'f /usr/lib/recasaos-public-files/rootfs/run/systemd/notify 0000 root root -' \
   'd /usr/lib/recasaos-public-files/rootfs/run/recasaos-cgroup 0555 root root -' \
   'f /usr/lib/recasaos-public-files/rootfs/run/recasaos-cgroup/memory.max 0000 root root -' \
   'f /usr/lib/recasaos-public-files/rootfs/run/recasaos-cgroup/memory.swap.max 0000 root root -' \
@@ -507,6 +511,10 @@ if test "${RECASAOS_SYSTEMD_LIVE_VERIFY:-0}" = 1; then
     /usr/lib/recasaos-public-files/rootfs/dev root:root:755
   require_live_directory_metadata \
     /usr/lib/recasaos-public-files/rootfs/run root:root:755
+  require_live_directory_metadata \
+    /usr/lib/recasaos-public-files/rootfs/run/systemd root:root:555
+  require_live_file_metadata \
+    /usr/lib/recasaos-public-files/rootfs/run/systemd/notify
   require_live_directory_metadata \
     /usr/lib/recasaos-public-files/rootfs/run/recasaos-cgroup root:root:555
   require_live_file_metadata \

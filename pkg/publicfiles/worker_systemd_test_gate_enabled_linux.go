@@ -66,8 +66,8 @@ func reportStorageWorkerSystemdTestEvent(
 		name = "worker-process-registered"
 	case systemdStorageWorkerTestOpenResponse:
 		name = "coordinator-open-response"
-	case systemdStorageWorkerTestReadResponse:
-		name = "coordinator-read-response"
+	case systemdStorageWorkerTestFirstReadResponse:
+		name = "coordinator-first-read-response"
 	case systemdStorageWorkerTestChildFirstReadSent:
 		name = "child-first-read-sent"
 	default:

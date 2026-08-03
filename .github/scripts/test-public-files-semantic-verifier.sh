@@ -79,6 +79,7 @@ printf '%s\n' \
   '[[ "$(grep -Fxc "ConditionPathExists=/sys/fs/cgroup/system.slice/memory.swap.max" "$socket")" == 1 ]]' \
   '[[ "$(grep -Fxc "ConditionPathExists=/sys/fs/cgroup/system.slice/pids.max" "$socket")" == 1 ]]' \
   '[[ "$(grep -Fxc "BindReadOnlyPaths=/srv/recasaos-public:/srv/public:rbind" "$service")" == 1 ]]' \
+  '[[ "$(grep -Fxc "BindReadOnlyPaths=/run/systemd/notify:/run/systemd/notify:norbind" "$service")" == 1 ]]' \
   '[[ "$(grep -Fxc "BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.max:/run/recasaos-cgroup/memory.max:norbind" "$service")" == 1 ]]' \
   '[[ "$(grep -Fxc "BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.swap.max:/run/recasaos-cgroup/memory.swap.max:norbind" "$service")" == 1 ]]' \
   '[[ "$(grep -Fxc "BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/pids.max:/run/recasaos-cgroup/pids.max:norbind" "$service")" == 1 ]]' \

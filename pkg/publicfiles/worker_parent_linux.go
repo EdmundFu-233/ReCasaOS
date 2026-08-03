@@ -82,6 +82,9 @@ type isolatedStorageFile struct {
 	info        isolatedFileInfo
 	nextID      uint64
 	offset      int64
+	// systemdTestFirstReadReported is consulted only by the CI-tagged build.
+	// The production build compiles the guarded branch away.
+	systemdTestFirstReadReported bool
 
 	mu        sync.Mutex
 	closed    bool
@@ -822,10 +825,11 @@ func (f *isolatedStorageFile) Read(buffer []byte) (int, error) {
 		}
 		return 0, f.sourceErr
 	}
-	if storageWorkerSystemdTestEnabled {
+	if storageWorkerSystemdTestEnabled && !f.systemdTestFirstReadReported {
 		reportStorageWorkerSystemdTestEvent(
-			systemdStorageWorkerTestReadResponse,
+			systemdStorageWorkerTestFirstReadResponse,
 		)
+		f.systemdTestFirstReadReported = true
 	}
 	count := copy(buffer, frame.payload)
 	f.offset += int64(count)

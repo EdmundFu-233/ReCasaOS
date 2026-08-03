@@ -164,11 +164,31 @@ basic public route-separation requirement, but these release gates remain:
 - Issue #25's bounded worker protocol is implemented as a release candidate,
   but the issue remains open until exact-head Linux and real
   FUSE/device-mapper/D-state tests prove timeout, quarantine, cgroup cleanup,
-  restart, cancellation, and resource-headroom behavior. The declared systemd
-  247 floor is source-reviewed but not execution-qualified; closing Issue #25
-  additionally requires the exact release candidate to pass under PID 1 on a
-  pristine, ephemeral Debian 11/systemd 247 unified-cgroup-v2 VM. Ubuntu
-  24.04/systemd 255 evidence does not satisfy that compatibility-floor gate.
+  restart, cancellation, and resource-headroom behavior. A dedicated CI job
+  boots the clean exact commit under PID 1 in a checksum-pinned, pristine
+  Debian 11/systemd 247 unified-cgroup-v2 QEMU TCG VM and runs the live
+  isolation suite; a skipped or failed job is not compatibility evidence.
+  Because systemd 247 does not yet auto-bind its notification socket into
+  `RootDirectory=`, the service carries the equivalent non-recursive read-only
+  bind explicitly. Its minimal root pre-creates a root-owned target directory
+  that is not writable by the service identity, plus a placeholder, so
+  `UMask=0077` cannot produce a root-only traversal path on that manager. The
+  live suite verifies that the jailed
+  socket is the host manager socket and is mounted read-only;
+  `NotifyAccess=main` limits accepted readiness messages to the service's main
+  process. The software-emulated guest receives a policy-locked 30-second
+  aggregate window to admit eight concurrently launched holders, while the
+  native hosted test retains 15 seconds. All clients, stopped workers, and the
+  exact first-read/capacity event chain remain mandatory; journal propagation
+  has a separate 10-second evidence-only bound. A single root-only `/proc`
+  snapshot checks all eight stopped identities, limits, bearer absence, memory
+  ownership, descriptor flags, and listener non-inheritance so observer
+  process startup cannot consume the service deadline under TCG. Per-worker
+  IPC, service, resource, and cleanup bounds are unchanged.
+  This closes the earlier parser-only evidence gap for heads on which the job
+  succeeds, but does not close Issue #25 or substitute for real hostile-storage
+  and exact target-host recovery evidence. Ubuntu 24.04/systemd 255 evidence
+  alone does not satisfy the compatibility-floor gate.
   Its normal activation, sandbox and API smoke checks use the production build,
   while the deterministic worker-capacity and coordinator-cleanup sections
   temporarily use a non-release CI build tag that stops only the exact
