@@ -2189,7 +2189,9 @@ sudo install -d -o root -g root -m 0755 \
   "$rootfs/proc" "$rootfs/sys" "$rootfs/dev" "$rootfs/run" \
   "$rootfs/tmp" "$rootfs/var" "$rootfs/var/tmp"
 sudo install -d -o root -g root -m 0555 \
-  "$rootfs/run/recasaos-cgroup"
+  "$rootfs/run/recasaos-cgroup" "$rootfs/run/systemd"
+sudo install -o root -g root -m 0000 /dev/null \
+  "$rootfs/run/systemd/notify"
 for cgroup_limit_file in memory.max memory.swap.max pids.max; do
   sudo install -o root -g root -m 0000 /dev/null \
     "$rootfs/run/recasaos-cgroup/$cgroup_limit_file"
@@ -2556,6 +2558,11 @@ do
     fail "jailed runtime has an unexpected cgroup mount: $cgroup_limit_name"
 done
 notify_socket_view="/proc/$portal_pid/root/run/systemd/notify"
+jailed_systemd_runtime_metadata="$(
+  sudo stat -Lc '%u:%g:%a' "/proc/$portal_pid/root/run/systemd"
+)"
+[[ "$jailed_systemd_runtime_metadata" == 0:0:555 ]] ||
+  fail "jailed systemd runtime directory metadata is unsafe"
 sudo test -S /run/systemd/notify ||
   fail "host systemd notification socket is missing"
 sudo test -S "$notify_socket_view" ||

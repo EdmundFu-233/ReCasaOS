@@ -75,6 +75,18 @@ expect_rejected() {
         "$service" >"$service.next"
       mv -f -- "$service.next" "$service"
       ;;
+    missing-notify-socket-target-directory)
+      sed \
+        '\|^d /usr/lib/recasaos-public-files/rootfs/run/systemd 0555 root root -$|d' \
+        "$tmpfiles" >"$tmpfiles.next"
+      mv -f -- "$tmpfiles.next" "$tmpfiles"
+      ;;
+    missing-notify-socket-target)
+      sed \
+        '\|^f /usr/lib/recasaos-public-files/rootfs/run/systemd/notify 0000 root root -$|d' \
+        "$tmpfiles" >"$tmpfiles.next"
+      mv -f -- "$tmpfiles.next" "$tmpfiles"
+      ;;
     recursive-cgroup-limit-bind)
       sed \
         's|:/run/recasaos-cgroup/pids.max:norbind$|:/run/recasaos-cgroup/pids.max:rbind|' \
@@ -243,6 +255,8 @@ expect_rejected duplicate-root
 expect_rejected writable-bind
 expect_rejected missing-cgroup-limit-bind
 expect_rejected missing-notify-socket-bind
+expect_rejected missing-notify-socket-target-directory
+expect_rejected missing-notify-socket-target
 expect_rejected recursive-cgroup-limit-bind
 expect_rejected missing-cgroup-limit-target
 expect_rejected host-relative-isolation

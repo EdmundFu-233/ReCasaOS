@@ -368,6 +368,8 @@ require_exact_active_lines "$tmpfiles" \
   'd /usr/lib/recasaos-public-files/rootfs/sys 0555 root root -' \
   'd /usr/lib/recasaos-public-files/rootfs/dev 0755 root root -' \
   'd /usr/lib/recasaos-public-files/rootfs/run 0755 root root -' \
+  'd /usr/lib/recasaos-public-files/rootfs/run/systemd 0555 root root -' \
+  'f /usr/lib/recasaos-public-files/rootfs/run/systemd/notify 0000 root root -' \
   'd /usr/lib/recasaos-public-files/rootfs/run/recasaos-cgroup 0555 root root -' \
   'f /usr/lib/recasaos-public-files/rootfs/run/recasaos-cgroup/memory.max 0000 root root -' \
   'f /usr/lib/recasaos-public-files/rootfs/run/recasaos-cgroup/memory.swap.max 0000 root root -' \
@@ -509,6 +511,10 @@ if test "${RECASAOS_SYSTEMD_LIVE_VERIFY:-0}" = 1; then
     /usr/lib/recasaos-public-files/rootfs/dev root:root:755
   require_live_directory_metadata \
     /usr/lib/recasaos-public-files/rootfs/run root:root:755
+  require_live_directory_metadata \
+    /usr/lib/recasaos-public-files/rootfs/run/systemd root:root:555
+  require_live_file_metadata \
+    /usr/lib/recasaos-public-files/rootfs/run/systemd/notify
   require_live_directory_metadata \
     /usr/lib/recasaos-public-files/rootfs/run/recasaos-cgroup root:root:555
   require_live_file_metadata \

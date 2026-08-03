@@ -379,8 +379,11 @@ the executable inside `RootDirectory=`. systemd 247 sets `NOTIFY_SOCKET` but,
 unlike systemd 248 and newer, does not automatically bind that socket into a
 service root. The packaged unit therefore declares the same non-recursive,
 read-only notification-socket bind explicitly, and the live test verifies its
-socket identity and mount flags before accepting the isolation result. Both
-the service and socket require a non-empty verifier and independently reject a
+socket identity and mount flags before accepting the isolation result. The
+minimal root also pre-creates a root-owned, non-writable `/run/systemd`
+directory and empty bind target so the service's restrictive `UMask=0077`
+cannot make a dynamically created parent untraversable on systemd 247. Both the
+service and socket require a non-empty verifier and independently reject a
 verifier-path symlink before
 their initial activation, so either condition prevents the socket from binding
 when it is already unsafe at that point. A non-empty malformed verifier, or a
