@@ -7,11 +7,17 @@ import {
   test,
   waitForSnapshot,
 } from './harness.js';
+import { navigatePortalWithDiagnostics } from './navigation-diagnostics.js';
 
-async function openPortal(page, portal) {
-  const response = await page.goto(portal.origin, {
-    waitUntil: 'domcontentloaded',
-  });
+async function openPortal(page, portal, diagnostics = null) {
+  const response =
+    diagnostics === null
+      ? await page.goto(portal.origin, { waitUntil: 'domcontentloaded' })
+      : await navigatePortalWithDiagnostics({
+          ...diagnostics,
+          page,
+          portal,
+        });
   expect(response !== null && response.ok(), 'portal document must load').toBe(
     true,
   );
@@ -383,15 +389,19 @@ test('an incorrect bearer fails closed', async ({ page, portal }) => {
   ).toBe(true);
 });
 
-test('a different tab cannot consume another tab download reservation', async ({
-  context,
-  page,
-  portal,
-}) => {
+test('a different tab cannot consume another tab download reservation', async (
+  { browserName, context, page, portal },
+  testInfo,
+) => {
   const attacker = await context.newPage();
   try {
     await openPortal(page, portal);
-    await openPortal(attacker, portal);
+    await openPortal(attacker, portal, {
+      browserName,
+      context,
+      firstPage: page,
+      testInfo,
+    });
     await loginLoadedPortalAndWaitForNativeStreaming(page, portal);
     await expect
       .poll(() =>

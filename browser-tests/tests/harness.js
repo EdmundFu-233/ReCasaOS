@@ -21,6 +21,27 @@ const snapshotKeys = [
   'credential_query_requests',
   'partial_file_responses',
 ];
+const serverDiagnosticKeys = [
+  'accepted_connections',
+  'active_connection_changes',
+  'idle_connection_changes',
+  'closed_connections',
+  'hijacked_connections',
+  'open_connections',
+  'server_errors',
+  'tls_handshake_errors',
+  'active_requests',
+  'started_requests',
+  'completed_requests',
+  'portal_documents_started',
+  'portal_documents_completed',
+  'static_assets_started',
+  'static_assets_completed',
+  'api_requests_started',
+  'api_requests_completed',
+  'other_requests_started',
+  'other_requests_completed',
+];
 
 function exactKeys(value, expected) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -390,30 +411,53 @@ function validateSnapshot(value) {
 }
 
 export async function readSnapshot(portal) {
+  return validateSnapshot(
+    await readControlObject(portal, '/snapshot', 'snapshot'),
+  );
+}
+
+async function readControlObject(portal, pathName, label) {
   let response;
   try {
-    response = await fetch(`${portal.controlOrigin}/snapshot`, {
+    response = await fetch(`${portal.controlOrigin}${pathName}`, {
       method: 'GET',
       redirect: 'error',
       signal: AbortSignal.timeout(3_000),
     });
   } catch {
-    throw new Error('browser harness snapshot request failed');
+    throw new Error(`browser harness ${label} request failed`);
   }
   if (
     response.status !== 200 ||
     response.redirected ||
-    response.url !== `${portal.controlOrigin}/snapshot`
+    response.url !== `${portal.controlOrigin}${pathName}`
   ) {
-    throw new Error('browser harness snapshot response was rejected');
+    throw new Error(`browser harness ${label} response was rejected`);
   }
   let value;
   try {
     value = await response.json();
   } catch {
-    throw new Error('browser harness snapshot response is not JSON');
+    throw new Error(`browser harness ${label} response is not JSON`);
   }
-  return validateSnapshot(value);
+  return value;
+}
+
+export async function readServerDiagnostics(portal) {
+  const value = await readControlObject(
+    portal,
+    '/diagnostics',
+    'diagnostics',
+  );
+  if (!exactKeys(value, serverDiagnosticKeys)) {
+    throw new Error('browser harness diagnostics schema is invalid');
+  }
+  for (const key of serverDiagnosticKeys) {
+    if (!Number.isSafeInteger(value[key]) || value[key] < 0) {
+      throw new Error('browser harness diagnostics value is invalid');
+    }
+  }
+  return value;
 }
 
 export async function waitForSnapshot(portal, predicate, label, timeout = 10_000) {

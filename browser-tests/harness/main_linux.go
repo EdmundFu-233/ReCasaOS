@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -90,6 +91,59 @@ type requestCounters struct {
 	credentialQueryRequests  atomic.Int64
 }
 
+type serverDiagnosticsSnapshot struct {
+	AcceptedConnections      int64 `json:"accepted_connections"`
+	ActiveConnectionChanges  int64 `json:"active_connection_changes"`
+	IdleConnectionChanges    int64 `json:"idle_connection_changes"`
+	ClosedConnections        int64 `json:"closed_connections"`
+	HijackedConnections      int64 `json:"hijacked_connections"`
+	OpenConnections          int64 `json:"open_connections"`
+	ServerErrors             int64 `json:"server_errors"`
+	TLSHandshakeErrors       int64 `json:"tls_handshake_errors"`
+	ActiveRequests           int64 `json:"active_requests"`
+	StartedRequests          int64 `json:"started_requests"`
+	CompletedRequests        int64 `json:"completed_requests"`
+	PortalDocumentsStarted   int64 `json:"portal_documents_started"`
+	PortalDocumentsCompleted int64 `json:"portal_documents_completed"`
+	StaticAssetsStarted      int64 `json:"static_assets_started"`
+	StaticAssetsCompleted    int64 `json:"static_assets_completed"`
+	APIRequestsStarted       int64 `json:"api_requests_started"`
+	APIRequestsCompleted     int64 `json:"api_requests_completed"`
+	OtherRequestsStarted     int64 `json:"other_requests_started"`
+	OtherRequestsCompleted   int64 `json:"other_requests_completed"`
+}
+
+type serverDiagnostics struct {
+	acceptedConnections      atomic.Int64
+	activeConnectionChanges  atomic.Int64
+	idleConnectionChanges    atomic.Int64
+	closedConnections        atomic.Int64
+	hijackedConnections      atomic.Int64
+	openConnections          atomic.Int64
+	serverErrors             atomic.Int64
+	tlsHandshakeErrors       atomic.Int64
+	activeRequests           atomic.Int64
+	startedRequests          atomic.Int64
+	completedRequests        atomic.Int64
+	portalDocumentsStarted   atomic.Int64
+	portalDocumentsCompleted atomic.Int64
+	staticAssetsStarted      atomic.Int64
+	staticAssetsCompleted    atomic.Int64
+	apiRequestsStarted       atomic.Int64
+	apiRequestsCompleted     atomic.Int64
+	otherRequestsStarted     atomic.Int64
+	otherRequestsCompleted   atomic.Int64
+}
+
+type diagnosticPortal struct {
+	next        http.Handler
+	diagnostics *serverDiagnostics
+}
+
+type diagnosticServerLog struct {
+	diagnostics *serverDiagnostics
+}
+
 type acceptReadyListener struct {
 	net.Listener
 	accepting chan struct{}
@@ -122,6 +176,90 @@ func (c *requestCounters) snapshot() requestSnapshot {
 		AuthorizationOnOtherPath: c.authorizationOnOtherPath.Load(),
 		CredentialQueryRequests:  c.credentialQueryRequests.Load(),
 	}
+}
+
+func (d *serverDiagnostics) snapshot() serverDiagnosticsSnapshot {
+	return serverDiagnosticsSnapshot{
+		AcceptedConnections:      d.acceptedConnections.Load(),
+		ActiveConnectionChanges:  d.activeConnectionChanges.Load(),
+		IdleConnectionChanges:    d.idleConnectionChanges.Load(),
+		ClosedConnections:        d.closedConnections.Load(),
+		HijackedConnections:      d.hijackedConnections.Load(),
+		OpenConnections:          d.openConnections.Load(),
+		ServerErrors:             d.serverErrors.Load(),
+		TLSHandshakeErrors:       d.tlsHandshakeErrors.Load(),
+		ActiveRequests:           d.activeRequests.Load(),
+		StartedRequests:          d.startedRequests.Load(),
+		CompletedRequests:        d.completedRequests.Load(),
+		PortalDocumentsStarted:   d.portalDocumentsStarted.Load(),
+		PortalDocumentsCompleted: d.portalDocumentsCompleted.Load(),
+		StaticAssetsStarted:      d.staticAssetsStarted.Load(),
+		StaticAssetsCompleted:    d.staticAssetsCompleted.Load(),
+		APIRequestsStarted:       d.apiRequestsStarted.Load(),
+		APIRequestsCompleted:     d.apiRequestsCompleted.Load(),
+		OtherRequestsStarted:     d.otherRequestsStarted.Load(),
+		OtherRequestsCompleted:   d.otherRequestsCompleted.Load(),
+	}
+}
+
+func (d *serverDiagnostics) connectionState(_ net.Conn, state http.ConnState) {
+	switch state {
+	case http.StateNew:
+		d.acceptedConnections.Add(1)
+		d.openConnections.Add(1)
+	case http.StateActive:
+		d.activeConnectionChanges.Add(1)
+	case http.StateIdle:
+		d.idleConnectionChanges.Add(1)
+	case http.StateHijacked:
+		d.hijackedConnections.Add(1)
+		d.openConnections.Add(-1)
+	case http.StateClosed:
+		d.closedConnections.Add(1)
+		d.openConnections.Add(-1)
+	}
+}
+
+func (d *serverDiagnostics) requestStarted(path string) func() {
+	d.activeRequests.Add(1)
+	d.startedRequests.Add(1)
+	var completed *atomic.Int64
+	switch path {
+	case publicfiles.BasePath + "/":
+		d.portalDocumentsStarted.Add(1)
+		completed = &d.portalDocumentsCompleted
+	case publicfiles.BasePath + "/style.css",
+		publicfiles.BasePath + "/app.js",
+		publicfiles.BasePath + "/download-worker.js":
+		d.staticAssetsStarted.Add(1)
+		completed = &d.staticAssetsCompleted
+	case publicfiles.BasePath + "/api/list",
+		publicfiles.BasePath + "/api/file":
+		d.apiRequestsStarted.Add(1)
+		completed = &d.apiRequestsCompleted
+	default:
+		d.otherRequestsStarted.Add(1)
+		completed = &d.otherRequestsCompleted
+	}
+	return func() {
+		d.activeRequests.Add(-1)
+		d.completedRequests.Add(1)
+		completed.Add(1)
+	}
+}
+
+func (h *diagnosticPortal) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	completed := h.diagnostics.requestStarted(r.URL.Path)
+	defer completed()
+	h.next.ServeHTTP(w, r)
+}
+
+func (w *diagnosticServerLog) Write(payload []byte) (int, error) {
+	w.diagnostics.serverErrors.Add(1)
+	if bytes.Contains(payload, []byte("TLS handshake error")) {
+		w.diagnostics.tlsHandshakeErrors.Add(1)
+	}
+	return len(payload), nil
 }
 
 type instrumentedPortal struct {
@@ -327,17 +465,28 @@ func run() (returnErr error) {
 	}()
 
 	counters := &requestCounters{}
-	handler := &instrumentedPortal{
+	diagnostics := &serverDiagnostics{}
+	instrumented := &instrumentedPortal{
 		next:           portal,
 		verifierDigest: verifierDigest,
 		counters:       counters,
+	}
+	handler := &diagnosticPortal{
+		next:        instrumented,
+		diagnostics: diagnostics,
 	}
 	publicServer := publicfiles.NewHTTPServer(handler)
 	publicServer.TLSConfig = &tls.Config{
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{certificate},
 	}
-	controlServer := newControlServer(counters)
+	publicServer.ConnState = diagnostics.connectionState
+	publicServer.ErrorLog = log.New(
+		&diagnosticServerLog{diagnostics: diagnostics},
+		"",
+		0,
+	)
+	controlServer := newControlServer(counters, diagnostics)
 
 	publicListener, err := listenLoopback()
 	if err != nil {
@@ -755,27 +904,16 @@ func listenLoopback() (net.Listener, error) {
 	return listener, nil
 }
 
-func newControlServer(counters *requestCounters) *http.Server {
+func newControlServer(
+	counters *requestCounters,
+	diagnostics *serverDiagnostics,
+) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/snapshot", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			w.Header().Set("Allow", "GET, HEAD")
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		payload, err := json.Marshal(counters.snapshot())
-		if err != nil {
-			http.Error(w, "snapshot unavailable", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Length", fmt.Sprint(len(payload)))
-		w.WriteHeader(http.StatusOK)
-		if r.Method == http.MethodGet {
-			_, _ = w.Write(payload)
-		}
+		writeControlJSON(w, r, counters.snapshot())
+	})
+	mux.HandleFunc("/diagnostics", func(w http.ResponseWriter, r *http.Request) {
+		writeControlJSON(w, r, diagnostics.snapshot())
 	})
 	return &http.Server{
 		Handler:           mux,
@@ -784,6 +922,27 @@ func newControlServer(counters *requestCounters) *http.Server {
 		WriteTimeout:      2 * time.Second,
 		IdleTimeout:       5 * time.Second,
 		MaxHeaderBytes:    8 << 10,
+	}
+}
+
+func writeControlJSON(w http.ResponseWriter, r *http.Request, value any) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	payload, err := json.Marshal(value)
+	if err != nil {
+		http.Error(w, "control response unavailable", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Length", fmt.Sprint(len(payload)))
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodGet {
+		_, _ = w.Write(payload)
 	}
 }
 

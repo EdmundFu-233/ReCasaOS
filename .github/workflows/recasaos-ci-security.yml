@@ -45,6 +45,9 @@ jobs:
       - name: Verify trusted privileged exact-SHA policy
         run: .github/scripts/test-trusted-privileged-workflow.sh
 
+      - name: Verify browser diagnostic retention policy
+        run: bash .github/scripts/check-public-files-browser-diagnostics-policy.sh
+
       - name: Validate GoReleaser configuration
         run: .github/scripts/check-goreleaser-config.sh
 
@@ -330,6 +333,7 @@ jobs:
           test "$(
             browser-tests/node_modules/.bin/playwright --version
           )" = "Version 1.62.0"
+          npm --prefix browser-tests run test:diagnostics
 
       - name: Install ephemeral browser dependencies
         timeout-minutes: 10
@@ -344,15 +348,70 @@ jobs:
           sudo env DEBIAN_FRONTEND=noninteractive \
             apt-get install --yes --no-install-recommends \
               libnss3-tools \
-              openssl
+              openssl \
+              unzip
           command -v certutil
           command -v openssl
+          command -v unzip
+
+      - name: Exercise browser diagnostic validator negative cases
+        env:
+          RECASAOS_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: >-
+          bash
+          .github/scripts/test-public-files-browser-diagnostics-validator.sh
 
       - name: Exercise the HTTPS browser boundary
         timeout-minutes: 15
         env:
           RECASAOS_RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: .github/scripts/test-public-files-browser.sh
+
+      - name: Validate credential-safe browser failure diagnostics
+        id: browser-diagnostics
+        if: >-
+          ${{
+            failure() &&
+            (
+              github.event_name != 'pull_request' ||
+              (
+                github.event.pull_request.head.repo.full_name == github.repository &&
+                github.actor != 'dependabot[bot]' &&
+                (
+                  github.event.pull_request.author_association == 'OWNER' ||
+                  github.event.pull_request.author_association == 'MEMBER' ||
+                  github.event.pull_request.author_association == 'COLLABORATOR'
+                )
+              )
+            )
+          }}
+        env:
+          RECASAOS_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        shell: bash
+        run: |
+          diagnostics="$RUNNER_TEMP/recasaos-browser-diagnostics-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          if bash .github/scripts/validate-public-files-browser-diagnostics.sh \
+            "$diagnostics"
+          then
+            printf 'ready=true\n' >>"$GITHUB_OUTPUT"
+          else
+            printf 'ready=false\n' >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload credential-safe browser failure diagnostics
+        if: >-
+          ${{
+            always() &&
+            steps.browser-diagnostics.outputs.ready == 'true'
+          }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: recasaos-browser-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/recasaos-browser-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
+          include-hidden-files: false
 
   govulncheck:
     name: Generate and scan reachable Go vulnerabilities

@@ -127,13 +127,20 @@ The repository also contains a narrower CI smoke test. On an ephemeral
 GitHub-hosted Ubuntu 24.04 runner it installs a one-run CA into the system and
 NSS trust stores, keeps TLS verification enabled, and exercises the real
 portal handler and frontend with the Playwright-bundled Chromium, Firefox, and
-WebKit engines. The job receives no production credential and retains no
-trace, HAR, video, browser profile, or HTML-report artifact. This does not
-exercise the production `NewIsolated` coordinator, systemd/cgroup sandbox,
-Caddy/Nginx, public DNS, HSTS, retail Chrome/Firefox, Safari/iOS, or a target
-host. Its initial-Range case is limited to the bundled engines and does not
-prove transparent retry/resume. It is not sufficient to close Issue #20 or
-enable public routing.
+WebKit engines. The job receives no production credential and ordinarily
+retains no trace, HAR, video, browser profile, or HTML-report artifact. If a
+trusted same-repository run stalls during the cross-tab portal navigation
+*before either page receives a bearer*, it may retain one narrowly scoped
+Playwright trace plus structured page, TLS, and loopback-server diagnostics
+for one day. The bundle excludes trace sources, request headers, query and
+fragment values, browser profiles, HAR, video, and HTML reports; both the test
+and an independent pre-upload gate delete or reject any file containing the
+`rc1_` bearer format. Untrusted fork PRs cannot upload this bundle. This
+failure-only evidence does not exercise the production `NewIsolated`
+coordinator, systemd/cgroup sandbox, Caddy/Nginx, public DNS, HSTS, retail
+Chrome/Firefox, Safari/iOS, or a target host. Its initial-Range case is limited
+to the bundled engines and does not prove transparent retry/resume. It is not
+sufficient to close Issue #20 or enable public routing.
 The cancel smoke requires all three engines to report the local download as
 canceled to Playwright, and exactly one authorized upstream request to reach a
 terminal state within the 40-second test-harness deadline. Chromium and WebKit
