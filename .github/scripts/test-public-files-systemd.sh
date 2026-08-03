@@ -170,13 +170,37 @@ compile(source, "start_slow_download.py", "exec")
 limit_start = (
     "    \"$storage_worker_address_space_minimum_reserve\" <<'PYTHON'\n"
 )
-limit_end = "\nPYTHON\n}\n\nprint_capacity_journal_diagnostics()"
+limit_end = (
+    "\nPYTHON\n}\n\n"
+    "assert_bounded_storage_worker_runtime_boundaries()"
+)
 if script.count(limit_start) != 1 or script.count(limit_end) != 1:
     raise SystemExit("address-space evidence sentinels are not unique")
 limit_source = script.split(limit_start, 1)[1].split(limit_end, 1)[0]
 compile(
     limit_source,
     "assert_storage_worker_address_space_limit.py",
+    "exec",
+)
+
+bounded_start = (
+    '    "${worker_identity_arguments[@]}" '
+    "<<'BOUNDED_PYTHON'\n"
+)
+bounded_end = (
+    "\nBOUNDED_PYTHON\n"
+    "  then\n"
+    '    fail "bounded storage worker runtime evidence failed"\n'
+    "  fi\n"
+    "}\n\n"
+    "print_capacity_journal_diagnostics()"
+)
+if script.count(bounded_start) != 1 or script.count(bounded_end) != 1:
+    raise SystemExit("bounded worker evidence sentinels are not unique")
+bounded_source = script.split(bounded_start, 1)[1].split(bounded_end, 1)[0]
+compile(
+    bounded_source,
+    "assert_bounded_storage_worker_runtime_boundaries.py",
     "exec",
 )
 PYTHON
@@ -1559,7 +1583,7 @@ assert_bounded_storage_worker_runtime_boundaries() {
     "$storage_worker_address_space_minimum_reserve" \
     "${#test_bearer}" \
     "$digest" \
-    "${worker_identity_arguments[@]}" <<'PYTHON'
+    "${worker_identity_arguments[@]}" <<'BOUNDED_PYTHON'
 import hashlib
 import os
 from pathlib import Path
@@ -1723,7 +1747,7 @@ for pair in worker_pairs:
         f"build=systemd-test pid={pid} vm-size-kib={vm_size_kib} "
         f"soft-bytes={soft} hard-bytes={hard} reserve-bytes={reserve}"
     )
-PYTHON
+BOUNDED_PYTHON
   then
     fail "bounded storage worker runtime evidence failed"
   fi

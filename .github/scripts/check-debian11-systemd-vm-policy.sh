@@ -219,6 +219,9 @@ require_exact_line "$systemd_script" \
   'assert_bounded_storage_worker_runtime_boundaries' \
   "bounded workers do not receive one fail-closed runtime inspection"
 require_text "$systemd_script" \
+  'bounded worker evidence sentinels are not unique' \
+  "bounded worker Python source is not self-validated"
+require_text "$systemd_script" \
   '    or len(worker_pairs) != 8' \
   "bounded runtime inspection does not require eight worker identities"
 require_text "$systemd_script" \
