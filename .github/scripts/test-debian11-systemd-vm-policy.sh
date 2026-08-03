@@ -91,6 +91,9 @@ expect_rejection hardware-acceleration vm \
 expect_rejection stale-sha vm \
   '[[ "$actual_sha" == "$RECASAOS_EXPECTED_SHA" ]]' \
   '[[ -n "$actual_sha" ]]'
+expect_rejection hostile-storage-opt-in vm \
+  '      RECASAOS_HOSTILE_STORAGE_VM_CI=1 \' \
+  '      RECASAOS_HOSTILE_STORAGE_VM_CI=0 \'
 expect_rejection debian-noexec-workspace systemd \
   '    workspace_parent=/var/lib' \
   '    workspace_parent=/run'
@@ -115,6 +118,21 @@ expect_rejection inherited-listener-inspection systemd \
 expect_rejection memory-peak-fail-open systemd \
   'elif [[ "${RECASAOS_SYSTEMD_TEST_TARGET:-}" != \' \
   'elif [[ -z "${RECASAOS_SYSTEMD_TEST_TARGET:-}" && \'
+expect_rejection host-hostile-storage-enable systemd \
+  '    hostile_storage_test_enabled=0' \
+  '    hostile_storage_test_enabled=1'
+expect_rejection hostile-storage-flushing-suspend systemd \
+  'sudo dmsetup suspend --nolockfs --noflush "$hostile_storage_name"' \
+  'sudo dmsetup suspend "$hostile_storage_name"'
+expect_rejection hostile-storage-fake-state systemd \
+  'if state != b"D":' \
+  'if state != b"T":'
+expect_rejection hostile-storage-incomplete-inspection systemd \
+  'or len(worker_pairs) != 4' \
+  'or len(worker_pairs) != 1'
+expect_rejection hostile-storage-cleanup-without-resume systemd \
+  'if ! resume_hostile_storage_for_cleanup; then' \
+  'if false; then'
 expect_rejection sampler-symlink-follow sampler \
   'source_flags |= os.O_NOFOLLOW' \
   'source_flags |= 0'

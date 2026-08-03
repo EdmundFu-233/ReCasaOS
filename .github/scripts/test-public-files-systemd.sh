@@ -47,6 +47,9 @@ case "${RECASAOS_SYSTEMD_TEST_TARGET:-}" in
       fail "the GitHub-hosted runner marker is missing"
     workspace_parent=/run
     worker_capacity_window_seconds=15
+    hostile_storage_test_enabled=0
+    [[ "${RECASAOS_HOSTILE_STORAGE_VM_CI:-0}" == 0 ]] ||
+      fail "hostile-storage testing is forbidden on the host runner"
     ;;
   debian-11-systemd-247-qemu)
     [[ "${RECASAOS_RUNNER_ENVIRONMENT:-}" == github-hosted-vm ]] ||
@@ -72,6 +75,9 @@ case "${RECASAOS_SYSTEMD_TEST_TARGET:-}" in
     # 15-second orchestration window. This changes only the test harness's
     # aggregate deadline; application IPC and service timeouts remain fixed.
     worker_capacity_window_seconds=30
+    [[ "${RECASAOS_HOSTILE_STORAGE_VM_CI:-0}" == 1 ]] ||
+      fail "the Debian VM hostile-storage opt-in is missing"
+    hostile_storage_test_enabled=1
     ;;
   *)
     fail "the exact systemd integration target is not authorized"
@@ -111,6 +117,9 @@ memory_sampler_stop="${workspace}/memory-current-sampler-stop"
 memory_sampler_failure="${workspace}/memory-current-sampler-failure"
 nested_backing="${workspace}/nested-backing"
 nested_mount="${share}/covered"
+hostile_storage_backing="${workspace}/hostile-storage.img"
+hostile_storage_name="recasaos-dstate-${run_key}"
+hostile_storage_mapper="/dev/mapper/${hostile_storage_name}"
 host_shm_sentinel_prefix="/dev/shm/recasaos-public-files-ci-${run_key}."
 host_shm_sentinel=
 test_bearer='rc1_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8'
@@ -126,6 +135,9 @@ storage_worker_address_space_minimum_reserve=134217728
   fail "refusing unsafe workspace path: $workspace"
 [[ "$host_shm_sentinel_prefix" =~ ^/dev/shm/recasaos-public-files-ci-[0-9]+-[0-9]+\.$ ]] ||
   fail "refusing unsafe shared-memory sentinel prefix: $host_shm_sentinel_prefix"
+[[ "$hostile_storage_name" =~ ^recasaos-dstate-[0-9]+-[0-9]+$ &&
+  "$hostile_storage_mapper" == "/dev/mapper/$hostile_storage_name" ]] ||
+  fail "refusing unsafe hostile-storage device name: $hostile_storage_name"
 
 [[ ! -e "$workspace" ]] || fail "test workspace already exists"
 [[ ! -e "$service_path" && ! -e "$socket_path" &&
@@ -145,6 +157,14 @@ do
   command -v "$required_tool" >/dev/null 2>&1 ||
     fail "required mount test tool is unavailable: $required_tool"
 done
+if [[ "$hostile_storage_test_enabled" == 1 ]]; then
+  for required_tool in \
+    blockdev dmsetup losetup lsblk mkfs.ext4 modprobe sync udevadm
+  do
+    command -v "$required_tool" >/dev/null 2>&1 ||
+      fail "required hostile-storage VM tool is unavailable: $required_tool"
+  done
+fi
 go_version="$(go version)" || fail "could not inspect the Go toolchain"
 [[ "$go_version" == "go version go1.26.5 linux/amd64" ]] ||
   fail "unexpected Go toolchain: $go_version"
@@ -203,6 +223,27 @@ compile(
     "assert_bounded_storage_worker_runtime_boundaries.py",
     "exec",
 )
+
+hostile_start = (
+    '    "${hostile_worker_identity_arguments[@]}" '
+    "<<'HOSTILE_PYTHON'\n"
+)
+hostile_end = (
+    "\nHOSTILE_PYTHON\n"
+    "  then\n"
+    '    fail "hostile-storage worker evidence failed"\n'
+    "  fi\n"
+    "}\n\n"
+    "hostile_storage_clients_are_live()"
+)
+if script.count(hostile_start) != 1 or script.count(hostile_end) != 1:
+    raise SystemExit("hostile-storage worker evidence sentinels are not unique")
+hostile_source = script.split(hostile_start, 1)[1].split(hostile_end, 1)[0]
+compile(
+    hostile_source,
+    "assert_hostile_storage_worker_boundaries.py",
+    "exec",
+)
 PYTHON
 /usr/bin/python3 -c '
 import os
@@ -229,6 +270,20 @@ fi
 account_cleanup_authorized=1
 nested_mount_cleanup_required=0
 host_shm_sentinel_created=0
+hostile_storage_loop=
+hostile_storage_loop_attached=0
+hostile_storage_dm_created=0
+hostile_storage_dm_suspended=0
+hostile_storage_share_mounted=0
+hostile_storage_major=
+hostile_storage_minor=
+hostile_storage_suspended_path=
+hostile_storage_clients=()
+hostile_storage_client_start_times=()
+hostile_storage_client_prefixes=()
+hostile_storage_client_sequence=0
+hostile_worker_pids=()
+hostile_worker_start_times=()
 slow_download_pids=()
 slow_download_ready_files=()
 slow_download_failure_files=()
@@ -787,6 +842,142 @@ cleanup_background_downloads() {
   max_storage_worker_count=0
 }
 
+cleanup_hostile_storage_clients() {
+  local client_index
+  local pid
+
+  for client_index in "${!hostile_storage_clients[@]}"; do
+    pid="${hostile_storage_clients[$client_index]}"
+    if ! terminate_exact_background_process \
+      "$pid" "${hostile_storage_client_start_times[$client_index]}"; then
+      cleanup_problem \
+        "could not terminate exact hostile-storage client identity $pid"
+    fi
+  done
+  for pid in "${hostile_storage_clients[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+  hostile_storage_clients=()
+  hostile_storage_client_start_times=()
+  hostile_storage_client_prefixes=()
+}
+
+hostile_storage_suspended_value() {
+  [[ "$hostile_storage_suspended_path" =~ \
+    ^/sys/dev/block/[0-9]+:[0-9]+/dm/suspended$ ]] || return 1
+  sudo test -f "$hostile_storage_suspended_path" || return 1
+  sudo cat "$hostile_storage_suspended_path"
+}
+
+record_hostile_storage_device_identity() {
+  local device_identity
+
+  device_identity="$(
+    sudo dmsetup info --columns --noheadings --separator : \
+      -o major,minor "$hostile_storage_name" | tr -d '[:space:]'
+  )" || return 1
+  [[ "$device_identity" =~ ^([0-9]+):([0-9]+)$ ]] || return 1
+  hostile_storage_major="${BASH_REMATCH[1]}"
+  hostile_storage_minor="${BASH_REMATCH[2]}"
+  hostile_storage_suspended_path="/sys/dev/block/${device_identity}/dm/suspended"
+  [[ "$hostile_storage_suspended_path" =~ \
+    ^/sys/dev/block/[0-9]+:[0-9]+/dm/suspended$ ]]
+}
+
+resume_hostile_storage_for_cleanup() {
+  local suspended_value
+
+  [[ "$hostile_storage_test_enabled" == 1 ]] || return 0
+  [[ "$hostile_storage_dm_created" == 1 ]] || return 0
+  if [[ ! "$hostile_storage_suspended_path" =~ \
+    ^/sys/dev/block/[0-9]+:[0-9]+/dm/suspended$ ]]; then
+    record_hostile_storage_device_identity || return 1
+  fi
+  suspended_value="$(hostile_storage_suspended_value)" || return 1
+  [[ "$suspended_value" == 0 || "$suspended_value" == 1 ]] || return 1
+  if [[ "$suspended_value" == 1 ]]; then
+    timeout --signal=TERM --kill-after=5s 10s \
+      sudo dmsetup resume "$hostile_storage_name" || return 1
+  fi
+  [[ "$(hostile_storage_suspended_value)" == 0 ]] || return 1
+  hostile_storage_dm_suspended=0
+}
+
+cleanup_hostile_storage_stack() {
+  local command_status
+  local mount_count
+
+  [[ "$hostile_storage_test_enabled" == 1 ]] || return 0
+  if [[ "$hostile_storage_share_mounted" == 1 ]]; then
+    mount_count="$(
+      awk -v target="$share" '$5 == target { count++ }
+        END { print count + 0 }' /proc/self/mountinfo
+    )"
+    command_status=$?
+    if [[ "$command_status" != 0 || "$mount_count" != 1 ]]; then
+      cleanup_problem \
+        "hostile-storage share has unsafe mount count: ${mount_count:-invalid}"
+      workspace_removal_safe=0
+      return 1
+    fi
+    sudo umount -- "$share"
+    command_status=$?
+    if [[ "$command_status" != 0 ]]; then
+      cleanup_problem \
+        "could not unmount hostile-storage share (status $command_status)"
+      workspace_removal_safe=0
+      return 1
+    fi
+    hostile_storage_share_mounted=0
+    if awk -v target="$share" '$5 == target { found = 1 }
+      END { exit found ? 0 : 1 }' /proc/self/mountinfo; then
+      cleanup_problem "hostile-storage share remains mounted"
+      workspace_removal_safe=0
+      return 1
+    fi
+  fi
+
+  if [[ "$hostile_storage_dm_created" == 1 ]]; then
+    sudo dmsetup remove --retry "$hostile_storage_name"
+    command_status=$?
+    if [[ "$command_status" != 0 ]]; then
+      cleanup_problem \
+        "could not remove hostile-storage mapping (status $command_status)"
+      workspace_removal_safe=0
+      return 1
+    fi
+    hostile_storage_dm_created=0
+    if sudo dmsetup info "$hostile_storage_name" >/dev/null 2>&1; then
+      cleanup_problem "hostile-storage mapping remains after removal"
+      workspace_removal_safe=0
+      return 1
+    fi
+  fi
+
+  if [[ "$hostile_storage_loop_attached" == 1 ]]; then
+    [[ "$hostile_storage_loop" =~ ^/dev/loop[0-9]+$ ]] || {
+      cleanup_problem \
+        "refusing unsafe hostile-storage loop detach: $hostile_storage_loop"
+      workspace_removal_safe=0
+      return 1
+    }
+    sudo losetup --detach "$hostile_storage_loop"
+    command_status=$?
+    if [[ "$command_status" != 0 ]]; then
+      cleanup_problem \
+        "could not detach hostile-storage loop (status $command_status)"
+      workspace_removal_safe=0
+      return 1
+    fi
+    hostile_storage_loop_attached=0
+    if sudo losetup "$hostile_storage_loop" >/dev/null 2>&1; then
+      cleanup_problem "hostile-storage loop remains attached"
+      workspace_removal_safe=0
+      return 1
+    fi
+  fi
+}
+
 cleanup_public_port_is_unbound() {
   local listener_count
   local command_status
@@ -824,7 +1015,13 @@ cleanup() {
   trap - EXIT
   set +e
 
+  if ! resume_hostile_storage_for_cleanup; then
+    cleanup_problem \
+      "could not resume the isolated hostile-storage mapping; the disposable VM must be terminated"
+    exit 1
+  fi
   cleanup_cgroup_memory_sampler
+  cleanup_hostile_storage_clients
   cleanup_background_downloads
   for unit in "$socket_unit" "$service_unit" "$sentinel_unit"; do
     cleanup_control_groups["$unit"]="$(
@@ -961,6 +1158,8 @@ cleanup() {
       fi
     fi
   fi
+
+  cleanup_hostile_storage_stack
 
   if [[ "$workspace_removal_safe" == 1 ]]; then
     if [[ -e "$workspace" || -L "$workspace" ]]; then
@@ -1425,6 +1624,287 @@ storage_workers_are_stopped() {
     count=$((count + 1))
   done < <(storage_worker_pids)
   [[ "$count" == "$expected" ]]
+}
+
+storage_workers_are_in_d_state() {
+  local expected=$1
+  local count=0
+  local process_state
+  local worker_pid
+
+  hostile_storage_clients_are_live || return 1
+  while IFS= read -r worker_pid; do
+    [[ "$worker_pid" =~ ^[0-9]+$ && "$worker_pid" -gt 1 ]] || return 1
+    process_state="$(
+      sudo ps -o stat= -p "$worker_pid" 2>/dev/null |
+        awk 'NR == 1 { print substr($1, 1, 1) }' || true
+    )"
+    [[ "$process_state" == D ]] || return 1
+    count=$((count + 1))
+  done < <(storage_worker_pids)
+  [[ "$count" == "$expected" ]]
+}
+
+assert_hostile_storage_worker_boundaries() {
+  local expected_parent=$2
+  local phase=$1
+  local hostile_worker_index
+  local hostile_worker_identity_arguments=()
+
+  [[ "$phase" == blocked || "$phase" == kill-pending ]] ||
+    fail "cannot inspect hostile workers in an unsafe phase: $phase"
+  [[ "$expected_parent" =~ ^[0-9]+$ && "$expected_parent" -ge 1 ]] ||
+    fail "cannot inspect hostile workers for an unsafe parent"
+  [[ "${#hostile_worker_pids[@]}" == 4 &&
+    "${#hostile_worker_start_times[@]}" == 4 ]] ||
+    fail "cannot inspect an incomplete hostile-storage worker set"
+  for hostile_worker_index in "${!hostile_worker_pids[@]}"; do
+    hostile_worker_identity_arguments+=(
+      "${hostile_worker_pids[$hostile_worker_index]}:${hostile_worker_start_times[$hostile_worker_index]}"
+    )
+  done
+
+  if ! sudo /usr/bin/python3 - \
+    "$phase" \
+    "$expected_parent" \
+    "$service_uid" \
+    "$rootfs/usr/bin/recasaos-public-files" \
+    "${hostile_worker_identity_arguments[@]}" <<'HOSTILE_PYTHON'
+import os
+from pathlib import Path
+import stat
+import sys
+
+phase = sys.argv[1]
+expected_parent = int(sys.argv[2])
+expected_uid = int(sys.argv[3])
+reviewed_binary_path = Path(sys.argv[4])
+worker_pairs = sys.argv[5:]
+
+if (
+    phase not in {"blocked", "kill-pending"}
+    or expected_parent < 1
+    or expected_uid < 1
+    or not reviewed_binary_path.is_absolute()
+    or len(worker_pairs) != 4
+):
+    raise SystemExit("unsafe hostile-storage worker evidence arguments")
+
+reviewed_binary = os.stat(reviewed_binary_path, follow_symlinks=False)
+if (
+    not stat.S_ISREG(reviewed_binary.st_mode)
+    or reviewed_binary.st_uid != 0
+    or reviewed_binary.st_gid != 0
+    or stat.S_IMODE(reviewed_binary.st_mode) != 0o755
+    or reviewed_binary.st_nlink != 1
+):
+    raise RuntimeError("reviewed hostile-storage worker image is unsafe")
+
+
+def read_identity(pid):
+    data = (Path("/proc") / str(pid) / "stat").read_bytes()
+    marker = data.rfind(b") ")
+    fields = data[marker + 2 :].split() if marker >= 0 else []
+    if len(fields) <= 19 or not fields[1].isdigit() or not fields[19].isdigit():
+        raise RuntimeError("could not parse hostile-storage worker identity")
+    return fields[0], int(fields[1]), fields[19]
+
+
+def read_status(pid):
+    values = {}
+    for line in (Path("/proc") / str(pid) / "status").read_bytes().splitlines():
+        if b":" in line:
+            key, value = line.split(b":", 1)
+            values[key] = value.strip()
+    return values
+
+
+seen = set()
+kill_bit = 1 << (9 - 1)
+for pair in worker_pairs:
+    pid_text, separator, expected_start = pair.partition(":")
+    if (
+        separator != ":"
+        or not pid_text.isdecimal()
+        or not expected_start.isdecimal()
+    ):
+        raise RuntimeError("malformed hostile-storage worker identity")
+    pid = int(pid_text)
+    if pid <= 1 or pid in seen:
+        raise RuntimeError("unsafe or duplicate hostile-storage worker PID")
+    seen.add(pid)
+
+    state, parent, start_before = read_identity(pid)
+    if start_before.decode("ascii") != expected_start:
+        raise RuntimeError("hostile-storage worker identity changed")
+    if state != b"D":
+        raise RuntimeError(
+            f"hostile-storage worker {pid} state is {state!r}, want D"
+        )
+    if parent != expected_parent:
+        raise RuntimeError(
+            f"hostile-storage worker {pid} parent is {parent}, "
+            f"want {expected_parent}"
+        )
+
+    worker_executable = os.stat(Path("/proc") / str(pid) / "exe")
+    if (
+        worker_executable.st_dev != reviewed_binary.st_dev
+        or worker_executable.st_ino != reviewed_binary.st_ino
+    ):
+        raise RuntimeError("hostile-storage worker image identity changed")
+
+    status = read_status(pid)
+    user_ids = status.get(b"Uid", b"").split()
+    if user_ids != [str(expected_uid).encode("ascii")] * 4:
+        raise RuntimeError("hostile-storage worker UID boundary changed")
+    if status.get(b"CapEff") != b"0000000000000000":
+        raise RuntimeError("hostile-storage worker retained an effective capability")
+    if phase == "kill-pending":
+        pending_values = []
+        for name in (b"SigPnd", b"ShdPnd"):
+            value = status.get(name, b"")
+            try:
+                pending_values.append(int(value, 16))
+            except ValueError as error:
+                raise RuntimeError("invalid pending-signal evidence") from error
+        if not any(value & kill_bit for value in pending_values):
+            raise RuntimeError(
+                f"hostile-storage worker {pid} has no pending SIGKILL"
+            )
+
+    state_after, parent_after, start_after = read_identity(pid)
+    if (
+        state_after != b"D"
+        or parent_after != expected_parent
+        or start_after != start_before
+    ):
+        raise RuntimeError("hostile-storage worker changed during inspection")
+
+print(
+    "hostile-storage worker evidence: "
+    f"phase={phase} parent={expected_parent} count={len(seen)} state=D"
+)
+HOSTILE_PYTHON
+  then
+    fail "hostile-storage worker evidence failed"
+  fi
+}
+
+hostile_storage_clients_are_live() {
+  local client_index
+
+  [[ "${#hostile_storage_clients[@]}" == 4 &&
+    "${#hostile_storage_client_start_times[@]}" == 4 ]] || return 1
+  for client_index in "${!hostile_storage_clients[@]}"; do
+    slow_download_process_is_live \
+      "${hostile_storage_clients[$client_index]}" \
+      "${hostile_storage_client_start_times[$client_index]}" || return 1
+  done
+}
+
+hostile_storage_clients_are_complete() {
+  local client_index
+
+  [[ "${#hostile_storage_clients[@]}" == 4 ]] || return 1
+  for client_index in "${!hostile_storage_clients[@]}"; do
+    if slow_download_process_is_live \
+      "${hostile_storage_clients[$client_index]}" \
+      "${hostile_storage_client_start_times[$client_index]}"; then
+      return 1
+    fi
+  done
+}
+
+start_hostile_storage_client() {
+  local failure_file
+  local pid
+  local prefix
+  local start_time
+
+  hostile_storage_client_sequence=$((hostile_storage_client_sequence + 1))
+  prefix="${workspace}/hostile-client-${hostile_storage_client_sequence}"
+  [[ "$prefix" == \
+    "$workspace/hostile-client-$hostile_storage_client_sequence" ]] ||
+    fail "refusing unsafe hostile-storage client prefix: $prefix"
+  for suffix in headers body status failure; do
+    [[ ! -e "$prefix.$suffix" && ! -L "$prefix.$suffix" ]] ||
+      fail "hostile-storage client state path already exists: $prefix.$suffix"
+    install -m 0600 /dev/null "$prefix.$suffix"
+  done
+  failure_file="$prefix.failure"
+
+  printf 'Authorization: Bearer %s\n' "$test_bearer" |
+    curl -q -sS \
+      --connect-timeout 2 \
+      --max-time 25 \
+      -H @- \
+      -H 'Connection: close' \
+      -D "$prefix.headers" \
+      -o "$prefix.body" \
+      -w '%{http_code}\n' \
+      'http://127.0.0.1:39777/public-files/api/list?path=' \
+      >"$prefix.status" 2>"$failure_file" &
+  pid=$!
+  start_time="$(process_start_time "$pid")" || {
+    wait "$pid" 2>/dev/null || true
+    fail "hostile-storage client exited before identity capture"
+  }
+  hostile_storage_clients+=("$pid")
+  hostile_storage_client_start_times+=("$start_time")
+  hostile_storage_client_prefixes+=("$prefix")
+}
+
+assert_hostile_storage_client_responses() {
+  local client_index
+  local prefix
+  local retry_after_evidence
+
+  [[ "${#hostile_storage_clients[@]}" == 4 &&
+    "${#hostile_storage_client_prefixes[@]}" == 4 ]] ||
+    fail "cannot validate an incomplete hostile-storage client set"
+  for client_index in "${!hostile_storage_clients[@]}"; do
+    prefix="${hostile_storage_client_prefixes[$client_index]}"
+    if ! wait "${hostile_storage_clients[$client_index]}"; then
+      sed -n '1,20p' "$prefix.failure" >&2
+      fail "hostile-storage client exited unsuccessfully"
+    fi
+    [[ "$(<"$prefix.status")" == 503 ]] ||
+      fail "hostile-storage timeout did not return 503"
+    [[ "$(<"$prefix.body")" == \
+      '{"error":"storage capacity unavailable"}' ]] ||
+      fail "hostile-storage timeout returned an unexpected body"
+    retry_after_evidence="$(
+      awk '
+        {
+          line = $0
+          sub(/\r$/, "", line)
+          separator = index(line, ":")
+          if (separator == 0)
+            next
+          name = tolower(substr(line, 1, separator - 1))
+          if (name != "retry-after")
+            next
+          count++
+          value = substr(line, separator + 1)
+          sub(/^[[:space:]]+/, "", value)
+          sub(/[[:space:]]+$/, "", value)
+          if (value != "5")
+            invalid++
+        }
+        END { printf "%d:%d\n", count + 0, invalid + 0 }
+      ' "$prefix.headers"
+    )"
+    [[ "$retry_after_evidence" == 1:0 ]] ||
+      fail "hostile-storage timeout lacked one exact Retry-After value 5"
+    if grep -aFq -- 'rc1_' \
+      "$prefix.headers" "$prefix.body" "$prefix.status" "$prefix.failure"; then
+      fail "hostile-storage client diagnostics retained a bearer-shaped value"
+    fi
+  done
+  hostile_storage_clients=()
+  hostile_storage_client_start_times=()
+  hostile_storage_client_prefixes=()
 }
 
 assert_storage_worker_address_space_limit() {
@@ -2420,6 +2900,128 @@ sentinel_is_active() {
   sudo systemctl is-active --quiet "$sentinel_unit"
 }
 
+service_is_deactivating() {
+  [[ "$(
+    sudo systemctl show --property=ActiveState --value "$service_unit"
+  )" == deactivating ]]
+}
+
+setup_hostile_storage_share() {
+  local device_identity
+  local loop_identity
+  local mount_evidence
+  local sectors
+  local table
+
+  [[ "$hostile_storage_test_enabled" == 1 ]] || return 0
+  [[ -d "$share" && ! -L "$share" ]] ||
+    fail "hostile-storage share target is unsafe"
+  [[ -z "$(find "$share" -mindepth 1 -print -quit)" ]] ||
+    fail "hostile-storage share target is not empty"
+  [[ ! -e "$hostile_storage_backing" && ! -L "$hostile_storage_backing" ]] ||
+    fail "hostile-storage backing path already exists"
+  if sudo dmsetup info "$hostile_storage_name" >/dev/null 2>&1; then
+    fail "hostile-storage mapping already exists"
+  fi
+
+  sudo modprobe loop
+  sudo modprobe dm_mod
+  sudo udevadm settle --timeout=10 ||
+    fail "udev did not settle after hostile-storage module loading"
+  sudo test -c /dev/loop-control ||
+    fail "isolated VM loop-control device is unavailable"
+  sudo test -c /dev/mapper/control ||
+    fail "isolated VM device-mapper control node is unavailable"
+  sudo dmsetup targets |
+    awk '$1 == "linear" { found = 1 } END { exit found ? 0 : 1 }' ||
+    fail "device-mapper linear target is unavailable"
+
+  truncate -s 268435456 "$hostile_storage_backing"
+  chmod 0600 "$hostile_storage_backing"
+  hostile_storage_loop="$(
+    sudo losetup --find --show "$hostile_storage_backing"
+  )" || fail "could not attach hostile-storage loop"
+  [[ "$hostile_storage_loop" =~ ^/dev/loop[0-9]+$ ]] ||
+    fail "losetup returned an unsafe loop path: $hostile_storage_loop"
+  hostile_storage_loop_attached=1
+  sectors="$(sudo blockdev --getsz "$hostile_storage_loop")" ||
+    fail "could not inspect hostile-storage loop size"
+  [[ "$sectors" =~ ^[0-9]+$ && "$sectors" -eq 524288 ]] ||
+    fail "hostile-storage loop has unexpected sectors: $sectors"
+  loop_identity="$(
+    lsblk --noheadings --nodeps --output MAJ:MIN "$hostile_storage_loop" |
+      tr -d '[:space:]'
+  )" || fail "could not inspect hostile-storage loop identity"
+  [[ "$loop_identity" =~ ^[0-9]+:[0-9]+$ ]] ||
+    fail "hostile-storage loop identity is malformed: $loop_identity"
+
+  table="0 $sectors linear $loop_identity 0"
+  if ! sudo dmsetup create "$hostile_storage_name" --table "$table"; then
+    if sudo dmsetup info "$hostile_storage_name" >/dev/null 2>&1; then
+      hostile_storage_dm_created=1
+      record_hostile_storage_device_identity || true
+    fi
+    fail "could not create hostile-storage mapping"
+  fi
+  hostile_storage_dm_created=1
+  record_hostile_storage_device_identity ||
+    fail "could not inspect hostile-storage device identity"
+  sudo udevadm settle --timeout=10 ||
+    fail "udev did not settle after hostile-storage mapping creation"
+  sudo test -b "$hostile_storage_mapper" ||
+    fail "hostile-storage mapper node is unavailable"
+  [[ "$(sudo dmsetup table "$hostile_storage_name")" == "$table" ]] ||
+    fail "hostile-storage mapping table changed"
+
+  device_identity="${hostile_storage_major}:${hostile_storage_minor}"
+  [[ "$(hostile_storage_suspended_value)" == 0 ]] ||
+    fail "new hostile-storage mapping is unexpectedly suspended"
+
+  sudo mkfs.ext4 -q -F -m 0 "$hostile_storage_mapper"
+  if ! sudo mount -t ext4 -o nodev,nosuid,noexec \
+    "$hostile_storage_mapper" "$share"; then
+    if awk -v target="$share" '$5 == target { found = 1 }
+      END { exit found ? 0 : 1 }' /proc/self/mountinfo; then
+      hostile_storage_share_mounted=1
+    fi
+    fail "could not mount hostile-storage share"
+  fi
+  hostile_storage_share_mounted=1
+  mount_evidence="$(
+    awk -v target="$share" -v identity="$device_identity" '
+      function has_option(options, wanted, count, values, option_index) {
+        count = split(options, values, ",")
+        for (option_index = 1; option_index <= count; option_index++)
+          if (values[option_index] == wanted)
+            return 1
+        return 0
+      }
+      {
+        separator = 0
+        for (field_index = 7; field_index <= NF; field_index++)
+          if ($field_index == "-") {
+            separator = field_index
+            break
+          }
+        if ($5 != target)
+          next
+        matches++
+        if ($3 != identity ||
+            !has_option($6, "rw") ||
+            !has_option($6, "nodev") ||
+            !has_option($6, "nosuid") ||
+            !has_option($6, "noexec") ||
+            separator == 0 ||
+            $(separator + 1) != "ext4")
+          invalid++
+      }
+      END { printf "%d:%d\n", matches + 0, invalid + 0 }
+    ' /proc/self/mountinfo
+  )" || fail "could not inspect hostile-storage share mount"
+  [[ "$mount_evidence" == 1:0 ]] ||
+    fail "hostile-storage share mount evidence is unsafe: $mount_evidence"
+}
+
 runner_uid="$(id -u)"
 runner_gid="$(id -g)"
 sudo install -d -o "$runner_uid" -g "$runner_gid" -m 0755 "$workspace"
@@ -2444,7 +3046,9 @@ service_gid="$(id -g recasaos-public)"
   fail "system account is privileged"
 
 sudo install -d -o root -g recasaos-public -m 0750 \
-  "$share" "$nested_backing" "$nested_mount" "$rootfs/srv/public"
+  "$share" "$nested_backing" "$rootfs/srv/public"
+setup_hostile_storage_share
+sudo install -d -o root -g recasaos-public -m 0750 "$nested_mount"
 printf 'systemd isolation fixture\n' |
   sudo tee "$share/report.txt" >/dev/null
 sudo truncate -s "$worker_load_bytes" "$share/worker-load.bin"
@@ -3129,6 +3733,207 @@ wait_until_before "storage worker reap after bounded load" \
 activate_public_binary \
   "$production_binary" \
   "production binary restoration after capacity test"
+
+if [[ "$hostile_storage_test_enabled" == 1 ]]; then
+  wait_until "storage workers before hostile-storage test" \
+    storage_worker_count_is 0
+  sudo sync
+  printf '3\n' | sudo tee /proc/sys/vm/drop_caches >/dev/null
+  [[ "$(hostile_storage_suspended_value)" == 0 ]] ||
+    fail "hostile-storage mapping was suspended before the test"
+  if ! sudo dmsetup suspend --nolockfs --noflush "$hostile_storage_name"; then
+    if [[ "$(hostile_storage_suspended_value 2>/dev/null || true)" == 1 ]]; then
+      hostile_storage_dm_suspended=1
+    fi
+    fail "could not suspend the hostile-storage mapping"
+  fi
+  hostile_storage_dm_suspended=1
+  [[ "$(hostile_storage_suspended_value)" == 1 ]] ||
+    fail "device-mapper did not report the hostile-storage suspension"
+
+  hostile_blocked_deadline=$((SECONDS + 8))
+  for _ in {1..4}; do
+    start_hostile_storage_client
+  done
+  wait_until_before "four live hostile-storage clients" \
+    "$hostile_blocked_deadline" \
+    hostile_storage_clients_are_live
+  wait_until_before "four hostile-storage workers" \
+    "$hostile_blocked_deadline" \
+    storage_worker_count_is 4
+  wait_until_before "four real D-state storage workers" \
+    "$hostile_blocked_deadline" \
+    storage_workers_are_in_d_state 4
+  mapfile -t hostile_worker_pids < <(storage_worker_pids)
+  [[ "${#hostile_worker_pids[@]}" == 4 ]] ||
+    fail "hostile-storage load did not retain exactly four workers"
+  for hostile_worker_pid in "${hostile_worker_pids[@]}"; do
+    hostile_worker_start_time="$(
+      process_start_time "$hostile_worker_pid"
+    )" || fail "could not capture hostile-storage worker identity"
+    hostile_worker_start_times+=("$hostile_worker_start_time")
+  done
+  assert_hostile_storage_worker_boundaries blocked "$portal_pid"
+
+  hostile_timeout_deadline=$((SECONDS + 18))
+  wait_until_before "four bounded hostile-storage timeouts" \
+    "$hostile_timeout_deadline" \
+    hostile_storage_clients_are_complete
+  assert_hostile_storage_client_responses
+  assert_hostile_storage_worker_boundaries kill-pending "$portal_pid"
+  [[ "$(storage_worker_count)" == 4 ]] ||
+    fail "hostile-storage timeout did not retain exactly four D-state workers"
+
+  hostile_quarantine_headers="${workspace}/hostile-quarantine.headers"
+  hostile_quarantine_body="${workspace}/hostile-quarantine.body"
+  for quarantine_path in \
+    "$hostile_quarantine_headers" "$hostile_quarantine_body"
+  do
+    [[ ! -e "$quarantine_path" && ! -L "$quarantine_path" ]] ||
+      fail "hostile-storage quarantine response path already exists"
+    install -m 0600 /dev/null "$quarantine_path"
+  done
+  hostile_quarantine_started=$SECONDS
+  hostile_quarantine_status="$(
+    printf 'Authorization: Bearer %s\n' "$test_bearer" |
+      curl -q -sS \
+        --connect-timeout 2 \
+        --max-time 5 \
+        -H @- \
+        -H 'Connection: close' \
+        -D "$hostile_quarantine_headers" \
+        -o "$hostile_quarantine_body" \
+        -w '%{http_code}' \
+        'http://127.0.0.1:39777/public-files/api/list?path='
+  )"
+  hostile_quarantine_elapsed=$((SECONDS - hostile_quarantine_started))
+  [[ "$hostile_quarantine_status" == 503 &&
+    "$hostile_quarantine_elapsed" -le 5 ]] ||
+    fail \
+      "quarantine admission returned $hostile_quarantine_status after ${hostile_quarantine_elapsed}s"
+  [[ "$(<"$hostile_quarantine_body")" == \
+    '{"error":"storage capacity unavailable"}' ]] ||
+    fail "quarantine admission returned an unexpected body"
+  [[ "$(
+    awk '
+      {
+        line = $0
+        sub(/\r$/, "", line)
+        separator = index(line, ":")
+        if (separator == 0)
+          next
+        name = tolower(substr(line, 1, separator - 1))
+        if (name != "retry-after")
+          next
+        count++
+        value = substr(line, separator + 1)
+        sub(/^[[:space:]]+/, "", value)
+        sub(/[[:space:]]+$/, "", value)
+        if (value != "5")
+          invalid++
+      }
+      END { printf "%d:%d\n", count + 0, invalid + 0 }
+    ' "$hostile_quarantine_headers"
+  )" == 1:0 ]] ||
+    fail "quarantine admission lacked one exact Retry-After value 5"
+  if grep -aFq -- 'rc1_' \
+    "$hostile_quarantine_headers" "$hostile_quarantine_body"; then
+    fail "quarantine response retained a bearer-shaped value"
+  fi
+  [[ "$(storage_worker_count)" == 4 ]] ||
+    fail "quarantine admission started an additional storage worker"
+  assert_hostile_storage_worker_boundaries kill-pending "$portal_pid"
+
+  hostile_tasks_current="$(
+    sudo systemctl show --property=TasksCurrent --value "$service_unit"
+  )"
+  hostile_memory_current="$(
+    sudo systemctl show --property=MemoryCurrent --value "$service_unit"
+  )"
+  [[ "$hostile_tasks_current" =~ ^[0-9]+$ &&
+    "$hostile_tasks_current" -le 224 ]] ||
+    fail \
+      "D-state TasksCurrent=$hostile_tasks_current leaves insufficient headroom"
+  [[ "$hostile_memory_current" =~ ^[0-9]+$ &&
+    "$hostile_memory_current" -le 469762048 ]] ||
+    fail \
+      "D-state MemoryCurrent=$hostile_memory_current leaves insufficient headroom"
+  assert_service_cgroup_limits
+  wait_until "unchanged management sentinel during D-state" \
+    sentinel_is_unchanged
+
+  hostile_old_portal_pid=$portal_pid
+  hostile_old_portal_invocation=$portal_invocation
+  hostile_old_portal_start_time="$(
+    process_start_time "$hostile_old_portal_pid"
+  )" || fail "could not capture the pre-restart portal identity"
+  sudo systemctl restart --no-block "$service_unit"
+  hostile_restart_pending_deadline=$((SECONDS + 8))
+  wait_until_before "old portal exit during D-state restart" \
+    "$hostile_restart_pending_deadline" \
+    process_identity_is_gone \
+    "$hostile_old_portal_pid" \
+    "$hostile_old_portal_start_time"
+  wait_until_before "service deactivation behind D-state workers" \
+    "$hostile_restart_pending_deadline" \
+    service_is_deactivating
+  assert_hostile_storage_worker_boundaries kill-pending 1
+  wait_until "unchanged management sentinel during pending restart" \
+    sentinel_is_unchanged
+  [[ "$(hostile_storage_suspended_value)" == 1 ]] ||
+    fail "hostile-storage mapping resumed without operator action"
+
+  sudo dmsetup resume "$hostile_storage_name"
+  [[ "$(hostile_storage_suspended_value)" == 0 ]] ||
+    fail "hostile-storage mapping did not resume"
+  hostile_storage_dm_suspended=0
+  hostile_recovery_deadline=$((SECONDS + 30))
+  for hostile_worker_index in "${!hostile_worker_pids[@]}"; do
+    wait_until_before \
+      "hostile-storage worker ${hostile_worker_pids[$hostile_worker_index]} reap" \
+      "$hostile_recovery_deadline" \
+      process_identity_is_gone \
+      "${hostile_worker_pids[$hostile_worker_index]}" \
+      "${hostile_worker_start_times[$hostile_worker_index]}"
+  done
+  wait_until_before "public service recovery after hostile storage" \
+    "$hostile_recovery_deadline" \
+    service_has_new_pid
+  wait_until_before "public portal recovery after hostile storage" \
+    "$hostile_recovery_deadline" \
+    page_is_ready
+  portal_pid="$(
+    sudo systemctl show --property=MainPID --value "$service_unit"
+  )"
+  portal_invocation="$(
+    sudo systemctl show --property=InvocationID --value "$service_unit"
+  )"
+  [[ "$portal_pid" =~ ^[0-9]+$ && "$portal_pid" -gt 1 &&
+    "$portal_pid" != "$hostile_old_portal_pid" &&
+    -n "$portal_invocation" &&
+    "$portal_invocation" != "$hostile_old_portal_invocation" ]] ||
+    fail "hostile-storage recovery did not create a new portal invocation"
+  hostile_worker_pids=()
+  hostile_worker_start_times=()
+  wait_until "storage workers after hostile-storage recovery" \
+    storage_worker_count_is 0
+
+  printf 'Authorization: Bearer %s\n' "$test_bearer" |
+    curl -q -sS -H @- \
+      'http://127.0.0.1:39777/public-files/api/file?path=report.txt' \
+      -o "$response_file"
+  printf '%s\n' 'systemd isolation fixture' |
+    cmp - "$response_file" ||
+    fail "post-D-state downloaded bytes differ from the approved file"
+  assert_service_cgroup_limits
+  assert_systemd_credential_for_pid "$portal_pid"
+  assert_service_api_vfs_isolation "$portal_pid"
+  wait_until "unchanged management sentinel after hostile-storage recovery" \
+    sentinel_is_unchanged
+  printf \
+    'real device-mapper D-state recovery passed: workers=4 tasks=%s memory=%s\n' \
+    "$hostile_tasks_current" "$hostile_memory_current"
+fi
 
 for blocked_file in \
   covered/must-remain-covered.txt \

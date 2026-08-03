@@ -161,6 +161,13 @@ require_text "$vm_script" \
 require_text "$vm_script" \
   'RECASAOS_SYSTEMD_TEST_TARGET=debian-11-systemd-247-qemu' \
   "guest is not bound to the Debian 11 qualification target"
+require_text "$vm_script" \
+  'RECASAOS_HOSTILE_STORAGE_VM_CI=1' \
+  "guest hostile-storage opt-in is missing"
+for guest_package in dmsetup e2fsprogs kmod udev; do
+  require_exact_line "$vm_script" "  - $guest_package" \
+    "guest hostile-storage package is missing: $guest_package"
+done
 for identity_proof in \
   '[[ "$guest_release" == debian:11 ]]' \
   '[[ "$guest_pid1" == systemd ]]' \
@@ -251,6 +258,48 @@ require_text "$systemd_script" \
 require_text "$systemd_script" \
   '  debian-11-systemd-247-qemu ]]; then' \
   "MemoryPeak fallback does not name the exact legacy target"
+require_text "$systemd_script" \
+  'fail "hostile-storage testing is forbidden on the host runner"' \
+  "host runner does not fail closed against hostile-storage testing"
+require_exact_line "$systemd_script" \
+  '    hostile_storage_test_enabled=0' \
+  "host runner unexpectedly enables hostile-storage testing"
+require_text "$systemd_script" \
+  'fail "the Debian VM hostile-storage opt-in is missing"' \
+  "Debian hostile-storage opt-in is not mandatory"
+require_exact_line "$systemd_script" \
+  '    hostile_storage_test_enabled=1' \
+  "Debian VM does not enable hostile-storage testing"
+require_text "$systemd_script" \
+  'sudo dmsetup suspend --nolockfs --noflush "$hostile_storage_name"' \
+  "hostile-storage suspension does not avoid filesystem sync and I/O flush"
+require_text "$systemd_script" \
+  'storage_workers_are_in_d_state 4' \
+  "hostile-storage phase does not require four real D-state workers"
+require_text "$systemd_script" \
+  'or len(worker_pairs) != 4' \
+  "hostile-storage runtime inspection does not require four workers"
+require_text "$systemd_script" \
+  'if state != b"D":' \
+  "hostile-storage runtime inspection does not require D-state"
+require_text "$systemd_script" \
+  'if not any(value & kill_bit for value in pending_values):' \
+  "hostile-storage runtime inspection does not require pending SIGKILL"
+require_text "$systemd_script" \
+  'assert_hostile_storage_worker_boundaries kill-pending 1' \
+  "hostile-storage restart does not prove orphaned D-state worker identity"
+require_text "$systemd_script" \
+  'if ! resume_hostile_storage_for_cleanup; then' \
+  "hostile-storage cleanup does not resume I/O before stopping systemd"
+require_text "$systemd_script" \
+  'sudo dmsetup remove --retry "$hostile_storage_name"' \
+  "hostile-storage cleanup does not remove the exact device mapping"
+require_text "$systemd_script" \
+  'sudo losetup --detach "$hostile_storage_loop"' \
+  "hostile-storage cleanup does not detach the exact loop device"
+require_text "$systemd_script" \
+  'real device-mapper D-state recovery passed:' \
+  "hostile-storage phase has no explicit success evidence"
 
 for sampler_proof in \
   'MAX_RUNTIME_SECONDS = 30.0' \
