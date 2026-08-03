@@ -12,9 +12,16 @@ repository="$(cd -- "$script_directory/../.." && pwd -P)"
 workflow="$repository/.github/workflows/recasaos-ci-security.yml"
 diagnostics="$repository/browser-tests/tests/navigation-diagnostics.js"
 playwright="$repository/browser-tests/playwright.config.js"
+public_files_spec="$repository/browser-tests/tests/public-files.spec.js"
 validator="$repository/.github/scripts/validate-public-files-browser-diagnostics.sh"
 
-for file in "$workflow" "$diagnostics" "$playwright" "$validator"; do
+for file in \
+  "$workflow" \
+  "$diagnostics" \
+  "$playwright" \
+  "$public_files_spec" \
+  "$validator"
+do
   [[ -f "$file" ]] || fail "required policy file is missing"
 done
 
@@ -104,6 +111,7 @@ for lifecycle_proof in \
   'exactPreAuthorizationPage(targetPageState, portalOrigin, true)' \
   'value.driver_url_is_about_blank === true' \
   'exactPortalURL(value.document_url, portalOrigin)' \
+  'value.browser_hidden === true' \
   'value.controlled === false' \
   "value.document_ready_state === 'complete'" \
   'value.login_visible === true' \
@@ -114,6 +122,24 @@ do
   require_text "$diagnostics" "$lifecycle_proof" \
     "Firefox lifecycle proof is missing: $lifecycle_proof"
 done
+[[ "$(grep -Fc -- 'verifiedFirefoxDocumentState: false' "$diagnostics")" == 1 ]] ||
+  fail "ordinary navigation must have exactly one false reconciliation marker"
+[[ "$(grep -Fc -- 'verifiedFirefoxDocumentState: true' "$diagnostics")" == 1 ]] ||
+  fail "Firefox reconciliation must have exactly one true marker"
+require_text "$diagnostics" 'reconciliation_recheck: reconciliationRecheck' \
+  "final pre-authorization recheck is not retained in failure diagnostics"
+require_text "$diagnostics" \
+  'validating the loaded document directly before continuing with ' \
+  "Firefox reconciliation does not announce its direct-document boundary"
+require_text "$public_files_spec" \
+  'async function readReconciledPortalState(page)' \
+  "direct reconciled DOM assertion is missing"
+require_text "$public_files_spec" \
+  'if (navigation.verifiedFirefoxDocumentState === true)' \
+  "Firefox reconciliation is not isolated from locator auto-wait"
+require_text "$public_files_spec" \
+  "'reconciled Firefox portal state must remain pre-authorization'" \
+  "Firefox reconciled DOM postcondition is missing"
 require_text "$diagnostics" 'sources: false' \
   "trace source capture is not disabled"
 require_text "$diagnostics" \
