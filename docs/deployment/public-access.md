@@ -385,17 +385,22 @@ Keep edge routing and health publication disabled, stop both units, reprovision
 the verifier, and repeat the activation tests before treating that listener as
 usable.
 
-> **Compatibility qualification status:** the packaged units are parsed and
-> semantically verified by the Debian 11 systemd 247 toolchain inside a pinned
-> official Debian image, in addition to the Ubuntu 24.04/systemd 255 live job.
-> The Debian check is deliberately unprivileged and parser-only; it does not
-> make systemd 247 execution-qualified or prove PID-1, cgroup, namespace, or
-> resource-control behavior.
-> Keep Issue #25 open, and do not enable public routing on a systemd 247 host,
-> until the exact release candidate passes under PID 1 on a pristine,
-> ephemeral Debian 11/systemd 247 VM with unified cgroup v2. That run must
-> exercise the three read-only effective-limit binds, readiness, restart,
-> cancellation, cleanup, and version-appropriate resource-headroom checks.
+> **Compatibility qualification status:** CI retains the unprivileged
+> parser/semantic check and separately boots a pristine, ephemeral Debian 11
+> guest with systemd 247 as PID 1 and unified cgroup v2. The latter job pins an
+> official Debian generic cloud image and its SHA-512 digest, uses QEMU TCG
+> software emulation without a host mount, device, or KVM dependency, transfers
+> only an archive of the clean exact commit plus the pinned Go toolchain, and
+> reruns the live isolation suite inside the guest. It exercises the three
+> read-only effective-limit binds, readiness, restart, cancellation, cleanup,
+> worker capacity, and resource headroom. Because systemd 247 does not expose
+> `MemoryPeak`, a separately tested 10 ms guest-side sampler records the peak
+> `memory.current`; newer managers must still expose a numeric `MemoryPeak`
+> which is at least the sampled peak. A skipped or failed VM job is not
+> compatibility evidence.
+> Keep Issue #25 open, and do not enable public routing merely because this VM
+> job passes: real FUSE/device-mapper/D-state behavior and the exact target-host
+> recovery matrix remain separate release gates.
 > Debian 11 is a compatibility target, not a recommended new deployment
 > platform.
 
@@ -1057,7 +1062,7 @@ token in the URL. Also verify:
 | Authentication | Missing, malformed, duplicate, wrong, and query-string tokens fail without revealing why. After atomic verifier publication and a controlled restart, the old bearer returns 401 and the new bearer returns 200. |
 | Credential isolation | The raw `rc1_` bearer was generated off-host, its only durable operator copy is in the password manager, and the host provisions only the exact versioned verifier through `recasaos-public-file-verifier`; authorized requests still place the bearer transiently in edge and portal memory. `LimitCORE=0` is active. Missing or malformed verifier input and every non-empty legacy `RECASAOS_PUBLIC_FILE_*` environment setting fail startup. Bidirectional bind-alias and rollback tests fail closed. |
 | Process isolation | systemd owns the Internet-facing loopback socket; the coordinator and workers run under the dedicated non-root `recasaos-public` identity, have no capability or CasaOS-service dependency, cannot create IP sockets, see only the minimal root, read-only share, credential, and three read-only effective cgroup limit files, and can fail/restart without changing the management daemon PID or health. Before loading the credential, the coordinator proves exact service cgroup membership and the source, mount identity, filesystem, read-only flag, and value of all three limit files. It becomes nondumpable; its retained storage and authentication state is limited to the verifier digest, an `O_PATH` root descriptor, fixed mount metadata, and bounded worker-manager state. It reports readiness only after bootstrap and HTTP accept. Bootstrap, list, open, classification, and read run in same-binary workers which inherit neither the AF_INET listener nor raw bearer. At most eight workers are active. Pre-response overload and list/open timeout return 503 with `Retry-After`; a mid-stream read timeout aborts the response connection because its success headers are already committed. Pidfd cancellation and `KillMode=control-group` clean normally killable children. A non-ESRCH pidfd signaling error closes later admission without a numeric-PID fallback. This row and Issue #25 remain open until real hostile-storage and target-host tests prove D-state admission control, unit resource bounds, restart, and recovery. |
-| Platform floor | The exact release candidate passes under PID 1 on a pristine, ephemeral Debian 11/systemd 247 host with Linux 5.8 or newer and unified cgroup v2. Record the manager and kernel versions, the three cgroup-control-file mount identities, cgroup2/read-only provenance, effective values, readiness, restart, cancellation, cleanup, and version-appropriate resource-headroom evidence. Ubuntu 24.04-only, parser-only, or ordinary-container evidence does not satisfy this row. |
+| Platform floor | The exact release candidate passes the `Debian 11 systemd 247 PID1 VM` job under PID 1 on a pristine, ephemeral Debian 11/systemd 247 host with Linux 5.8 or newer and unified cgroup v2. Record the exact commit and image digest, manager and kernel versions, the three cgroup-control-file mount identities, cgroup2/read-only provenance, effective values, readiness, restart, cancellation, cleanup, and version-appropriate resource-headroom evidence. A skipped job, Ubuntu 24.04-only, parser-only, or ordinary-container evidence does not satisfy this row. |
 | Path confinement | Absolute/parent/encoded traversal, hidden names, symlinks, hardlinks, mount points, devices, pipes, and sockets cannot be listed or downloaded. |
 | Root filesystem | Startup records the mount ID and allowlisted filesystem type from the pinned root FD. FUSE, network, overlay, ZFS, and unknown roots are rejected before the listener is usable; replacing or remounting the configured pathname does not redirect the live portal away from its original descriptor. |
 | Browser boundary | CSP has no inline/eval allowance; the supplied client is designed not to write the bearer to a URL, Referer, history, cookie, Cache API, Web Storage, or IndexedDB, while page, Worker, header, edge, and server request memory remain transient handling boundaries. In stable Chromium, Firefox, and WebKit over real HTTPS, verify storage, DevTools, proxy/application logs, and crash artifacts do not retain it; verify a large download starts without full-body buffering and preserves bytes/filename; replay, another tab, Worker restart, logout, rotation, redirect, and malformed messages fail closed. Record memory measurements and initial Range, retry/resume, and cancellation results. |

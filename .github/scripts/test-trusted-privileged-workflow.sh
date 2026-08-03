@@ -85,5 +85,8 @@ expect_rejection unsafe-cleanup \
 expect_rejection changed-trusted-workflow \
   '            [[ "$head_policy_blob" == "$default_policy_blob" ]]' \
   '            [[ -n "$head_policy_blob" ]]'
+expect_rejection compatibility-job-omitted \
+  "          compatibility_job='Debian 11 systemd 247 PID1 VM'" \
+  "          compatibility_job='untrusted compatibility result'"
 
 printf 'trusted privileged workflow negative tests passed\n'

@@ -15,10 +15,6 @@ fail() {
   fail "the repository identity is not the trusted ReCasaOS repository"
 [[ "${RUNNER_OS:-}" == Linux ]] ||
   fail "the runner is not Linux"
-[[ "${RECASAOS_RUNNER_ENVIRONMENT:-}" == github-hosted ]] ||
-  fail "GitHub did not identify this as a hosted runner"
-[[ -d /opt/hostedtoolcache ]] ||
-  fail "the GitHub-hosted runner marker is missing"
 [[ "${GITHUB_RUN_ID:-}" =~ ^[0-9]+$ ]] ||
   fail "GITHUB_RUN_ID is missing or unsafe"
 [[ "${GITHUB_RUN_ATTEMPT:-}" =~ ^[0-9]+$ ]] ||
@@ -27,6 +23,50 @@ fail() {
   fail "PID 1 is not systemd"
 [[ "$(stat -fc %T /sys/fs/cgroup)" == cgroup2fs ]] ||
   fail "the runner is not using cgroup v2"
+systemd_version_output="$(systemd --version)" ||
+  fail "could not inspect the systemd manager version"
+systemd_version_line="${systemd_version_output%%$'\n'*}"
+IFS=' ' read -r systemd_command systemd_version _ <<<"$systemd_version_line"
+[[ "$systemd_command" == systemd && "$systemd_version" =~ ^[0-9]+$ ]] ||
+  fail "systemd reported an invalid version: $systemd_version_line"
+manager_version_output="$(
+  systemctl show --property=Version --value
+)" || fail "could not inspect the running systemd manager version"
+[[ "$manager_version_output" =~ ^([0-9]+) ]] ||
+  fail "systemd manager reported an invalid version: $manager_version_output"
+manager_version="${BASH_REMATCH[1]}"
+[[ "$manager_version" == "$systemd_version" ]] ||
+  fail "systemd binary version $systemd_version differs from manager $manager_version"
+printf 'verified systemd manager version: %s\n' "$manager_version_output"
+
+case "${RECASAOS_SYSTEMD_TEST_TARGET:-}" in
+  github-hosted-ubuntu)
+    [[ "${RECASAOS_RUNNER_ENVIRONMENT:-}" == github-hosted ]] ||
+      fail "GitHub did not identify this as a hosted runner"
+    [[ -d /opt/hostedtoolcache ]] ||
+      fail "the GitHub-hosted runner marker is missing"
+    ;;
+  debian-11-systemd-247-qemu)
+    [[ "${RECASAOS_RUNNER_ENVIRONMENT:-}" == github-hosted-vm ]] ||
+      fail "the Debian qualification target is not the expected hosted VM"
+    [[ "$systemd_version" == 247 ]] ||
+      fail "the Debian qualification VM is not running systemd 247"
+    guest_release="$(
+      . /etc/os-release
+      printf '%s:%s\n' "${ID:-}" "${VERSION_ID:-}"
+    )" || fail "could not inspect the Debian qualification release"
+    [[ "$guest_release" == debian:11 ]] ||
+      fail "the qualification VM release is $guest_release, want debian:11"
+    if systemd-detect-virt --container >/dev/null 2>&1; then
+      fail "the Debian qualification target is a container"
+    fi
+    [[ "$(systemd-detect-virt --vm)" == qemu ]] ||
+      fail "the Debian qualification target is not an isolated QEMU VM"
+    ;;
+  *)
+    fail "the exact systemd integration target is not authorized"
+    ;;
+esac
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 cd -- "$repo_root"
@@ -51,6 +91,10 @@ management_dir="${workspace}/management"
 response_file="${workspace}/response"
 ninth_response_headers="${workspace}/ninth-response.headers"
 capacity_events="${workspace}/capacity-events"
+memory_sampler_output="${workspace}/memory-current-sampled-peak"
+memory_sampler_ready="${workspace}/memory-current-sampler-ready"
+memory_sampler_stop="${workspace}/memory-current-sampler-stop"
+memory_sampler_failure="${workspace}/memory-current-sampler-failure"
 nested_backing="${workspace}/nested-backing"
 nested_mount="${share}/covered"
 host_shm_sentinel_prefix="/dev/shm/recasaos-public-files-ci-${run_key}."
@@ -83,11 +127,14 @@ if getent passwd recasaos-public >/dev/null ||
   fail "the recasaos-public account unexpectedly already exists"
 fi
 for required_tool in \
-  cmp find getfacl mktemp mount mountpoint pgrep ps sort ss systemctl truncate umount
+  cmp find getfacl go mktemp mount mountpoint pgrep ps sort ss systemctl truncate umount
 do
   command -v "$required_tool" >/dev/null 2>&1 ||
     fail "required mount test tool is unavailable: $required_tool"
 done
+go_version="$(go version)" || fail "could not inspect the Go toolchain"
+[[ "$go_version" == "go version go1.26.5 linux/amd64" ]] ||
+  fail "unexpected Go toolchain: $go_version"
 [[ -x /usr/bin/python3 ]] ||
   fail "required Python interpreter is unavailable: /usr/bin/python3"
 /usr/bin/python3 - \
@@ -160,6 +207,9 @@ last_storage_worker_count=0
 max_storage_worker_count=0
 portal_invocation=
 capacity_journal_cursor=
+memory_sampler_pid=
+memory_sampler_start_time=
+sampled_memory_peak=
 
 cleanup_problem() {
   printf 'public-files systemd test cleanup: %s\n' "$*" >&2
@@ -459,12 +509,14 @@ process_start_time() {
   printf '%s\n' "${stat_fields[19]}"
 }
 
-terminate_exact_background_process() {
+signal_exact_background_process() {
   local pid=$1
   local start_time=$2
+  local signal_number=$3
 
   [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 &&
-    "$start_time" =~ ^[0-9]+$ ]] || return 1
+    "$start_time" =~ ^[0-9]+$ &&
+    ( "$signal_number" == 9 || "$signal_number" == 15 ) ]] || return 1
   /usr/bin/python3 -c '
 import os
 import signal
@@ -472,6 +524,7 @@ import sys
 
 pid = int(sys.argv[1])
 expected_start = sys.argv[2].encode("ascii")
+signal_number = int(sys.argv[3])
 try:
     pidfd = os.pidfd_open(pid, 0)
 except ProcessLookupError:
@@ -489,12 +542,181 @@ try:
     if fields[19] != expected_start:
         raise SystemExit(0)
     try:
-        signal.pidfd_send_signal(pidfd, signal.SIGTERM, None, 0)
+        signal.pidfd_send_signal(pidfd, signal_number, None, 0)
     except ProcessLookupError:
         pass
 finally:
     os.close(pidfd)
-' "$pid" "$start_time"
+' "$pid" "$start_time" "$signal_number"
+}
+
+terminate_exact_background_process() {
+  signal_exact_background_process "$1" "$2" 15
+}
+
+kill_exact_background_process() {
+  signal_exact_background_process "$1" "$2" 9
+}
+
+memory_sampler_process_is_live() {
+  local current_start_time
+
+  [[ "$memory_sampler_pid" =~ ^[0-9]+$ &&
+    "$memory_sampler_pid" -gt 1 &&
+    "$memory_sampler_start_time" =~ ^[0-9]+$ ]] || return 1
+  current_start_time="$(
+    process_start_time "$memory_sampler_pid" 2>/dev/null
+  )" || return 1
+  [[ "$current_start_time" == "$memory_sampler_start_time" ]]
+}
+
+memory_sampler_ready_is_valid() {
+  local metadata
+  local value
+
+  [[ -f "$memory_sampler_ready" && ! -L "$memory_sampler_ready" ]] ||
+    return 1
+  metadata="$(stat -c '%u:%a:%h' "$memory_sampler_ready")" || return 1
+  [[ "$metadata" == "$(id -u):600:1" ]] || return 1
+  value="$(<"$memory_sampler_ready")" || return 1
+  [[ "$value" =~ ^[0-9]+$ ]]
+}
+
+start_cgroup_memory_sampler() {
+  local cgroup_memory_current
+  local ready_deadline
+
+  [[ -z "$memory_sampler_pid" && -z "$memory_sampler_start_time" ]] ||
+    fail "cgroup memory sampler is already recorded"
+  for control_path in \
+    "$memory_sampler_output" \
+    "$memory_sampler_ready" \
+    "$memory_sampler_stop" \
+    "$memory_sampler_failure"
+  do
+    [[ ! -e "$control_path" && ! -L "$control_path" ]] ||
+      fail "cgroup memory sampler control path already exists: $control_path"
+  done
+  cgroup_memory_current="/sys/fs/cgroup/system.slice/${service_unit}/memory.current"
+  [[ "$cgroup_memory_current" == \
+    /sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.current ]] ||
+    fail "refusing unexpected cgroup memory source: $cgroup_memory_current"
+  [[ -f "$cgroup_memory_current" &&
+    ! -L "$cgroup_memory_current" &&
+    -r "$cgroup_memory_current" ]] ||
+    fail "service cgroup memory.current is not a readable regular file"
+  [[ -f "$repo_root/.github/scripts/sample-cgroup-memory.py" &&
+    ! -L "$repo_root/.github/scripts/sample-cgroup-memory.py" ]] ||
+    fail "reviewed cgroup memory sampler is unavailable"
+
+  install -m 0600 /dev/null "$memory_sampler_failure"
+  PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 \
+    "$repo_root/.github/scripts/sample-cgroup-memory.py" \
+    "$cgroup_memory_current" \
+    "$memory_sampler_output" \
+    "$memory_sampler_ready" \
+    "$memory_sampler_stop" \
+    2>"$memory_sampler_failure" &
+  memory_sampler_pid=$!
+  memory_sampler_start_time="$(
+    process_start_time "$memory_sampler_pid"
+  )" || fail "could not record the cgroup memory sampler identity"
+
+  ready_deadline=$((SECONDS + 5))
+  while ! memory_sampler_ready_is_valid; do
+    ((SECONDS < ready_deadline)) || {
+      sed -n '1,20p' "$memory_sampler_failure" >&2
+      fail "cgroup memory sampler did not become ready"
+    }
+    memory_sampler_process_is_live || {
+      sed -n '1,20p' "$memory_sampler_failure" >&2
+      fail "cgroup memory sampler exited before becoming ready"
+    }
+    sleep 0.02
+  done
+}
+
+stop_cgroup_memory_sampler() {
+  local metadata
+  local sampler_deadline
+
+  memory_sampler_process_is_live ||
+    fail "cgroup memory sampler identity disappeared before stop"
+  [[ ! -e "$memory_sampler_stop" && ! -L "$memory_sampler_stop" ]] ||
+    fail "cgroup memory sampler stop marker already exists"
+  install -m 0600 /dev/null "$memory_sampler_stop"
+
+  sampler_deadline=$((SECONDS + 5))
+  while memory_sampler_process_is_live; do
+    ((SECONDS < sampler_deadline)) || {
+      terminate_exact_background_process \
+        "$memory_sampler_pid" "$memory_sampler_start_time" || true
+      fail "cgroup memory sampler did not stop within the deadline"
+    }
+    sleep 0.02
+  done
+  if ! wait "$memory_sampler_pid"; then
+    sed -n '1,20p' "$memory_sampler_failure" >&2
+    fail "cgroup memory sampler exited unsuccessfully"
+  fi
+
+  [[ -f "$memory_sampler_output" && ! -L "$memory_sampler_output" ]] ||
+    fail "cgroup memory sampler output is unavailable"
+  metadata="$(stat -c '%u:%a:%h' "$memory_sampler_output")" ||
+    fail "could not inspect cgroup memory sampler output"
+  [[ "$metadata" == "$(id -u):600:1" ]] ||
+    fail "cgroup memory sampler output metadata is unsafe: $metadata"
+  sampled_memory_peak="$(<"$memory_sampler_output")" ||
+    fail "could not read cgroup memory sampler output"
+  [[ "$sampled_memory_peak" =~ ^[0-9]+$ ]] ||
+    fail "cgroup memory sampler output is invalid"
+
+  memory_sampler_pid=
+  memory_sampler_start_time=
+}
+
+cleanup_cgroup_memory_sampler() {
+  local sampler_deadline
+
+  if [[ ! "$memory_sampler_pid" =~ ^[0-9]+$ ||
+    "$memory_sampler_pid" -le 1 ||
+    ! "$memory_sampler_start_time" =~ ^[0-9]+$ ]]; then
+    memory_sampler_pid=
+    memory_sampler_start_time=
+    return
+  fi
+
+  if [[ ! -e "$memory_sampler_stop" && ! -L "$memory_sampler_stop" ]]; then
+    install -m 0600 /dev/null "$memory_sampler_stop" ||
+      cleanup_problem "could not create cgroup memory sampler stop marker"
+  fi
+  if memory_sampler_process_is_live; then
+    if ! terminate_exact_background_process \
+      "$memory_sampler_pid" "$memory_sampler_start_time"; then
+      cleanup_problem "could not terminate exact cgroup memory sampler identity"
+    fi
+  fi
+  sampler_deadline=$((SECONDS + 3))
+  while memory_sampler_process_is_live && ((SECONDS < sampler_deadline)); do
+    sleep 0.02
+  done
+  if memory_sampler_process_is_live; then
+    if ! kill_exact_background_process \
+      "$memory_sampler_pid" "$memory_sampler_start_time"; then
+      cleanup_problem "could not kill exact cgroup memory sampler identity"
+    fi
+    sampler_deadline=$((SECONDS + 2))
+    while memory_sampler_process_is_live && ((SECONDS < sampler_deadline)); do
+      sleep 0.02
+    done
+  fi
+  if memory_sampler_process_is_live; then
+    cleanup_problem "cgroup memory sampler remains live after exact SIGKILL"
+  else
+    wait "$memory_sampler_pid" 2>/dev/null || true
+  fi
+  memory_sampler_pid=
+  memory_sampler_start_time=
 }
 
 cleanup_background_downloads() {
@@ -565,6 +787,7 @@ cleanup() {
   trap - EXIT
   set +e
 
+  cleanup_cgroup_memory_sampler
   cleanup_background_downloads
   for unit in "$socket_unit" "$service_unit" "$sentinel_unit"; do
     cleanup_control_groups["$unit"]="$(
@@ -2489,6 +2712,7 @@ sudo cmp -s -- "/proc/$portal_pid/exe" "$systemd_test_binary" ||
   fail "running systemd-test portal bytes differ from the reviewed binary"
 wait_until "storage workers before bounded load" storage_worker_count_is 0
 capture_capacity_journal_cursor
+start_cgroup_memory_sampler
 worker_capacity_deadline=$((SECONDS + 15))
 for expected_worker_count in {1..8}; do
   start_slow_download
@@ -2561,6 +2785,7 @@ for bounded_worker_index in "${!bounded_worker_pids[@]}"; do
     "${bounded_worker_start_times[$bounded_worker_index]}" \
     systemd-test
 done
+stop_cgroup_memory_sampler
 
 tasks_current="$(
   sudo systemctl show --property=TasksCurrent --value "$service_unit"
@@ -2568,15 +2793,31 @@ tasks_current="$(
 memory_current="$(
   sudo systemctl show --property=MemoryCurrent --value "$service_unit"
 )"
-memory_peak="$(
-  sudo systemctl show --property=MemoryPeak --value "$service_unit"
-)"
+if ! memory_peak="$(
+  sudo systemctl show --property=MemoryPeak --value "$service_unit" \
+    2>/dev/null
+)"; then
+  memory_peak=
+fi
 [[ "$tasks_current" =~ ^[0-9]+$ && "$tasks_current" -le 224 ]] ||
   fail "eight-worker TasksCurrent=$tasks_current leaves insufficient headroom"
 [[ "$memory_current" =~ ^[0-9]+$ && "$memory_current" -le 469762048 ]] ||
   fail "eight-worker MemoryCurrent=$memory_current leaves insufficient headroom"
-[[ "$memory_peak" =~ ^[0-9]+$ && "$memory_peak" -le 469762048 ]] ||
-  fail "eight-worker MemoryPeak=$memory_peak leaves insufficient headroom"
+[[ "$sampled_memory_peak" =~ ^[0-9]+$ &&
+  "$sampled_memory_peak" -le 469762048 ]] ||
+  fail "sampled eight-worker memory peak=$sampled_memory_peak leaves insufficient headroom"
+if [[ "$memory_peak" =~ ^[0-9]+$ ]]; then
+  [[ "$memory_peak" -le 469762048 ]] ||
+    fail "eight-worker MemoryPeak=$memory_peak leaves insufficient headroom"
+  [[ "$memory_peak" -ge "$sampled_memory_peak" ]] ||
+    fail "systemd MemoryPeak=$memory_peak is below sampled peak=$sampled_memory_peak"
+elif [[ "${RECASAOS_SYSTEMD_TEST_TARGET:-}" != \
+  debian-11-systemd-247-qemu ]]; then
+  fail "systemd MemoryPeak is unavailable on a target that requires it"
+else
+  printf 'systemd 247 MemoryPeak unavailable; reviewed memory.current sampler peak=%s\n' \
+    "$sampled_memory_peak"
+fi
 
 listener_inode="$(
   sudo awk \

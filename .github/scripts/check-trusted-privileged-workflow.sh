@@ -115,7 +115,13 @@ require_block_text "$attest_block" \
 for trusted_path in \
   .github/workflows/recasaos-ci-security.yml \
   .github/workflows/trusted-privileged-ci.yml \
+  .github/scripts/check-debian11-systemd-vm-policy.sh \
   .github/scripts/check-trusted-privileged-workflow.sh \
+  .github/scripts/sample-cgroup-memory.py \
+  .github/scripts/test-cgroup-memory-sampler.sh \
+  .github/scripts/test-debian11-systemd-vm-policy.sh \
+  .github/scripts/test-public-files-debian11-vm.sh \
+  .github/scripts/test-public-files-systemd.sh \
   .github/scripts/test-trusted-privileged-workflow.sh
 do
   require_block_text "$attest_block" "$trusted_path" \
@@ -133,6 +139,12 @@ require_block_text "$attest_block" \
 require_block_text "$attest_block" \
   "privileged_job='Privileged mount regressions (isolated namespace)'" \
   "automatic attestor does not require the privileged mount job"
+require_block_text "$attest_block" \
+  "compatibility_job='Debian 11 systemd 247 PID1 VM'" \
+  "automatic attestor does not require the Debian 11 PID1 VM job"
+require_block_text "$attest_block" \
+  'skip "Debian 11 PID1 VM job did not pass exactly once"' \
+  "automatic attestor does not enforce the Debian 11 PID1 VM result"
 require_block_text "$attest_block" \
   "'Verify isolated Samba probe privilege boundary'" \
   "automatic attestor omits the trusted Samba step"

@@ -164,11 +164,14 @@ basic public route-separation requirement, but these release gates remain:
 - Issue #25's bounded worker protocol is implemented as a release candidate,
   but the issue remains open until exact-head Linux and real
   FUSE/device-mapper/D-state tests prove timeout, quarantine, cgroup cleanup,
-  restart, cancellation, and resource-headroom behavior. The declared systemd
-  247 floor is source-reviewed but not execution-qualified; closing Issue #25
-  additionally requires the exact release candidate to pass under PID 1 on a
-  pristine, ephemeral Debian 11/systemd 247 unified-cgroup-v2 VM. Ubuntu
-  24.04/systemd 255 evidence does not satisfy that compatibility-floor gate.
+  restart, cancellation, and resource-headroom behavior. A dedicated CI job
+  boots the clean exact commit under PID 1 in a checksum-pinned, pristine
+  Debian 11/systemd 247 unified-cgroup-v2 QEMU TCG VM and runs the live
+  isolation suite; a skipped or failed job is not compatibility evidence.
+  This closes the earlier parser-only evidence gap for heads on which the job
+  succeeds, but does not close Issue #25 or substitute for real hostile-storage
+  and exact target-host recovery evidence. Ubuntu 24.04/systemd 255 evidence
+  alone does not satisfy the compatibility-floor gate.
   Its normal activation, sandbox and API smoke checks use the production build,
   while the deterministic worker-capacity and coordinator-cleanup sections
   temporarily use a non-release CI build tag that stops only the exact
