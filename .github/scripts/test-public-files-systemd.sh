@@ -1528,6 +1528,207 @@ print(
 PYTHON
 }
 
+assert_bounded_storage_worker_runtime_boundaries() {
+  local index
+  local worker_identity_arguments=()
+
+  [[ "${#bounded_worker_pids[@]}" == 8 &&
+    "${#bounded_worker_start_times[@]}" == 8 ]] ||
+    fail "cannot inspect an incomplete bounded worker set"
+  [[ "$portal_pid" =~ ^[0-9]+$ && "$portal_pid" -gt 1 ]] ||
+    fail "cannot inspect bounded workers for an unsafe portal identity"
+  [[ "$listener_inode" =~ ^[0-9]+$ ]] ||
+    fail "cannot inspect bounded workers for an unsafe listener inode"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] ||
+    fail "cannot inspect bounded workers with an unsafe bearer digest"
+
+  for index in "${!bounded_worker_pids[@]}"; do
+    worker_identity_arguments+=(
+      "${bounded_worker_pids[$index]}:${bounded_worker_start_times[$index]}"
+    )
+  done
+
+  # One root process takes the same before/after identity snapshots and checks
+  # every stopped worker. Spawning dozens of sudo helpers under QEMU TCG would
+  # measure the observer rather than the service and can outlive the unchanged
+  # production write deadline.
+  if ! sudo /usr/bin/python3 - \
+    "$portal_pid" \
+    "$listener_inode" \
+    "$storage_worker_address_space_ceiling" \
+    "$storage_worker_address_space_minimum_reserve" \
+    "${#test_bearer}" \
+    "$digest" \
+    "${worker_identity_arguments[@]}" <<'PYTHON'
+import hashlib
+import os
+from pathlib import Path
+import re
+import sys
+
+expected_parent = int(sys.argv[1])
+listener_inode = sys.argv[2]
+ceiling = int(sys.argv[3])
+minimum_reserve = int(sys.argv[4])
+secret_length = int(sys.argv[5])
+secret_digest = sys.argv[6]
+worker_pairs = sys.argv[7:]
+
+if (
+    expected_parent <= 1
+    or not listener_inode.isdigit()
+    or ceiling != 2 * 1024 * 1024 * 1024
+    or minimum_reserve != 128 * 1024 * 1024
+    or secret_length <= 0
+    or secret_length > 4096
+    or re.fullmatch(r"[0-9a-f]{64}", secret_digest) is None
+    or len(worker_pairs) != 8
+    or getattr(os, "O_CLOEXEC", 0) != 0o2000000
+):
+    raise SystemExit("unsafe bounded worker evidence arguments")
+
+expected_command = (
+    b"/proc/self/exe\0"
+    b"--internal-public-files-storage-worker\0"
+    b"file\0"
+)
+listener_target = f"socket:[{listener_inode}]"
+portal_executable = os.stat(f"/proc/{expected_parent}/exe")
+
+
+def contains_secret(data):
+    if len(data) < secret_length:
+        return False
+    for offset in range(len(data) - secret_length + 1):
+        candidate = data[offset : offset + secret_length]
+        if hashlib.sha256(candidate).hexdigest() == secret_digest:
+            return True
+    return False
+
+
+def identity(proc):
+    stat_data = (proc / "stat").read_bytes()
+    marker = stat_data.rfind(b") ")
+    fields = stat_data[marker + 2 :].split() if marker >= 0 else []
+    if (
+        len(fields) <= 19
+        or fields[0] != b"T"
+        or not fields[1].isdigit()
+        or not fields[19].isdigit()
+    ):
+        raise RuntimeError("could not parse one stopped worker identity")
+    return fields[19], int(fields[1]), (proc / "cmdline").read_bytes()
+
+
+seen_pids = set()
+for pair in worker_pairs:
+    match = re.fullmatch(r"([1-9][0-9]*):([1-9][0-9]*)", pair)
+    if match is None:
+        raise RuntimeError("malformed bounded worker identity")
+    pid = int(match.group(1))
+    expected_start = match.group(2).encode("ascii")
+    if pid <= 1 or pid in seen_pids:
+        raise RuntimeError("unsafe or duplicate bounded worker PID")
+    seen_pids.add(pid)
+    proc = Path(f"/proc/{pid}")
+
+    start_before, parent_before, command_before = identity(proc)
+    if (
+        start_before != expected_start
+        or parent_before != expected_parent
+        or command_before != expected_command
+    ):
+        raise RuntimeError("bounded worker identity changed before inspection")
+
+    worker_executable = os.stat(proc / "exe")
+    if (
+        worker_executable.st_dev != portal_executable.st_dev
+        or worker_executable.st_ino != portal_executable.st_ino
+    ):
+        raise RuntimeError("bounded worker does not share the reviewed image")
+
+    limits = (proc / "limits").read_text(encoding="ascii")
+    address_limits = []
+    for line in limits.splitlines():
+        fields = line.split()
+        if fields[:3] == ["Max", "address", "space"]:
+            if (
+                len(fields) != 6
+                or fields[5] != "bytes"
+                or not fields[3].isdigit()
+                or not fields[4].isdigit()
+            ):
+                raise RuntimeError("bounded worker address limit is malformed")
+            address_limits.append((int(fields[3]), int(fields[4])))
+    if len(address_limits) != 1:
+        raise RuntimeError("could not parse one bounded worker address limit")
+    soft, hard = address_limits[0]
+
+    status = (proc / "status").read_text(encoding="ascii")
+    vm_sizes = re.findall(
+        r"^VmSize:\s*([0-9]+)\s+kB\s*$",
+        status,
+        re.MULTILINE,
+    )
+    if len(vm_sizes) != 1:
+        raise RuntimeError("could not parse one bounded worker VmSize")
+    vm_size_kib = int(vm_sizes[0])
+    if vm_size_kib <= 0 or vm_size_kib > ceiling // 1024:
+        raise RuntimeError("bounded worker VmSize is outside the ceiling")
+    vm_size_bytes = vm_size_kib * 1024
+    if soft != hard or soft <= vm_size_bytes or soft > ceiling:
+        raise RuntimeError("bounded worker address-space limit is unsafe")
+    reserve = soft - vm_size_bytes
+    if reserve < minimum_reserve:
+        raise RuntimeError("bounded worker address-space reserve is too small")
+
+    environment = (proc / "environ").read_bytes()
+    if contains_secret(command_before) or contains_secret(environment):
+        raise RuntimeError("raw bearer is present in a bounded worker")
+    if os.stat(proc / "mem").st_uid != 0:
+        raise RuntimeError("bounded worker memory remains dumpable")
+
+    descriptor_directory = proc / "fd"
+    descriptor_names = os.listdir(descriptor_directory)
+    if any(not name.isdigit() for name in descriptor_names):
+        raise RuntimeError("bounded worker exposed a nonnumeric descriptor")
+    for descriptor_name in descriptor_names:
+        descriptor = int(descriptor_name)
+        descriptor_path = descriptor_directory / descriptor_name
+        if os.readlink(descriptor_path) == listener_target:
+            raise RuntimeError("bounded worker inherited the AF_INET listener")
+        if descriptor <= 2:
+            continue
+        descriptor_info = (
+            proc / "fdinfo" / descriptor_name
+        ).read_text(encoding="ascii")
+        flags = re.findall(
+            r"^flags:\s*([0-7]+)\s*$",
+            descriptor_info,
+            re.MULTILINE,
+        )
+        if len(flags) != 1 or (int(flags[0], 8) & os.O_CLOEXEC) == 0:
+            raise RuntimeError("bounded worker descriptor is not close-on-exec")
+
+    start_after, parent_after, command_after = identity(proc)
+    if (
+        start_after != start_before
+        or parent_after != parent_before
+        or command_after != command_before
+    ):
+        raise RuntimeError("bounded worker identity changed during inspection")
+
+    print(
+        "storage worker address-space evidence: "
+        f"build=systemd-test pid={pid} vm-size-kib={vm_size_kib} "
+        f"soft-bytes={soft} hard-bytes={hard} reserve-bytes={reserve}"
+    )
+PYTHON
+  then
+    fail "bounded storage worker runtime evidence failed"
+  fi
+}
+
 print_capacity_journal_diagnostics() {
   local diagnostics
 
@@ -2838,12 +3039,14 @@ worker_capacity_evidence_deadline=$((
 wait_until_before "storage worker capacity event chain" \
   "$worker_capacity_evidence_deadline" \
   capacity_phase_events_are_complete
-for bounded_worker_index in "${!bounded_worker_pids[@]}"; do
-  assert_storage_worker_address_space_limit \
-    "${bounded_worker_pids[$bounded_worker_index]}" \
-    "${bounded_worker_start_times[$bounded_worker_index]}" \
-    systemd-test
-done
+listener_inode="$(
+  sudo awk \
+    '$2 == "0100007F:9B61" && $4 == "0A" { print $10; exit }' \
+    /proc/net/tcp
+)"
+[[ "$listener_inode" =~ ^[0-9]+$ ]] ||
+  fail "could not resolve the public listener inode"
+assert_bounded_storage_worker_runtime_boundaries
 stop_cgroup_memory_sampler
 
 tasks_current="$(
@@ -2878,53 +3081,6 @@ else
     "$sampled_memory_peak"
 fi
 
-listener_inode="$(
-  sudo awk \
-    '$2 == "0100007F:9B61" && $4 == "0A" { print $10; exit }' \
-    /proc/net/tcp
-)"
-[[ "$listener_inode" =~ ^[0-9]+$ ]] ||
-  fail "could not resolve the public listener inode"
-while IFS= read -r worker_pid; do
-  [[ "$worker_pid" =~ ^[0-9]+$ && "$worker_pid" -gt 1 ]] ||
-    fail "invalid storage worker PID: $worker_pid"
-  worker_command="$(
-    sudo cat "/proc/$worker_pid/cmdline" | tr '\0' ' '
-  )"
-  [[ "$worker_command" == *"--internal-public-files-storage-worker file"* ]] ||
-    fail "unexpected storage worker command line"
-  if printf '%s' "$worker_command" | grep -Fq "$test_bearer"; then
-    fail "raw bearer is present in a storage worker command line"
-  fi
-  if sudo cat "/proc/$worker_pid/environ" |
-    tr '\0' '\n' |
-    grep -F -- "$test_bearer" >/dev/null; then
-    fail "raw bearer is present in a storage worker environment"
-  fi
-  [[ "$(sudo stat -Lc %u "/proc/$worker_pid/mem")" == 0 ]] ||
-    fail "storage worker process memory remains dumpable"
-  while IFS= read -r descriptor_path; do
-    descriptor="${descriptor_path##*/}"
-    [[ "$descriptor" =~ ^[0-9]+$ ]] ||
-      fail "storage worker exposed a nonnumeric descriptor"
-    descriptor_target="$(sudo readlink "$descriptor_path")"
-    [[ "$descriptor_target" != "socket:[$listener_inode]" ]] ||
-      fail "storage worker inherited the AF_INET listener"
-    if [[ "$descriptor" -gt 2 ]]; then
-      descriptor_flags="$(
-        sudo awk '$1 == "flags:" { print $2; exit }' \
-          "/proc/$worker_pid/fdinfo/$descriptor"
-      )"
-      [[ "$descriptor_flags" =~ ^[0-7]+$ ]] ||
-        fail "storage worker descriptor $descriptor has invalid flags"
-      descriptor_flags_value=$((8#$descriptor_flags))
-      (( (descriptor_flags_value & 02000000) != 0 )) ||
-        fail "storage worker descriptor $descriptor is not close-on-exec"
-    fi
-  done < <(
-    sudo find "/proc/$worker_pid/fd" -mindepth 1 -maxdepth 1 -print
-  )
-done < <(storage_worker_pids)
 worker_pre_cancellation_budget=$((worker_capacity_window_seconds + 10))
 ((SECONDS < worker_capacity_deadline + 10)) ||
   fail \

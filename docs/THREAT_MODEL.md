@@ -180,8 +180,11 @@ basic public route-separation requirement, but these release gates remain:
   aggregate window to admit eight concurrently launched holders, while the
   native hosted test retains 15 seconds. All clients, stopped workers, and the
   exact first-read/capacity event chain remain mandatory; journal propagation
-  has a separate 10-second evidence-only bound. Per-worker IPC, service,
-  resource, and cleanup bounds are unchanged.
+  has a separate 10-second evidence-only bound. A single root-only `/proc`
+  snapshot checks all eight stopped identities, limits, bearer absence, memory
+  ownership, descriptor flags, and listener non-inheritance so observer
+  process startup cannot consume the service deadline under TCG. Per-worker
+  IPC, service, resource, and cleanup bounds are unchanged.
   This closes the earlier parser-only evidence gap for heads on which the job
   succeeds, but does not close Issue #25 or substitute for real hostile-storage
   and exact target-host recovery evidence. Ubuntu 24.04/systemd 255 evidence

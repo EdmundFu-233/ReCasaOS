@@ -103,6 +103,15 @@ expect_rejection expanded-capacity-evidence-window systemd \
 expect_rejection serialized-capacity-admission systemd \
   'for _ in {1..8}; do' \
   'for expected_worker_count in {1..8}; do'
+expect_rejection incomplete-bounded-worker-inspection systemd \
+  '    or len(worker_pairs) != 8' \
+  '    or len(worker_pairs) != 1'
+expect_rejection skipped-bounded-worker-inspection systemd \
+  $'\nassert_bounded_storage_worker_runtime_boundaries\nstop_cgroup_memory_sampler' \
+  $'\n: # bounded worker inspection skipped\nstop_cgroup_memory_sampler'
+expect_rejection inherited-listener-inspection systemd \
+  '        if os.readlink(descriptor_path) == listener_target:' \
+  '        if os.readlink(descriptor_path) != listener_target:'
 expect_rejection memory-peak-fail-open systemd \
   'elif [[ "${RECASAOS_SYSTEMD_TEST_TARGET:-}" != \' \
   'elif [[ -z "${RECASAOS_SYSTEMD_TEST_TARGET:-}" && \'

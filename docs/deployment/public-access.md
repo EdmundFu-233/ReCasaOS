@@ -407,8 +407,11 @@ usable.
 > native hosted runner. The eight holders are launched without serializing
 > each admission, then every client, stopped worker, and exact event chain must
 > be present. Journal visibility has a separate 10-second evidence-only bound;
-> this does not change the service write timeout, worker IPC deadlines, cgroup
-> limits, or cleanup requirements. Because systemd 247 does
+> one root-only `/proc` snapshot checks all eight immutable process identities,
+> address-space limits, bearer absence, memory ownership, descriptor flags, and
+> listener non-inheritance without serial observer overhead. This does not
+> change the service write timeout, worker IPC deadlines, cgroup limits, or
+> cleanup requirements. Because systemd 247 does
 > not expose
 > `MemoryPeak`, a separately tested 10 ms guest-side sampler records the peak
 > `memory.current`; newer managers must still expose a numeric `MemoryPeak`

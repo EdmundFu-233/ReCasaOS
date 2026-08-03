@@ -27,6 +27,14 @@ require_text() {
   grep -Fq -- "$value" "$file" || fail "$reason"
 }
 
+require_exact_line() {
+  local file=$1
+  local value=$2
+  local reason=$3
+
+  grep -Fxq -- "$value" "$file" || fail "$reason"
+}
+
 forbid_text() {
   local file=$1
   local value=$2
@@ -207,6 +215,21 @@ require_text "$systemd_script" \
 require_text "$systemd_script" \
   '  slow_downloads_are_healthy' \
   "capacity phase does not require all eight clients to become ready"
+require_exact_line "$systemd_script" \
+  'assert_bounded_storage_worker_runtime_boundaries' \
+  "bounded workers do not receive one fail-closed runtime inspection"
+require_text "$systemd_script" \
+  '    or len(worker_pairs) != 8' \
+  "bounded runtime inspection does not require eight worker identities"
+require_text "$systemd_script" \
+  '    if contains_secret(command_before) or contains_secret(environment):' \
+  "bounded runtime inspection does not scan command and environment bytes"
+require_text "$systemd_script" \
+  '        if os.readlink(descriptor_path) == listener_target:' \
+  "bounded runtime inspection does not reject the AF_INET listener"
+require_text "$systemd_script" \
+  '        if len(flags) != 1 or (int(flags[0], 8) & os.O_CLOEXEC) == 0:' \
+  "bounded runtime inspection does not enforce close-on-exec"
 require_text "$systemd_script" \
   '[[ "$manager_version" == "$systemd_version" ]]' \
   "systemd integration does not compare binary and manager versions"
