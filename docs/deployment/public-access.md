@@ -127,13 +127,35 @@ The repository also contains a narrower CI smoke test. On an ephemeral
 GitHub-hosted Ubuntu 24.04 runner it installs a one-run CA into the system and
 NSS trust stores, keeps TLS verification enabled, and exercises the real
 portal handler and frontend with the Playwright-bundled Chromium, Firefox, and
-WebKit engines. The job receives no production credential and retains no
-trace, HAR, video, browser profile, or HTML-report artifact. This does not
-exercise the production `NewIsolated` coordinator, systemd/cgroup sandbox,
-Caddy/Nginx, public DNS, HSTS, retail Chrome/Firefox, Safari/iOS, or a target
-host. Its initial-Range case is limited to the bundled engines and does not
-prove transparent retry/resume. It is not sufficient to close Issue #20 or
-enable public routing.
+WebKit engines. The job receives no production credential and ordinarily
+retains no trace, HAR, video, browser profile, or HTML-report artifact. If a
+trusted same-repository run stalls during the cross-tab portal navigation
+*before either page receives a bearer*, it may retain one narrowly scoped
+Playwright trace plus structured page, TLS, and loopback-server diagnostics
+for one day. Structured events exclude header and query/fragment values. The
+trace can contain ordinary pre-authorization browser request/response headers,
+but both the test and an independent pre-upload gate delete or reject any file
+containing the `rc1_` bearer format or an `Authorization`,
+`Proxy-Authorization`, `Cookie`, or `Set-Cookie` header, or non-empty parsed
+cookie metadata. Trace sources, browser profiles, HAR, video, and HTML reports
+remain excluded, and untrusted fork PRs cannot upload this bundle. This
+failure-only evidence does not exercise the production `NewIsolated`
+coordinator, systemd/cgroup sandbox, Caddy/Nginx, public DNS, HSTS, retail
+Chrome/Firefox, Safari/iOS, or a target host. Its initial-Range case is limited
+to the bundled engines and does not prove transparent retry/resume. It is not
+sufficient to close Issue #20 or enable public routing.
+
+If Firefox loses only Playwright's external navigation lifecycle event while
+the target document is already loaded, the smoke test continues without a
+retry only when every independent proof agrees: the driver remains exactly on
+`about:blank`, the in-document URL is the exact HTTPS portal, the pre-auth DOM
+is complete and credential-free, the captured main-frame response is a direct
+non-Service-Worker `GET` document with status `200`, the Go request delta is
+exactly one start and one completion with no active request or server/TLS
+error, and a separate trusted TLS 1.3 probe returns `200`. The full cross-tab
+authorization and download-reservation assertions still run. Any mismatch
+remains a test failure and follows the diagnostic path above.
+
 The cancel smoke requires all three engines to report the local download as
 canceled to Playwright, and exactly one authorized upstream request to reach a
 terminal state within the 40-second test-harness deadline. Chromium and WebKit

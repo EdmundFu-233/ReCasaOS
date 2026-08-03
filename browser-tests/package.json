@@ -7,7 +7,8 @@
     "node": ">=24.18.0"
   },
   "scripts": {
-    "smoke": "playwright test --config=playwright.config.js"
+    "smoke": "playwright test --config=playwright.config.js",
+    "test:diagnostics": "node --test unit/*.test.js"
   },
   "devDependencies": {
     "@playwright/test": "1.62.0"

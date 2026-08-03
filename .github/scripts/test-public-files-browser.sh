@@ -30,6 +30,8 @@ command -v openssl >/dev/null 2>&1 ||
   fail "openssl is unavailable"
 command -v update-ca-certificates >/dev/null 2>&1 ||
   fail "update-ca-certificates is unavailable"
+command -v unzip >/dev/null 2>&1 ||
+  fail "unzip is unavailable"
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 runner_temp="$(realpath -e -- "$RUNNER_TEMP")"
@@ -40,6 +42,7 @@ runner_temp="$(realpath -e -- "$RUNNER_TEMP")"
 
 run_key="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 workspace="${runner_temp}/recasaos-browser-${run_key}"
+diagnostics_directory="${runner_temp}/recasaos-browser-diagnostics-${run_key}"
 ca_key="${workspace}/ca.key"
 ca_certificate="${workspace}/ca.crt"
 server_key="${workspace}/server.key"
@@ -63,10 +66,16 @@ case "$workspace" in
   /home/runner/work/_temp/recasaos-browser-[0-9]*-[0-9]*) ;;
   *) fail "refusing unsafe browser workspace: $workspace" ;;
 esac
+case "$diagnostics_directory" in
+  /home/runner/work/_temp/recasaos-browser-diagnostics-[0-9]*-[0-9]*) ;;
+  *) fail "refusing unsafe browser diagnostics directory" ;;
+esac
 [[ "$system_ca" =~ ^/usr/local/share/ca-certificates/recasaos-browser-[0-9]+-[0-9]+\.crt$ ]] ||
   fail "refusing unsafe system CA path"
 [[ ! -e "$workspace" && ! -L "$workspace" ]] ||
   fail "browser workspace already exists"
+[[ ! -e "$diagnostics_directory" && ! -L "$diagnostics_directory" ]] ||
+  fail "browser diagnostics directory already exists"
 sudo test ! -e "$system_ca" ||
   fail "ephemeral system CA path already exists"
 
@@ -101,6 +110,16 @@ cleanup() {
   if [[ -e "$workspace" || -L "$workspace" ]]; then
     cleanup_failed=1
   fi
+  if [[ "$status" == 0 && ( -e "$diagnostics_directory" || -L "$diagnostics_directory" ) ]]; then
+    case "$diagnostics_directory" in
+      /home/runner/work/_temp/recasaos-browser-diagnostics-[0-9]*-[0-9]*)
+        rm -rf -- "$diagnostics_directory" || cleanup_failed=1
+        ;;
+      *)
+        cleanup_failed=1
+        ;;
+    esac
+  fi
 
   if [[ "$cleanup_failed" != 0 ]]; then
     printf 'public-files browser test cleanup failed\n' >&2
@@ -111,6 +130,7 @@ cleanup() {
 trap cleanup EXIT
 
 install -d -m 0700 "$workspace"
+install -d -m 0700 "$diagnostics_directory"
 umask 077
 
 openssl genpkey \
@@ -188,6 +208,10 @@ certutil -L \
   -d "sql:${nss_database}" \
   -n "$nss_nickname" >/dev/null
 
+CGO_ENABLED=0 go test \
+  -count=1 \
+  -tags 'netgo osusergo recasaos_publicfiles_browser_test' \
+  ./browser-tests/harness
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
   go build \
     -trimpath \
@@ -201,6 +225,7 @@ export RECASAOS_BROWSER_HARNESS="$harness"
 export RECASAOS_BROWSER_CA_CERTIFICATE="$ca_certificate"
 export RECASAOS_BROWSER_CERTIFICATE="$server_certificate"
 export RECASAOS_BROWSER_PRIVATE_KEY="$server_key"
+export RECASAOS_BROWSER_DIAGNOSTICS_DIRECTORY="$diagnostics_directory"
 export RECASAOS_BROWSER_TEST=1
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
