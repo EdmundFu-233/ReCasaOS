@@ -95,9 +95,9 @@ reaped. The packaged service reports readiness only after bootstrap succeeds
 and the HTTP server enters its accept loop.
 [Issue #25](https://github.com/EdmundFu-233/ReCasaOS/issues/25) remains open
 until exact-head Linux CI and real hung-storage/D-state tests prove those bounds
-on the supported deployment stack. The declared systemd 247 floor is
-source-reviewed but is not yet execution-qualified; the Ubuntu 24.04/systemd
-255 integration job is not evidence for that floor.
+on the supported deployment stack. The declared systemd 247 floor is qualified
+only for commits whose dedicated Debian 11/systemd 247 PID-1 VM job passes; the
+Ubuntu 24.04/systemd 255 integration job is not evidence for that floor.
 That hosted job runs the normal production build for activation, sandbox and
 API smoke checks. Only its deterministic worker-capacity and
 coordinator-cleanup phases swap in a non-release, CI-tagged binary whose exact

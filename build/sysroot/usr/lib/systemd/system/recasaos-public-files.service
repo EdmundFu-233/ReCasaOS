@@ -31,6 +31,10 @@ MountAPIVFS=yes
 # reject them. A non-recursive bind could expose files hidden below a host
 # mountpoint as ordinary same-mount content inside the service.
 BindReadOnlyPaths=/srv/recasaos-public:/srv/public:rbind
+# systemd 247 exports NOTIFY_SOCKET but does not automatically bind the socket
+# into RootDirectory=. systemd 248 and newer add the equivalent read-only bind;
+# keep it explicit so readiness remains fail-closed on the supported floor.
+BindReadOnlyPaths=/run/systemd/notify:/run/systemd/notify:norbind
 # Expose only this unit's three effective cgroup-v2 limit files at fixed paths
 # inside the jail. The process validates each mount's cgroup source, identity,
 # read-only flag, and exact value before it loads the public credential.

@@ -375,8 +375,13 @@ credential-directory specifier was added later and must not be substituted
 while systemd 247 remains supported. The staging checker accommodates
 `systemd-analyze`'s host-path executable check with a disposable unit copy; the
 production `ExecStart` remains byte-locked and the live activation gate proves
-the executable inside `RootDirectory=`. Both the service and socket require a
-non-empty verifier and independently reject a verifier-path symlink before
+the executable inside `RootDirectory=`. systemd 247 sets `NOTIFY_SOCKET` but,
+unlike systemd 248 and newer, does not automatically bind that socket into a
+service root. The packaged unit therefore declares the same non-recursive,
+read-only notification-socket bind explicitly, and the live test verifies its
+socket identity and mount flags before accepting the isolation result. Both
+the service and socket require a non-empty verifier and independently reject a
+verifier-path symlink before
 their initial activation, so either condition prevents the socket from binding
 when it is already unsafe at that point. A non-empty malformed verifier, or a
 verifier changed after socket activation, instead makes service bootstrap and
@@ -695,10 +700,13 @@ the reviewed worker-containment boundary; they do not replace the target-host
 hung-storage tests.
 
 The packaged service uses a minimal `RootDirectory=`, exposes the share only as
-the read-only `/srv/public`, exposes only the three read-only effective cgroup
-limit files described above, imports the verifier through `LoadCredential=`,
-has a private network namespace, permits creation of only AF_UNIX sockets, and
-has an empty capability bounding set. Its `InaccessiblePaths=` and
+the read-only `/srv/public`, exposes the system manager's notification socket
+as one non-recursive read-only bind needed for `READY=1`, exposes only the three
+read-only effective cgroup limit files described above, imports the verifier
+through `LoadCredential=`, has a private network namespace, permits creation of
+only AF_UNIX sockets, and has an empty capability bounding set. With
+`NotifyAccess=main`, PID 1 accepts readiness messages only from the main
+service process. Its `InaccessiblePaths=` and
 `ReadOnlyPaths=` entries use systemd's `+` prefix so the masks apply inside
 `RootDirectory=` rather than to the host root: jail `/sys` is mandatory and
 inaccessible, `/dev/shm` is inaccessible when present, and jail `/tmp` and

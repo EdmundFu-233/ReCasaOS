@@ -2374,6 +2374,7 @@ printf '%s\n' \
   "RootDirectory=$rootfs" \
   'BindReadOnlyPaths=' \
   "BindReadOnlyPaths=$share:/srv/public:rbind" \
+  'BindReadOnlyPaths=/run/systemd/notify:/run/systemd/notify:norbind' \
   'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.max:/run/recasaos-cgroup/memory.max:norbind' \
   'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.swap.max:/run/recasaos-cgroup/memory.swap.max:norbind' \
   'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/pids.max:/run/recasaos-cgroup/pids.max:norbind' \
@@ -2554,6 +2555,31 @@ do
     ' "/proc/$portal_pid/mountinfo" ||
     fail "jailed runtime has an unexpected cgroup mount: $cgroup_limit_name"
 done
+notify_socket_view="/proc/$portal_pid/root/run/systemd/notify"
+sudo test -S /run/systemd/notify ||
+  fail "host systemd notification socket is missing"
+sudo test -S "$notify_socket_view" ||
+  fail "systemd notification socket is unavailable inside the service root"
+host_notify_socket_identity="$(sudo stat -Lc '%d:%i' /run/systemd/notify)"
+jailed_notify_socket_identity="$(sudo stat -Lc '%d:%i' "$notify_socket_view")"
+[[ "$host_notify_socket_identity" == "$jailed_notify_socket_identity" ]] ||
+  fail "jailed systemd notification socket does not match the host socket"
+sudo awk '
+  function has_option(options, wanted, count, values, option_index) {
+    count = split(options, values, ",")
+    for (option_index = 1; option_index <= count; option_index++)
+      if (values[option_index] == wanted)
+        return 1
+    return 0
+  }
+  $5 == "/run/systemd/notify" {
+    matches++
+    if (!has_option($6, "ro") || has_option($6, "rw"))
+      invalid = 1
+  }
+  END { exit !(matches == 1 && !invalid) }
+' "/proc/$portal_pid/mountinfo" ||
+  fail "jailed systemd notification socket is not one exact read-only mount"
 sudo awk -v uid="$service_uid" -v gid="$service_gid" '
   BEGIN {
     uid_ok = gid_ok = groups_ok = umask_ok = caps_ok = nnp_ok = seccomp_ok = 0

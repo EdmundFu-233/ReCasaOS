@@ -195,6 +195,7 @@ require_exact_sectioned_active_lines "$service" \
   'WorkingDirectory=/' \
   'MountAPIVFS=yes' \
   'BindReadOnlyPaths=/srv/recasaos-public:/srv/public:rbind' \
+  'BindReadOnlyPaths=/run/systemd/notify:/run/systemd/notify:norbind' \
   'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.max:/run/recasaos-cgroup/memory.max:norbind' \
   'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.swap.max:/run/recasaos-cgroup/memory.swap.max:norbind' \
   'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/pids.max:/run/recasaos-cgroup/pids.max:norbind' \
@@ -280,6 +281,7 @@ require_exact_key_assignments Service RootDirectory "$service" \
   'RootDirectory=/usr/lib/recasaos-public-files/rootfs'
 require_exact_key_assignments Service BindReadOnlyPaths "$service" \
   'BindReadOnlyPaths=/srv/recasaos-public:/srv/public:rbind' \
+  'BindReadOnlyPaths=/run/systemd/notify:/run/systemd/notify:norbind' \
   'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.max:/run/recasaos-cgroup/memory.max:norbind' \
   'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/memory.swap.max:/run/recasaos-cgroup/memory.swap.max:norbind' \
   'BindReadOnlyPaths=/sys/fs/cgroup/system.slice/recasaos-public-files.service/pids.max:/run/recasaos-cgroup/pids.max:norbind'

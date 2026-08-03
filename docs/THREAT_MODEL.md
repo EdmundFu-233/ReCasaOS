@@ -168,6 +168,11 @@ basic public route-separation requirement, but these release gates remain:
   boots the clean exact commit under PID 1 in a checksum-pinned, pristine
   Debian 11/systemd 247 unified-cgroup-v2 QEMU TCG VM and runs the live
   isolation suite; a skipped or failed job is not compatibility evidence.
+  Because systemd 247 does not yet auto-bind its notification socket into
+  `RootDirectory=`, the service carries the equivalent non-recursive read-only
+  bind explicitly. The live suite verifies that the jailed socket is the host
+  manager socket and is mounted read-only; `NotifyAccess=main` limits accepted
+  readiness messages to the service's main process.
   This closes the earlier parser-only evidence gap for heads on which the job
   succeeds, but does not close Issue #25 or substitute for real hostile-storage
   and exact target-host recovery evidence. Ubuntu 24.04/systemd 255 evidence
