@@ -94,6 +94,9 @@ expect_rejection stale-sha vm \
 expect_rejection debian-noexec-workspace systemd \
   '    workspace_parent=/var/lib' \
   '    workspace_parent=/run'
+expect_rejection expanded-tcg-capacity-window systemd \
+  '    worker_capacity_window_seconds=30' \
+  '    worker_capacity_window_seconds=60'
 expect_rejection memory-peak-fail-open systemd \
   'elif [[ "${RECASAOS_SYSTEMD_TEST_TARGET:-}" != \' \
   'elif [[ -z "${RECASAOS_SYSTEMD_TEST_TARGET:-}" && \'

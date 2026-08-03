@@ -187,6 +187,15 @@ require_text "$systemd_script" \
   'workspace_parent=/var/lib' \
   "Debian test workspace is not on the reviewed executable filesystem"
 require_text "$systemd_script" \
+  '    worker_capacity_window_seconds=15' \
+  "native hosted capacity window drifted"
+require_text "$systemd_script" \
+  '    worker_capacity_window_seconds=30' \
+  "Debian TCG capacity window drifted"
+require_text "$systemd_script" \
+  'worker_capacity_deadline=$((SECONDS + worker_capacity_window_seconds))' \
+  "capacity phase does not use the reviewed target-specific window"
+require_text "$systemd_script" \
   '[[ "$manager_version" == "$systemd_version" ]]' \
   "systemd integration does not compare binary and manager versions"
 require_text "$systemd_script" \

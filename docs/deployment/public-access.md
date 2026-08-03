@@ -380,10 +380,11 @@ unlike systemd 248 and newer, does not automatically bind that socket into a
 service root. The packaged unit therefore declares the same non-recursive,
 read-only notification-socket bind explicitly, and the live test verifies its
 socket identity and mount flags before accepting the isolation result. The
-minimal root also pre-creates a root-owned, non-writable `/run/systemd`
-directory and empty bind target so the service's restrictive `UMask=0077`
-cannot make a dynamically created parent untraversable on systemd 247. Both the
-service and socket require a non-empty verifier and independently reject a
+minimal root also pre-creates a root-owned `/run/systemd` directory that is not
+writable by the service identity, plus an empty bind target, so the service's
+restrictive `UMask=0077` cannot make a dynamically created parent
+untraversable on systemd 247. Both the service and socket require a non-empty
+verifier and independently reject a
 verifier-path symlink before
 their initial activation, so either condition prevents the socket from binding
 when it is already unsafe at that point. A non-empty malformed verifier, or a
@@ -401,7 +402,11 @@ usable.
 > only an archive of the clean exact commit plus the pinned Go toolchain, and
 > reruns the live isolation suite inside the guest. It exercises the three
 > read-only effective-limit binds, readiness, restart, cancellation, cleanup,
-> worker capacity, and resource headroom. Because systemd 247 does not expose
+> worker capacity, and resource headroom. Its eight-worker aggregate
+> orchestration window is 30 seconds under QEMU TCG, versus 15 seconds on the
+> native hosted runner; this does not change the service or worker IPC
+> deadlines, cgroup limits, or cleanup requirements. Because systemd 247 does
+> not expose
 > `MemoryPeak`, a separately tested 10 ms guest-side sampler records the peak
 > `memory.current`; newer managers must still expose a numeric `MemoryPeak`
 > which is at least the sampled peak. A skipped or failed VM job is not

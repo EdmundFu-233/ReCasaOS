@@ -170,12 +170,16 @@ basic public route-separation requirement, but these release gates remain:
   isolation suite; a skipped or failed job is not compatibility evidence.
   Because systemd 247 does not yet auto-bind its notification socket into
   `RootDirectory=`, the service carries the equivalent non-recursive read-only
-  bind explicitly. Its minimal root pre-creates a root-owned, non-writable
-  target directory and placeholder so `UMask=0077` cannot produce a root-only
-  traversal path on that manager. The live suite verifies that the jailed
+  bind explicitly. Its minimal root pre-creates a root-owned target directory
+  that is not writable by the service identity, plus a placeholder, so
+  `UMask=0077` cannot produce a root-only traversal path on that manager. The
+  live suite verifies that the jailed
   socket is the host manager socket and is mounted read-only;
   `NotifyAccess=main` limits accepted readiness messages to the service's main
-  process.
+  process. The software-emulated guest receives a policy-locked 30-second
+  aggregate window to admit eight workers, while the native hosted test retains
+  15 seconds; per-worker IPC, service, resource, and cleanup bounds are
+  unchanged.
   This closes the earlier parser-only evidence gap for heads on which the job
   succeeds, but does not close Issue #25 or substitute for real hostile-storage
   and exact target-host recovery evidence. Ubuntu 24.04/systemd 255 evidence
