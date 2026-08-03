@@ -180,6 +180,7 @@ async function inspectPage(page) {
         controlled:
           'serviceWorker' in navigator &&
           navigator.serviceWorker.controller !== null,
+        document_url: window.location.href,
         document_ready_state: document.readyState,
         login_visible: document.getElementById('login')?.hidden === false,
         secure_context: window.isSecureContext,
@@ -198,6 +199,7 @@ async function inspectPage(page) {
     browser_version: browser === null ? null : browser.version(),
     url: summarizeDiagnosticURL(page.url()),
     ...value,
+    document_url: summarizeDiagnosticURL(value.document_url),
     service_worker_registration_scopes:
       value.service_worker_registration_scopes.map(summarizeDiagnosticURL),
     user_agent: redactDiagnosticText(value.user_agent),

@@ -193,6 +193,33 @@ async function launchIsolatedContext(browserName, playwright) {
   }
 }
 
+export async function acquireFixturePage(browserName, context) {
+  const existingPages = context.pages();
+  if (browserName === 'firefox') {
+    if (
+      existingPages.length !== 1 ||
+      existingPages[0].isClosed() ||
+      existingPages[0].url() !== 'about:blank'
+    ) {
+      throw new Error(
+        'Firefox persistent context did not provide one clean initial page',
+      );
+    }
+    return {
+      closeBeforeContext: false,
+      page: existingPages[0],
+    };
+  }
+
+  if (existingPages.length !== 0) {
+    throw new Error('ephemeral browser context was not initially empty');
+  }
+  return {
+    closeBeforeContext: true,
+    page: await context.newPage(),
+  };
+}
+
 async function closeLaunchedContext(launched) {
   const cleanupErrors = [];
   try {
@@ -485,12 +512,14 @@ export const test = base.extend({
       await closeLaunchedContext(launched);
     }
   },
-  page: async ({ context }, use) => {
-    const page = await context.newPage();
+  page: async ({ browserName, context }, use) => {
+    const acquired = await acquireFixturePage(browserName, context);
     try {
-      await use(page);
+      await use(acquired.page);
     } finally {
-      await page.close();
+      if (acquired.closeBeforeContext && !acquired.page.isClosed()) {
+        await acquired.page.close();
+      }
     }
   },
   portal: [
