@@ -21,6 +21,6 @@ const (
 	systemdStorageWorkerTestPostStartRejected
 	systemdStorageWorkerTestProcessRegistered
 	systemdStorageWorkerTestOpenResponse
-	systemdStorageWorkerTestReadResponse
+	systemdStorageWorkerTestFirstReadResponse
 	systemdStorageWorkerTestChildFirstReadSent
 )

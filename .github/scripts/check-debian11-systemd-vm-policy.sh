@@ -196,6 +196,18 @@ require_text "$systemd_script" \
   'worker_capacity_deadline=$((SECONDS + worker_capacity_window_seconds))' \
   "capacity phase does not use the reviewed target-specific window"
 require_text "$systemd_script" \
+  'worker_capacity_evidence_window_seconds=10' \
+  "capacity evidence window drifted"
+require_text "$systemd_script" \
+  '  SECONDS + worker_capacity_evidence_window_seconds' \
+  "capacity evidence does not use its reviewed bounded window"
+require_text "$systemd_script" \
+  'for _ in {1..8}; do' \
+  "capacity holders are not launched without per-worker serialization"
+require_text "$systemd_script" \
+  '  slow_downloads_are_healthy' \
+  "capacity phase does not require all eight clients to become ready"
+require_text "$systemd_script" \
   '[[ "$manager_version" == "$systemd_version" ]]' \
   "systemd integration does not compare binary and manager versions"
 require_text "$systemd_script" \

@@ -97,6 +97,12 @@ expect_rejection debian-noexec-workspace systemd \
 expect_rejection expanded-tcg-capacity-window systemd \
   '    worker_capacity_window_seconds=30' \
   '    worker_capacity_window_seconds=60'
+expect_rejection expanded-capacity-evidence-window systemd \
+  'worker_capacity_evidence_window_seconds=10' \
+  'worker_capacity_evidence_window_seconds=20'
+expect_rejection serialized-capacity-admission systemd \
+  'for _ in {1..8}; do' \
+  'for expected_worker_count in {1..8}; do'
 expect_rejection memory-peak-fail-open systemd \
   'elif [[ "${RECASAOS_SYSTEMD_TEST_TARGET:-}" != \' \
   'elif [[ -z "${RECASAOS_SYSTEMD_TEST_TARGET:-}" && \'

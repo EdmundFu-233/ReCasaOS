@@ -404,8 +404,11 @@ usable.
 > read-only effective-limit binds, readiness, restart, cancellation, cleanup,
 > worker capacity, and resource headroom. Its eight-worker aggregate
 > orchestration window is 30 seconds under QEMU TCG, versus 15 seconds on the
-> native hosted runner; this does not change the service or worker IPC
-> deadlines, cgroup limits, or cleanup requirements. Because systemd 247 does
+> native hosted runner. The eight holders are launched without serializing
+> each admission, then every client, stopped worker, and exact event chain must
+> be present. Journal visibility has a separate 10-second evidence-only bound;
+> this does not change the service write timeout, worker IPC deadlines, cgroup
+> limits, or cleanup requirements. Because systemd 247 does
 > not expose
 > `MemoryPeak`, a separately tested 10 ms guest-side sampler records the peak
 > `memory.current`; newer managers must still expose a numeric `MemoryPeak`

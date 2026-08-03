@@ -77,6 +77,10 @@ case "${RECASAOS_SYSTEMD_TEST_TARGET:-}" in
     fail "the exact systemd integration target is not authorized"
     ;;
 esac
+# Journal visibility is evidence collection after admission, not additional
+# worker-start budget. Keep it separately and identically bounded on both
+# targets so a slow journal cannot silently widen the capacity requirement.
+worker_capacity_evidence_window_seconds=10
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 cd -- "$repo_root"
@@ -1557,7 +1561,7 @@ print_capacity_journal_diagnostics() {
           allowed["recasaos-systemd-test-event=worker-post-start-rejected"] = 1
           allowed["recasaos-systemd-test-event=worker-process-registered"] = 1
           allowed["recasaos-systemd-test-event=coordinator-open-response"] = 1
-          allowed["recasaos-systemd-test-event=coordinator-read-response"] = 1
+          allowed["recasaos-systemd-test-event=coordinator-first-read-response"] = 1
           allowed["recasaos-systemd-test-event=child-first-read-sent"] = 1
         }
         {
@@ -1901,7 +1905,11 @@ capacity_phase_events_are_complete() {
     ' >"$capacity_events" || return 1
   awk '
     BEGIN {
-      # Eight successful holders emit seven events each. The ninth request
+      # Eight successful holders emit seven events each. The coordinator
+      # records only the first successful read for each holder: under slow
+      # emulation the child can complete already queued reads before its
+      # process-wide SIGSTOP is observed, and those extra reads are not new
+      # worker admissions. The ninth request
       # enters the handler, acquires one of 64 download slots, then reaches the
       # independently bounded eight-worker coordinator and is rejected there.
       expected["recasaos-systemd-test-event=handler-entered"] = 9
@@ -1919,7 +1927,7 @@ capacity_phase_events_are_complete() {
       expected["recasaos-systemd-test-event=worker-post-start-rejected"] = 0
       expected["recasaos-systemd-test-event=worker-process-registered"] = 8
       expected["recasaos-systemd-test-event=coordinator-open-response"] = 8
-      expected["recasaos-systemd-test-event=coordinator-read-response"] = 8
+      expected["recasaos-systemd-test-event=coordinator-first-read-response"] = 8
       expected["recasaos-systemd-test-event=child-first-read-sent"] = 8
     }
     { observed[$0]++ }
@@ -2766,22 +2774,18 @@ wait_until "storage workers before bounded load" storage_worker_count_is 0
 capture_capacity_journal_cursor
 start_cgroup_memory_sampler
 worker_capacity_deadline=$((SECONDS + worker_capacity_window_seconds))
-for expected_worker_count in {1..8}; do
+for _ in {1..8}; do
   start_slow_download
-  wait_until_before "slow download $expected_worker_count response" \
-    "$worker_capacity_deadline" \
-    slow_download_is_ready \
-    "$latest_slow_download_pid" \
-    "$latest_slow_download_ready_file" \
-    "$latest_slow_download_failure_file" \
-    "$latest_slow_download_start_time"
-  wait_until_before "$expected_worker_count bounded storage workers" \
-    "$worker_capacity_deadline" \
-    storage_worker_count_is "$expected_worker_count"
-  wait_until_before "$expected_worker_count stopped storage workers" \
-    "$worker_capacity_deadline" \
-    storage_workers_are_stopped "$expected_worker_count"
 done
+wait_until_before "eight slow download responses" \
+  "$worker_capacity_deadline" \
+  slow_downloads_are_healthy
+wait_until_before "eight bounded storage workers" \
+  "$worker_capacity_deadline" \
+  storage_worker_count_is 8
+wait_until_before "eight stopped storage workers" \
+  "$worker_capacity_deadline" \
+  storage_workers_are_stopped 8
 mapfile -t bounded_worker_pids < <(storage_worker_pids)
 [[ "${#bounded_worker_pids[@]}" == 8 ]] ||
   fail "bounded load did not retain exactly eight worker identities"
@@ -2828,8 +2832,11 @@ ninth_status="$(
   ' "$ninth_response_headers"
 )" == 1:0 ]] ||
   fail "ninth concurrent storage request lacked one exact Retry-After value 5"
+worker_capacity_evidence_deadline=$((
+  SECONDS + worker_capacity_evidence_window_seconds
+))
 wait_until_before "storage worker capacity event chain" \
-  "$worker_capacity_deadline" \
+  "$worker_capacity_evidence_deadline" \
   capacity_phase_events_are_complete
 for bounded_worker_index in "${!bounded_worker_pids[@]}"; do
   assert_storage_worker_address_space_limit \
