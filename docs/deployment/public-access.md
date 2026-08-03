@@ -144,6 +144,18 @@ coordinator, systemd/cgroup sandbox, Caddy/Nginx, public DNS, HSTS, retail
 Chrome/Firefox, Safari/iOS, or a target host. Its initial-Range case is limited
 to the bundled engines and does not prove transparent retry/resume. It is not
 sufficient to close Issue #20 or enable public routing.
+
+If Firefox loses only Playwright's external navigation lifecycle event while
+the target document is already loaded, the smoke test continues without a
+retry only when every independent proof agrees: the driver remains exactly on
+`about:blank`, the in-document URL is the exact HTTPS portal, the pre-auth DOM
+is complete and credential-free, the captured main-frame response is a direct
+non-Service-Worker `GET` document with status `200`, the Go request delta is
+exactly one start and one completion with no active request or server/TLS
+error, and a separate trusted TLS 1.3 probe returns `200`. The full cross-tab
+authorization and download-reservation assertions still run. Any mismatch
+remains a test failure and follows the diagnostic path above.
+
 The cancel smoke requires all three engines to report the local download as
 canceled to Playwright, and exactly one authorized upstream request to reach a
 terminal state within the 40-second test-harness deadline. Chromium and WebKit

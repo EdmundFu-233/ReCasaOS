@@ -75,6 +75,45 @@ for credential_scan_target in archive stdout serialized; do
 done
 require_text "$diagnostics" 'const navigationTimeoutMs = 20_000;' \
   "bounded navigation deadline changed"
+[[ "$(grep -Fc -- 'page.goto(' "$diagnostics")" == 1 ]] ||
+  fail "diagnostic navigation must make exactly one attempt"
+forbid_text "$diagnostics" 'page.reload(' \
+  "diagnostic navigation must not reload"
+for lifecycle_proof in \
+  "browserName === 'firefox'" \
+  "navigationError?.name === 'TimeoutError'" \
+  'request.frame() === page.mainFrame()' \
+  'navigationResponse?.from_service_worker === false' \
+  "navigationResponse.method === 'GET'" \
+  'navigationResponse.redirected === false' \
+  "navigationResponse.resource_type === 'document'" \
+  'navigationResponse?.status === 200' \
+  'navigationResponse.url === portalOrigin' \
+  'serverDelta?.started === 1' \
+  'serverDelta.completed === 1' \
+  'afterNavigationServer?.ok === true' \
+  'afterNavigationServer.value?.active_requests === 0' \
+  'afterNavigationServer.value.server_errors === 0' \
+  'afterNavigationServer.value.tls_handshake_errors === 0' \
+  'tlsProbe?.ok === true' \
+  'tlsProbe.value?.ok === true' \
+  'tlsProbe.value.status === 200' \
+  'tlsProbe.value.tls?.authorized === true' \
+  "tlsProbe.value.tls.protocol === 'TLSv1.3'" \
+  'exactPreAuthorizationPage(firstPageState, portalOrigin, false)' \
+  'exactPreAuthorizationPage(targetPageState, portalOrigin, true)' \
+  'value.driver_url_is_about_blank === true' \
+  'exactPortalURL(value.document_url, portalOrigin)' \
+  'value.controlled === false' \
+  "value.document_ready_state === 'complete'" \
+  'value.login_visible === true' \
+  'value.secure_context === true' \
+  'value.service_worker_registration_scopes.length === 0' \
+  'value.token_empty === true'
+do
+  require_text "$diagnostics" "$lifecycle_proof" \
+    "Firefox lifecycle proof is missing: $lifecycle_proof"
+done
 require_text "$diagnostics" 'sources: false' \
   "trace source capture is not disabled"
 require_text "$diagnostics" \

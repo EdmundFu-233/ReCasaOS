@@ -77,6 +77,7 @@ function recordPageEvents(page) {
   const started = Date.now();
   const events = [];
   let omitted = 0;
+  let navigationResponse = null;
   const listeners = [];
   const record = (type, value = {}) => {
     if (events.length >= maximumDiagnosticEvents) {
@@ -104,6 +105,13 @@ function recordPageEvents(page) {
   });
   listen('response', (response) => {
     const request = response.request();
+    if (
+      request.isNavigationRequest() &&
+      request.frame() === page.mainFrame() &&
+      navigationResponse === null
+    ) {
+      navigationResponse = response;
+    }
     record('response', {
       navigation: request.isNavigationRequest(),
       resource_type: request.resourceType(),
@@ -147,6 +155,9 @@ function recordPageEvents(page) {
         omitted_events: omitted,
       };
     },
+    navigationResponse() {
+      return navigationResponse;
+    },
     stop() {
       for (const [name, handler] of listeners) {
         page.off(name, handler);
@@ -177,6 +188,7 @@ async function inspectPage(page) {
     return { closed: true };
   }
   const browser = page.context().browser();
+  const driverURL = page.url();
   const value = await bounded(
     page.evaluate(async () => {
       let registrations = [];
@@ -204,7 +216,8 @@ async function inspectPage(page) {
   return {
     closed: false,
     browser_version: browser === null ? null : browser.version(),
-    url: summarizeDiagnosticURL(page.url()),
+    driver_url_is_about_blank: driverURL === 'about:blank',
+    url: summarizeDiagnosticURL(driverURL),
     ...value,
     document_url: summarizeDiagnosticURL(value.document_url),
     service_worker_registration_scopes:
@@ -442,6 +455,79 @@ function serverDocumentDelta(before, after) {
   };
 }
 
+function exactPortalURL(summary, portalOrigin) {
+  const expected = summarizeDiagnosticURL(portalOrigin);
+  return (
+    expected.valid === true &&
+    summary !== null &&
+    typeof summary === 'object' &&
+    summary.valid === true &&
+    summary.protocol === expected.protocol &&
+    summary.origin === expected.origin &&
+    summary.pathname === expected.pathname &&
+    summary.search_parameter_count === 0 &&
+    summary.has_fragment === false &&
+    summary.has_userinfo === false
+  );
+}
+
+function exactPreAuthorizationPage(state, portalOrigin, staleDriverURL) {
+  if (state?.ok !== true || state.value?.closed !== false) return false;
+  const value = state.value;
+  const driverURLMatches = staleDriverURL
+    ? value.driver_url_is_about_blank === true &&
+      value.url?.valid === true &&
+      value.url.protocol === 'about:'
+    : exactPortalURL(value.url, portalOrigin);
+  return (
+    driverURLMatches &&
+    exactPortalURL(value.document_url, portalOrigin) &&
+    value.controlled === false &&
+    value.document_ready_state === 'complete' &&
+    value.login_visible === true &&
+    value.secure_context === true &&
+    Array.isArray(value.service_worker_registration_scopes) &&
+    value.service_worker_registration_scopes.length === 0 &&
+    value.token_empty === true
+  );
+}
+
+export function isVerifiedFirefoxLifecycleDesynchronization({
+  afterNavigationServer,
+  browserName,
+  firstPageState,
+  navigationError,
+  navigationResponse,
+  portalOrigin,
+  serverDelta,
+  targetPageState,
+  tlsProbe,
+}) {
+  return (
+    browserName === 'firefox' &&
+    navigationError?.name === 'TimeoutError' &&
+    navigationResponse?.from_service_worker === false &&
+    navigationResponse.method === 'GET' &&
+    navigationResponse.redirected === false &&
+    navigationResponse.resource_type === 'document' &&
+    navigationResponse?.status === 200 &&
+    navigationResponse.url === portalOrigin &&
+    serverDelta?.started === 1 &&
+    serverDelta.completed === 1 &&
+    afterNavigationServer?.ok === true &&
+    afterNavigationServer.value?.active_requests === 0 &&
+    afterNavigationServer.value.server_errors === 0 &&
+    afterNavigationServer.value.tls_handshake_errors === 0 &&
+    tlsProbe?.ok === true &&
+    tlsProbe.value?.ok === true &&
+    tlsProbe.value.status === 200 &&
+    tlsProbe.value.tls?.authorized === true &&
+    tlsProbe.value.tls.protocol === 'TLSv1.3' &&
+    exactPreAuthorizationPage(firstPageState, portalOrigin, false) &&
+    exactPreAuthorizationPage(targetPageState, portalOrigin, true)
+  );
+}
+
 async function requirePreAuthorizationTraceBoundary(firstPage, page, portal) {
   const first = await inspectPage(firstPage);
   if (
@@ -508,6 +594,47 @@ export async function navigatePortalWithDiagnostics({
     ]);
     const tlsProbe = await capture(probePortalTLS(portal));
     const afterProbeServer = await capture(readServerDiagnostics(portal));
+    const delta = serverDocumentDelta(beforeServer, afterNavigationServer);
+    const navigationResponse = recorder.navigationResponse();
+    let lifecycleDesynchronization =
+      isVerifiedFirefoxLifecycleDesynchronization({
+        afterNavigationServer,
+        browserName,
+        firstPageState,
+        navigationError,
+        navigationResponse:
+          navigationResponse === null
+            ? null
+            : {
+                from_service_worker: navigationResponse.fromServiceWorker(),
+                method: navigationResponse.request().method(),
+                redirected:
+                  navigationResponse.request().redirectedFrom() !== null,
+                resource_type: navigationResponse.request().resourceType(),
+                status: navigationResponse.status(),
+                url: navigationResponse.url(),
+              },
+        portalOrigin: portal.origin,
+        serverDelta: delta,
+        targetPageState,
+        tlsProbe,
+      });
+    if (lifecycleDesynchronization && traceStarted) {
+      try {
+        await context.tracing.stop();
+        traceStarted = false;
+      } catch {
+        lifecycleDesynchronization = false;
+      }
+    }
+    if (lifecycleDesynchronization) {
+      recorder.stop();
+      console.warn(
+        'ReCasaOS verified a Firefox navigation lifecycle desynchronization; ' +
+          'continuing with the full cross-tab isolation assertions',
+      );
+      return navigationResponse;
+    }
     recorder.stop();
 
     const diagnostic = {
@@ -540,10 +667,7 @@ export async function navigatePortalWithDiagnostics({
         after_probe: afterProbeServer,
         before_navigation: beforeServer,
         file_request_snapshot: fileSnapshot,
-        portal_document_navigation_delta: serverDocumentDelta(
-          beforeServer,
-          afterNavigationServer,
-        ),
+        portal_document_navigation_delta: delta,
         tls_probe: tlsProbe,
       },
       trace_start_error: traceStartError,
@@ -562,11 +686,12 @@ export async function navigatePortalWithDiagnostics({
     if (!diagnosticBytesContainBearer(serialized)) {
       console.error(`ReCasaOS navigation diagnostics: ${serialized}`);
     }
-    const delta = diagnostic.service.portal_document_navigation_delta;
+    const diagnosticDelta =
+      diagnostic.service.portal_document_navigation_delta;
     const deltaText =
-      delta === null
+      diagnosticDelta === null
         ? 'server document delta unavailable'
-        : `server document delta started=${delta.started} completed=${delta.completed}`;
+        : `server document delta started=${diagnosticDelta.started} completed=${diagnosticDelta.completed}`;
     throw new Error(
       `pre-auth cross-tab navigation failed after ${navigationTimeoutMs}ms; ` +
         `${deltaText}; diagnostic artifact preserved=${artifact.preserved}`,
