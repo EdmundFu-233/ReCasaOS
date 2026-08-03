@@ -54,6 +54,44 @@ jobs:
       - name: Verify public-file systemd packaging boundary
         run: deploy/systemd/check-public-files-units.sh .
 
+      - name: Verify Debian 11 systemd 247 unit compatibility
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          IFS=$'\n\t'
+
+          # This is the official Debian 11.11 image published on 2026-07-13,
+          # pinned to its linux/amd64 OCI manifest. The repository is mounted
+          # read-only and the container receives no host environment, devices,
+          # elevated privileges, or Docker socket.
+          image='debian:bullseye-20260713@sha256:e40377b87a60470bf4aa59f0598d173bfb7d705e83bb310f9b6ef4a0ed00ec21'
+          docker run --rm \
+            --security-opt no-new-privileges \
+            --pids-limit 512 \
+            --memory 1g \
+            --cpus 2 \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/repo,readonly" \
+            --tmpfs /tmp:rw,nosuid,nodev,exec,size=64m \
+            "$image" \
+            /bin/bash -ceu '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update >/dev/null
+              apt-get install --yes --no-install-recommends systemd >/dev/null
+
+              set -- $(systemd-analyze --version)
+              test "$1" = systemd
+              test "$2" = 247
+
+              systemd-sysusers \
+                /repo/build/sysroot/usr/lib/sysusers.d/recasaos-public-files.conf
+              /repo/deploy/systemd/check-public-files-units.sh /repo
+              /repo/deploy/systemd/verify-public-files-units.sh \
+                /repo/build/sysroot/usr/lib/systemd/system/recasaos-public-files.service \
+                /repo/build/sysroot/usr/lib/systemd/system/recasaos-public-files.socket \
+                /bin/true
+            '
+
       - name: Exercise public-file unit checker negative cases
         run: .github/scripts/test-public-files-unit-checker.sh
 

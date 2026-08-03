@@ -353,9 +353,12 @@ Keep edge routing and health publication disabled, stop both units, reprovision
 the verifier, and repeat the activation tests before treating that listener as
 usable.
 
-> **Compatibility qualification status:** the systemd 247 floor is
-> source-reviewed but has not been execution-qualified. The current GitHub
-> integration runs on Ubuntu 24.04/systemd 255 and does not satisfy that floor.
+> **Compatibility qualification status:** the packaged units are parsed and
+> semantically verified by the Debian 11 systemd 247 toolchain inside a pinned
+> official Debian image, in addition to the Ubuntu 24.04/systemd 255 live job.
+> The Debian check is deliberately unprivileged and parser-only; it does not
+> make systemd 247 execution-qualified or prove PID-1, cgroup, namespace, or
+> resource-control behavior.
 > Keep Issue #25 open, and do not enable public routing on a systemd 247 host,
 > until the exact release candidate passes under PID 1 on a pristine,
 > ephemeral Debian 11/systemd 247 VM with unified cgroup v2. That run must
