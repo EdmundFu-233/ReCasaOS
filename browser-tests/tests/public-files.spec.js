@@ -163,7 +163,7 @@ async function prepareManualDownload(page, bearer, path) {
           port === null ||
           event.source !== controller ||
           data?.type !== 'recasaos-download-auth' ||
-          data?.version !== 1 ||
+          data?.version !== protocolVersion ||
           data?.nonce !== nonce ||
           data?.path !== relativePath ||
           data?.requestURL !== requestURL.href
@@ -181,7 +181,7 @@ async function prepareManualDownload(page, bearer, path) {
         port.start();
         port.postMessage({
           type: 'recasaos-download-auth-response',
-          version: 1,
+          version: protocolVersion,
           nonce,
           path: relativePath,
           token: bearerValue,
@@ -203,7 +203,7 @@ async function prepareManualDownload(page, bearer, path) {
         channel.port1.onmessage = (event) =>
           finish(
             event.data?.type === 'recasaos-download-prepared' &&
-              event.data?.version === 1 &&
+              event.data?.version === protocolVersion &&
               event.data?.nonce === nonce,
           );
         channel.port1.onmessageerror = () => finish(false);
@@ -211,7 +211,7 @@ async function prepareManualDownload(page, bearer, path) {
         controller.postMessage(
           {
             type: 'recasaos-download-prepare',
-            version: 1,
+            version: protocolVersion,
             nonce,
             navigationProof,
             path: relativePath,
@@ -268,6 +268,31 @@ async function submitManualDownload(page, requestURL) {
       throw new Error('prepared download submission was rejected');
     }
     window.__recasaosManualDownload = null;
+  }, requestURL);
+}
+
+async function preserveManualDownloadForReplay(page, requestURL) {
+  await page.evaluate((url) => {
+    const state = window.__recasaosManualDownload;
+    if (
+      !state ||
+      state.requestURL !== url ||
+      typeof state.navigationProof !== 'string' ||
+      state.navigationProof.length === 0
+    ) {
+      throw new Error('prepared download proof is unavailable');
+    }
+    window.__recasaosReplayDownload = { ...state };
+  }, requestURL);
+}
+
+async function submitReplayedDownload(page, requestURL) {
+  await page.evaluate((url) => {
+    const state = window.__recasaosReplayDownload;
+    if (!state || state.requestURL !== url || !submitNativeDownload(state)) {
+      throw new Error('replayed download submission was rejected locally');
+    }
+    window.__recasaosReplayDownload = null;
   }, requestURL);
 }
 
@@ -517,6 +542,60 @@ test('a different tab cannot consume another tab download reservation', async (
   }
 });
 
+test('a consumed navigation proof cannot authorize a replay', async ({
+  page,
+  portal,
+}) => {
+  await loginAndWaitForNativeStreaming(page, portal);
+  const before = await readSnapshot(portal);
+  const initialPageURL = page.url();
+  const prepared = await prepareManualDownload(
+    page,
+    portal.bearer,
+    'report.txt',
+  );
+  await preserveManualDownloadForReplay(page, prepared.requestURL);
+
+  const downloadPromise = page.waitForEvent('download', { timeout: 30_000 });
+  await submitManualDownload(page, prepared.requestURL);
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toBe('report.txt');
+  expect(await download.failure()).toBeNull();
+  expect(await hashDownload(download)).toEqual(portal.fixtures['report.txt']);
+  await expect
+    .poll(() => page.evaluate(() => window.__recasaosIsolation))
+    .toEqual({ challengeCount: 1, httpStatus: 200, status: 'handed' });
+
+  const terminal = await waitForSnapshot(
+    portal,
+    (snapshot) =>
+      snapshot.active_file_requests === 0 &&
+      snapshot.authorized_file_requests - before.authorized_file_requests ===
+        1 &&
+      snapshot.canceled_file_requests - before.canceled_file_requests === 0 &&
+      snapshot.completed_file_requests - before.completed_file_requests === 1,
+    'original download before navigation-proof replay',
+  );
+
+  const replayDownload = page
+    .waitForEvent('download', { timeout: 1_000 })
+    .catch(() => null);
+  await submitReplayedDownload(page, prepared.requestURL);
+  expect(
+    await replayDownload,
+    'a consumed navigation proof must not create another download',
+  ).toBeNull();
+  expect(page.url()).toBe(initialPageURL);
+  expect(
+    await page.evaluate(() => window.__recasaosIsolation.challengeCount),
+    'a replay must not trigger a second authorization challenge',
+  ).toBe(1);
+  expect(fileRequestState(await readSnapshot(portal))).toEqual(
+    fileRequestState(terminal),
+  );
+  await expectFileRequestStateToRemainQuiescent(portal, terminal);
+});
+
 test('native browser download preserves bytes and leaves no bearer residue', async ({
   context,
   page,
@@ -611,6 +690,56 @@ test('native browser download preserves bytes and leaves no bearer residue', asy
     after.authorized_file_requests - before.authorized_file_requests,
     'native download must use exactly one authenticated file request',
   ).toBe(1);
+  expect(after.authorization_on_other_path).toBe(0);
+  expect(after.credential_query_requests).toBe(0);
+  await expectFileRequestStateToRemainQuiescent(portal, after);
+});
+
+test('forgetting the token aborts a handed browser stream', async ({
+  page,
+  portal,
+}) => {
+  await loginAndWaitForNativeStreaming(page, portal);
+  const before = await readSnapshot(portal);
+
+  const downloadPromise = page.waitForEvent('download', { timeout: 30_000 });
+  await page.locator('#entries a', { hasText: 'stream.bin' }).click();
+  const download = await downloadPromise;
+  await expect(page.locator('#status')).toHaveText(
+    'Download handed to the browser: stream.bin',
+  );
+  await waitForSnapshot(
+    portal,
+    (snapshot) => snapshot.active_file_requests > 0,
+    'active handed browser stream before logout',
+  );
+
+  await page.locator('#logout').click();
+  await expect(page.locator('#login')).toBeVisible();
+  await expect(page.locator('#browser')).toBeHidden();
+  await expect(page.locator('#token')).toHaveValue('');
+  await expect(page.locator('#status')).toHaveText(
+    'Token forgotten for this page',
+  );
+  expect(
+    await download.failure(),
+    'logout must terminate a browser stream that has already been handed off',
+  ).not.toBeNull();
+  assertNoBrowserStorageResidue(
+    await browserStorageResidue(page, portal.bearer),
+  );
+
+  const after = await waitForSnapshot(
+    portal,
+    (snapshot) =>
+      snapshot.active_file_requests === 0 &&
+      snapshot.authorized_file_requests - before.authorized_file_requests ===
+        1 &&
+      snapshot.canceled_file_requests - before.canceled_file_requests === 1 &&
+      snapshot.completed_file_requests - before.completed_file_requests === 0,
+    'logout-canceled handed browser stream cleanup',
+    40_000,
+  );
   expect(after.authorization_on_other_path).toBe(0);
   expect(after.credential_query_requests).toBe(0);
   await expectFileRequestStateToRemainQuiescent(portal, after);

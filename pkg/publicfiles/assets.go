@@ -31,7 +31,7 @@ const portalHTML = `<!doctype html>
 const portalCSS = `:root{color-scheme:light dark;font:16px/1.5 system-ui,sans-serif}body{margin:0;padding:2rem;background:#10151d;color:#edf2f7}main{max-width:58rem;margin:auto}[hidden]{display:none!important}form,nav{display:flex;gap:.75rem;align-items:center;flex-wrap:wrap}input,button{font:inherit;padding:.55rem .75rem;border-radius:.4rem;border:1px solid #778;background:#182231;color:inherit}button{cursor:pointer}button:disabled{cursor:not-allowed;opacity:.6}button:focus,input:focus,a:focus{outline:3px solid #69b7ff;outline-offset:2px}ul{list-style:none;padding:0;border-top:1px solid #445}li{display:flex;justify-content:space-between;gap:1rem;padding:.7rem;border-bottom:1px solid #334}a{color:#80c7ff}code{overflow-wrap:anywhere}#status{min-height:1.5rem}.size,.help{color:#aab}.help{font-size:.9rem}`
 
 const portalJavaScript = `'use strict';
-const protocolVersion=1;
+const protocolVersion=2;
 const fallbackByteLimit=32*1024*1024;
 const workerReplyTimeoutMs=3000;
 const nativeRequestLifetimeMs=10000;
@@ -229,14 +229,16 @@ function handleWorkerChallenge(event){
   if(!port)return;
   if(!pending||!exactKeys(data,['nonce','path','requestURL','type','version'])||data.type!=='recasaos-download-auth'||data.version!==protocolVersion||event.source!==pending.controller||currentWorker()!==pending.controller||Date.now()>pending.expiresAt||data.nonce!==pending.nonce||data.path!==pending.path||data.requestURL!==pending.requestURL||!accessToken){denyPort(port);return;}
   clearTimeout(pending.timer);pendingNative=null;
-  const state={nonce:pending.nonce,path:pending.path,name:pending.name,requestURL:pending.requestURL,controller:pending.controller,port:port,timer:null};
+  const state={nonce:pending.nonce,path:pending.path,name:pending.name,requestURL:pending.requestURL,controller:pending.controller,port:port,timer:null,handed:false};
   state.timer=setTimeout(()=>{if(activeNative===state){cancelNativeTransport(state);activeNative=null;showError(new Error('The browser did not accept the download in time'));}},nativeRequestLifetimeMs);
   activeNative=state;
   port.onmessage=statusEvent=>{
     const status=statusEvent.data;
     if(activeNative!==state||!exactKeys(status,['httpStatus','nonce','path','status','type','version'])||status.type!=='recasaos-download-status'||status.version!==protocolVersion||status.nonce!==state.nonce||status.path!==state.path)return;
+    if(status.status==='handed'&&!state.handed&&(status.httpStatus===200||status.httpStatus===206)){clearTimeout(state.timer);state.timer=null;state.handed=true;statusNode.textContent='Download handed to the browser: '+state.name;return;}
+    if(state.handed&&status.status==='completed'&&(status.httpStatus===200||status.httpStatus===206)){activeNative=null;port.close();statusNode.textContent='Download stream completed: '+state.name;return;}
+    if(state.handed&&status.status==='canceled'&&(status.httpStatus===200||status.httpStatus===206)){activeNative=null;port.close();statusNode.textContent='Download stopped: '+state.name;return;}
     clearTimeout(state.timer);activeNative=null;port.close();
-    if(status.status==='handed'&&(status.httpStatus===200||status.httpStatus===206)){statusNode.textContent='Download handed to the browser: '+state.name;return;}
     cancelNativeTransport(state);
     if(status.httpStatus===401){forgetAuthorization('Authorization failed');return;}
     showError(new Error('The browser download was rejected'));
@@ -259,7 +261,7 @@ showLogin('');
 `
 
 const downloadWorkerJavaScript = `'use strict';
-const protocolVersion=1;
+const protocolVersion=2;
 const challengeTimeoutMs=3000;
 const pendingLifetimeMs=10000;
 const pendingLimit=8;
@@ -300,7 +302,7 @@ function cancelDownload(event,data){
   const prepared=pendingDownloads.get(data.nonce);
   if(sameDownloadState(prepared,data,event.source.id))pendingDownloads.delete(data.nonce);
   const active=activeDownloads.get(data.nonce);
-  if(sameDownloadState(active,data,event.source.id)){activeDownloads.delete(data.nonce);clearTimeout(active.timer);active.controller.abort();}
+  if(sameDownloadState(active,data,event.source.id)){active.cancelRequested=true;active.controller.abort();}
 }
 function handleProtocolMessage(event){
   const data=event.data;const port=event.ports&&event.ports.length===1?event.ports[0]:null;
@@ -345,14 +347,43 @@ function requestAuthorization(client,download,signal){
     try{client.postMessage({type:'recasaos-download-auth',version:protocolVersion,nonce:download.nonce,path:download.path,requestURL:download.requestURL},[channel.port2]);}catch(_error){finish(new TypeError('download authorization client error'));}
   });
 }
-function sendStatus(port,download,status,httpStatus){try{port.postMessage({type:'recasaos-download-status',version:protocolVersion,nonce:download.nonce,path:download.path,status:status,httpStatus:httpStatus});}catch(_error){}try{port.close();}catch(_error){}}
+function sendStatus(port,download,status,httpStatus,closePort){try{port.postMessage({type:'recasaos-download-status',version:protocolVersion,nonce:download.nonce,path:download.path,status:status,httpStatus:httpStatus});}catch(_error){}if(closePort){try{port.close();}catch(_error){}}}
 function responseHeaderIsOnly(response,name,expected){const values=(response.headers.get(name)||'').split(',').map(value=>value.trim().toLowerCase()).filter(Boolean);return values.length>0&&values.every(value=>value===expected);}
 function safeDownloadResponse(response,cleanURL,requestedRange){
   const disposition=response.headers.get('Content-Disposition')||'';
   const contentType=(response.headers.get('Content-Type')||'').split(';',1)[0].trim().toLowerCase();
+  const contentEncoding=response.headers.get('Content-Encoding');
+  const contentLength=response.headers.get('Content-Length')||'';
   const cacheDirectives=(response.headers.get('Cache-Control')||'').split(',').map(value=>value.trim().toLowerCase());
   const contentRange=response.headers.get('Content-Range')||'';
-  return !response.redirected&&response.url===cleanURL.href&&(response.status===200||response.status===206)&&/^attachment(?:\s*;|$)/i.test(disposition)&&contentType==='application/octet-stream'&&cacheDirectives.includes('no-store')&&responseHeaderIsOnly(response,'X-Content-Type-Options','nosniff')&&responseHeaderIsOnly(response,'Accept-Ranges','bytes')&&(response.status!==206||(requestedRange&&/^bytes [0-9]+-[0-9]+\/[0-9]+$/.test(contentRange)));
+  return !response.redirected&&response.url===cleanURL.href&&(response.status===200||response.status===206)&&response.body&&typeof response.body.getReader==='function'&&/^attachment(?:\s*;|$)/i.test(disposition)&&contentType==='application/octet-stream'&&contentEncoding===null&&/^(?:0|[1-9][0-9]*)$/.test(contentLength)&&cacheDirectives.includes('no-store')&&responseHeaderIsOnly(response,'X-Content-Type-Options','nosniff')&&responseHeaderIsOnly(response,'Accept-Ranges','bytes')&&(response.status!==206||(requestedRange&&/^bytes [0-9]+-[0-9]+\/[0-9]+$/.test(contentRange)));
+}
+function finishActiveDownload(download,active,status){
+  if(active.finished)return;
+  active.finished=true;
+  if(activeDownloads.get(download.nonce)===active)activeDownloads.delete(download.nonce);
+  clearTimeout(active.timer);
+  if(status!=='completed')active.controller.abort();
+  sendStatus(active.port,download,status,active.httpStatus,true);
+}
+function monitoredDownloadResponse(response,download,active){
+  const reader=response.body.getReader();
+  const body=new ReadableStream({
+    async pull(controller){
+      try{
+        const result=await reader.read();
+        if(result.done){finishActiveDownload(download,active,'completed');controller.close();return;}
+        controller.enqueue(result.value);
+      }catch(error){finishActiveDownload(download,active,active.cancelRequested?'canceled':'rejected');controller.error(error);}
+    },
+    async cancel(reason){
+      active.cancelRequested=true;
+      active.controller.abort();
+      try{await reader.cancel(reason);}catch(_error){}
+      finishActiveDownload(download,active,'canceled');
+    }
+  });
+  return new Response(body,{status:response.status,statusText:response.statusText,headers:response.headers});
 }
 async function handleDownload(download,event){
   if(download.error)throw new TypeError('invalid download request');
@@ -363,8 +394,8 @@ async function handleDownload(download,event){
   prepared.navigationProof='';
   pendingDownloads.delete(download.nonce);
   const controller=new AbortController();
-  const active={nonce:prepared.nonce,path:prepared.path,requestURL:prepared.requestURL,clientId:prepared.clientId,controller:controller,timer:null};
-  const abortFromNavigation=()=>controller.abort();
+  const active={nonce:prepared.nonce,path:prepared.path,requestURL:prepared.requestURL,clientId:prepared.clientId,controller:controller,timer:null,port:null,httpStatus:0,cancelRequested:false,finished:false};
+  const abortFromNavigation=()=>{active.cancelRequested=true;controller.abort();};
   if(event.request.signal.aborted)controller.abort();else event.request.signal.addEventListener('abort',abortFromNavigation,{once:true});
   active.timer=setTimeout(()=>controller.abort(),pendingLifetimeMs);
   activeDownloads.set(download.nonce,active);
@@ -382,10 +413,11 @@ async function handleDownload(download,event){
     const request=new Request(cleanURL.href,{method:'GET',headers:headers,credentials:'omit',cache:'no-store',redirect:'error',referrerPolicy:'no-referrer',mode:'same-origin',signal:controller.signal});
     const response=await fetch(request);
     if(!safeDownloadResponse(response,cleanURL,headers.has('Range'))){rejectionStatus=response.status;throw new TypeError('download response rejected');}
-    if(activeDownloads.get(download.nonce)===active)activeDownloads.delete(download.nonce);clearTimeout(active.timer);event.request.signal.removeEventListener('abort',abortFromNavigation);
-    sendStatus(authorization.port,download,'handed',response.status);
-    return response;
-  }catch(error){if(activeDownloads.get(download.nonce)===active)activeDownloads.delete(download.nonce);clearTimeout(active.timer);event.request.signal.removeEventListener('abort',abortFromNavigation);controller.abort();if(authorization)sendStatus(authorization.port,download,'rejected',rejectionStatus);throw error;}
+    clearTimeout(active.timer);active.timer=null;event.request.signal.removeEventListener('abort',abortFromNavigation);active.port=authorization.port;active.httpStatus=response.status;
+    const monitored=monitoredDownloadResponse(response,download,active);
+    sendStatus(active.port,download,'handed',active.httpStatus,false);
+    return monitored;
+  }catch(error){if(activeDownloads.get(download.nonce)===active)activeDownloads.delete(download.nonce);clearTimeout(active.timer);event.request.signal.removeEventListener('abort',abortFromNavigation);controller.abort();if(authorization)sendStatus(authorization.port,download,active.cancelRequested?'canceled':'rejected',rejectionStatus,true);throw error;}
 }
 function emptyNavigationResponse(){return new Response(null,{status:204,headers:{'Cache-Control':'no-store','Referrer-Policy':'no-referrer','X-Content-Type-Options':'nosniff'}});}
 async function respondToDownload(download,event){try{return await handleDownload(download,event);}catch(_error){return emptyNavigationResponse();}}

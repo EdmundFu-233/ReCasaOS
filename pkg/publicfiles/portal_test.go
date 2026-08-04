@@ -317,6 +317,7 @@ func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *test
 		}
 	}
 	for _, required := range []string{
+		"const protocolVersion=2",
 		"const fallbackByteLimit=32*1024*1024",
 		"response.body.getReader()",
 		"received>fallbackByteLimit",
@@ -327,6 +328,7 @@ func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *test
 		"credentials:'omit'",
 		"referrerPolicy:'no-referrer'",
 		"Download handed to the browser",
+		"Download stream completed",
 		"recasaos-download-prepare",
 		"recasaos-download-cancel",
 		"state.navigationProof",
@@ -337,6 +339,8 @@ func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *test
 		"proof.name='proof'",
 		"proof.value=state.navigationProof",
 		"form.submit()",
+		"handed:false",
+		"state.handed&&status.status==='completed'",
 		"boundedDownload(path,entry).catch(showError);",
 		"Token forgotten after page restore",
 		"const bearerPattern=/^rc1_[A-Za-z0-9_-]{43}$/",
@@ -398,6 +402,7 @@ func TestDownloadWorkerIsNarrowNoStoreAsset(t *testing.T) {
 		}
 	}
 	for _, required := range []string{
+		"const protocolVersion=2",
 		"const filePath=basePath+'/api/file'",
 		"request.method!=='POST'",
 		"request.mode==='navigate'",
@@ -418,13 +423,20 @@ func TestDownloadWorkerIsNarrowNoStoreAsset(t *testing.T) {
 		"event.request.signal.removeEventListener('abort',abortFromNavigation)",
 		"/^attachment(?:\\s*;|$)/i.test(disposition)",
 		"contentType==='application/octet-stream'",
+		"contentEncoding===null",
+		"/^(?:0|[1-9][0-9]*)$/.test(contentLength)",
 		"cacheDirectives.includes('no-store')",
 		"X-Content-Type-Options",
 		"Accept-Ranges",
+		"const reader=response.body.getReader()",
+		"const body=new ReadableStream({",
+		"finishActiveDownload(download,active,'completed')",
+		"active.cancelRequested=true;active.controller.abort()",
+		"sendStatus(active.port,download,'handed',active.httpStatus,false)",
 		"controller.abort()",
 		"status:204",
 		"respondToDownload(download,event)",
-		"return response",
+		"return monitored",
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("download worker is missing %q", required)

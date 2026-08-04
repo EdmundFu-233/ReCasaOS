@@ -335,7 +335,7 @@ func newTestIsolatedStorageManager(
 	quarantineAdmissionLimit int32,
 ) (*isolatedStorageManager, [32]byte) {
 	t.Helper()
-	root := t.TempDir()
+	root := protectedTestDirectory(t)
 	manager, verifier, err := newIsolatedStorageWith(
 		root,
 		filepath.Join(root, "unused-verifier"),

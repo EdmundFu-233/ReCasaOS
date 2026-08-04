@@ -79,12 +79,15 @@ receives the bearer once, removes the fragment, and makes one clean same-origin
 file request with the bearer in the `Authorization` header. Redirects fail,
 credentials are omitted, and the
 worker requires the exact clean URL, 200/206 status, attachment disposition,
-octet-stream type, `no-store`, `nosniff`, and byte-range policy before returning
-the upstream streaming response without calling `blob()`, `arrayBuffer()`,
-cloning, or teeing the body. A restart loses all transient reservations and
-therefore fails closed. Cancellation before response handoff aborts the worker
-fetch; browser download cancellation after handoff must still be verified end
-to end. Invalid controlled navigations receive an empty `204` without
+octet-stream type, absent content encoding, an explicit decimal content length,
+`no-store`, `nosniff`, and byte-range policy. It then wraps the upstream body in
+a one-chunk, backpressure-preserving monitor without calling `blob()`,
+`arrayBuffer()`, cloning, or teeing the body. The Worker retains only the active
+abort handle and status port until EOF, cancellation, or an error. Forgetting
+the token therefore aborts the upstream fetch even after the response has been
+handed to the browser, while normal completion releases the page and Worker
+state. A restart loses all transient reservations and therefore fails closed.
+Invalid controlled navigations receive an empty `204` without
 consuming a valid reservation. If the POST reaches the server because the
 Worker was replaced or bypassed, its browser-generated navigation metadata also
 selects an empty `204`, so the portal document remains in place and access stays
@@ -143,7 +146,11 @@ remain excluded, and untrusted fork PRs cannot upload this bundle. This
 failure-only evidence does not exercise the production `NewIsolated`
 coordinator, systemd/cgroup sandbox, Caddy/Nginx, public DNS, HSTS, retail
 Chrome/Firefox, Safari/iOS, or a target host. Its initial-Range case is limited
-to the bundled engines and does not prove transparent retry/resume. It is not
+to the bundled engines. Its lifecycle cases require an exactly consumed proof
+to fail replay without another authorization challenge or upstream request and
+require a page logout to terminate an already handed, still-active stream. They
+do not prove Worker-process restart, token rotation, transparent retry/resume,
+retail-browser behavior, or target-host behavior. Passing them is not
 sufficient to close Issue #20 or enable public routing.
 
 If Firefox loses only Playwright's external navigation lifecycle event while
