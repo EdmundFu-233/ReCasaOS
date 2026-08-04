@@ -24,7 +24,7 @@ func signExtendedFilesystemMagic(magic uint32) int64 {
 
 func newSecureRootFixture(t *testing.T) (*secureRoot, string) {
 	t.Helper()
-	rootPath := filepath.Join(t.TempDir(), "shared")
+	rootPath := filepath.Join(protectedTestDirectory(t), "shared")
 	if err := os.Mkdir(rootPath, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestPublicRootFilesystemPolicyIsExplicitAndFailClosed(t *testing.T) {
 }
 
 func TestOpenSecureRootRejectsUnsupportedFilesystemAndClosesDescriptor(t *testing.T) {
-	rootPath := filepath.Join(t.TempDir(), "shared")
+	rootPath := filepath.Join(protectedTestDirectory(t), "shared")
 	if err := os.Mkdir(rootPath, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestOpenSecureRootRejectsUnsupportedFilesystemAndClosesDescriptor(t *testin
 }
 
 func TestOpenSecureRootInspectionFailureRollsBackDescriptor(t *testing.T) {
-	rootPath := filepath.Join(t.TempDir(), "shared")
+	rootPath := filepath.Join(protectedTestDirectory(t), "shared")
 	if err := os.Mkdir(rootPath, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +136,7 @@ func TestOpenSecureRootInspectionFailureRollsBackDescriptor(t *testing.T) {
 }
 
 func TestOpenSecureRootRejectsZeroMountIDAndClosesDescriptor(t *testing.T) {
-	rootPath := filepath.Join(t.TempDir(), "shared")
+	rootPath := filepath.Join(protectedTestDirectory(t), "shared")
 	if err := os.Mkdir(rootPath, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func TestOpenSecureRootReadabilityProbeUsesPinnedDescriptorAndRollsBack(t *testi
 		t.Skip("root bypasses the directory read-permission boundary")
 	}
 
-	base := t.TempDir()
+	base := protectedTestDirectory(t)
 	rootPath := filepath.Join(base, "shared")
 	movedPath := filepath.Join(base, "shared-pinned")
 	if err := os.Mkdir(rootPath, 0o700); err != nil {
@@ -212,7 +212,7 @@ func TestOpenSecureRootReadabilityProbeUsesPinnedDescriptorAndRollsBack(t *testi
 }
 
 func TestSecureRootRecordsAndRevalidatesPinnedMountIdentity(t *testing.T) {
-	rootPath := filepath.Join(t.TempDir(), "shared")
+	rootPath := filepath.Join(protectedTestDirectory(t), "shared")
 	if err := os.Mkdir(rootPath, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -413,7 +413,7 @@ func TestOpenRegularFailsClosedWhenProcReopenIsUnavailable(t *testing.T) {
 }
 
 func TestOpenPinnedRegularClosesPinnedFDWhenReopenFails(t *testing.T) {
-	target := filepath.Join(t.TempDir(), "report")
+	target := filepath.Join(protectedTestDirectory(t), "report")
 	if err := os.WriteFile(target, []byte("report"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -492,7 +492,7 @@ func TestOpenRegularRevalidatesLinkCountAfterReopen(t *testing.T) {
 func TestVerifierReadsStrictSerializedDigest(t *testing.T) {
 	for _, mode := range []os.FileMode{0o400, 0o600} {
 		t.Run(fmt.Sprintf("%04o", mode), func(t *testing.T) {
-			verifierPath := filepath.Join(t.TempDir(), "verifier")
+			verifierPath := filepath.Join(protectedTestDirectory(t), "verifier")
 			expected := digestPublicBearer(testPublicBearer(1))
 			if err := os.WriteFile(verifierPath, serializeTestPublicVerifier(expected), mode); err != nil {
 				t.Fatal(err)
@@ -525,7 +525,7 @@ func TestVerifierRejectsUnsafePermissions(t *testing.T) {
 		0o600 | os.ModeSticky,
 	} {
 		t.Run(fmt.Sprintf("%04o", mode), func(t *testing.T) {
-			verifierPath := filepath.Join(t.TempDir(), "verifier")
+			verifierPath := filepath.Join(protectedTestDirectory(t), "verifier")
 			expected := digestPublicBearer(testPublicBearer(2))
 			if err := os.WriteFile(verifierPath, serializeTestPublicVerifier(expected), 0o600); err != nil {
 				t.Fatal(err)
@@ -607,7 +607,7 @@ func TestVerifierLoaderPreservesStrictFormatFailure(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			verifierPath := filepath.Join(t.TempDir(), "verifier")
+			verifierPath := filepath.Join(protectedTestDirectory(t), "verifier")
 			if err := os.WriteFile(verifierPath, []byte(test.value), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -620,7 +620,7 @@ func TestVerifierLoaderPreservesStrictFormatFailure(t *testing.T) {
 }
 
 func TestVerifierRejectsUnsafeObjectBeforeDataOpen(t *testing.T) {
-	base := t.TempDir()
+	base := protectedTestDirectory(t)
 	if err := os.Mkdir(filepath.Join(base, "directory"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -657,7 +657,7 @@ func TestVerifierRejectsUnsafeObjectBeforeDataOpen(t *testing.T) {
 }
 
 func TestVerifierFailsClosedWhenProcReopenIsUnavailable(t *testing.T) {
-	verifierPath := filepath.Join(t.TempDir(), "verifier")
+	verifierPath := filepath.Join(protectedTestDirectory(t), "verifier")
 	expected := digestPublicBearer(testPublicBearer(3))
 	if err := os.WriteFile(verifierPath, serializeTestPublicVerifier(expected), 0o600); err != nil {
 		t.Fatal(err)
@@ -677,7 +677,7 @@ func TestVerifierFailsClosedWhenProcReopenIsUnavailable(t *testing.T) {
 }
 
 func TestVerifierReopensFinalConfiguredPath(t *testing.T) {
-	verifierPath := filepath.Join(t.TempDir(), "verifier")
+	verifierPath := filepath.Join(protectedTestDirectory(t), "verifier")
 	expected := digestPublicBearer(testPublicBearer(13))
 	if err := os.WriteFile(
 		verifierPath,
@@ -716,7 +716,7 @@ func TestVerifierReopensFinalConfiguredPath(t *testing.T) {
 }
 
 func TestVerifierFailsClosedWhenFinalPathReopenIsUnavailable(t *testing.T) {
-	verifierPath := filepath.Join(t.TempDir(), "verifier")
+	verifierPath := filepath.Join(protectedTestDirectory(t), "verifier")
 	expected := digestPublicBearer(testPublicBearer(14))
 	if err := os.WriteFile(
 		verifierPath,
@@ -757,7 +757,7 @@ func TestVerifierFailsClosedWhenFinalPathReopenIsUnavailable(t *testing.T) {
 }
 
 func TestVerifierRejectsReopenedIdentityMismatch(t *testing.T) {
-	base := t.TempDir()
+	base := protectedTestDirectory(t)
 	expectedPath := filepath.Join(base, "expected-verifier")
 	otherPath := filepath.Join(base, "other-verifier")
 	expected := digestPublicBearer(testPublicBearer(4))
@@ -792,7 +792,7 @@ func TestVerifierRejectsReopenedIdentityMismatch(t *testing.T) {
 func TestVerifierRejectsMetadataDriftAcrossReadableReopen(t *testing.T) {
 	for _, mode := range []os.FileMode{0o400, 0o640} {
 		t.Run(fmt.Sprintf("%04o", mode), func(t *testing.T) {
-			verifierPath := filepath.Join(t.TempDir(), "verifier")
+			verifierPath := filepath.Join(protectedTestDirectory(t), "verifier")
 			expected := digestPublicBearer(testPublicBearer(15))
 			if err := os.WriteFile(
 				verifierPath,
@@ -835,7 +835,7 @@ func TestVerifierRejectsWritableParentDirectory(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			verifierDir := filepath.Join(t.TempDir(), "credentials")
+			verifierDir := filepath.Join(protectedTestDirectory(t), "credentials")
 			if err := os.Mkdir(verifierDir, 0o700); err != nil {
 				t.Fatal(err)
 			}
@@ -858,7 +858,7 @@ func TestVerifierRejectsWritableParentDirectory(t *testing.T) {
 }
 
 func TestVerifierFailsClosedWhenConfiguredPathIsAtomicallyReplaced(t *testing.T) {
-	base := t.TempDir()
+	base := protectedTestDirectory(t)
 	configuredPath := filepath.Join(base, "configured.verifier")
 	replacementPath := filepath.Join(base, "replacement.verifier")
 	expected := digestPublicBearer(testPublicBearer(8))
