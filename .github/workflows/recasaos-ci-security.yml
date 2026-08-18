@@ -42,6 +42,12 @@ jobs:
       - name: Verify exact Go toolchain policy
         run: .github/scripts/test-go-toolchain-version-policy.sh
 
+      - name: Verify reviewed SMB2 module boundary
+        run: .github/scripts/check-smb2-module-boundary.sh
+
+      - name: Exercise SMB2 module boundary fixtures
+        run: .github/scripts/test-smb2-module-boundary.sh
+
       - name: Enforce offline release and migration policy
         run: .github/scripts/check-release-policy.sh
 
@@ -130,6 +136,12 @@ jobs:
 
       - name: Verify generated API clients are committed
         run: git diff --exit-code -- codegen/
+
+      - name: Verify generation preserved module locks
+        run: git diff --exit-code -- go.mod go.sum
+
+      - name: Recheck reviewed SMB2 module boundary after generation
+        run: .github/scripts/check-smb2-module-boundary.sh
 
       - name: Enforce selected Go package dependency boundary
         run: .github/scripts/check-go-dependency-boundary.sh
@@ -505,6 +517,9 @@ jobs:
           go-version: "1.26.6"
           cache: true
 
+      - name: Verify reviewed SMB2 module boundary
+        run: .github/scripts/check-smb2-module-boundary.sh
+
       - name: Preflight selected Go tool dependency boundary
         run: .github/scripts/check-go-dependency-boundary.sh --tools-only
 
@@ -513,6 +528,12 @@ jobs:
 
       - name: Verify generated API clients are committed
         run: git diff --exit-code -- codegen/
+
+      - name: Verify generation preserved module locks
+        run: git diff --exit-code -- go.mod go.sum
+
+      - name: Recheck reviewed SMB2 module boundary after generation
+        run: .github/scripts/check-smb2-module-boundary.sh
 
       - name: Run govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
