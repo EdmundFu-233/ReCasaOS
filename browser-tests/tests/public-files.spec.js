@@ -807,11 +807,20 @@ test('native browser download preserves bytes and leaves no bearer residue', asy
 });
 
 test('forgetting the token aborts a handed browser stream', async ({
+  browserName,
   context,
   page,
   portal,
-}) => {
-  await loginAndWaitForNativeStreaming(page, portal);
+}, testInfo) => {
+  const verifier = await context.newPage();
+  await openPortal(page, portal);
+  await openPortal(verifier, portal, {
+    browserName,
+    context,
+    firstPage: page,
+    testInfo,
+  });
+  await loginLoadedPortalAndWaitForNativeStreaming(page, portal);
   const before = await readSnapshot(portal);
 
   const downloadPromise = page.waitForEvent('download', { timeout: 30_000 });
@@ -833,19 +842,10 @@ test('forgetting the token aborts a handed browser stream', async ({
   await expect(page.locator('#status')).toHaveText(
     'Token forgotten for this page',
   );
-  const after = await waitForSnapshot(
-    portal,
-    (snapshot) =>
-      snapshot.active_file_requests === 0 &&
-      snapshot.authorized_file_requests - before.authorized_file_requests ===
-        1 &&
-      snapshot.canceled_file_requests - before.canceled_file_requests === 1 &&
-      snapshot.completed_file_requests - before.completed_file_requests === 0,
-    'logout-canceled handed browser stream cleanup',
-    40_000,
-  );
-  expect(after.authorization_on_other_path).toBe(0);
-  expect(after.credential_query_requests).toBe(0);
+  // A failed top-level Firefox download can invalidate later commands against
+  // that page. Capture its page-specific state immediately after synchronous
+  // logout. A separate same-origin verifier remains outside the download
+  // lifecycle and checks shared browser stores again after server cleanup.
   const [browserResidue, cookies, storageState] = await Promise.all([
     browserStorageResidue(page, portal.bearer),
     context.cookies(),
@@ -859,12 +859,29 @@ test('forgetting the token aborts a handed browser stream', async ({
           cookie.name.includes(portal.bearer) ||
           cookie.value.includes(portal.bearer),
       ),
-    'browser cookies must remain credential-free after cancellation',
+    'browser cookies must remain credential-free after logout',
   ).toBe(true);
   expect(
     !JSON.stringify(storageState).includes(portal.bearer),
-    'browser storage state must remain credential-free after cancellation',
+    'browser storage state must remain credential-free after logout',
   ).toBe(true);
+
+  const after = await waitForSnapshot(
+    portal,
+    (snapshot) =>
+      snapshot.active_file_requests === 0 &&
+      snapshot.authorized_file_requests - before.authorized_file_requests ===
+        1 &&
+      snapshot.canceled_file_requests - before.canceled_file_requests === 1 &&
+      snapshot.completed_file_requests - before.completed_file_requests === 0,
+    'logout-canceled handed browser stream cleanup',
+    40_000,
+  );
+  expect(after.authorization_on_other_path).toBe(0);
+  expect(after.credential_query_requests).toBe(0);
+  assertNoBrowserStorageResidue(
+    await browserStorageResidue(verifier, portal.bearer),
+  );
   expect(
     await download.failure(),
     'logout must terminate a browser stream that has already been handed off',
