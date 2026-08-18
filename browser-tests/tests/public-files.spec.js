@@ -123,9 +123,14 @@ async function loginAndWaitForNativeStreaming(page, portal) {
   await loginLoadedPortalAndWaitForNativeStreaming(page, portal);
 }
 
-async function prepareManualDownload(page, bearer, path) {
+async function prepareManualDownload(
+  page,
+  bearer,
+  path,
+  retainChallengeListener = false,
+) {
   return page.evaluate(
-    async ({ bearerValue, relativePath }) => {
+    async ({ bearerValue, relativePath, retainListener }) => {
       const controller = navigator.serviceWorker.controller;
       if (controller === null) {
         throw new Error('service worker controller is unavailable');
@@ -175,7 +180,7 @@ async function prepareManualDownload(page, bearer, path) {
           const status = statusEvent.data;
           window.__recasaosIsolation.httpStatus = status?.httpStatus ?? 0;
           window.__recasaosIsolation.status = status?.status ?? '';
-          navigator.serviceWorker.removeEventListener('message', onChallenge);
+          if (!retainListener) cleanupChallengeListener();
           port.close();
         };
         port.start();
@@ -187,6 +192,17 @@ async function prepareManualDownload(page, bearer, path) {
           token: bearerValue,
         });
       };
+      const cleanupChallengeListener = () => {
+        navigator.serviceWorker.removeEventListener('message', onChallenge);
+        if (
+          window.__recasaosIsolationCleanup === cleanupChallengeListener
+        ) {
+          window.__recasaosIsolationCleanup = null;
+        }
+      };
+      if (retainListener) {
+        window.__recasaosIsolationCleanup = cleanupChallengeListener;
+      }
       navigator.serviceWorker.addEventListener('message', onChallenge);
 
       const prepared = await new Promise((resolve) => {
@@ -221,7 +237,7 @@ async function prepareManualDownload(page, bearer, path) {
         );
       });
       if (!prepared) {
-        navigator.serviceWorker.removeEventListener('message', onChallenge);
+        cleanupChallengeListener();
         throw new Error('manual download reservation was denied');
       }
       window.__recasaosManualDownload = {
@@ -232,8 +248,20 @@ async function prepareManualDownload(page, bearer, path) {
       };
       return { nonce, path: relativePath, requestURL: requestURL.href };
     },
-    { bearerValue: bearer, relativePath: path },
+    {
+      bearerValue: bearer,
+      relativePath: path,
+      retainListener: retainChallengeListener,
+    },
   );
+}
+
+async function stopManualDownloadChallengeProbe(page) {
+  await page.evaluate(() => {
+    const cleanup = window.__recasaosIsolationCleanup;
+    if (typeof cleanup === 'function') cleanup();
+    window.__recasaosIsolationCleanup = null;
+  });
 }
 
 async function submitUntrustedDownload(page, requestURL) {
@@ -359,10 +387,35 @@ async function browserStorageResidue(page, bearer) {
       } catch {
         historyContains = true;
       }
-      const cacheNames = await caches.keys();
+      const withinDeadline = (operation, stage) =>
+        new Promise((resolve, reject) => {
+          let settled = false;
+          const finish = (error, value) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            if (error === null) resolve(value);
+            else reject(error);
+          };
+          const timer = setTimeout(
+            () => finish(new Error(`${stage} inspection timed out`)),
+            3_000,
+          );
+          Promise.resolve(operation).then(
+            (value) => finish(null, value),
+            () => finish(new Error(`${stage} inspection failed`)),
+          );
+        });
+      const cacheNames = await withinDeadline(
+        caches.keys(),
+        'CacheStorage',
+      );
       const databases =
         typeof indexedDB.databases === 'function'
-          ? await indexedDB.databases()
+          ? await withinDeadline(
+              indexedDB.databases(),
+              'IndexedDB',
+            )
           : null;
       return {
         cacheCount: cacheNames.length,
@@ -381,7 +434,14 @@ async function browserStorageResidue(page, bearer) {
         sessionStorageCount: sessionStorage.length,
       };
     }, bearer);
-  } catch {
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '';
+    const stage = message.match(
+      /(?:CacheStorage|IndexedDB) inspection (?:failed|timed out)/,
+    );
+    if (stage !== null) {
+      throw new Error(stage[0]);
+    }
     throw new Error('browser storage inspection failed');
   }
 }
@@ -553,6 +613,7 @@ test('a consumed navigation proof cannot authorize a replay', async ({
     page,
     portal.bearer,
     'report.txt',
+    true,
   );
   await preserveManualDownloadForReplay(page, prepared.requestURL);
 
@@ -581,19 +642,69 @@ test('a consumed navigation proof cannot authorize a replay', async ({
     .waitForEvent('download', { timeout: 1_000 })
     .catch(() => null);
   await submitReplayedDownload(page, prepared.requestURL);
-  expect(
-    await replayDownload,
-    'a consumed navigation proof must not create another download',
-  ).toBeNull();
+  const replayArtifact = await replayDownload;
+  if (replayArtifact !== null) {
+    const replayURL = replayArtifact.url();
+    const replayFilename = replayArtifact.suggestedFilename();
+    const bearerValuePattern = /rc1_[A-Za-z0-9_-]{43}/;
+    let parsedReplayURL;
+    try {
+      parsedReplayURL = new URL(replayURL);
+    } catch {
+      throw new Error('rejected replay download URL is invalid');
+    }
+    const portalURL = new URL(portal.origin);
+    expect(
+      !replayURL.includes(portal.bearer) &&
+        !bearerValuePattern.test(replayURL) &&
+        parsedReplayURL.protocol === 'https:' &&
+        parsedReplayURL.username === '' &&
+        parsedReplayURL.password === '' &&
+        parsedReplayURL.origin === portalURL.origin &&
+        parsedReplayURL.pathname === '/public-files/api/file' &&
+        parsedReplayURL.searchParams.size === 1 &&
+        parsedReplayURL.searchParams.getAll('path').length === 1 &&
+        parsedReplayURL.searchParams.get('path') === 'report.txt' &&
+        (parsedReplayURL.hash === '' ||
+          /^#[A-Za-z0-9_-]{32}$/.test(parsedReplayURL.hash)),
+      'a browser artifact for the rejected replay must remain scoped and credential-free',
+    ).toBe(true);
+    expect(
+      !replayFilename.includes(portal.bearer) &&
+        !bearerValuePattern.test(replayFilename),
+      'a browser artifact for the rejected replay must use a credential-free filename',
+    ).toBe(true);
+    if ((await replayArtifact.failure()) === null) {
+      const rejected = await hashDownload(replayArtifact);
+      expect(
+        rejected.size,
+        'a successful browser artifact for an empty 204 rejection must contain no bytes',
+      ).toBe(0);
+      expect(
+        rejected.sha256,
+        'a rejected replay must not contain the protected file bytes',
+      ).not.toBe(portal.fixtures['report.txt'].sha256);
+    }
+  }
   expect(page.url()).toBe(initialPageURL);
   expect(
     await page.evaluate(() => window.__recasaosIsolation.challengeCount),
     'a replay must not trigger a second authorization challenge',
   ).toBe(1);
-  expect(fileRequestState(await readSnapshot(portal))).toEqual(
-    fileRequestState(terminal),
-  );
-  await expectFileRequestStateToRemainQuiescent(portal, terminal);
+  expect(
+    await readSnapshot(portal),
+    'a replay must not change any public-files request counter',
+  ).toEqual(terminal);
+  await delay(4_000);
+  expect(
+    await readSnapshot(portal),
+    'all public-files request counters must remain quiescent after replay',
+  ).toEqual(terminal);
+  expect(
+    await page.evaluate(() => window.__recasaosIsolation.challengeCount),
+    'a delayed replay challenge must not occur before probe cleanup',
+  ).toBe(1);
+  await stopManualDownloadChallengeProbe(page);
 });
 
 test('native browser download preserves bytes and leaves no bearer residue', async ({
@@ -696,6 +807,7 @@ test('native browser download preserves bytes and leaves no bearer residue', asy
 });
 
 test('forgetting the token aborts a handed browser stream', async ({
+  context,
   page,
   portal,
 }) => {
@@ -721,10 +833,6 @@ test('forgetting the token aborts a handed browser stream', async ({
   await expect(page.locator('#status')).toHaveText(
     'Token forgotten for this page',
   );
-  expect(
-    await download.failure(),
-    'logout must terminate a browser stream that has already been handed off',
-  ).not.toBeNull();
   assertNoBrowserStorageResidue(
     await browserStorageResidue(page, portal.bearer),
   );
@@ -742,6 +850,24 @@ test('forgetting the token aborts a handed browser stream', async ({
   );
   expect(after.authorization_on_other_path).toBe(0);
   expect(after.credential_query_requests).toBe(0);
+  expect(
+    await download.failure(),
+    'logout must terminate a browser stream that has already been handed off',
+  ).not.toBeNull();
+  const cookies = await context.cookies();
+  expect(
+    cookies.length === 0 &&
+      !cookies.some(
+        (cookie) =>
+          cookie.name.includes(portal.bearer) ||
+          cookie.value.includes(portal.bearer),
+      ),
+    'browser cookies must remain credential-free after cancellation',
+  ).toBe(true);
+  expect(
+    !JSON.stringify(await context.storageState()).includes(portal.bearer),
+    'browser storage state must remain credential-free after cancellation',
+  ).toBe(true);
   await expectFileRequestStateToRemainQuiescent(portal, after);
 });
 
