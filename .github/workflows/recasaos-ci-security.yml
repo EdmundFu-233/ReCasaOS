@@ -55,7 +55,12 @@ jobs:
         run: .github/scripts/test-trusted-privileged-workflow.sh
 
       - name: Verify browser diagnostic retention policy
+        shell: bash
         run: bash .github/scripts/check-public-files-browser-diagnostics-policy.sh
+
+      - name: Exercise browser diagnostic policy negative cases
+        shell: bash
+        run: bash .github/scripts/test-public-files-browser-diagnostics-policy.sh
 
       - name: Validate GoReleaser configuration
         run: .github/scripts/check-goreleaser-config.sh
@@ -392,7 +397,7 @@ jobs:
   public-files-browser-smoke:
     name: Public-files HTTPS browser smoke (Playwright)
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - name: Check out source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -422,7 +427,7 @@ jobs:
           npm --prefix browser-tests run test:diagnostics
 
       - name: Install ephemeral browser dependencies
-        timeout-minutes: 10
+        timeout-minutes: 20
         shell: bash
         run: |
           browser-tests/node_modules/.bin/playwright install \
@@ -430,7 +435,6 @@ jobs:
             chromium \
             firefox \
             webkit
-          sudo apt-get update
           sudo env DEBIAN_FRONTEND=noninteractive \
             apt-get install --yes --no-install-recommends \
               libnss3-tools \
@@ -451,6 +455,7 @@ jobs:
 
       - name: Exercise the HTTPS browser boundary
         timeout-minutes: 15
+        shell: bash
         env:
           RECASAOS_RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: .github/scripts/test-public-files-browser.sh
