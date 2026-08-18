@@ -833,10 +833,6 @@ test('forgetting the token aborts a handed browser stream', async ({
   await expect(page.locator('#status')).toHaveText(
     'Token forgotten for this page',
   );
-  assertNoBrowserStorageResidue(
-    await browserStorageResidue(page, portal.bearer),
-  );
-
   const after = await waitForSnapshot(
     portal,
     (snapshot) =>
@@ -850,11 +846,12 @@ test('forgetting the token aborts a handed browser stream', async ({
   );
   expect(after.authorization_on_other_path).toBe(0);
   expect(after.credential_query_requests).toBe(0);
-  expect(
-    await download.failure(),
-    'logout must terminate a browser stream that has already been handed off',
-  ).not.toBeNull();
-  const cookies = await context.cookies();
+  const [browserResidue, cookies, storageState] = await Promise.all([
+    browserStorageResidue(page, portal.bearer),
+    context.cookies(),
+    context.storageState(),
+  ]);
+  assertNoBrowserStorageResidue(browserResidue);
   expect(
     cookies.length === 0 &&
       !cookies.some(
@@ -865,9 +862,13 @@ test('forgetting the token aborts a handed browser stream', async ({
     'browser cookies must remain credential-free after cancellation',
   ).toBe(true);
   expect(
-    !JSON.stringify(await context.storageState()).includes(portal.bearer),
+    !JSON.stringify(storageState).includes(portal.bearer),
     'browser storage state must remain credential-free after cancellation',
   ).toBe(true);
+  expect(
+    await download.failure(),
+    'logout must terminate a browser stream that has already been handed off',
+  ).not.toBeNull();
   await expectFileRequestStateToRemainQuiescent(portal, after);
 });
 
