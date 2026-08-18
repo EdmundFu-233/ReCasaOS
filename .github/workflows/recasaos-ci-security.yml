@@ -213,7 +213,7 @@ jobs:
           cache: true
 
       - name: Install filesystem compatibility tools
-        timeout-minutes: 5
+        timeout-minutes: 10
         shell: bash
         run: |
           sudo apt-get update
