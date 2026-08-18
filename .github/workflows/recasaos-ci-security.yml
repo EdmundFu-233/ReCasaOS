@@ -39,6 +39,9 @@ jobs:
       - name: Verify dependency graph is tidy
         run: go mod tidy -diff
 
+      - name: Verify exact Go toolchain policy
+        run: .github/scripts/test-go-toolchain-version-policy.sh
+
       - name: Enforce offline release and migration policy
         run: .github/scripts/check-release-policy.sh
 
