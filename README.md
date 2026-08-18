@@ -134,6 +134,11 @@ response-body cancellation is not propagated to a Service Worker, but the
 native-download path exercised here is not identical. It proves that the test
 fixture does not retain an active slot; it does not prove Firefox cancel
 propagation or satisfy Issue #20's release gate.
+The same bundled-engine matrix now also requires an already consumed navigation
+proof to fail replay without another authorization challenge or upstream
+request, and requires forgetting the page token to abort an already handed,
+still-active upstream stream. These are repository CI checks, not evidence of
+retail-browser, reverse-proxy, token-rotation, or target-host readiness.
 
 The portal also verifies the already-pinned root descriptor's Linux mount ID
 and filesystem type before it becomes available. Only ext2/3/4, XFS, Btrfs,

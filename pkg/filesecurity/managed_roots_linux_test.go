@@ -1133,7 +1133,12 @@ func TestManagedRootsCommitNoReplaceRejectsSameSizeMutationDuringCopy(t *testing
 	roots.commitCopy = func(destination io.Writer, source io.Reader) (int64, error) {
 		written, copyErr := io.Copy(destination, source)
 		mutationErr := os.WriteFile(staging, []byte("evil"), 0o600)
-		return written, errors.Join(copyErr, mutationErr)
+		// Filesystems may report multiple writes inside one timestamp quantum
+		// with identical mtime and ctime values. Force an observable metadata
+		// transition so this test exercises the stat-bound mutation guard
+		// deterministically; digest-bound callers are covered separately.
+		timestampErr := os.Chtimes(staging, time.Unix(1, 0), time.Unix(2, 0))
+		return written, errors.Join(copyErr, mutationErr, timestampErr)
 	}
 	if err := roots.CommitNoReplace(staging, destination); !errors.Is(err, ErrUnsafePath) {
 		t.Fatalf("same-size mutation error = %v", err)

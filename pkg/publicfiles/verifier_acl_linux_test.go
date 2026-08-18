@@ -236,7 +236,7 @@ func TestVerifierAccessACLRequiresReadableDescriptor(t *testing.T) {
 		serviceUID = 1
 	}
 	expected := exactSystemdCredentialACLForTest(serviceUID)
-	verifierPath := filepath.Join(t.TempDir(), "verifier")
+	verifierPath := filepath.Join(protectedTestDirectory(t), "verifier")
 	if err := os.WriteFile(verifierPath, []byte("fixture"), 0o600); err != nil {
 		t.Fatal(err)
 	}

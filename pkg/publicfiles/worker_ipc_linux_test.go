@@ -32,7 +32,7 @@ func TestReceiveStorageWorkerFrameClosesRightsOnTruncation(t *testing.T) {
 			files := make([]*os.File, test.rightsCount)
 			descriptors := make([]int, test.rightsCount)
 			for index := range files {
-				file, err := os.CreateTemp(t.TempDir(), "storage-worker-right-")
+				file, err := os.CreateTemp(protectedTestDirectory(t), "storage-worker-right-")
 				if err != nil {
 					t.Fatal(err)
 				}

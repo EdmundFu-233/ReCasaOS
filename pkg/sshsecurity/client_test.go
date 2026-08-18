@@ -12,7 +12,7 @@ import (
 )
 
 func TestLoadHostKeyCallbackAcceptsOnlyProtectedPinnedKey(t *testing.T) {
-	directory := t.TempDir()
+	directory := protectedTestDirectory(t)
 	trusted := generateSSHTestKey(t)
 	other := generateSSHTestKey(t)
 	path := filepath.Join(directory, "ssh_host_ed25519_key.pub")
@@ -33,7 +33,7 @@ func TestLoadHostKeyCallbackAcceptsOnlyProtectedPinnedKey(t *testing.T) {
 }
 
 func TestLoadHostKeyCallbackRejectsWritableKeyMaterial(t *testing.T) {
-	directory := t.TempDir()
+	directory := protectedTestDirectory(t)
 	path := filepath.Join(directory, "ssh_host_ed25519_key.pub")
 	if err := os.WriteFile(path, ssh.MarshalAuthorizedKey(generateSSHTestKey(t)), 0o600); err != nil {
 		t.Fatal(err)
@@ -44,6 +44,15 @@ func TestLoadHostKeyCallbackRejectsWritableKeyMaterial(t *testing.T) {
 	if _, err := LoadHostKeyCallback(directory); err == nil {
 		t.Fatal("group/world-writable host key was trusted")
 	}
+}
+
+func protectedTestDirectory(t *testing.T) string {
+	t.Helper()
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return directory
 }
 
 func generateSSHTestKey(t *testing.T) ssh.PublicKey {
