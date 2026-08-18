@@ -30,14 +30,17 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Go 1.26.5
+      - name: Set up Go 1.26.6
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
-          go-version: "1.26.5"
+          go-version: "1.26.6"
           cache: true
 
       - name: Verify dependency graph is tidy
         run: go mod tidy -diff
+
+      - name: Verify exact Go toolchain policy
+        run: .github/scripts/test-go-toolchain-version-policy.sh
 
       - name: Enforce offline release and migration policy
         run: .github/scripts/check-release-policy.sh
@@ -203,10 +206,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Go 1.26.5
+      - name: Set up Go 1.26.6
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
-          go-version: "1.26.5"
+          go-version: "1.26.6"
           cache: true
 
       - name: Install filesystem compatibility tools
@@ -296,10 +299,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Go 1.26.5
+      - name: Set up Go 1.26.6
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
-          go-version: "1.26.5"
+          go-version: "1.26.6"
           cache: true
 
       - name: Exercise the isolated public-files service
@@ -337,10 +340,10 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Set up Go 1.26.5
+      - name: Set up Go 1.26.6
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
-          go-version: "1.26.5"
+          go-version: "1.26.6"
           cache: false
 
       - name: Install software-emulated VM tools
@@ -375,10 +378,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Go 1.26.5
+      - name: Set up Go 1.26.6
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
-          go-version: "1.26.5"
+          go-version: "1.26.6"
           cache: false
 
       - name: Set up Node.js 24.18.0
@@ -487,10 +490,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Go 1.26.5
+      - name: Set up Go 1.26.6
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
-          go-version: "1.26.5"
+          go-version: "1.26.6"
           cache: true
 
       - name: Generate API clients
