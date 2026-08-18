@@ -129,10 +129,6 @@ test_bearer='rc1_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8'
 worker_load_bytes=67108864
 storage_worker_address_space_ceiling=2147483648
 storage_worker_address_space_minimum_reserve=134217728
-# One shared aggregate budget, started only after all four client identities
-# are captured, for their workers to enter real D-state under QEMU. It remains
-# within the production worker operation timeout.
-hostile_storage_blocked_window_seconds=9
 
 [[ "$workspace" =~ ^/(run|var/lib)/recasaos-public-files-ci-[0-9]+-[0-9]+$ &&
   "$workspace" == "$workspace_parent/recasaos-public-files-ci-$run_key" ]] ||
@@ -246,6 +242,19 @@ hostile_source = script.split(hostile_start, 1)[1].split(hostile_end, 1)[0]
 compile(
     hostile_source,
     "assert_hostile_storage_worker_boundaries.py",
+    "exec",
+)
+d_state_start = (
+    "<<'D_STATE_PYTHON' \\\n"
+    "    >/dev/null 2>&1\n"
+)
+d_state_end = "\nD_STATE_PYTHON\n}"
+if script.count(d_state_start) != 1 or script.count(d_state_end) != 1:
+    raise SystemExit("D-state polling Python sentinels are not unique")
+d_state_source = script.split(d_state_start, 1)[1].split(d_state_end, 1)[0]
+compile(
+    d_state_source,
+    "storage_workers_are_in_d_state.py",
     "exec",
 )
 PYTHON
@@ -1632,21 +1641,51 @@ storage_workers_are_stopped() {
 
 storage_workers_are_in_d_state() {
   local expected=$1
-  local count=0
-  local process_state
+  local -a worker_pids=()
   local worker_pid
 
   hostile_storage_clients_are_live || return 1
-  while IFS= read -r worker_pid; do
+  mapfile -t worker_pids < <(storage_worker_pids)
+  [[ "${#worker_pids[@]}" == "$expected" ]] || return 1
+  for worker_pid in "${worker_pids[@]}"; do
     [[ "$worker_pid" =~ ^[0-9]+$ && "$worker_pid" -gt 1 ]] || return 1
-    process_state="$(
-      sudo ps -o stat= -p "$worker_pid" 2>/dev/null |
-        awk 'NR == 1 { print substr($1, 1, 1) }' || true
-    )"
-    [[ "$process_state" == D ]] || return 1
-    count=$((count + 1))
-  done < <(storage_worker_pids)
-  [[ "$count" == "$expected" ]]
+  done
+  sudo /usr/bin/python3 - "${worker_pids[@]}" <<'D_STATE_PYTHON' \
+    >/dev/null 2>&1
+from pathlib import Path
+import sys
+
+
+def task_state(stat_path):
+    data = stat_path.read_bytes()
+    marker = data.rfind(b") ")
+    fields = data[marker + 2 :].split() if marker >= 0 else []
+    if len(fields) <= 19:
+        raise RuntimeError("could not parse worker task identity")
+    return fields[0]
+
+
+for pid_text in sys.argv[1:]:
+    if not pid_text.isdecimal() or int(pid_text) <= 1:
+        raise SystemExit(1)
+    task_root = Path("/proc") / pid_text / "task"
+    try:
+        tasks = list(task_root.iterdir())
+    except FileNotFoundError:
+        raise SystemExit(1)
+    has_d_state_task = False
+    for task in tasks:
+        if not task.name.isdecimal():
+            continue
+        try:
+            if task_state(task / "stat") == b"D":
+                has_d_state_task = True
+                break
+        except FileNotFoundError:
+            continue
+    if not has_d_state_task:
+        raise SystemExit(1)
+D_STATE_PYTHON
 }
 
 assert_hostile_storage_worker_boundaries() {
@@ -1723,7 +1762,37 @@ def read_status(pid):
     return values
 
 
+def read_task_identity(pid, tid):
+    data = (Path("/proc") / str(pid) / "task" / str(tid) / "stat").read_bytes()
+    marker = data.rfind(b") ")
+    fields = data[marker + 2 :].split() if marker >= 0 else []
+    if len(fields) <= 19 or not fields[19].isdigit():
+        raise RuntimeError("could not parse hostile-storage task identity")
+    return fields[0], fields[19]
+
+
+def find_d_state_task(pid):
+    task_root = Path("/proc") / str(pid) / "task"
+    candidates = []
+    for task in task_root.iterdir():
+        if not task.name.isdecimal():
+            continue
+        tid = int(task.name)
+        try:
+            task_state, task_start = read_task_identity(pid, tid)
+        except FileNotFoundError:
+            continue
+        if task_state == b"D":
+            candidates.append((tid, task_start))
+    if not candidates:
+        raise RuntimeError(
+            f"hostile-storage worker {pid} has no D-state task"
+        )
+    return min(candidates)
+
+
 seen = set()
+d_tasks = []
 kill_bit = 1 << (9 - 1)
 for pair in worker_pairs:
     pid_text, separator, expected_start = pair.partition(":")
@@ -1741,15 +1810,13 @@ for pair in worker_pairs:
     state, parent, start_before = read_identity(pid)
     if start_before.decode("ascii") != expected_start:
         raise RuntimeError("hostile-storage worker identity changed")
-    if state != b"D":
-        raise RuntimeError(
-            f"hostile-storage worker {pid} state is {state!r}, want D"
-        )
     if parent != expected_parent:
         raise RuntimeError(
             f"hostile-storage worker {pid} parent is {parent}, "
             f"want {expected_parent}"
         )
+    d_tid, d_start_before = find_d_state_task(pid)
+    d_tasks.append(f"{pid}:{d_tid}")
 
     worker_executable = os.stat(Path("/proc") / str(pid) / "exe")
     if (
@@ -1783,15 +1850,18 @@ for pair in worker_pairs:
 
     state_after, parent_after, start_after = read_identity(pid)
     if (
-        state_after != b"D"
-        or parent_after != expected_parent
+        parent_after != expected_parent
         or start_after != start_before
     ):
         raise RuntimeError("hostile-storage worker changed during inspection")
+    d_state_after, d_start_after = read_task_identity(pid, d_tid)
+    if d_state_after != b"D" or d_start_after != d_start_before:
+        raise RuntimeError("hostile-storage D-state task changed during inspection")
 
 print(
     "hostile-storage worker evidence: "
-    f"phase={phase} parent={expected_parent} count={len(seen)} state=D"
+    f"phase={phase} parent={expected_parent} count={len(seen)} "
+    f"state=D tasks={','.join(d_tasks)}"
 )
 HOSTILE_PYTHON
   then
@@ -2406,6 +2476,8 @@ print_storage_worker_diagnostics() {
   sudo ps -o pid=,ppid=,stat=,etime=,args= --ppid "$portal_pid" >&2 || true
   while IFS= read -r worker_pid; do
     [[ "$worker_pid" =~ ^[0-9]+$ && "$worker_pid" -gt 1 ]] || continue
+    sudo ps -L -o pid=,lwp=,ppid=,stat=,wchan=,comm= \
+      -p "$worker_pid" >&2 || true
     worker_start_time="$(
       process_start_time "$worker_pid" 2>/dev/null || true
     )"
@@ -3759,12 +3831,10 @@ if [[ "$hostile_storage_test_enabled" == 1 ]]; then
   [[ "$(hostile_storage_suspended_value)" == 1 ]] ||
     fail "device-mapper did not report the hostile-storage suspension"
 
+  hostile_blocked_deadline=$((SECONDS + 8))
   for _ in {1..4}; do
     start_hostile_storage_client
   done
-  hostile_blocked_deadline=$((
-    SECONDS + hostile_storage_blocked_window_seconds
-  ))
   wait_until_before "four live hostile-storage clients" \
     "$hostile_blocked_deadline" \
     hostile_storage_clients_are_live

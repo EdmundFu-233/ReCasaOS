@@ -289,16 +289,9 @@ require_text "$systemd_script" \
   'storage_workers_are_in_d_state 4' \
   "hostile-storage phase does not require four real D-state workers"
 require_exact_count "$systemd_script" \
-  'hostile_storage_blocked_window_seconds=9' \
+  '  hostile_blocked_deadline=$((SECONDS + 8))' \
   1 \
-  "hostile-storage D-state formation window is not the one reviewed 9-second budget"
-require_exact_count "$systemd_script" \
-  '  hostile_blocked_deadline=$((' \
-  1 \
-  "hostile-storage aggregate deadline assignment count changed"
-require_text "$systemd_script" \
-  '    SECONDS + hostile_storage_blocked_window_seconds' \
-  "hostile-storage deadline does not use the reviewed aggregate window"
+  "hostile-storage D-state formation deadline is not the reviewed 8 seconds"
 require_exact_count "$systemd_script" \
   '    "$hostile_blocked_deadline" \' \
   3 \
@@ -336,23 +329,50 @@ signal_policy = """    pending_values = []
 """
 if worker_python.count(signal_policy) != 1:
     raise SystemExit("hostile-storage pending-signal policy changed")
+for task_proof in (
+    'task_root = Path("/proc") / str(pid) / "task"',
+    'if task_state == b"D":',
+    'f"hostile-storage worker {pid} has no D-state task"',
+    "d_tid, d_start_before = find_d_state_task(pid)",
+    'if d_state_after != b"D" or d_start_after != d_start_before:',
+):
+    if worker_python.count(task_proof) != 1:
+        raise SystemExit("hostile-storage thread-level D-state proof changed")
+
+poll_start = (
+    "<<'D_STATE_PYTHON' \\\n"
+    "    >/dev/null 2>&1\n"
+    "from pathlib import Path"
+)
+poll_end = "\nD_STATE_PYTHON\n}"
+if source.count(poll_start) != 1 or source.count(poll_end) != 1:
+    raise SystemExit("D-state polling Python sentinels are not unique")
+poll_python = "from pathlib import Path" + source.split(
+    poll_start, 1
+)[1].split(poll_end, 1)[0]
+compile(poll_python, "storage_workers_are_in_d_state.py", "exec")
+for poll_proof in (
+    'task_root = Path("/proc") / pid_text / "task"',
+    'if task_state(task / "stat") == b"D":',
+    "if not has_d_state_task:",
+):
+    if poll_python.count(poll_proof) != 1:
+        raise SystemExit("D-state polling no longer checks every worker task set")
 
 phase_start = """if [[ "$hostile_storage_test_enabled" == 1 ]]; then
   wait_until "storage workers before hostile-storage test"""
 phase_end = "  hostile_timeout_deadline=$((SECONDS + 18))"
-launch_start = "  for _ in {1..4}; do"
+launch_start = "  hostile_blocked_deadline=$((SECONDS + 8))"
 if source.count(phase_start) != 1 or source.count(phase_end) != 1:
     raise SystemExit("hostile-storage live phase sentinels are not unique")
 live_phase = source.split(phase_start, 1)[1].split(phase_end, 1)[0]
 if live_phase.count(launch_start) != 1:
     raise SystemExit("hostile-storage client launch is not unique in live phase")
 formation = live_phase[live_phase.index(launch_start) :]
-expected = """  for _ in {1..4}; do
+expected = """  hostile_blocked_deadline=$((SECONDS + 8))
+  for _ in {1..4}; do
     start_hostile_storage_client
   done
-  hostile_blocked_deadline=$((
-    SECONDS + hostile_storage_blocked_window_seconds
-  ))
   wait_until_before "four live hostile-storage clients" \\
     "$hostile_blocked_deadline" \\
     hostile_storage_clients_are_live
@@ -386,8 +406,8 @@ require_text "$systemd_script" \
   'or len(worker_pairs) != 4' \
   "hostile-storage runtime inspection does not require four workers"
 require_text "$systemd_script" \
-  'if state != b"D":' \
-  "hostile-storage runtime inspection does not require D-state"
+  'if task_state == b"D":' \
+  "hostile-storage runtime inspection does not require a D-state task"
 require_text "$systemd_script" \
   'if phase == "kill-pending" and not kill_is_pending:' \
   "hostile-storage runtime inspection does not require pending SIGKILL"
