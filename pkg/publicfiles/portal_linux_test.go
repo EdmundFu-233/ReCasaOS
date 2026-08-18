@@ -35,7 +35,7 @@ func writeTestVerifierFile(t *testing.T, path, bearer string, mode os.FileMode) 
 
 func newPortalFixture(t *testing.T, maxEntries int) portalFixture {
 	t.Helper()
-	base := t.TempDir()
+	base := protectedTestDirectory(t)
 	root := filepath.Join(base, "shared")
 	if err := os.Mkdir(root, 0o700); err != nil {
 		t.Fatal(err)
@@ -69,7 +69,7 @@ func serve(portal *Portal, request *http.Request) *httptest.ResponseRecorder {
 }
 
 func TestNewRejectsUnsafeRootsAndVerifierFiles(t *testing.T) {
-	base := t.TempDir()
+	base := protectedTestDirectory(t)
 	root := filepath.Join(base, "root")
 	if err := os.Mkdir(root, 0o700); err != nil {
 		t.Fatal(err)

@@ -275,7 +275,7 @@ func TestPublicVerifierBindAliasDisclosureCannotAuthenticate(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			rootPath, verifierPath := test.setup(t, t.TempDir())
+			rootPath, verifierPath := test.setup(t, protectedTestDirectory(t))
 			for _, direction := range []struct {
 				name      string
 				ancestor  string
@@ -370,7 +370,7 @@ func TestPublicVerifierBindAliasDisclosureCannotAuthenticate(t *testing.T) {
 
 func TestPinnedPublicRootSurvivesBindMountReplacement(t *testing.T) {
 	requireIsolatedPublicMountTest(t)
-	base := t.TempDir()
+	base := protectedTestDirectory(t)
 	original := filepath.Join(base, "original")
 	replacement := filepath.Join(base, "replacement")
 	mountPoint := filepath.Join(base, "public-root")
@@ -443,9 +443,9 @@ func TestPinnedPublicRootSurvivesBindMountReplacement(t *testing.T) {
 
 func TestPublicRootRejectsNestedBindMount(t *testing.T) {
 	requireIsolatedPublicMountTest(t)
-	rootPath := t.TempDir()
+	rootPath := protectedTestDirectory(t)
 	nested := filepath.Join(rootPath, "nested")
-	backing := t.TempDir()
+	backing := protectedTestDirectory(t)
 	if err := os.Mkdir(nested, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -480,7 +480,7 @@ func TestPublicRootRejectsNestedBindMount(t *testing.T) {
 
 func TestPublicRootAcceptsTmpfsInIsolatedNamespace(t *testing.T) {
 	requireIsolatedPublicMountTest(t)
-	mountPoint := t.TempDir()
+	mountPoint := protectedTestDirectory(t)
 	if err := unix.Mount("none", mountPoint, "tmpfs", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, "size=4m,mode=0700"); err != nil {
 		t.Fatalf("explicitly requested tmpfs regression cannot mount: %v", err)
 	}
@@ -569,7 +569,7 @@ func TestPublicRootAllowlistedFilesystemCompatibilityMatrix(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			mkfsTool := requirePublicFilesystemTool(t, test.mkfsTool)
-			base := t.TempDir()
+			base := protectedTestDirectory(t)
 			imagePath := filepath.Join(base, test.name+".img")
 			image, err := os.OpenFile(imagePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 			if err != nil {
