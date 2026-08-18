@@ -347,7 +347,7 @@ jobs:
           cache: false
 
       - name: Install software-emulated VM tools
-        timeout-minutes: 5
+        timeout-minutes: 10
         shell: bash
         run: |
           sudo apt-get update
