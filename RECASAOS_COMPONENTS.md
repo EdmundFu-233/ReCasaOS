@@ -41,7 +41,17 @@ be hand-edited.
 3. The UI must be represented by a tracked gitlink (or a checksum-verified build
    artifact). The `branch = main` hint in `.gitmodules` is not a lock.
 4. Go dependencies remain locked by `go.mod` and `go.sum`. Dependency upgrades
-   are reviewed changes and must pass tests, `go vet`, and `govulncheck`.
+   are reviewed changes and must pass tests, `go vet`, and `govulncheck`. CI
+   also decodes Go's selected-package graph for Linux tests in both CGO modes,
+   the race-enabled test selection, privileged browser and systemd build-tag
+   selections, every supported
+   Linux release architecture in both CGO modes, the boundary checker, and the
+   `go.mod` tool graph in both CGO modes. Tool graphs are checked before any
+   generator executes and the complete graph is checked again afterward. CI
+   rejects `golang.org/x/crypto/openpgp` and every package below that boundary.
+   This is intentionally a package boundary, not a ban on the complete
+   `golang.org/x/crypto` module: the separately required
+   `golang.org/x/crypto/ssh` package remains allowed.
 5. OpenAPI generators and input specifications are both supply-chain inputs.
    The local root specification, generator version, and remote Message Bus
    specification commit are explicit. Verify regenerated output whenever one

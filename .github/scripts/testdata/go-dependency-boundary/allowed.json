@@ -1,0 +1,6 @@
+{"ImportPath":"golang.org/x/crypto/ssh"}
+{"ImportPath":"golang.org/x/crypto/ssh/agent"}
+{"ImportPath":"golang.org/x/crypto/ssh [example.com/recasaos.test]"}
+{"ImportPath":"golang.org/x/crypto/openpgp2"}
+{"ImportPath":"example.com/golang.org/x/crypto/openpgp"}
+{"ImportPath":"example.com/safe","Doc":"golang.org/x/crypto/openpgp/packet is text, not a selected package"}
