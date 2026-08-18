@@ -364,6 +364,21 @@ async function hashDownload(download) {
   return { sha256: digest.digest('hex'), size };
 }
 
+async function boundedBrowserOperation(label, operation, timeoutMs = 10_000) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+  });
+  try {
+    return await Promise.race([operation, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function browserStorageResidue(page, bearer) {
   try {
     return await page.evaluate(async (secret) => {
@@ -847,9 +862,15 @@ test('forgetting the token aborts a handed browser stream', async ({
   // logout. A separate same-origin verifier remains outside the download
   // lifecycle and checks shared browser stores again after server cleanup.
   const [browserResidue, cookies, storageState] = await Promise.all([
-    browserStorageResidue(page, portal.bearer),
-    context.cookies(),
-    context.storageState(),
+    boundedBrowserOperation(
+      'logout page storage inspection',
+      browserStorageResidue(page, portal.bearer),
+    ),
+    boundedBrowserOperation('logout cookie inspection', context.cookies()),
+    boundedBrowserOperation(
+      'logout context storage inspection',
+      context.storageState(),
+    ),
   ]);
   assertNoBrowserStorageResidue(browserResidue);
   expect(
@@ -880,10 +901,16 @@ test('forgetting the token aborts a handed browser stream', async ({
   expect(after.authorization_on_other_path).toBe(0);
   expect(after.credential_query_requests).toBe(0);
   assertNoBrowserStorageResidue(
-    await browserStorageResidue(verifier, portal.bearer),
+    await boundedBrowserOperation(
+      'terminal shared storage inspection',
+      browserStorageResidue(verifier, portal.bearer),
+    ),
   );
   expect(
-    await download.failure(),
+    await boundedBrowserOperation(
+      'browser download failure inspection',
+      download.failure(),
+    ),
     'logout must terminate a browser stream that has already been handed off',
   ).not.toBeNull();
   await expectFileRequestStateToRemainQuiescent(portal, after);
