@@ -7,6 +7,41 @@ fail() {
   exit 1
 }
 
+publish_fixture_sample() {
+  local path=$1
+  local value=$2
+
+  [[ "$value" =~ ^[0-9]{3}$ ]] || fail "unsafe fixture sample value"
+  python3 - "$path" "$value" <<'PYTHON'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+payload = f"{sys.argv[2]}\n".encode("ascii")
+flags = os.O_WRONLY | os.O_CLOEXEC
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+descriptor = os.open(path, flags)
+try:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
+        or metadata.st_size != len(payload)
+    ):
+        raise SystemExit("unsafe memory.current fixture metadata")
+    written = os.pwrite(descriptor, payload, 0)
+    if written != len(payload):
+        raise SystemExit("short memory.current fixture write")
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PYTHON
+}
+
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 sampler="$script_dir/sample-cgroup-memory.py"
 workspace="$(mktemp -d)"
@@ -46,6 +81,7 @@ ready_file="$workspace/ready"
 stop_file="$workspace/stop"
 failure_file="$workspace/failure"
 printf '100\n' >"$source_file"
+chmod 0600 "$source_file"
 python3 "$sampler" \
   "$source_file" "$output_file" "$ready_file" "$stop_file" \
   2>"$failure_file" &
@@ -61,12 +97,12 @@ while [[ ! -s "$ready_file" ]]; do
   sleep 0.02
 done
 
-printf '500\n' >"$source_file"
+publish_fixture_sample "$source_file" 500
 while [[ "$(<"$ready_file")" != 500 ]]; do
   ((SECONDS < deadline)) || fail "sampler did not observe the high-water value"
   sleep 0.02
 done
-printf '300\n' >"$source_file"
+publish_fixture_sample "$source_file" 300
 install -m 0600 /dev/null "$stop_file"
 wait "$sampler_pid" || {
   sed -n '1,20p' "$failure_file" >&2
