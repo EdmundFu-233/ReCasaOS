@@ -35,6 +35,18 @@ require_exact_line() {
   grep -Fxq -- "$value" "$file" || fail "$reason"
 }
 
+require_exact_count() {
+  local file=$1
+  local value=$2
+  local expected=$3
+  local reason=$4
+  local count
+
+  count=$(grep -Fxc -- "$value" "$file" || true)
+  [[ "$count" == "$expected" ]] ||
+    fail "$reason: found $count, want $expected"
+}
+
 forbid_text() {
   local file=$1
   local value=$2
@@ -276,6 +288,100 @@ require_text "$systemd_script" \
 require_text "$systemd_script" \
   'storage_workers_are_in_d_state 4' \
   "hostile-storage phase does not require four real D-state workers"
+require_exact_count "$systemd_script" \
+  'hostile_storage_blocked_window_seconds=9' \
+  1 \
+  "hostile-storage D-state formation window is not the one reviewed 9-second budget"
+require_exact_count "$systemd_script" \
+  '  hostile_blocked_deadline=$((' \
+  1 \
+  "hostile-storage aggregate deadline assignment count changed"
+require_text "$systemd_script" \
+  '    SECONDS + hostile_storage_blocked_window_seconds' \
+  "hostile-storage deadline does not use the reviewed aggregate window"
+require_exact_count "$systemd_script" \
+  '    "$hostile_blocked_deadline" \' \
+  3 \
+  "hostile-storage formation waits do not share exactly one deadline"
+command -v python3 >/dev/null 2>&1 ||
+  fail "Python is unavailable for hostile-storage policy parsing"
+if ! python3 - "$systemd_script" <<'PYTHON'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+python_start = "<<'HOSTILE_PYTHON'\nimport os"
+python_end = "\nHOSTILE_PYTHON\n  then"
+if source.count(python_start) != 1 or source.count(python_end) != 1:
+    raise SystemExit("hostile-storage Python sentinels are not unique")
+worker_python = "import os" + source.split(python_start, 1)[1].split(
+    python_end, 1
+)[0]
+signal_policy = """    pending_values = []
+    for name in (b"SigPnd", b"ShdPnd"):
+        value = status.get(name, b"")
+        try:
+            pending_values.append(int(value, 16))
+        except ValueError as error:
+            raise RuntimeError("invalid pending-signal evidence") from error
+    kill_is_pending = any(value & kill_bit for value in pending_values)
+    if phase == "blocked" and kill_is_pending:
+        raise RuntimeError(
+            f"hostile-storage worker {pid} already has pending SIGKILL"
+        )
+    if phase == "kill-pending" and not kill_is_pending:
+        raise RuntimeError(
+            f"hostile-storage worker {pid} has no pending SIGKILL"
+        )
+"""
+if worker_python.count(signal_policy) != 1:
+    raise SystemExit("hostile-storage pending-signal policy changed")
+
+phase_start = """if [[ "$hostile_storage_test_enabled" == 1 ]]; then
+  wait_until "storage workers before hostile-storage test"""
+phase_end = "  hostile_timeout_deadline=$((SECONDS + 18))"
+launch_start = "  for _ in {1..4}; do"
+if source.count(phase_start) != 1 or source.count(phase_end) != 1:
+    raise SystemExit("hostile-storage live phase sentinels are not unique")
+live_phase = source.split(phase_start, 1)[1].split(phase_end, 1)[0]
+if live_phase.count(launch_start) != 1:
+    raise SystemExit("hostile-storage client launch is not unique in live phase")
+formation = live_phase[live_phase.index(launch_start) :]
+expected = """  for _ in {1..4}; do
+    start_hostile_storage_client
+  done
+  hostile_blocked_deadline=$((
+    SECONDS + hostile_storage_blocked_window_seconds
+  ))
+  wait_until_before "four live hostile-storage clients" \\
+    "$hostile_blocked_deadline" \\
+    hostile_storage_clients_are_live
+  wait_until_before "four hostile-storage workers" \\
+    "$hostile_blocked_deadline" \\
+    storage_worker_count_is 4
+  wait_until_before "four real D-state storage workers" \\
+    "$hostile_blocked_deadline" \\
+    storage_workers_are_in_d_state 4
+  mapfile -t hostile_worker_pids < <(storage_worker_pids)
+  [[ "${#hostile_worker_pids[@]}" == 4 ]] ||
+    fail "hostile-storage load did not retain exactly four workers"
+  for hostile_worker_pid in "${hostile_worker_pids[@]}"; do
+    hostile_worker_start_time="$(
+      process_start_time "$hostile_worker_pid"
+    )" || fail "could not capture hostile-storage worker identity"
+    hostile_worker_start_times+=("$hostile_worker_start_time")
+  done
+  assert_hostile_storage_worker_boundaries blocked "$portal_pid"
+  hostile_storage_clients_are_live ||
+    fail "hostile-storage clients exited during blocked worker inspection"
+
+"""
+if formation != expected:
+    raise SystemExit("hostile-storage live formation sequence changed")
+PYTHON
+then
+  fail "hostile-storage formation sequence changed"
+fi
 require_text "$systemd_script" \
   'or len(worker_pairs) != 4' \
   "hostile-storage runtime inspection does not require four workers"
@@ -283,8 +389,14 @@ require_text "$systemd_script" \
   'if state != b"D":' \
   "hostile-storage runtime inspection does not require D-state"
 require_text "$systemd_script" \
-  'if not any(value & kill_bit for value in pending_values):' \
+  'if phase == "kill-pending" and not kill_is_pending:' \
   "hostile-storage runtime inspection does not require pending SIGKILL"
+require_text "$systemd_script" \
+  'if phase == "blocked" and kill_is_pending:' \
+  "hostile-storage blocked phase permits pending SIGKILL"
+require_text "$systemd_script" \
+  'fail "hostile-storage clients exited during blocked worker inspection"' \
+  "hostile-storage blocked inspection does not recheck client liveness"
 require_text "$systemd_script" \
   'assert_hostile_storage_worker_boundaries kill-pending 1' \
   "hostile-storage restart does not prove orphaned D-state worker identity"

@@ -129,6 +129,10 @@ test_bearer='rc1_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8'
 worker_load_bytes=67108864
 storage_worker_address_space_ceiling=2147483648
 storage_worker_address_space_minimum_reserve=134217728
+# One shared aggregate budget, started only after all four client identities
+# are captured, for their workers to enter real D-state under QEMU. It remains
+# within the production worker operation timeout.
+hostile_storage_blocked_window_seconds=9
 
 [[ "$workspace" =~ ^/(run|var/lib)/recasaos-public-files-ci-[0-9]+-[0-9]+$ &&
   "$workspace" == "$workspace_parent/recasaos-public-files-ci-$run_key" ]] ||
@@ -1760,18 +1764,22 @@ for pair in worker_pairs:
         raise RuntimeError("hostile-storage worker UID boundary changed")
     if status.get(b"CapEff") != b"0000000000000000":
         raise RuntimeError("hostile-storage worker retained an effective capability")
-    if phase == "kill-pending":
-        pending_values = []
-        for name in (b"SigPnd", b"ShdPnd"):
-            value = status.get(name, b"")
-            try:
-                pending_values.append(int(value, 16))
-            except ValueError as error:
-                raise RuntimeError("invalid pending-signal evidence") from error
-        if not any(value & kill_bit for value in pending_values):
-            raise RuntimeError(
-                f"hostile-storage worker {pid} has no pending SIGKILL"
-            )
+    pending_values = []
+    for name in (b"SigPnd", b"ShdPnd"):
+        value = status.get(name, b"")
+        try:
+            pending_values.append(int(value, 16))
+        except ValueError as error:
+            raise RuntimeError("invalid pending-signal evidence") from error
+    kill_is_pending = any(value & kill_bit for value in pending_values)
+    if phase == "blocked" and kill_is_pending:
+        raise RuntimeError(
+            f"hostile-storage worker {pid} already has pending SIGKILL"
+        )
+    if phase == "kill-pending" and not kill_is_pending:
+        raise RuntimeError(
+            f"hostile-storage worker {pid} has no pending SIGKILL"
+        )
 
     state_after, parent_after, start_after = read_identity(pid)
     if (
@@ -3751,10 +3759,12 @@ if [[ "$hostile_storage_test_enabled" == 1 ]]; then
   [[ "$(hostile_storage_suspended_value)" == 1 ]] ||
     fail "device-mapper did not report the hostile-storage suspension"
 
-  hostile_blocked_deadline=$((SECONDS + 8))
   for _ in {1..4}; do
     start_hostile_storage_client
   done
+  hostile_blocked_deadline=$((
+    SECONDS + hostile_storage_blocked_window_seconds
+  ))
   wait_until_before "four live hostile-storage clients" \
     "$hostile_blocked_deadline" \
     hostile_storage_clients_are_live
@@ -3774,6 +3784,8 @@ if [[ "$hostile_storage_test_enabled" == 1 ]]; then
     hostile_worker_start_times+=("$hostile_worker_start_time")
   done
   assert_hostile_storage_worker_boundaries blocked "$portal_pid"
+  hostile_storage_clients_are_live ||
+    fail "hostile-storage clients exited during blocked worker inspection"
 
   hostile_timeout_deadline=$((SECONDS + 18))
   wait_until_before "four bounded hostile-storage timeouts" \
