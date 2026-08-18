@@ -166,7 +166,7 @@ if [[ "$hostile_storage_test_enabled" == 1 ]]; then
   done
 fi
 go_version="$(go version)" || fail "could not inspect the Go toolchain"
-[[ "$go_version" == "go version go1.26.5 linux/amd64" ]] ||
+[[ "$go_version" == "go version go1.26.6 linux/amd64" ]] ||
   fail "unexpected Go toolchain: $go_version"
 [[ -x /usr/bin/python3 ]] ||
   fail "required Python interpreter is unavailable: /usr/bin/python3"

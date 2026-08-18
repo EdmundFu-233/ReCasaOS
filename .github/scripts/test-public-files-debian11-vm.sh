@@ -42,8 +42,8 @@ do
   command -v "$required_tool" >/dev/null 2>&1 ||
     fail "required VM test tool is unavailable: $required_tool"
 done
-[[ "$(go version)" == "go version go1.26.5 linux/amd64" ]] ||
-  fail "the host Go toolchain is not exact Go 1.26.5 linux/amd64"
+[[ "$(go version)" == "go version go1.26.6 linux/amd64" ]] ||
+  fail "the host Go toolchain is not exact Go 1.26.6 linux/amd64"
 /usr/bin/python3 -c '
 import os
 import signal
@@ -290,7 +290,7 @@ cloud-localds "$seed_image" "$user_data" "$meta_data"
 
 host_goroot="$(cd -- "$(go env GOROOT)" && pwd -P)"
 case "$host_goroot" in
-  /opt/hostedtoolcache/go/1.26.5/*) ;;
+  /opt/hostedtoolcache/go/1.26.6/*) ;;
   *) fail "host Go root is outside the pinned hosted toolcache" ;;
 esac
 tar -C "$host_goroot" -czf "$go_archive" .
@@ -425,7 +425,7 @@ sudo tar -C /usr/local/go -xzf go.tar.gz
 sudo tar -C /opt -xf recasaos.tar
 sudo chown -R debian:debian /opt/recasaos-src
 test "$(/usr/local/go/bin/go version)" = \
-  'go version go1.26.5 linux/amd64'
+  'go version go1.26.6 linux/amd64'
 REMOTE_SETUP
 
 timeout --signal=TERM --kill-after=120s 22m \
