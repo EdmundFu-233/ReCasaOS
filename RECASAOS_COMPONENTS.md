@@ -24,6 +24,7 @@ be hand-edited.
 | --- | --- | --- |
 | Administrative Web UI | `.gitmodules` declares `UI` from `IceWhaleTech/CasaOS-UI` on `main` | Dashboard/login behavior lives outside the root Go service. The dedicated public-files page is embedded locally and does not depend on this UI. This checkout has no tracked `UI` gitlink, so `--recurse-submodules` cannot provide a reproducible admin UI revision. |
 | CasaOS Common | Go module `github.com/IceWhaleTech/CasaOS-Common` | Supplies shared runtime discovery, Gateway management, and JWT helpers. Its API and security behavior are locked through `go.mod` plus `go.sum`. |
+| SMB2 client fork | Go module `github.com/EdmundFu-233/go-smb2@v1.1.1-recasaos.1`, release commit `11ee3a1e5240a64ccb0223983243f29d6b710413` | ReCasaOS-maintained BSD-2-Clause fork of `hirochachacha/go-smb2` v1.1.0. It carries reviewed directory-response and 32-bit payload bounds, pins Go 1.25 / toolchain 1.26.6 and `x/crypto` v0.55.0, and deliberately excludes CloudSoda and SDDL. The root module graph must select this exact tag directly. |
 | Gateway | Discovered through `CasaOS-Common/external` at runtime | Owns the private management listener, administrative routing, dashboard entry point, and upstream client-IP forwarding. It must not be the public-file edge upstream. The independent `recasaos-public-files.socket` owns the literal-loopback portal listener; Gateway's registered `/public-files` handler is only a 404 tombstone. |
 | User/authentication service | Reached through Gateway routes and runtime public-key material | Owns account enrollment, token issuance, revocation, and session policy. Root endpoints validate its JWTs; end-to-end authentication must be tested across both components. |
 | Message Bus | Runtime address is discovered via `CasaOS-Common`; its client is generated from the OpenAPI document at upstream commit `ba87168fcfa4ac5ff7a114f66a139eb5fe427646` | Event delivery is optional in parts of the root service, but schema drift can still break notifications. Updating the pinned specification requires review and regenerated-client tests. |
@@ -51,7 +52,11 @@ be hand-edited.
    rejects `golang.org/x/crypto/openpgp` and every package below that boundary.
    This is intentionally a package boundary, not a ban on the complete
    `golang.org/x/crypto` module: the separately required
-   `golang.org/x/crypto/ssh` package remains allowed.
+   `golang.org/x/crypto/ssh` package remains allowed. A separate module gate
+   requires exactly `github.com/EdmundFu-233/go-smb2@v1.1.1-recasaos.1`
+   without a `replace`, and rejects the upstream hiro module, either CloudSoda
+   path spelling, SDDL, and any other unreviewed `go-smb2` fork as direct
+   modules or replacements.
 5. OpenAPI generators and input specifications are both supply-chain inputs.
    The local root specification, generator version, and remote Message Bus
    specification commit are explicit. Verify regenerated output whenever one

@@ -9,7 +9,7 @@ import (
 	"runtime/debug"
 	"time"
 
-	"github.com/hirochachacha/go-smb2"
+	"github.com/EdmundFu-233/go-smb2"
 )
 
 // RunInternalProbe is invoked only by the hidden child mode in main. It owns
