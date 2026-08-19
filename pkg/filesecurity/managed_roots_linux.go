@@ -21,11 +21,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const managedResolvePolicy = unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_SYMLINKS
-
 const (
-	maxManagedTreeEntries int64 = 100_000
-	maxManagedRemoveDepth       = 128
+	managedResolvePolicy                        = unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_SYMLINKS
+	managedRootDescriptorName                   = "<managed-root>"
+	managedOpenedPathDescriptorName             = "<managed-opened-path>"
+	managedTemporaryDescriptorName              = "<managed-temporary>"
+	managedRemovalDirectoryDescriptorName       = "<managed-removal-directory>"
+	maxManagedTreeEntries                 int64 = 100_000
+	maxManagedRemoveDepth                       = 128
 )
 
 type managedRoot struct {
@@ -40,6 +43,15 @@ type managedRoot struct {
 type managedRootDescriptor struct {
 	path string
 	fd   int
+}
+
+type managedNamedFileInfo struct {
+	os.FileInfo
+	name string
+}
+
+func (info managedNamedFileInfo) Name() string {
+	return info.name
 }
 
 // ManagedRoots pins each explicitly authorized management root to a directory
@@ -111,7 +123,9 @@ func OpenManagementFileRoots(paths []string) (*ManagedRoots, error) {
 			_ = result.Close()
 			return nil, fmt.Errorf("verify management root %q mount boundary support: %w", root, mountErr)
 		}
-		pinned := os.NewFile(uintptr(fd), root)
+		// The descriptor is already bound by openat2 above. Keep the configured
+		// root path out of descriptor diagnostics.
+		pinned := os.NewFile(uintptr(fd), managedRootDescriptorName)
 		if pinned == nil {
 			unix.Close(fd)
 			_ = result.Close()
@@ -216,7 +230,8 @@ func (m *ManagedRoots) MatchChild(base, relative string) (ManagedLocation, error
 }
 
 // OpenRegular opens an existing regular file without following symbolic or
-// magic links in any component.
+// magic links in any component. The returned File.Name() is an opaque diagnostic
+// label; callers needing a display path must use Match.
 func (m *ManagedRoots) OpenRegular(absolutePath string) (*os.File, error) {
 	opened, err := m.open(absolutePath, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOCTTY, 0)
 	if err != nil {
@@ -231,7 +246,8 @@ func (m *ManagedRoots) OpenRegular(absolutePath string) (*os.File, error) {
 
 // OpenPath opens an existing file or directory through the managed root. The
 // returned descriptor's Stat result, rather than a prior pathname lookup, must
-// be used to decide how to process it.
+// be used to decide how to process it. File.Name() and Stat().Name() are opaque
+// diagnostic labels; callers needing a display path must use Match.
 func (m *ManagedRoots) OpenPath(absolutePath string) (*os.File, error) {
 	opened, err := m.open(absolutePath, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOCTTY, 0)
 	if err != nil {
@@ -244,7 +260,9 @@ func (m *ManagedRoots) OpenPath(absolutePath string) (*os.File, error) {
 	return opened, nil
 }
 
-// OpenDirectory opens an existing directory beneath a configured root.
+// OpenDirectory opens an existing directory beneath a configured root. The
+// returned File.Name() is an opaque diagnostic label; callers needing a display
+// path must use Match.
 func (m *ManagedRoots) OpenDirectory(absolutePath string) (*os.File, error) {
 	return m.open(absolutePath, unix.O_RDONLY|unix.O_DIRECTORY, 0)
 }
@@ -285,7 +303,7 @@ func (m *ManagedRoots) ChmodDirectory(absolutePath string, permission fs.FileMod
 // Stat inspects an existing path through a pinned root without following
 // symbolic or magic links.
 func (m *ManagedRoots) Stat(absolutePath string) (os.FileInfo, error) {
-	opened, err := m.open(absolutePath, unix.O_PATH, 0)
+	opened, location, err := m.openWithLocation(absolutePath, unix.O_PATH, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -293,7 +311,11 @@ func (m *ManagedRoots) Stat(absolutePath string) (os.FileInfo, error) {
 	if err := validateManagedOpenedFile(opened, true); err != nil {
 		return nil, err
 	}
-	return opened.Stat()
+	info, err := opened.Stat()
+	if err != nil {
+		return nil, err
+	}
+	return managedNamedFileInfo{FileInfo: info, name: filepath.Base(location.Canonical)}, nil
 }
 
 // RewriteRegular replaces an existing regular file with a completely written,
@@ -1032,19 +1054,28 @@ func (m *ManagedRoots) commitNoReplaceWithExpectedIdentity(stagingPath, destinat
 }
 
 func (m *ManagedRoots) open(absolutePath string, flags int, permission fs.FileMode) (*os.File, error) {
+	opened, _, err := m.openWithLocation(absolutePath, flags, permission)
+	return opened, err
+}
+
+func (m *ManagedRoots) openWithLocation(absolutePath string, flags int, permission fs.FileMode) (*os.File, ManagedLocation, error) {
 	if m == nil {
-		return nil, ErrManagedPathOutsideRoots
+		return nil, ManagedLocation{}, ErrManagedPathOutsideRoots
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.closed {
-		return nil, fs.ErrClosed
+		return nil, ManagedLocation{}, fs.ErrClosed
 	}
 	root, location, err := m.resolveLocked(absolutePath)
 	if err != nil {
-		return nil, err
+		return nil, ManagedLocation{}, err
 	}
-	return openManagedAt(root, location, flags, permission)
+	opened, err := openManagedAt(root, location, flags, permission)
+	if err != nil {
+		return nil, ManagedLocation{}, err
+	}
+	return opened, location, nil
 }
 
 func openManagedAt(root *managedRoot, location ManagedLocation, flags int, permission fs.FileMode) (*os.File, error) {
@@ -1066,7 +1097,9 @@ func openManagedAtFD(rootFD int, location ManagedLocation, flags int, permission
 	if err != nil {
 		return nil, classifyManagedResolutionError(err)
 	}
-	opened := os.NewFile(uintptr(fd), location.Canonical)
+	// The descriptor is already bound by openat2 above. Keep route-selected
+	// paths out of File.Name and any os.PathError produced by later operations.
+	opened := os.NewFile(uintptr(fd), managedOpenedPathDescriptorName)
 	if opened == nil {
 		unix.Close(fd)
 		return nil, fmt.Errorf("open managed path")
@@ -1107,7 +1140,7 @@ func (m *ManagedRoots) createManagedTemporary(parentFD int, prefix string) (*os.
 	if err != nil {
 		return nil, "", classifyManagedResolutionError(err)
 	}
-	temporary := os.NewFile(uintptr(temporaryFD), temporaryName)
+	temporary := os.NewFile(uintptr(temporaryFD), managedTemporaryDescriptorName)
 	if temporary == nil {
 		closeErr := unix.Close(temporaryFD)
 		cleanupErr := m.unlinkManagedNameAndSync(parentFD, temporaryName, 0, "sync failed managed staging creation cleanup", false)
@@ -1181,7 +1214,9 @@ func (m *ManagedRoots) removeManagedEntryAtPrevalidated(parentFD int, name strin
 		unix.Close(directoryFD)
 		return managedRemovalFailure(state, fmt.Errorf("%w: directory mount changed during removal", ErrUnsafePath))
 	}
-	directory := os.NewFile(uintptr(directoryFD), name)
+	// The directory is already bound by openat2 and mount identity checks.
+	// Keep the route-selected component out of descriptor diagnostics.
+	directory := os.NewFile(uintptr(directoryFD), managedRemovalDirectoryDescriptorName)
 	if directory == nil {
 		unix.Close(directoryFD)
 		return managedRemovalFailure(state, errors.New("open managed directory for removal"))
