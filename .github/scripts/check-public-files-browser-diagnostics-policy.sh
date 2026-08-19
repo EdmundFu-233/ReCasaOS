@@ -9,7 +9,8 @@ fail() {
 
 script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 repository="$(cd -- "$script_directory/../.." && pwd -P)"
-workflow="$repository/.github/workflows/recasaos-ci-security.yml"
+[[ $# -le 1 ]] || fail 'usage: check-public-files-browser-diagnostics-policy.sh [WORKFLOW]'
+workflow="${1:-$repository/.github/workflows/recasaos-ci-security.yml}"
 diagnostics="$repository/browser-tests/tests/navigation-diagnostics.js"
 playwright="$repository/browser-tests/playwright.config.js"
 public_files_spec="$repository/browser-tests/tests/public-files.spec.js"
@@ -22,7 +23,8 @@ for file in \
   "$public_files_spec" \
   "$validator"
 do
-  [[ -f "$file" ]] || fail "required policy file is missing"
+  [[ -f "$file" && ! -L "$file" ]] ||
+    fail "required policy file is missing or linked"
 done
 
 require_text() {
@@ -40,6 +42,143 @@ forbid_text() {
     fail "$reason"
   fi
 }
+
+command -v ruby >/dev/null 2>&1 || fail "Ruby YAML parser is unavailable"
+ruby - "$workflow" <<'RUBY' || exit 1
+require "yaml"
+require "json"
+require "digest"
+
+def reject(reason)
+  warn "public-files browser diagnostics policy failed: #{reason}"
+  exit 1
+end
+
+workflow = YAML.safe_load(
+  File.read(ARGV.fetch(0), encoding: "UTF-8"),
+  permitted_classes: [],
+  permitted_symbols: [],
+  aliases: false,
+)
+reject("workflow root is not a mapping") unless workflow.is_a?(Hash)
+reject("workflow root defaults are forbidden") if workflow.key?("defaults")
+reject("workflow root environment changed") unless
+  workflow["env"] == {"GOTOOLCHAIN" => "local"}
+jobs = workflow["jobs"]
+reject("workflow jobs are missing") unless jobs.is_a?(Hash)
+test_job = jobs["test-and-vet"]
+reject("test-and-vet job is missing") unless test_job.is_a?(Hash)
+test_steps = test_job["steps"]
+reject("test-and-vet steps are missing") unless test_steps.is_a?(Array)
+policy_steps = {
+  "Verify browser diagnostic retention policy" =>
+    "bash .github/scripts/check-public-files-browser-diagnostics-policy.sh",
+  "Exercise browser diagnostic policy negative cases" =>
+    "bash .github/scripts/test-public-files-browser-diagnostics-policy.sh",
+}
+policy_steps.each do |name, command|
+  matches = test_steps.select do |step|
+    step.is_a?(Hash) && step["name"] == name
+  end
+  reject("policy step count for #{name} is #{matches.length}, want 1") unless
+    matches.length == 1
+  step = matches.fetch(0)
+  reject("policy step has unexpected keys: #{name}") unless
+    step.keys.sort == ["name", "run", "shell"]
+  reject("policy step shell changed: #{name}") unless step["shell"] == "bash"
+  reject("policy step command changed: #{name}") unless step["run"] == command
+end
+matching_job_ids = jobs.each_with_object([]) do |(job_id, candidate), result|
+  if candidate.is_a?(Hash) &&
+      candidate["name"] == "Public-files HTTPS browser smoke (Playwright)"
+    result << job_id
+  end
+end
+reject("browser job display name is not globally unique") unless
+  matching_job_ids == ["public-files-browser-smoke"]
+job = jobs["public-files-browser-smoke"]
+reject("browser job is missing") unless job.is_a?(Hash)
+canonicalize = lambda do |value|
+  case value
+  when Hash
+    value.keys.sort.each_with_object({}) do |key, result|
+      result[key] = canonicalize.call(value[key])
+    end
+  when Array
+    value.map { |item| canonicalize.call(item) }
+  else
+    value
+  end
+end
+job_digest = Digest::SHA256.hexdigest(JSON.generate(canonicalize.call(job)))
+expected_job_digest = "cff2a06f51ec029ff0b72057f610083189ae5ffb31f763bb90c296fb59bb69e2"
+reject("browser job semantic digest changed") unless
+  job_digest == expected_job_digest
+reject("browser job has unexpected keys") unless
+  job.keys.sort == ["name", "runs-on", "steps", "timeout-minutes"]
+reject("browser job name changed") unless
+  job["name"] == "Public-files HTTPS browser smoke (Playwright)"
+reject("browser runner changed") unless job["runs-on"] == "ubuntu-24.04"
+reject("browser job timeout is not 40 minutes") unless
+  job["timeout-minutes"] == 40
+
+steps = job["steps"]
+reject("browser steps are missing") unless steps.is_a?(Array)
+expected_step_names = [
+  "Check out source",
+  "Set up Go 1.26.6",
+  "Set up Node.js 24.18.0",
+  "Install exact browser-test dependencies",
+  "Install ephemeral browser dependencies",
+  "Exercise browser diagnostic validator negative cases",
+  "Exercise the HTTPS browser boundary",
+  "Validate credential-safe browser failure diagnostics",
+  "Upload credential-safe browser failure diagnostics",
+]
+actual_step_names = steps.map do |step|
+  reject("browser step is not a mapping") unless step.is_a?(Hash)
+  step["name"]
+end
+reject("browser step set or order changed") unless
+  actual_step_names == expected_step_names
+
+find_step = lambda do |name|
+  matches = steps.select { |step| step.is_a?(Hash) && step["name"] == name }
+  reject("browser step count for #{name} is #{matches.length}, want 1") unless
+    matches.length == 1
+  matches.fetch(0)
+end
+
+install = find_step.call("Install ephemeral browser dependencies")
+reject("browser dependency step has unexpected keys") unless
+  install.keys.sort == ["name", "run", "shell", "timeout-minutes"]
+reject("browser dependency timeout is not 20 minutes") unless
+  install["timeout-minutes"] == 20
+reject("browser dependency shell changed") unless install["shell"] == "bash"
+run = install["run"]
+reject("browser dependency command is missing") unless run.is_a?(String)
+lines = run.lines.map(&:chomp)
+expected_prefix = [
+  "browser-tests/node_modules/.bin/playwright install \\",
+  "  --with-deps \\",
+  "  chromium \\",
+  "  firefox \\",
+  "  webkit",
+]
+reject("Playwright install command or browser matrix changed") unless
+  lines.first(expected_prefix.length) == expected_prefix
+reject("browser job repeats apt metadata download") if
+  lines.any? { |line| line.include?("apt-get update") }
+
+boundary = find_step.call("Exercise the HTTPS browser boundary")
+reject("browser boundary step has unexpected keys") unless
+  boundary.keys.sort == ["env", "name", "run", "shell", "timeout-minutes"]
+reject("browser boundary timeout is not 15 minutes") unless
+  boundary["timeout-minutes"] == 15
+reject("browser boundary shell changed") unless boundary["shell"] == "bash"
+reject("browser boundary command changed") unless
+  boundary["run"] == ".github/scripts/test-public-files-browser.sh"
+RUBY
 
 [[ "$(grep -Fc -- 'uses: actions/upload-artifact@' "$workflow")" == 1 ]] ||
   fail "workflow must contain exactly one artifact uploader"

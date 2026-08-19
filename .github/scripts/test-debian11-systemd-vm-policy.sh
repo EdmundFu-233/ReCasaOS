@@ -125,11 +125,38 @@ expect_rejection hostile-storage-flushing-suspend systemd \
   'sudo dmsetup suspend --nolockfs --noflush "$hostile_storage_name"' \
   'sudo dmsetup suspend "$hostile_storage_name"'
 expect_rejection hostile-storage-fake-state systemd \
-  'if state != b"D":' \
-  'if state != b"T":'
+  'if task_state == b"D":' \
+  'if task_state == b"T":'
+expect_rejection hostile-storage-short-formation-window systemd \
+  'hostile_blocked_deadline=$((SECONDS + 8))' \
+  'hostile_blocked_deadline=$((SECONDS + 7))'
+expect_rejection hostile-storage-expanded-formation-window systemd \
+  'hostile_blocked_deadline=$((SECONDS + 8))' \
+  'hostile_blocked_deadline=$((SECONDS + 9))'
+expect_rejection hostile-storage-deadline-after-clients systemd \
+  $'  hostile_blocked_deadline=$((SECONDS + 8))\n  for _ in {1..4}; do\n    start_hostile_storage_client\n  done' \
+  $'  ignored_deadline=$((SECONDS + 8))\n  for _ in {1..4}; do\n    start_hostile_storage_client\n  done\n  hostile_blocked_deadline=$((SECONDS + 8))'
+expect_rejection hostile-storage-leader-only-d-state systemd \
+  'task_root = Path("/proc") / str(pid) / "task"' \
+  'task_root = Path("/proc") / str(pid)'
+expect_rejection hostile-storage-three-d-state-workers systemd \
+  'storage_workers_are_in_d_state 4' \
+  'storage_workers_are_in_d_state 3'
+expect_rejection hostile-storage-split-formation-deadline systemd \
+  '    "$hostile_blocked_deadline" \' \
+  '    "$hostile_timeout_deadline" \'
+expect_rejection hostile-storage-blocked-allows-pending-kill systemd \
+  'if phase == "blocked" and kill_is_pending:' \
+  'if phase == "blocked" and false:'
 expect_rejection hostile-storage-incomplete-inspection systemd \
   'or len(worker_pairs) != 4' \
   'or len(worker_pairs) != 1'
+expect_rejection hostile-storage-missing-pid1-reparent systemd \
+  'assert_hostile_storage_worker_boundaries kill-pending 1' \
+  'assert_hostile_storage_worker_boundaries kill-pending "$portal_pid"'
+expect_rejection hostile-storage-missing-post-inspection-client-check systemd \
+  $'  hostile_storage_clients_are_live ||\n    fail "hostile-storage clients exited during blocked worker inspection"' \
+  '  : # blocked client liveness recheck skipped'
 expect_rejection hostile-storage-cleanup-without-resume systemd \
   'if ! resume_hostile_storage_for_cleanup; then' \
   'if false; then'
