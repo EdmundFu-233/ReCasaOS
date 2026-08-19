@@ -15,7 +15,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const maxManagedRenameCandidates = 10_000
+const (
+	maxManagedRenameCandidates                        = 10_000
+	managedTransferDestinationFileDescriptorName      = "<managed-transfer-destination-file>"
+	managedTransferDestinationDirectoryDescriptorName = "<managed-transfer-destination-directory>"
+	managedTransferChildDescriptorName                = "<managed-transfer-child>"
+	managedTransferTransactionDescriptorName          = "<managed-transfer-transaction>"
+	managedReplacementDirectoryDescriptorName         = "<managed-replacement-directory>"
+)
 
 type managedTransferBudget struct {
 	entries int64
@@ -389,7 +396,7 @@ func copyManagedOpenedToNew(source *os.File, sourceStat *unix.Stat_t, destinatio
 		if err != nil {
 			return false, classifyManagedResolutionError(err)
 		}
-		destination := os.NewFile(uintptr(destinationFD), destinationName)
+		destination := os.NewFile(uintptr(destinationFD), managedTransferDestinationFileDescriptorName)
 		if destination == nil {
 			unix.Close(destinationFD)
 			return true, errors.New("open managed transfer destination")
@@ -409,7 +416,7 @@ func copyManagedOpenedToNew(source *os.File, sourceStat *unix.Stat_t, destinatio
 		if err != nil {
 			return true, classifyManagedResolutionError(err)
 		}
-		destination := os.NewFile(uintptr(destinationFD), destinationName)
+		destination := os.NewFile(uintptr(destinationFD), managedTransferDestinationDirectoryDescriptorName)
 		if destination == nil {
 			unix.Close(destinationFD)
 			return true, errors.New("open managed transfer directory")
@@ -794,6 +801,9 @@ func (m *ManagedRoots) validateManagedAtomicMoveTree(opened *os.File, before *un
 }
 
 func openManagedTransferChild(parentFD int, name string) (*os.File, error) {
+	if err := ValidatePathComponent(name); err != nil {
+		return nil, err
+	}
 	fd, err := unix.Openat2(parentFD, name, &unix.OpenHow{
 		Flags:   unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW | unix.O_NONBLOCK | unix.O_NOCTTY,
 		Resolve: managedResolvePolicy,
@@ -801,7 +811,9 @@ func openManagedTransferChild(parentFD int, name string) (*os.File, error) {
 	if err != nil {
 		return nil, classifyManagedResolutionError(err)
 	}
-	opened := os.NewFile(uintptr(fd), name)
+	// The descriptor is already bound by openat2 above. Keep the source entry
+	// name out of File.Name and any os.PathError from descriptor operations.
+	opened := os.NewFile(uintptr(fd), managedTransferChildDescriptorName)
 	if opened == nil {
 		unix.Close(fd)
 		return nil, errors.New("open managed transfer source")
@@ -1090,7 +1102,7 @@ func createManagedTransferTransaction(parentFD int, parentMountID uint64) (*os.F
 	if err != nil {
 		return nil, name, retained("open newly created managed transfer transaction", classifyManagedResolutionError(err))
 	}
-	transaction := os.NewFile(uintptr(fd), name)
+	transaction := os.NewFile(uintptr(fd), managedTransferTransactionDescriptorName)
 	if transaction == nil {
 		unix.Close(fd)
 		return nil, name, retained("convert newly created managed transfer transaction descriptor", errors.New("descriptor conversion failed"))
@@ -1385,7 +1397,9 @@ func validateManagedRemovableEntryAt(parentFD int, name string, parentMountID ui
 		if err != nil {
 			return classifyManagedResolutionError(err)
 		}
-		directory := os.NewFile(uintptr(fd), name)
+		// The directory is already bound by openat2 above. Keep the validated
+		// replacement component out of descriptor diagnostics.
+		directory := os.NewFile(uintptr(fd), managedReplacementDirectoryDescriptorName)
 		if directory == nil {
 			unix.Close(fd)
 			return errors.New("open managed replacement target")

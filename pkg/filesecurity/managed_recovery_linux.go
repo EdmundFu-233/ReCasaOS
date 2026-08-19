@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	maxManagedTransferInventoryEntries     = 4_096
-	maxManagedTransferInventoryCandidates  = 128
-	managedTransferInventoryDirectoryFlags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NONBLOCK | unix.O_NOATIME
+	maxManagedTransferInventoryEntries       = 4_096
+	maxManagedTransferInventoryCandidates    = 128
+	managedTransferInventoryDirectoryFlags   = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NONBLOCK | unix.O_NOATIME
+	managedRecoveryTransactionDescriptorName = "<managed-recovery-transaction>"
 )
 
 // InventoryManagedTransferTransactions performs a bounded, single-directory,
@@ -205,7 +206,7 @@ func (m *ManagedRoots) inspectManagedTransferTransaction(parentFD int, parentMou
 		item.Finding = ManagedTransferFindingCandidateOpenFailed
 		return item
 	}
-	transaction := os.NewFile(uintptr(transactionFD), name)
+	transaction := os.NewFile(uintptr(transactionFD), managedRecoveryTransactionDescriptorName)
 	if transaction == nil {
 		_ = unix.Close(transactionFD)
 		item.Finding = ManagedTransferFindingCandidateOpenFailed

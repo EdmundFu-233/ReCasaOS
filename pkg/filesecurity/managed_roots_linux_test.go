@@ -31,6 +31,120 @@ func TestManagedRootsRejectRootSymlink(t *testing.T) {
 	}
 }
 
+func TestManagedDescriptorNamesAreOpaqueAndStatPreservesBaseName(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "private-root-marker")
+	directoryPath := filepath.Join(root, "private-directory-marker")
+	filePath := filepath.Join(root, "private-file-marker.txt")
+	if err := os.MkdirAll(directoryPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filePath, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	if got := roots.roots[0].file.Name(); got != managedRootDescriptorName || strings.Contains(got, "private-root-marker") {
+		t.Fatalf("managed root descriptor name = %q", got)
+	}
+
+	tests := []struct {
+		name string
+		open func() (*os.File, error)
+	}{
+		{name: "regular", open: func() (*os.File, error) { return roots.OpenRegular(filePath) }},
+		{name: "path", open: func() (*os.File, error) { return roots.OpenPath(filePath) }},
+		{name: "directory", open: func() (*os.File, error) { return roots.OpenDirectory(directoryPath) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			opened, err := test.open()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer opened.Close()
+			if got := opened.Name(); got != managedOpenedPathDescriptorName || strings.Contains(got, "private-") {
+				t.Fatalf("descriptor name = %q", got)
+			}
+			info, err := opened.Stat()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := info.Name(); got != managedOpenedPathDescriptorName || strings.Contains(got, "private-") {
+				t.Fatalf("descriptor stat name = %q", got)
+			}
+		})
+	}
+
+	for _, path := range []string{root, directoryPath, filePath} {
+		info, err := roots.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := info.Name(), filepath.Base(path); got != want {
+			t.Fatalf("managed Stat(%q) name = %q, want %q", path, got, want)
+		}
+	}
+
+	opened, err := roots.OpenRegular(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var before unix.Stat_t
+	if err := unix.Fstat(int(opened.Fd()), &before); err != nil {
+		_ = opened.Close()
+		t.Fatal(err)
+	}
+	movedPath := filepath.Join(root, "moved-original")
+	if err := os.Rename(filePath, movedPath); err != nil {
+		_ = opened.Close()
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filePath, []byte("replacement"), 0o600); err != nil {
+		_ = opened.Close()
+		t.Fatal(err)
+	}
+	content, err := io.ReadAll(opened)
+	if err != nil {
+		_ = opened.Close()
+		t.Fatal(err)
+	}
+	var after unix.Stat_t
+	if err := unix.Fstat(int(opened.Fd()), &after); err != nil {
+		_ = opened.Close()
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "original" || before.Dev != after.Dev || before.Ino != after.Ino {
+		t.Fatalf("descriptor followed a renamed path: content=%q before=%d:%d after=%d:%d", content, before.Dev, before.Ino, after.Dev, after.Ino)
+	}
+
+	closed, err := roots.OpenDirectory(directoryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := closed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := closed.ReadDir(1); err == nil {
+		t.Fatal("ReadDir on a closed managed descriptor succeeded")
+	} else {
+		var pathErr *os.PathError
+		if !errors.As(err, &pathErr) {
+			t.Fatalf("closed descriptor error type = %T, want *os.PathError", err)
+		}
+		if pathErr.Path != managedOpenedPathDescriptorName || strings.Contains(pathErr.Path, "private-") {
+			t.Fatalf("closed descriptor error path = %q", pathErr.Path)
+		}
+	}
+}
+
 func TestManagedRootsOpenRegularRejectsEscapesAndSymlinks(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "managed")

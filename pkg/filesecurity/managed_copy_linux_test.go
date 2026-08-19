@@ -5,6 +5,7 @@ package filesecurity
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -62,6 +63,60 @@ func TestManagedRootsCopyIntoConflictStyles(t *testing.T) {
 	}
 	assertManagedTestContent(t, renamed, "new")
 	assertManagedTestContent(t, source, "new")
+}
+
+func TestManagedTransferChildDescriptorNameIsOpaque(t *testing.T) {
+	root := t.TempDir()
+	name := "private-transfer-marker.txt"
+	path := filepath.Join(root, name)
+	if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	parentFD, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(parentFD)
+
+	opened, err := openManagedTransferChild(parentFD, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := opened.Name(); got != managedTransferChildDescriptorName || strings.Contains(got, "private-transfer-marker") {
+		_ = opened.Close()
+		t.Fatalf("managed transfer child descriptor name = %q", got)
+	}
+	moved := filepath.Join(root, "moved-original")
+	if err := os.Rename(path, moved); err != nil {
+		_ = opened.Close()
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("replacement"), 0o600); err != nil {
+		_ = opened.Close()
+		t.Fatal(err)
+	}
+	content, err := io.ReadAll(opened)
+	if err != nil {
+		_ = opened.Close()
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "original" {
+		t.Fatalf("managed transfer child followed a renamed path: %q", content)
+	}
+
+	for _, unsafeName := range []string{"", ".", "..", "nested/name", "nul\x00name"} {
+		opened, err := openManagedTransferChild(parentFD, unsafeName)
+		if opened != nil {
+			_ = opened.Close()
+			t.Fatalf("openManagedTransferChild(%q) returned a descriptor", unsafeName)
+		}
+		if !errors.Is(err, ErrUnsafePath) {
+			t.Fatalf("openManagedTransferChild(%q) error = %v, want ErrUnsafePath", unsafeName, err)
+		}
+	}
 }
 
 func TestManagedReplaceAllowsExchangeCtimeChangeAndRemovesHiddenTarget(t *testing.T) {
