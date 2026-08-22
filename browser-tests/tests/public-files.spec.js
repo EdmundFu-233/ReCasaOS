@@ -83,7 +83,118 @@ async function submitBearer(page, bearer) {
   }
 }
 
-async function loginLoadedPortalAndWaitForNativeStreaming(page, portal) {
+async function gateWorkerRegistration(page, { block = 'none' } = {}) {
+  await page.addInitScript(
+    ({ blockMode }) => {
+      if (!('serviceWorker' in navigator)) return;
+      const container = navigator.serviceWorker;
+      const originalRegister = container.register.bind(container);
+      const probe = {
+        calls: 0,
+        pending: 0,
+        released: 0,
+        started: 0,
+        releaseFirst: () => false,
+      };
+      Object.defineProperty(window, '__recasaosWorkerRegistrationProbe', {
+        configurable: false,
+        value: probe,
+      });
+      Object.defineProperty(container, 'register', {
+        configurable: true,
+        value: (...args) => {
+          probe.calls += 1;
+          const call = probe.calls;
+          const start = () => {
+            probe.started += 1;
+            return originalRegister(...args);
+          };
+          if (blockMode === 'all' || (blockMode === 'first' && call === 1)) {
+            return new Promise(() => {});
+          }
+          if (blockMode !== 'manual-first' || call !== 1) return start();
+          probe.pending = 1;
+          return new Promise((resolve, reject) => {
+            probe.releaseFirst = () => {
+              if (probe.pending !== 1) return false;
+              probe.pending = 0;
+              probe.released += 1;
+              Promise.resolve(start()).then(resolve, reject);
+              return true;
+            };
+          });
+        },
+      });
+    },
+    { blockMode: block },
+  );
+}
+
+async function gateAbortInsensitiveFallbackBody(page) {
+  await page.evaluate(() => {
+    const originalFetch = window.fetch.bind(window);
+    const encoder = new TextEncoder();
+    const first = encoder.encode('old-session-');
+    const second = encoder.encode('must-not-download');
+    const probe = {
+      canceled: false,
+      fileFetches: 0,
+      pullWaiting: false,
+      released: false,
+      releaseBody: () => false,
+    };
+    Object.defineProperty(window, '__recasaosFallbackBodyProbe', {
+      configurable: false,
+      value: probe,
+    });
+    window.fetch = (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input, location.href);
+      if (
+        url.pathname !== '/public-files/api/file' ||
+        url.searchParams.get('path') !== 'report.txt'
+      ) {
+        return originalFetch(input, init);
+      }
+      probe.fileFetches += 1;
+      const body = new ReadableStream({
+        start(controller) {
+          controller.enqueue(first);
+        },
+        pull(controller) {
+          probe.pullWaiting = true;
+          return new Promise((resolve) => {
+            probe.releaseBody = () => {
+              if (probe.released) return false;
+              probe.released = true;
+              controller.enqueue(second);
+              controller.close();
+              resolve();
+              return true;
+            };
+          });
+        },
+        cancel() {
+          probe.canceled = true;
+        },
+      });
+      return Promise.resolve(
+        new Response(body, {
+          headers: {
+            'Accept-Ranges': 'bytes',
+            'Cache-Control': 'no-store',
+            'Content-Disposition': 'attachment; filename="report.txt"',
+            'Content-Length': String(first.byteLength + second.byteLength),
+            'Content-Type': 'application/octet-stream',
+            'X-Content-Type-Options': 'nosniff',
+          },
+          status: 200,
+        }),
+      );
+    };
+  });
+}
+
+async function loginLoadedPortal(page, portal) {
   await submitBearer(page, portal.bearer);
 
   await expect(page.locator('#login')).toBeHidden();
@@ -96,6 +207,10 @@ async function loginLoadedPortalAndWaitForNativeStreaming(page, portal) {
   await expect(
     page.locator('#entries a', { hasText: 'stream.bin' }),
   ).toHaveCount(1);
+}
+
+async function loginLoadedPortalAndWaitForNativeStreaming(page, portal) {
+  await loginLoadedPortal(page, portal);
 
   await expect
     .poll(() =>
@@ -517,6 +632,334 @@ test('trusted HTTPS login is controlled by the service worker', async ({
     protocol: 'https:',
     secureContext: true,
   });
+});
+
+test('an immediate first click waits for delayed native streaming and preserves handoff wording', async ({
+  page,
+  portal,
+}) => {
+  await gateWorkerRegistration(page, { block: 'manual-first' });
+  await openPortal(page, portal);
+  await loginLoadedPortal(page, portal);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => window.__recasaosWorkerRegistrationProbe?.calls ?? 0,
+      ),
+    )
+    .toBe(1);
+  expect(
+    await page.evaluate(
+      () =>
+        typeof window.canUseNativeStreaming === 'function' &&
+        window.canUseNativeStreaming(),
+    ),
+    'the delayed first registration must still be unavailable at click time',
+  ).toBe(false);
+
+  const before = await readSnapshot(portal);
+  const downloadPromise = page.waitForEvent('download', { timeout: 30_000 });
+  await page.locator('#entries a', { hasText: 'stream.bin' }).click();
+  await expect(page.locator('#status')).toHaveText(
+    'Preparing secure browser streaming for stream.bin…',
+  );
+  expect(fileRequestState(await readSnapshot(portal))).toEqual(
+    fileRequestState(before),
+  );
+  expect(
+    await page.evaluate(() =>
+      window.__recasaosWorkerRegistrationProbe.releaseFirst(),
+    ),
+    'the delayed first worker registration must be pending',
+  ).toBe(true);
+  const download = await downloadPromise;
+  await expect(page.locator('#status')).toHaveText(
+    'Download handed to the browser: stream.bin',
+  );
+  await waitForSnapshot(
+    portal,
+    (snapshot) =>
+      snapshot.active_file_requests > 0 &&
+      snapshot.authorized_file_requests - before.authorized_file_requests === 1,
+    'delayed first-click handoff before upstream terminal state',
+  );
+
+  expect(await download.failure()).toBeNull();
+  const downloaded = await hashDownload(download);
+  expect(downloaded.size).toBe(portal.fixtures['stream.bin'].size);
+  expect(downloaded.sha256).toBe(portal.fixtures['stream.bin'].sha256);
+  const terminal = await waitForSnapshot(
+    portal,
+    (snapshot) =>
+      snapshot.active_file_requests === 0 &&
+      snapshot.authorized_file_requests - before.authorized_file_requests === 1 &&
+      snapshot.canceled_file_requests - before.canceled_file_requests === 0 &&
+      snapshot.completed_file_requests - before.completed_file_requests === 1,
+    'delayed first-click terminal cleanup',
+  );
+  await expect(page.locator('#status')).toHaveText(
+    'Download handed to the browser: stream.bin',
+  );
+  expect(terminal.authorization_on_other_path).toBe(0);
+  expect(terminal.credential_query_requests).toBe(0);
+  await expectFileRequestStateToRemainQuiescent(portal, terminal);
+});
+
+test('a worker-preparation timeout permits only the bounded small-file fallback', async ({
+  page,
+  portal,
+}) => {
+  await gateWorkerRegistration(page, { block: 'all' });
+  await openPortal(page, portal);
+  await loginLoadedPortal(page, portal);
+  const before = await readSnapshot(portal);
+
+  const downloadPromise = page.waitForEvent('download', { timeout: 15_000 });
+  await page.locator('#entries a', { hasText: 'report.txt' }).click();
+  const download = await downloadPromise;
+  const fallbackURL = download.url();
+  expect(
+    fallbackURL.startsWith('blob:') && !fallbackURL.includes(portal.bearer),
+    'the small-file timeout path must use a credential-free bounded in-memory fallback',
+  ).toBe(true);
+  expect(await download.failure()).toBeNull();
+  const downloaded = await hashDownload(download);
+  expect(downloaded.size).toBe(portal.fixtures['report.txt'].size);
+  expect(downloaded.sha256).toBe(portal.fixtures['report.txt'].sha256);
+  await expect(page.locator('#status')).toHaveText(
+    'Download handed to the browser: report.txt',
+  );
+
+  const terminal = await waitForSnapshot(
+    portal,
+    (snapshot) =>
+      snapshot.active_file_requests === 0 &&
+      snapshot.authorized_file_requests - before.authorized_file_requests === 1 &&
+      snapshot.canceled_file_requests - before.canceled_file_requests === 0 &&
+      snapshot.completed_file_requests - before.completed_file_requests === 1,
+    'bounded fallback terminal cleanup',
+  );
+  expect(
+    await page.evaluate(
+      () => window.__recasaosWorkerRegistrationProbe?.calls ?? 0,
+    ),
+    'login and the first click must share one blocked preparation',
+  ).toBe(1);
+  expect(terminal.authorization_on_other_path).toBe(0);
+  expect(terminal.credential_query_requests).toBe(0);
+  await expectFileRequestStateToRemainQuiescent(portal, terminal);
+});
+
+test('a worker-preparation timeout rejects a large fallback without a file request', async ({
+  page,
+  portal,
+}) => {
+  await gateWorkerRegistration(page, { block: 'all' });
+  await openPortal(page, portal);
+  await loginLoadedPortal(page, portal);
+  const before = await readSnapshot(portal);
+  let downloadCount = 0;
+  page.on('download', () => {
+    downloadCount += 1;
+  });
+
+  await page.locator('#entries a', { hasText: 'stream.bin' }).click();
+  await expect(page.locator('#status')).toHaveText(
+    'This browser cannot safely download this file in memory; use a reviewed Authorization-header client',
+    { timeout: 15_000 },
+  );
+  await delay(1_000);
+  expect(downloadCount).toBe(0);
+  expect(fileRequestState(await readSnapshot(portal))).toEqual(
+    fileRequestState(before),
+  );
+  expect(
+    await page.evaluate(
+      () => window.__recasaosWorkerRegistrationProbe?.calls ?? 0,
+    ),
+    'the timed-out click must not duplicate worker registration',
+  ).toBe(1);
+});
+
+test('logout and same-token relogin cannot revive the old download intent', async ({
+  page,
+  portal,
+}) => {
+  await gateWorkerRegistration(page, { block: 'manual-first' });
+  await openPortal(page, portal);
+  await loginLoadedPortal(page, portal);
+  const before = await readSnapshot(portal);
+
+  await page.locator('#entries a', { hasText: 'stream.bin' }).click();
+  await expect(page.locator('#status')).toHaveText(
+    'Preparing secure browser streaming for stream.bin…',
+  );
+  await page.locator('#logout').click();
+  await expect(page.locator('#status')).toHaveText(
+    'Token forgotten for this page',
+  );
+  await expect(page.locator('#entries li')).toHaveCount(0);
+  await expect(page.locator('#path')).toHaveText('/');
+  await loginLoadedPortalAndWaitForNativeStreaming(page, portal);
+  expect(
+    await page.evaluate(() =>
+      window.__recasaosWorkerRegistrationProbe.releaseFirst(),
+    ),
+    'the stale first-session preparation must still be releasable',
+  ).toBe(true);
+  await delay(1_000);
+  expect(fileRequestState(await readSnapshot(portal))).toEqual(
+    fileRequestState(before),
+  );
+
+  const downloadPromise = page.waitForEvent('download', { timeout: 30_000 });
+  await page.locator('#entries a', { hasText: 'report.txt' }).click();
+  const download = await downloadPromise;
+  expect(await download.failure()).toBeNull();
+  const downloaded = await hashDownload(download);
+  expect(downloaded.size).toBe(portal.fixtures['report.txt'].size);
+  expect(downloaded.sha256).toBe(portal.fixtures['report.txt'].sha256);
+  const terminal = await waitForSnapshot(
+    portal,
+    (snapshot) =>
+      snapshot.active_file_requests === 0 &&
+      snapshot.authorized_file_requests - before.authorized_file_requests === 1 &&
+      snapshot.canceled_file_requests - before.canceled_file_requests === 0 &&
+      snapshot.completed_file_requests - before.completed_file_requests === 1,
+    'same-token relogin download terminal cleanup',
+  );
+  expect(terminal.authorization_on_other_path).toBe(0);
+  expect(terminal.credential_query_requests).toBe(0);
+  await expectFileRequestStateToRemainQuiescent(portal, terminal);
+});
+
+test('an abort-insensitive fallback body cannot cross a same-token session boundary', async ({
+  page,
+  portal,
+}) => {
+  await gateWorkerRegistration(page, { block: 'manual-first' });
+  await openPortal(page, portal);
+  await loginLoadedPortal(page, portal);
+  await gateAbortInsensitiveFallbackBody(page);
+  const before = await readSnapshot(portal);
+  let downloadCount = 0;
+  page.on('download', () => {
+    downloadCount += 1;
+  });
+
+  await page.locator('#entries a', { hasText: 'report.txt' }).click();
+  await expect
+    .poll(
+      () =>
+        page.evaluate(
+          () => window.__recasaosFallbackBodyProbe?.pullWaiting === true,
+        ),
+      { timeout: 15_000 },
+    )
+    .toBe(true);
+  expect(
+    await page.evaluate(
+      () => window.__recasaosFallbackBodyProbe?.fileFetches ?? 0,
+    ),
+  ).toBe(1);
+
+  await page.locator('#logout').click();
+  await expect(page.locator('#entries li')).toHaveCount(0);
+  await loginLoadedPortalAndWaitForNativeStreaming(page, portal);
+  expect(
+    await page.evaluate(() =>
+      window.__recasaosFallbackBodyProbe.releaseBody(),
+    ),
+    'the old fallback body must still be waiting after relogin',
+  ).toBe(true);
+  await delay(1_000);
+  expect(downloadCount).toBe(0);
+  await expect(page.locator('#status')).toHaveText('2 entries');
+  expect(fileRequestState(await readSnapshot(portal))).toEqual(
+    fileRequestState(before),
+  );
+
+  const downloadPromise = page.waitForEvent('download', { timeout: 30_000 });
+  await page.locator('#entries a', { hasText: 'report.txt' }).click();
+  const download = await downloadPromise;
+  expect(await download.failure()).toBeNull();
+  expect(await hashDownload(download)).toEqual(portal.fixtures['report.txt']);
+  const terminal = await waitForSnapshot(
+    portal,
+    (snapshot) =>
+      snapshot.active_file_requests === 0 &&
+      snapshot.authorized_file_requests - before.authorized_file_requests === 1 &&
+      snapshot.canceled_file_requests - before.canceled_file_requests === 0 &&
+      snapshot.completed_file_requests - before.completed_file_requests === 1,
+    'post-fallback-session native download terminal cleanup',
+  );
+  expect(downloadCount).toBe(1);
+  expect(
+    await page.evaluate(
+      () => window.__recasaosFallbackBodyProbe?.fileFetches ?? 0,
+    ),
+    'the new native download must not reuse the old page fallback body',
+  ).toBe(1);
+  expect(terminal.authorization_on_other_path).toBe(0);
+  expect(terminal.credential_query_requests).toBe(0);
+  await expectFileRequestStateToRemainQuiescent(portal, terminal);
+});
+
+test('controller generation change wakes a click whose old preparation is stuck', async ({
+  page,
+  portal,
+}) => {
+  await gateWorkerRegistration(page, { block: 'first' });
+  await openPortal(page, portal);
+  await loginLoadedPortal(page, portal);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => window.__recasaosWorkerRegistrationProbe?.calls ?? 0,
+      ),
+    )
+    .toBe(1);
+  const before = await readSnapshot(portal);
+
+  const clickStarted = Date.now();
+  const downloadPromise = page.waitForEvent('download', { timeout: 30_000 });
+  await page.locator('#entries a', { hasText: 'stream.bin' }).click();
+  await expect(page.locator('#status')).toHaveText(
+    'Preparing secure browser streaming for stream.bin…',
+  );
+  await page.evaluate(() => {
+    navigator.serviceWorker.dispatchEvent(new Event('controllerchange'));
+  });
+  const download = await downloadPromise;
+  expect(
+    Date.now() - clickStarted,
+    'a fresh generation should avoid the blocked preparation timeout path',
+  ).toBeLessThan(10_000);
+  await expect(page.locator('#status')).toHaveText(
+    'Download handed to the browser: stream.bin',
+  );
+  expect(await download.failure()).toBeNull();
+  const downloaded = await hashDownload(download);
+  expect(downloaded.size).toBe(portal.fixtures['stream.bin'].size);
+  expect(downloaded.sha256).toBe(portal.fixtures['stream.bin'].sha256);
+  const terminal = await waitForSnapshot(
+    portal,
+    (snapshot) =>
+      snapshot.active_file_requests === 0 &&
+      snapshot.authorized_file_requests - before.authorized_file_requests === 1 &&
+      snapshot.canceled_file_requests - before.canceled_file_requests === 0 &&
+      snapshot.completed_file_requests - before.completed_file_requests === 1,
+    'fresh controller generation terminal cleanup',
+  );
+  expect(
+    await page.evaluate(
+      () => window.__recasaosWorkerRegistrationProbe?.calls ?? 0,
+    ),
+    'a fresh controller generation must replace the stuck preparation',
+  ).toBeGreaterThan(1);
+  expect(terminal.authorization_on_other_path).toBe(0);
+  expect(terminal.credential_query_requests).toBe(0);
+  await expectFileRequestStateToRemainQuiescent(portal, terminal);
 });
 
 test('an incorrect bearer fails closed', async ({ page, portal }) => {
