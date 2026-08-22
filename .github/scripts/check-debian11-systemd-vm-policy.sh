@@ -292,7 +292,7 @@ require_text "$systemd_script" \
   'hostile_storage_backing="${hostile_storage_fuse_mount}/hostile-storage.img"' \
   "NBD does not consume the reviewed FUSE-mounted backing path"
 require_text "$systemd_script" \
-  "hostile_storage_fuse_options='nodev,nosuid,noexec,attr_timeout=0,entry_timeout=0,negative_timeout=0'" \
+  "hostile_storage_fuse_options='nodev,nosuid,noexec,subtype=bindfs,attr_timeout=0,entry_timeout=0,negative_timeout=0'" \
   "hostile-storage FUSE cache and mount policy drifted"
 require_text "$systemd_script" \
   'sudo modprobe fuse' \
@@ -566,6 +566,9 @@ require_order(
     ),
     "hostile-storage FUSE setup",
 )
+fuse_setup_mount_type_proof = '            $(separator + 1) != "fuse.bindfs" ||'
+if fuse_setup.count(fuse_setup_mount_type_proof) != 1:
+    raise SystemExit("hostile-storage FUSE setup mount type proof changed")
 for fuse_identity_proof in (
     'readlink -f "/proc/$hostile_storage_fuse_daemon_pid/exe"',
     '"/proc/$hostile_storage_fuse_daemon_pid/cmdline"',
@@ -723,6 +726,11 @@ require_order(
     ),
     "hostile-storage stack cleanup",
 )
+fuse_cleanup_mount_type_proof = (
+    'if (separator == 0 || $(separator + 1) != "fuse.bindfs")'
+)
+if cleanup_stack.count(fuse_cleanup_mount_type_proof) != 1:
+    raise SystemExit("hostile-storage FUSE cleanup mount type proof changed")
 
 cleanup_resume = unique_slice(
     "resume_hostile_storage_for_cleanup() {",

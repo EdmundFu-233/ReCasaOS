@@ -139,6 +139,15 @@ expect_rejection hostile-storage-fuse-command-bypass systemd \
 expect_rejection hostile-storage-fuse-allow-other systemd \
   '--no-allow-other' \
   '--allow-other'
+expect_rejection hostile-storage-fuse-subtype-drift systemd \
+  'subtype=bindfs' \
+  'subtype=unknown'
+expect_rejection hostile-storage-fuse-cleanup-type-bypass systemd \
+  'if (separator == 0 || $(separator + 1) != "fuse.bindfs")' \
+  'if (separator == 0 || $(separator + 1) != "fuse.bindfs" && 0)'
+expect_rejection hostile-storage-fuse-setup-type-bypass systemd \
+  '            $(separator + 1) != "fuse.bindfs" ||' \
+  '            $(separator + 1) != "fuse.bindfs" && 0 ||'
 expect_rejection hostile-storage-wrong-stop-signal systemd \
   'signal_exact_hostile_storage_nbd_server 19' \
   'signal_exact_hostile_storage_nbd_server 15'

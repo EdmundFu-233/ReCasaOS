@@ -120,7 +120,9 @@ nested_mount="${share}/covered"
 hostile_storage_fuse_source="${workspace}/hostile-storage-fuse-source"
 hostile_storage_fuse_mount="${workspace}/hostile-storage-fuse-mount"
 hostile_storage_fuse_log="${workspace}/hostile-storage-fuse.log"
-hostile_storage_fuse_options='nodev,nosuid,noexec,attr_timeout=0,entry_timeout=0,negative_timeout=0'
+# bindfs sets fsname, which suppresses libfuse 2's automatic subtype. Keep an
+# explicit subtype so mountinfo can prove fuse.bindfs instead of plain fuse.
+hostile_storage_fuse_options='nodev,nosuid,noexec,subtype=bindfs,attr_timeout=0,entry_timeout=0,negative_timeout=0'
 hostile_storage_backing_source="${hostile_storage_fuse_source}/hostile-storage.img"
 hostile_storage_backing="${hostile_storage_fuse_mount}/hostile-storage.img"
 hostile_storage_name="recasaos-dstate-${run_key}"
@@ -151,7 +153,7 @@ storage_worker_address_space_minimum_reserve=134217728
 [[ "$hostile_storage_fuse_source" == "$workspace/hostile-storage-fuse-source" &&
   "$hostile_storage_fuse_mount" == "$workspace/hostile-storage-fuse-mount" &&
   "$hostile_storage_fuse_log" == "$workspace/hostile-storage-fuse.log" &&
-  "$hostile_storage_fuse_options" == 'nodev,nosuid,noexec,attr_timeout=0,entry_timeout=0,negative_timeout=0' &&
+  "$hostile_storage_fuse_options" == 'nodev,nosuid,noexec,subtype=bindfs,attr_timeout=0,entry_timeout=0,negative_timeout=0' &&
   "$hostile_storage_backing_source" == "$hostile_storage_fuse_source/hostile-storage.img" &&
   "$hostile_storage_backing" == "$hostile_storage_fuse_mount/hostile-storage.img" ]] ||
   fail "refusing unsafe hostile-storage FUSE identity"
