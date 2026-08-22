@@ -21,15 +21,15 @@ do_mount() {
     exit 1
   fi
 
-  # Get info for this drive: $ID_FS_LABEL and $ID_FS_TYPE
-  eval $(blkid -o udev ${DEVICE} | grep -i -e "ID_FS_LABEL" -e "ID_FS_TYPE")
 
-  #ID_FS_LABEL=新加卷
-  #ID_FS_LABEL_ENC=新加卷
-  #ID_FS_TYPE=ntfs
+  # Read only the filesystem type. Never evaluate blkid's udev-shaped output:
+  # removable-media labels are attacker-controlled strings.
+  if ! ID_FS_TYPE="$(blkid -s TYPE -o value -- "$DEVICE")"; then
+    logger -t usb-mount.sh -s -- "Unable to identify the filesystem on ${DEVICE}"
+    exit 1
+  fi
 
   # Figure out a mount point to use
-  # LABEL=${ID_FS_LABEL}
   LABEL=${DEVBASE}
   if grep -q " /DATA/USB_Storage_${LABEL} " /etc/mtab; then
     # Already in use, make a unique one
@@ -84,7 +84,7 @@ do_mount() {
   #
   #  ${log} "Mounted ${DEVICE} at ${MOUNT_POINT}"
 
-  case ${ID_FS_TYPE} in
+  case "${ID_FS_TYPE}" in
   vfat)
     mount -t vfat -o rw,relatime,users,gid=100,umask=000,shortname=mixed,utf8=1,flush ${DEVICE} ${MOUNT_POINT}
     ;;
