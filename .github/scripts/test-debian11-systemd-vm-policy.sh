@@ -94,6 +94,9 @@ expect_rejection stale-sha vm \
 expect_rejection hostile-storage-opt-in vm \
   '      RECASAOS_HOSTILE_STORAGE_VM_CI=1 \' \
   '      RECASAOS_HOSTILE_STORAGE_VM_CI=0 \'
+expect_rejection hostile-storage-missing-bindfs vm \
+  '  - bindfs' \
+  '  # bindfs omitted'
 expect_rejection debian-noexec-workspace systemd \
   '    workspace_parent=/var/lib' \
   '    workspace_parent=/run'
@@ -121,9 +124,69 @@ expect_rejection memory-peak-fail-open systemd \
 expect_rejection host-hostile-storage-enable systemd \
   '    hostile_storage_test_enabled=0' \
   '    hostile_storage_test_enabled=1'
-expect_rejection hostile-storage-flushing-suspend systemd \
-  'sudo dmsetup suspend --nolockfs --noflush "$hostile_storage_name"' \
-  'sudo dmsetup suspend "$hostile_storage_name"'
+expect_rejection hostile-storage-nbd-non-loopback systemd \
+  '--bind=127.0.0.1 \' \
+  '--bind=0.0.0.0 \'
+expect_rejection hostile-storage-multiple-nbd-devices systemd \
+  'sudo modprobe nbd nbds_max=1 max_part=0' \
+  'sudo modprobe nbd nbds_max=16 max_part=16'
+expect_rejection hostile-storage-nbd-netlink-connect systemd \
+  $'sudo nbd-client \\\n      --nonetlink \\\n      127.0.0.1' \
+  $'sudo nbd-client \\\n      127.0.0.1'
+expect_rejection hostile-storage-nbd-netlink-cleanup systemd \
+  $'sudo nbd-client \\\n        --nonetlink \\\n        -d "$hostile_storage_nbd_device"' \
+  $'sudo nbd-client \\\n        -d "$hostile_storage_nbd_device"'
+expect_rejection hostile-storage-nbd-readiness-bypass systemd \
+  'while ((SECONDS < nbd_client_deadline)); do' \
+  'while false && ((SECONDS < nbd_client_deadline)); do'
+expect_rejection hostile-storage-nbd-readiness-window systemd \
+  'nbd_client_deadline=$((SECONDS + 5))' \
+  'nbd_client_deadline=$((SECONDS + 10))'
+expect_rejection hostile-storage-nbd-duplicate-readiness-deadline systemd \
+  '  nbd_client_deadline=$((SECONDS + 5))' \
+  $'  nbd_client_deadline=$((SECONDS + 5))\n  nbd_client_deadline=$((SECONDS + 1000))'
+expect_rejection hostile-storage-nbd-client-exec-bypass systemd \
+  '[[ "$nbd_client_expected_executable" == /usr/sbin/nbd-client ]]' \
+  '[[ -n "$nbd_client_expected_executable" ]]'
+expect_rejection hostile-storage-nbd-client-uid-bypass systemd \
+  '    "$nbd_client_uid" == 0:0:0:0 ]] ||' \
+  '    -n "$nbd_client_uid" ]] ||'
+expect_rejection hostile-storage-nbd-client-identity-fail-open systemd \
+  $'    "$nbd_client_uid" == 0:0:0:0 ]] ||\n    fail "hostile-storage NBD client process identity is unsafe"' \
+  $'    "$nbd_client_uid" == 0:0:0:0 ]] || true ||\n    fail "hostile-storage NBD client process identity is unsafe"'
+expect_rejection hostile-storage-fuse-bypass systemd \
+  'hostile_storage_backing="${hostile_storage_fuse_mount}/hostile-storage.img"' \
+  'hostile_storage_backing="${hostile_storage_fuse_source}/hostile-storage.img"'
+expect_rejection hostile-storage-fuse-command-bypass systemd \
+  $'    "$hostile_storage_backing" \\\n    >/dev/null 2>"$hostile_storage_nbd_log" &' \
+  $'    "$hostile_storage_backing_source" \\\n    >/dev/null 2>"$hostile_storage_nbd_log" &'
+expect_rejection hostile-storage-fuse-allow-other systemd \
+  '--no-allow-other' \
+  '--allow-other'
+expect_rejection hostile-storage-fuse-subtype-drift systemd \
+  'subtype=bindfs' \
+  'subtype=unknown'
+expect_rejection hostile-storage-fuse-cleanup-type-bypass systemd \
+  'if (separator == 0 || $(separator + 1) != "fuse.bindfs")' \
+  'if (separator == 0 || $(separator + 1) != "fuse.bindfs" && 0)'
+expect_rejection hostile-storage-fuse-setup-type-bypass systemd \
+  '            $(separator + 1) != "fuse.bindfs" ||' \
+  '            $(separator + 1) != "fuse.bindfs" && 0 ||'
+expect_rejection hostile-storage-wrong-stop-signal systemd \
+  'signal_exact_hostile_storage_nbd_server 19' \
+  'signal_exact_hostile_storage_nbd_server 15'
+expect_rejection hostile-storage-fuse-wrong-stop-signal systemd \
+  'signal_exact_hostile_storage_fuse_daemon 19' \
+  'signal_exact_hostile_storage_fuse_daemon 15'
+expect_rejection hostile-storage-fuse-fake-waiting systemd \
+  '[[ "$waiting_value" -ge 1 ]]' \
+  '[[ "$waiting_value" -ge 0 ]]'
+expect_rejection hostile-storage-fuse-waiting-without-live-nbd systemd \
+  $'hostile_storage_fuse_daemon_state_is T || return 1\n  hostile_storage_nbd_server_is_resumed || return 1' \
+  $'hostile_storage_fuse_daemon_state_is T || return 1\n  : # live NBD proof skipped'
+expect_rejection hostile-storage-nbd-exec-race systemd \
+  'while ! hostile_storage_nbd_server_is_exact &&' \
+  'while ! hostile_storage_nbd_server_is_exact && false &&'
 expect_rejection hostile-storage-fake-state systemd \
   'if task_state == b"D":' \
   'if task_state == b"T":'
@@ -142,12 +205,18 @@ expect_rejection hostile-storage-leader-only-d-state systemd \
 expect_rejection hostile-storage-three-d-state-workers systemd \
   'storage_workers_are_in_d_state 4' \
   'storage_workers_are_in_d_state 3'
+expect_rejection hostile-storage-fuse-three-d-state-workers systemd \
+  $'  wait_until_before "four real FUSE-backed D-state storage workers" \\\n    "$hostile_fuse_blocked_deadline" \\\n    storage_workers_are_in_d_state 4' \
+  $'  wait_until_before "four real FUSE-backed D-state storage workers" \\\n    "$hostile_fuse_blocked_deadline" \\\n    storage_workers_are_in_d_state 3'
 expect_rejection hostile-storage-split-formation-deadline systemd \
   '    "$hostile_blocked_deadline" \' \
   '    "$hostile_timeout_deadline" \'
 expect_rejection hostile-storage-blocked-allows-pending-kill systemd \
   'if phase == "blocked" and kill_is_pending:' \
   'if phase == "blocked" and false:'
+expect_rejection hostile-storage-missing-exe-fail-open systemd \
+  '        if phase != "kill-pending":' \
+  '        if False:'
 expect_rejection hostile-storage-incomplete-inspection systemd \
   'or len(worker_pairs) != 4' \
   'or len(worker_pairs) != 1'
@@ -160,6 +229,15 @@ expect_rejection hostile-storage-missing-post-inspection-client-check systemd \
 expect_rejection hostile-storage-cleanup-without-resume systemd \
   'if ! resume_hostile_storage_for_cleanup; then' \
   'if false; then'
+expect_rejection hostile-storage-cleanup-without-fuse-resume systemd \
+  '  resume_hostile_storage_fuse_for_cleanup || return 1' \
+  '  : # exact FUSE resume skipped'
+expect_rejection hostile-storage-cleanup-nbd-before-fuse systemd \
+  $'  resume_hostile_storage_fuse_for_cleanup || return 1\n  resume_hostile_storage_nbd_for_cleanup' \
+  $'  resume_hostile_storage_nbd_for_cleanup || return 1\n  resume_hostile_storage_fuse_for_cleanup'
+expect_rejection hostile-storage-cleanup-without-fuse-unmount systemd \
+  $'      "$hostile_storage_fusermount_executable" \\\n      -u "$hostile_storage_fuse_mount"' \
+  '      true # FUSE unmount skipped'
 expect_rejection sampler-symlink-follow sampler \
   'source_flags |= os.O_NOFOLLOW' \
   'source_flags |= 0'

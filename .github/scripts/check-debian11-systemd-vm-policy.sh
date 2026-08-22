@@ -176,7 +176,7 @@ require_text "$vm_script" \
 require_text "$vm_script" \
   'RECASAOS_HOSTILE_STORAGE_VM_CI=1' \
   "guest hostile-storage opt-in is missing"
-for guest_package in dmsetup e2fsprogs kmod udev; do
+for guest_package in bindfs dmsetup e2fsprogs kmod nbd-client qemu-utils udev; do
   require_exact_line "$vm_script" "  - $guest_package" \
     "guest hostile-storage package is missing: $guest_package"
 done
@@ -283,8 +283,62 @@ require_exact_line "$systemd_script" \
   '    hostile_storage_test_enabled=1' \
   "Debian VM does not enable hostile-storage testing"
 require_text "$systemd_script" \
-  'sudo dmsetup suspend --nolockfs --noflush "$hostile_storage_name"' \
-  "hostile-storage suspension does not avoid filesystem sync and I/O flush"
+  'sudo modprobe nbd nbds_max=1 max_part=0' \
+  "hostile-storage phase does not load one exact partitionless NBD device"
+require_text "$systemd_script" \
+  'hostile_storage_backing_source="${hostile_storage_fuse_source}/hostile-storage.img"' \
+  "hostile-storage source file is not below the reviewed FUSE source"
+require_text "$systemd_script" \
+  'hostile_storage_backing="${hostile_storage_fuse_mount}/hostile-storage.img"' \
+  "NBD does not consume the reviewed FUSE-mounted backing path"
+require_text "$systemd_script" \
+  "hostile_storage_fuse_options='nodev,nosuid,noexec,subtype=bindfs,attr_timeout=0,entry_timeout=0,negative_timeout=0'" \
+  "hostile-storage FUSE cache and mount policy drifted"
+require_text "$systemd_script" \
+  'sudo modprobe fuse' \
+  "hostile-storage phase does not load the kernel FUSE module"
+require_text "$systemd_script" \
+  '[[ "$device_metadata" == a:e5:0:0:666 ]]' \
+  "hostile-storage phase does not verify the exact FUSE device"
+require_text "$systemd_script" \
+  'sudo mount -t fusectl -o nodev,nosuid,noexec ' \
+  "hostile-storage phase does not create a restricted FUSE control mount"
+require_text "$systemd_script" \
+  '    --no-allow-other ' \
+  "hostile-storage FUSE daemon is not restricted to its unprivileged owner"
+forbid_text "$systemd_script" \
+  '--allow-other' \
+  "hostile-storage FUSE daemon exposes its mount through allow_other"
+require_text "$systemd_script" \
+  '"$capability_value" == 0000000000000000' \
+  "hostile-storage FUSE daemon does not prove empty effective capabilities"
+require_text "$systemd_script" \
+  '"$uid_value" == "$runner_uid:$runner_uid:$runner_uid:$runner_uid"' \
+  "hostile-storage FUSE daemon does not prove its four unprivileged UIDs"
+require_text "$systemd_script" \
+  'fail "isolated VM NBD module parameters are not exact"' \
+  "hostile-storage phase does not verify the loaded NBD module parameters"
+require_text "$systemd_script" \
+  '--bind=127.0.0.1 \' \
+  "hostile-storage NBD server is not bound to exact loopback"
+require_text "$systemd_script" \
+  'sudo nbd-client \' \
+  "hostile-storage phase does not attach a kernel NBD client"
+require_text "$systemd_script" \
+  'signal_exact_hostile_storage_nbd_server 19' \
+  "hostile-storage phase does not stop the exact NBD server"
+require_text "$systemd_script" \
+  'signal_exact_hostile_storage_fuse_daemon 19' \
+  "hostile-storage FUSE phase does not stop the exact bindfs daemon"
+require_text "$systemd_script" \
+  '[[ "$waiting_value" -ge 1 ]]' \
+  "hostile-storage FUSE phase does not require a real kernel waiting request"
+require_text "$systemd_script" \
+  'wait_until "static portal during FUSE storage quarantine" page_is_ready' \
+  "hostile-storage FUSE phase does not preserve the static portal path"
+require_text "$systemd_script" \
+  'fail "hostile-storage mapping, rather than its NBD server, was suspended"' \
+  "hostile-storage phase does not prove the mapper remains active"
 require_text "$systemd_script" \
   'storage_workers_are_in_d_state 4' \
   "hostile-storage phase does not require four real D-state workers"
@@ -296,6 +350,14 @@ require_exact_count "$systemd_script" \
   '    "$hostile_blocked_deadline" \' \
   3 \
   "hostile-storage formation waits do not share exactly one deadline"
+require_exact_count "$systemd_script" \
+  '  hostile_fuse_blocked_deadline=$((SECONDS + 8))' \
+  1 \
+  "FUSE hostile-storage formation deadline is not the reviewed 8 seconds"
+require_exact_count "$systemd_script" \
+  '    "$hostile_fuse_blocked_deadline" \' \
+  4 \
+  "FUSE hostile-storage formation waits do not share exactly one deadline"
 command -v python3 >/dev/null 2>&1 ||
   fail "Python is unavailable for hostile-storage policy parsing"
 if ! python3 - "$systemd_script" <<'PYTHON'
@@ -329,6 +391,27 @@ signal_policy = """    pending_values = []
 """
 if worker_python.count(signal_policy) != 1:
     raise SystemExit("hostile-storage pending-signal policy changed")
+executable_policy = '''    try:
+        worker_executable = os.stat(Path("/proc") / str(pid) / "exe")
+    except FileNotFoundError:
+        # After a group-wide SIGKILL, Linux can tear down the thread-group
+        # leader's executable while a sibling task remains blocked in D-state.
+        # The blocked phase already proved the image, and this phase still
+        # proves the recorded PID/start time, D-state task, credentials, and
+        # pending SIGKILL before accepting that narrow kernel state.
+        if phase != "kill-pending":
+            raise RuntimeError(
+                f"hostile-storage worker {pid} image disappeared before cancellation"
+            ) from None
+    else:
+        if (
+            worker_executable.st_dev != reviewed_binary.st_dev
+            or worker_executable.st_ino != reviewed_binary.st_ino
+        ):
+            raise RuntimeError("hostile-storage worker image identity changed")
+'''
+if worker_python.count(executable_policy) != 1:
+    raise SystemExit("hostile-storage executable teardown policy changed")
 for task_proof in (
     'task_root = Path("/proc") / str(pid) / "task"',
     'if task_state == b"D":',
@@ -398,6 +481,343 @@ expected = """  hostile_blocked_deadline=$((SECONDS + 8))
 """
 if formation != expected:
     raise SystemExit("hostile-storage live formation sequence changed")
+
+def unique_slice(start, end, label):
+    if source.count(start) != 1 or source.count(end) != 1:
+        raise SystemExit(f"{label} sentinels are not unique")
+    return source.split(start, 1)[1].split(end, 1)[0]
+
+def require_order(scope, fragments, label):
+    positions = []
+    for fragment in fragments:
+        if scope.count(fragment) != 1:
+            raise SystemExit(f"{label} proof is not unique: {fragment!r}")
+        positions.append(scope.index(fragment))
+    if positions != sorted(positions):
+        raise SystemExit(f"{label} ordering changed")
+
+setup = unique_slice(
+    "setup_hostile_storage_share() {",
+    "\n}\n\nrunner_uid=",
+    "hostile-storage NBD setup",
+)
+require_order(
+    setup,
+    (
+        "sudo modprobe nbd nbds_max=1 max_part=0",
+        '"$hostile_storage_nbd_server_executable" \\\n    --persistent',
+        "hostile_storage_nbd_server_pid=$!",
+        "nbd_server_deadline=$((SECONDS + 5))",
+        "while ! hostile_storage_nbd_server_is_exact &&\n"
+        "    ((SECONDS < nbd_server_deadline)); do",
+        "if hostile_storage_nbd_server_process_is_gone; then",
+        "sudo nbd-client \\\n      --nonetlink \\\n      127.0.0.1",
+        'nbd_client_expected_executable="$(',
+        '[[ "$nbd_client_expected_executable" == /usr/sbin/nbd-client ]]',
+        "nbd_client_deadline=$((SECONDS + 5))",
+        "while ((SECONDS < nbd_client_deadline)); do",
+        ')" && [[ "$nbd_client_pid" =~ ^[0-9]+$ && '
+        '"$nbd_client_pid" -gt 1 ]]; then',
+        "hostile_storage_nbd_server_is_exact ||\n"
+        '      fail "hostile-storage NBD server changed before client readiness"',
+        "hostile_storage_nbd_listener_is_exact ||\n"
+        '      fail "hostile-storage NBD listener changed before client readiness"',
+        'nbd_client_start_time="$(process_start_time "$nbd_client_pid")"',
+        'sudo readlink -f "/proc/$nbd_client_pid/exe"',
+        '"/proc/$nbd_client_pid/status"',
+        '[[ "$nbd_client_executable" == "$nbd_client_expected_executable" &&',
+        '    "$nbd_client_uid" == 0:0:0:0 ]] ||',
+        '[[ "$(sudo cat /sys/block/nbd0/pid)" == "$nbd_client_pid" ]]',
+        '[[ "$(process_start_time "$nbd_client_pid")" == \\\n    "$nbd_client_start_time" ]]',
+        'table="0 $sectors linear $nbd_identity 0"',
+        'sudo dmsetup create "$hostile_storage_name" --table "$table"',
+    ),
+    "hostile-storage NBD setup",
+)
+nbd_client_identity_start = '  nbd_client_expected_executable="$('
+nbd_client_identity_end = (
+    '  sectors="$(sudo blockdev --getsz "$hostile_storage_nbd_device")" ||'
+)
+nbd_client_identity = (
+    nbd_client_identity_start
+    + unique_slice(
+        nbd_client_identity_start,
+        nbd_client_identity_end,
+        "hostile-storage NBD client identity",
+    )
+    + nbd_client_identity_end
+)
+expected_nbd_client_identity = r'''  nbd_client_expected_executable="$(
+    readlink -f "$(command -v nbd-client)"
+  )" || fail "could not resolve the hostile-storage NBD client"
+  [[ "$nbd_client_expected_executable" == /usr/sbin/nbd-client ]] ||
+    fail "unexpected hostile-storage NBD client: $nbd_client_expected_executable"
+  nbd_client_deadline=$((SECONDS + 5))
+  nbd_client_pid=
+  while ((SECONDS < nbd_client_deadline)); do
+    if nbd_client_pid="$(
+      sudo nbd-client -c "$hostile_storage_nbd_device" |
+        tr -d '[:space:]'
+    )" && [[ "$nbd_client_pid" =~ ^[0-9]+$ && "$nbd_client_pid" -gt 1 ]]; then
+      break
+    fi
+    nbd_client_pid=
+    hostile_storage_nbd_server_is_exact ||
+      fail "hostile-storage NBD server changed before client readiness"
+    hostile_storage_nbd_listener_is_exact ||
+      fail "hostile-storage NBD listener changed before client readiness"
+    sleep 0.02
+  done
+  [[ "$nbd_client_pid" =~ ^[0-9]+$ && "$nbd_client_pid" -gt 1 ]] ||
+    fail "hostile-storage NBD client PID is invalid: $nbd_client_pid"
+  nbd_client_start_time="$(process_start_time "$nbd_client_pid")" ||
+    fail "could not capture the hostile-storage NBD client identity"
+  nbd_client_executable="$(
+    sudo readlink -f "/proc/$nbd_client_pid/exe"
+  )" || fail "could not inspect the hostile-storage NBD client executable"
+  nbd_client_uid="$(
+    awk '$1 == "Uid:" { print $2 ":" $3 ":" $4 ":" $5; exit }' \
+      "/proc/$nbd_client_pid/status"
+  )" || fail "could not inspect the hostile-storage NBD client UID"
+  [[ "$nbd_client_executable" == "$nbd_client_expected_executable" &&
+    "$nbd_client_uid" == 0:0:0:0 ]] ||
+    fail "hostile-storage NBD client process identity is unsafe"
+  [[ "$(sudo cat /sys/block/nbd0/pid)" == "$nbd_client_pid" ]] ||
+    fail "hostile-storage NBD kernel identity changed"
+  [[ "$(process_start_time "$nbd_client_pid")" == \
+    "$nbd_client_start_time" ]] ||
+    fail "hostile-storage NBD client process identity changed"
+  sectors="$(sudo blockdev --getsz "$hostile_storage_nbd_device")" ||'''
+if nbd_client_identity != expected_nbd_client_identity:
+    raise SystemExit("hostile-storage NBD client identity control flow changed")
+for setup_proof in (
+    "--shared=1 \\",
+    "--bind=127.0.0.1 \\",
+    '--port="$hostile_storage_nbd_port" \\',
+    '--export-name="$hostile_storage_nbd_export" \\',
+    "--format=raw \\",
+    "--cache=none \\",
+    "--aio=threads \\",
+    '--pid-file="$hostile_storage_nbd_pid_file" \\',
+    '"$hostile_storage_backing" \\\n    >/dev/null 2>"$hostile_storage_nbd_log" &',
+    'fail "hostile-storage NBD server exited before exact identity capture"',
+    '[[ "$nbd_identity" == 43:0 ]]',
+):
+    if setup.count(setup_proof) != 1:
+        raise SystemExit(f"hostile-storage NBD setup proof changed: {setup_proof!r}")
+
+for identity_proof in (
+    'readlink -f "/proc/$hostile_storage_nbd_server_pid/exe"',
+    '"/proc/$hostile_storage_nbd_server_pid/status"',
+    'wanted_address = f"0100007F:{port:04X}"',
+    "matches[0] not in socket_inodes",
+    '"$hostile_storage_nbd_server_start_time" \\\n    "$signal_number"',
+):
+    if source.count(identity_proof) != 1:
+        raise SystemExit(
+            f"hostile-storage NBD identity proof changed: {identity_proof!r}"
+        )
+
+fuse_setup = unique_slice(
+    "setup_hostile_storage_fuse_backing() {",
+    "\n}\n\nsetup_hostile_storage_share() {",
+    "hostile-storage FUSE setup",
+)
+require_order(
+    fuse_setup,
+    (
+        "sudo modprobe fuse",
+        'device_metadata="$(stat -c \'%t:%T:%u:%g:%a\' /dev/fuse)"',
+        "sudo mount -t fusectl -o nodev,nosuid,noexec",
+        'truncate -s 268435456 "$hostile_storage_backing_source"',
+        '"$hostile_storage_fuse_daemon_executable" \\\n    -f \\\n    --no-allow-other',
+        "hostile_storage_fuse_daemon_pid=$!",
+        "while ! hostile_storage_fuse_daemon_is_exact &&",
+        "hostile_storage_fuse_connection=$connection",
+        '[[ "$(hostile_storage_fuse_waiting_value)" == 0 ]]',
+        '[[ -f "$hostile_storage_backing" && ! -L "$hostile_storage_backing"',
+    ),
+    "hostile-storage FUSE setup",
+)
+fuse_setup_mount_type_proof = '            $(separator + 1) != "fuse.bindfs" ||'
+if fuse_setup.count(fuse_setup_mount_type_proof) != 1:
+    raise SystemExit("hostile-storage FUSE setup mount type proof changed")
+for fuse_identity_proof in (
+    'readlink -f "/proc/$hostile_storage_fuse_daemon_pid/exe"',
+    '"/proc/$hostile_storage_fuse_daemon_pid/cmdline"',
+    '"$hostile_storage_fuse_daemon_start_time" \\\n    "$signal_number"',
+    'waiting_path="/sys/fs/fuse/connections/$hostile_storage_fuse_connection/waiting"',
+):
+    if source.count(fuse_identity_proof) != 1:
+        raise SystemExit(
+            f"hostile-storage FUSE identity proof changed: {fuse_identity_proof!r}"
+        )
+if source.count('"/proc/$hostile_storage_fuse_daemon_pid/status"') != 2:
+    raise SystemExit("hostile-storage FUSE UID/capability status proofs changed")
+fuse_waiting = unique_slice(
+    "hostile_storage_fuse_has_waiting_request() {",
+    "\n}\n\nhostile_storage_fuse_is_recovered() {",
+    "hostile-storage FUSE waiting proof",
+)
+expected_fuse_waiting = """
+  local waiting_value
+
+  hostile_storage_fuse_daemon_state_is T || return 1
+  hostile_storage_nbd_server_is_resumed || return 1
+  waiting_value="$(hostile_storage_fuse_waiting_value)" || return 1
+  [[ "$waiting_value" -ge 1 ]]"""
+if fuse_waiting != expected_fuse_waiting:
+    raise SystemExit("hostile-storage FUSE waiting proof changed")
+
+nbd_live_phase = unique_slice(
+    phase_start,
+    '\n\n  wait_until "storage workers before FUSE hostile-storage test"',
+    "hostile-storage NBD live phase",
+)
+require_order(
+    nbd_live_phase,
+    (
+        "signal_exact_hostile_storage_nbd_server 19",
+        'wait_until_before "hostile-storage NBD server stop"',
+        launch_start,
+        "assert_hostile_storage_worker_boundaries kill-pending 1",
+        "signal_exact_hostile_storage_nbd_server 18",
+        'wait_until_before "hostile-storage NBD server resume"',
+    ),
+    "hostile-storage NBD fault/recovery",
+)
+
+fuse_phase_start = '  wait_until "storage workers before FUSE hostile-storage test"'
+fuse_phase_end = "  printf \\\n    'real FUSE-backed NBD D-state recovery passed:"
+fuse_live_phase = unique_slice(
+    fuse_phase_start,
+    fuse_phase_end,
+    "hostile-storage FUSE live phase",
+)
+require_order(
+    fuse_live_phase,
+    (
+        "signal_exact_hostile_storage_fuse_daemon 19",
+        'wait_until_before "hostile-storage FUSE daemon stop"',
+        "hostile_fuse_blocked_deadline=$((SECONDS + 8))",
+        'wait_until_before "FUSE kernel waiting request"',
+        'wait_until_before "four real FUSE-backed D-state storage workers"',
+        "assert_hostile_storage_worker_boundaries blocked \"$portal_pid\"",
+        'wait_until_before "four bounded FUSE hostile-storage timeouts"',
+        "assert_hostile_storage_worker_boundaries kill-pending \"$portal_pid\"\n"
+        "  [[ \"$(storage_worker_count)\" == 4 ]]",
+        'wait_until "static portal during FUSE storage quarantine" page_is_ready',
+        "assert_hostile_storage_worker_boundaries kill-pending 1",
+        'fail "FUSE kernel waiting evidence disappeared during pending restart"',
+        "signal_exact_hostile_storage_fuse_daemon 18",
+        'wait_until_before "hostile-storage FUSE daemon and request recovery"',
+        'fail "post-FUSE-D-state downloaded bytes differ from the approved file"',
+        'fail "FUSE connection was not idle after byte-correct recovery"',
+    ),
+    "hostile-storage FUSE fault/recovery",
+)
+fuse_formation_start = "  hostile_fuse_blocked_deadline=$((SECONDS + 8))"
+fuse_formation_end = "  hostile_fuse_timeout_deadline=$((SECONDS + 18))"
+fuse_formation = unique_slice(
+    fuse_formation_start,
+    fuse_formation_end,
+    "hostile-storage FUSE live formation",
+)
+expected_fuse_formation = """\n  for _ in {1..4}; do
+    start_hostile_storage_client
+  done
+  wait_until_before "four live FUSE hostile-storage clients" \\
+    "$hostile_fuse_blocked_deadline" \\
+    hostile_storage_clients_are_live
+  wait_until_before "FUSE kernel waiting request" \\
+    "$hostile_fuse_blocked_deadline" \\
+    hostile_storage_fuse_has_waiting_request
+  wait_until_before "four FUSE hostile-storage workers" \\
+    "$hostile_fuse_blocked_deadline" \\
+    storage_worker_count_is 4
+  wait_until_before "four real FUSE-backed D-state storage workers" \\
+    "$hostile_fuse_blocked_deadline" \\
+    storage_workers_are_in_d_state 4
+  mapfile -t hostile_worker_pids < <(storage_worker_pids)
+  [[ "${#hostile_worker_pids[@]}" == 4 ]] ||
+    fail "FUSE hostile-storage load did not retain exactly four workers"
+  for hostile_worker_pid in "${hostile_worker_pids[@]}"; do
+    hostile_worker_start_time="$(
+      process_start_time "$hostile_worker_pid"
+    )" || fail "could not capture FUSE hostile-storage worker identity"
+    hostile_worker_start_times+=("$hostile_worker_start_time")
+  done
+  assert_hostile_storage_worker_boundaries blocked "$portal_pid"
+  hostile_storage_fuse_has_waiting_request ||
+    fail "FUSE kernel waiting evidence disappeared during blocked inspection"
+  hostile_storage_nbd_server_is_resumed ||
+    fail "NBD server was not runnable during the FUSE-backed D-state fault"
+  hostile_storage_nbd_listener_is_exact ||
+    fail "NBD listener changed during the FUSE-backed D-state fault"
+  [[ "$(hostile_storage_suspended_value)" == 0 ]] ||
+    fail "hostile-storage mapping changed during the FUSE fault"
+  hostile_storage_clients_are_live ||
+    fail "FUSE hostile-storage clients exited during blocked worker inspection"
+
+"""
+if fuse_formation != expected_fuse_formation:
+    raise SystemExit("hostile-storage FUSE live formation sequence changed")
+
+cleanup_main = unique_slice(
+    "\ncleanup() {",
+    "\n}\ntrap cleanup EXIT",
+    "hostile-storage main cleanup",
+)
+require_order(
+    cleanup_main,
+    (
+        "if ! resume_hostile_storage_for_cleanup; then",
+        "cleanup_cgroup_memory_sampler",
+        'for unit in "$socket_unit" "$service_unit" "$sentinel_unit"; do\n'
+        '    cleanup_control_groups["$unit"]="$(',
+        'if [[ "$nested_mount_cleanup_required" == 1 ]]; then',
+        "cleanup_hostile_storage_stack",
+    ),
+    "hostile-storage main cleanup",
+)
+
+cleanup_stack = unique_slice(
+    "cleanup_hostile_storage_stack() {",
+    "\n}\n\ncleanup_public_port_is_unbound",
+    "hostile-storage stack cleanup",
+)
+require_order(
+    cleanup_stack,
+    (
+        'sudo umount -- "$share"',
+        'sudo dmsetup remove --retry "$hostile_storage_name"',
+        'sudo nbd-client \\\n        --nonetlink \\\n        -d "$hostile_storage_nbd_device"',
+        'if ! terminate_exact_background_process \\\n      "$hostile_storage_nbd_server_pid"',
+        '"$hostile_storage_fusermount_executable" \\\n      -u "$hostile_storage_fuse_mount"',
+        'if ! terminate_exact_background_process \\\n        "$hostile_storage_fuse_daemon_pid"',
+        "sudo umount -- /sys/fs/fuse/connections",
+    ),
+    "hostile-storage stack cleanup",
+)
+fuse_cleanup_mount_type_proof = (
+    'if (separator == 0 || $(separator + 1) != "fuse.bindfs")'
+)
+if cleanup_stack.count(fuse_cleanup_mount_type_proof) != 1:
+    raise SystemExit("hostile-storage FUSE cleanup mount type proof changed")
+
+cleanup_resume = unique_slice(
+    "resume_hostile_storage_for_cleanup() {",
+    "\n}\n\ncleanup_hostile_storage_stack() {",
+    "hostile-storage cleanup resume",
+)
+require_order(
+    cleanup_resume,
+    (
+        "resume_hostile_storage_fuse_for_cleanup || return 1",
+        "resume_hostile_storage_nbd_for_cleanup",
+    ),
+    "hostile-storage cleanup resume",
+)
 PYTHON
 then
   fail "hostile-storage formation sequence changed"
@@ -422,16 +842,24 @@ require_text "$systemd_script" \
   "hostile-storage restart does not prove orphaned D-state worker identity"
 require_text "$systemd_script" \
   'if ! resume_hostile_storage_for_cleanup; then' \
-  "hostile-storage cleanup does not resume I/O before stopping systemd"
+  "hostile-storage cleanup does not resume FUSE/NBD I/O before stopping systemd"
 require_text "$systemd_script" \
   'sudo dmsetup remove --retry "$hostile_storage_name"' \
   "hostile-storage cleanup does not remove the exact device mapping"
 require_text "$systemd_script" \
-  'sudo losetup --detach "$hostile_storage_loop"' \
-  "hostile-storage cleanup does not detach the exact loop device"
+  'sudo nbd-client \
+        --nonetlink \
+        -d "$hostile_storage_nbd_device"' \
+  "hostile-storage cleanup does not disconnect the exact NBD device"
 require_text "$systemd_script" \
-  'real device-mapper D-state recovery passed:' \
+  'terminate_exact_background_process \' \
+  "hostile-storage cleanup does not terminate by recorded process identity"
+require_text "$systemd_script" \
+  'real loopback-NBD D-state recovery passed:' \
   "hostile-storage phase has no explicit success evidence"
+require_text "$systemd_script" \
+  'real FUSE-backed NBD D-state recovery passed:' \
+  "hostile-storage FUSE phase has no explicit success evidence"
 
 for sampler_proof in \
   'MAX_RUNTIME_SECONDS = 30.0' \
