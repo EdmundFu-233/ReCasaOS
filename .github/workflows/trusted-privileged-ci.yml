@@ -444,13 +444,34 @@ jobs:
         run: |
           set -Eeuo pipefail
           IFS=$'\n\t'
+          required_management_tests=(
+            TestManagedDirectDirectoryRenameRejectsNestedBindMount
+            TestManagedRemoveAllPreflightsNestedMountBeforeDeletingSibling
+            TestManagedRootsTreeSizeRejectsNestedBindMount
+            TestManagedDirectoryCopyRejectsBindMountAliasIntoSource
+            TestManagedRegularCopyRejectsDestinationBindAliasIntoAnotherConfiguredRoot
+            TestManagedReplaceCleanupRejectsBindAliasAncestorOfConfiguredRoot
+            TestWalkManagedArchiveRejectsChildMountReplacement
+            TestWalkManagedArchiveAllowsStableNestedMount
+          )
+          for required_test in "${required_management_tests[@]}"; do
+            listed="$(
+              "$RUNNER_TEMP/recasaos-filesecurity.test" \
+                -test.list "^${required_test}$"
+            )"
+            if [[ "$listed" != "$required_test" ]]; then
+              printf 'required privileged test is missing: %s\n' \
+                "$required_test" >&2
+              exit 1
+            fi
+          done
           sudo unshare --mount --propagation private --fork --kill-child=KILL \
             env \
               PATH=/usr/sbin:/usr/bin:/sbin:/bin \
               RECASAOS_PRIVILEGED_MOUNT_TEST=1 \
               "$RUNNER_TEMP/recasaos-filesecurity.test" \
                 -test.count=1 \
-                -test.run '^(TestManagedDirectDirectoryRenameRejectsNestedBindMount|TestManagedRemoveAllPreflightsNestedMountBeforeDeletingSibling|TestManagedRootsTreeSizeRejectsNestedBindMount|TestManagedDirectoryCopyRejectsBindMountAliasIntoSource|TestManagedRegularCopyRejectsDestinationBindAliasIntoAnotherConfiguredRoot|TestManagedReplaceCleanupRejectsBindAliasAncestorOfConfiguredRoot)$' \
+                -test.run '^(TestManagedDirectDirectoryRenameRejectsNestedBindMount|TestManagedRemoveAllPreflightsNestedMountBeforeDeletingSibling|TestManagedRootsTreeSizeRejectsNestedBindMount|TestManagedDirectoryCopyRejectsBindMountAliasIntoSource|TestManagedRegularCopyRejectsDestinationBindAliasIntoAnotherConfiguredRoot|TestManagedReplaceCleanupRejectsBindAliasAncestorOfConfiguredRoot|TestWalkManagedArchiveRejectsChildMountReplacement|TestWalkManagedArchiveAllowsStableNestedMount)$' \
                 -test.timeout=4m \
                 -test.v
 
