@@ -59,6 +59,9 @@ func EnsureGatewayPort(gateway GatewayPortClient, desired string) error {
 }
 
 func gatewayPortFromResponse(response string) (int, error) {
+	if !gjson.Valid(response) {
+		return 0, errors.New("Gateway response is not valid JSON")
+	}
 	value := gjson.Get(response, "data")
 	if !value.Exists() {
 		return 0, errors.New("Gateway response is missing data")

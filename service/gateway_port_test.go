@@ -79,6 +79,13 @@ func TestEnsureGatewayPortFailsClosedWhenStateCannotBeConfirmed(t *testing.T) {
 			wantGets:    1,
 		},
 		{
+			name:        "confirmation response has trailing garbage",
+			desired:     "8080",
+			gateway:     &fakeGatewayPortClient{changeErr: errors.New("change failed"), getResponse: `{"data":8080} trailing`},
+			wantChanges: 1,
+			wantGets:    1,
+		},
+		{
 			name:        "Gateway remains on another port",
 			desired:     "8080",
 			gateway:     &fakeGatewayPortClient{changeErr: errors.New("change failed"), getResponse: `{"data":80}`},
