@@ -12,6 +12,7 @@
 ###
 
 set -e
+umask 077
 
 APP_NAME="casaos"
 
@@ -22,16 +23,35 @@ CONF_FILE=${CONF_PATH}/${APP_NAME}.conf
 CONF_FILE_SAMPLE=${CONF_PATH}/${APP_NAME}.conf.sample
 
 
-if [ -f "${OLD_CONF_PATH}" ]; then
-    echo "copy old conf"
-    cp "${OLD_CONF_PATH}" "${CONF_FILE}"
-fi
-if [ ! -f "${CONF_FILE}" ]; then
-    echo "Initializing config file..."
-    cp -v "${CONF_FILE_SAMPLE}" "${CONF_FILE}"
+if [ -L "${CONF_FILE}" ] || { [ -e "${CONF_FILE}" ] && [ ! -f "${CONF_FILE}" ]; }; then
+    echo "Refusing unsafe config path: ${CONF_FILE}" >&2
+    exit 1
 fi
 
-rm -rf /etc/systemd/system/casaos.service # remove old service file
+if [ ! -e "${CONF_FILE}" ]; then
+    if [ -e "${OLD_CONF_PATH}" ] || [ -L "${OLD_CONF_PATH}" ]; then
+        if [ ! -f "${OLD_CONF_PATH}" ] || [ -L "${OLD_CONF_PATH}" ]; then
+            echo "Refusing unsafe legacy config: ${OLD_CONF_PATH}" >&2
+            exit 1
+        fi
+        echo "Migrating legacy config file..."
+        CONF_SOURCE="${OLD_CONF_PATH}"
+    else
+        echo "Initializing config file..."
+        CONF_SOURCE="${CONF_FILE_SAMPLE}"
+    fi
+
+    if [ ! -f "${CONF_SOURCE}" ] || [ -L "${CONF_SOURCE}" ]; then
+        echo "Refusing unsafe config source: ${CONF_SOURCE}" >&2
+        exit 1
+    fi
+    install -o root -g root -m 0600 -- "${CONF_SOURCE}" "${CONF_FILE}"
+fi
+
+chown root:root -- "${CONF_FILE}"
+chmod 0600 -- "${CONF_FILE}"
+
+rm -f -- /etc/systemd/system/casaos.service # remove old service file
 
 systemctl daemon-reload
 

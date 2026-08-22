@@ -136,7 +136,13 @@ func PutCasaOSPort(ctx echo.Context) error {
 				Message: common_err.GetMsg(common_err.PORT_IS_OCCUPIED),
 			})
 	}
-	service.MyService.System().UpSystemPort(strconv.Itoa(portNumber))
+	if err := service.MyService.System().UpSystemPort(strconv.Itoa(portNumber)); err != nil {
+		return ctx.JSON(http.StatusInternalServerError,
+			model.Result{
+				Success: common_err.SERVICE_ERROR,
+				Message: common_err.GetMsg(common_err.SERVICE_ERROR),
+			})
+	}
 	return ctx.JSON(common_err.SUCCESS,
 		model.Result{
 			Success: common_err.SUCCESS,
