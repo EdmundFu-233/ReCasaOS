@@ -22,6 +22,7 @@ import (
 type FileInfo struct {
 	lock                 sync.Mutex
 	init                 bool
+	principalID          int
 	uploaded             []bool
 	chunkDigests         [][sha256.Size]byte
 	uploadedChunkNum     int64
@@ -99,9 +100,13 @@ const (
 
 func (s *FileUploadService) TestChunk(
 	c echo.Context,
+	principalID int,
 	identifier string,
 	chunkNumber int64,
 ) error {
+	if principalID < 1 {
+		return fmt.Errorf("authenticated upload principal is required")
+	}
 	s.cleanupExpiredUploads(time.Now())
 	if err := validateUploadIdentifier(identifier); err != nil {
 		return err
@@ -122,7 +127,7 @@ func (s *FileUploadService) TestChunk(
 	basePath := baseLocation.Canonical
 	targetRelative := filepath.Clean(c.QueryParam("relativePath"))
 
-	key := boundUploadIdentifier(identifier, targetPath)
+	key := boundUploadIdentifier(principalID, identifier, targetPath)
 	s.sessionsMu.Lock()
 	fileInfo, ok := s.uploadStatus[key]
 	s.sessionsMu.Unlock()
@@ -135,7 +140,7 @@ func (s *FileUploadService) TestChunk(
 
 	fileInfo.lock.Lock()
 	defer fileInfo.lock.Unlock()
-	if !sameServiceUploadNamespace(fileInfo, roots, basePath, targetPath, targetRelative) ||
+	if !sameServiceUploadNamespace(fileInfo, principalID, roots, basePath, targetPath, targetRelative) ||
 		(!fileInfo.init && !fileInfo.completed) {
 		return fmt.Errorf("file not initialized")
 	}
@@ -158,6 +163,7 @@ func (s *FileUploadService) TestChunk(
 
 func (s *FileUploadService) UploadFile(
 	c echo.Context,
+	principalID int,
 	path string,
 	chunkNumber int64,
 	chunkSize int64,
@@ -170,6 +176,9 @@ func (s *FileUploadService) UploadFile(
 	bin *multipart.FileHeader,
 ) error {
 	_ = c
+	if principalID < 1 {
+		return fmt.Errorf("authenticated upload principal is required")
+	}
 	s.cleanupExpiredUploads(time.Now())
 	if err := filesecurity.ValidateChunk(totalChunks, chunkNumber); err != nil {
 		return err
@@ -207,8 +216,8 @@ func (s *FileUploadService) UploadFile(
 	}
 	targetPath := targetLocation.Canonical
 	basePath := baseLocation.Canonical
-	uploadHash := boundUploadIdentifier(identifier, targetPath)
-	tempRelative := filepath.Join(".temp", "v2-upload-"+uploadHash)
+	key := boundUploadIdentifier(principalID, identifier, targetPath)
+	tempRelative := filepath.Join(".temp", "v2-upload-"+key)
 	tempLocation, err := roots.MatchChild(basePath, tempRelative)
 	if err != nil {
 		return err
@@ -225,9 +234,9 @@ func (s *FileUploadService) UploadFile(
 	}
 	assemblyPath := assemblyLocation.Canonical
 
-	key := boundUploadIdentifier(identifier, targetPath)
 	candidate := &FileInfo{
 		init:           true,
+		principalID:    principalID,
 		uploaded:       make([]bool, int(totalChunks)),
 		chunkDigests:   make([][sha256.Size]byte, int(totalChunks)),
 		base:           basePath,
@@ -416,8 +425,8 @@ func (s *FileUploadService) makeUploadDirectory(roots *filesecurity.ManagedRoots
 	return s.mkdirAll(roots, path, mode)
 }
 
-func sameServiceUploadNamespace(fileInfo *FileInfo, roots *filesecurity.ManagedRoots, basePath, targetPath, targetRelative string) bool {
-	return fileInfo != nil && fileInfo.roots == roots &&
+func sameServiceUploadNamespace(fileInfo *FileInfo, principalID int, roots *filesecurity.ManagedRoots, basePath, targetPath, targetRelative string) bool {
+	return fileInfo != nil && fileInfo.principalID == principalID && fileInfo.roots == roots &&
 		fileInfo.base == basePath && fileInfo.targetPath == targetPath &&
 		fileInfo.targetRelative == targetRelative
 }
@@ -426,6 +435,7 @@ func sameServiceUploadMetadata(existing, candidate *FileInfo) bool {
 	return existing != nil && candidate != nil &&
 		sameServiceUploadNamespace(
 			existing,
+			candidate.principalID,
 			candidate.roots,
 			candidate.base,
 			candidate.targetPath,
@@ -695,8 +705,8 @@ func validateChunkShape(chunkNumber, chunkSize, currentChunkSize, totalChunks, t
 	return nil
 }
 
-func boundUploadIdentifier(identifier, targetPath string) string {
-	digest := sha256.Sum256([]byte(identifier + "\x00" + targetPath))
+func boundUploadIdentifier(principalID int, identifier, targetPath string) string {
+	digest := sha256.Sum256([]byte("jwt-user\x00" + strconv.Itoa(principalID) + "\x00" + identifier + "\x00" + targetPath))
 	return hex.EncodeToString(digest[:])
 }
 
