@@ -120,6 +120,11 @@ nested_mount="${share}/covered"
 hostile_storage_backing="${workspace}/hostile-storage.img"
 hostile_storage_name="recasaos-dstate-${run_key}"
 hostile_storage_mapper="/dev/mapper/${hostile_storage_name}"
+hostile_storage_nbd_device=/dev/nbd0
+hostile_storage_nbd_export="recasaos-hostile-${run_key}"
+hostile_storage_nbd_log="${workspace}/hostile-storage-nbd.log"
+hostile_storage_nbd_pid_file="${workspace}/hostile-storage-nbd.pid"
+hostile_storage_nbd_port=10925
 host_shm_sentinel_prefix="/dev/shm/recasaos-public-files-ci-${run_key}."
 host_shm_sentinel=
 test_bearer='rc1_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8'
@@ -138,6 +143,13 @@ storage_worker_address_space_minimum_reserve=134217728
 [[ "$hostile_storage_name" =~ ^recasaos-dstate-[0-9]+-[0-9]+$ &&
   "$hostile_storage_mapper" == "/dev/mapper/$hostile_storage_name" ]] ||
   fail "refusing unsafe hostile-storage device name: $hostile_storage_name"
+[[ "$hostile_storage_nbd_device" == /dev/nbd0 &&
+  "$hostile_storage_nbd_export" =~ ^recasaos-hostile-[0-9]+-[0-9]+$ &&
+  "$hostile_storage_nbd_log" == "$workspace/hostile-storage-nbd.log" &&
+  "$hostile_storage_nbd_pid_file" == \
+    "$workspace/hostile-storage-nbd.pid" &&
+  "$hostile_storage_nbd_port" == 10925 ]] ||
+  fail "refusing unsafe hostile-storage NBD identity"
 
 [[ ! -e "$workspace" ]] || fail "test workspace already exists"
 [[ ! -e "$service_path" && ! -e "$socket_path" &&
@@ -152,14 +164,15 @@ if getent passwd recasaos-public >/dev/null ||
   fail "the recasaos-public account unexpectedly already exists"
 fi
 for required_tool in \
-  cmp find getfacl go mktemp mount pgrep ps sort ss systemctl truncate umount
+  cmp find getfacl go mktemp mount pgrep ps readlink sort ss systemctl \
+  truncate umount
 do
   command -v "$required_tool" >/dev/null 2>&1 ||
     fail "required mount test tool is unavailable: $required_tool"
 done
 if [[ "$hostile_storage_test_enabled" == 1 ]]; then
   for required_tool in \
-    blockdev dmsetup losetup lsblk mkfs.ext4 modprobe sync udevadm
+    blockdev dmsetup lsblk mkfs.ext4 modprobe nbd-client qemu-nbd sync udevadm
   do
     command -v "$required_tool" >/dev/null 2>&1 ||
       fail "required hostile-storage VM tool is unavailable: $required_tool"
@@ -283,14 +296,17 @@ fi
 account_cleanup_authorized=1
 nested_mount_cleanup_required=0
 host_shm_sentinel_created=0
-hostile_storage_loop=
-hostile_storage_loop_attached=0
 hostile_storage_dm_created=0
-hostile_storage_dm_suspended=0
 hostile_storage_share_mounted=0
 hostile_storage_major=
 hostile_storage_minor=
 hostile_storage_suspended_path=
+hostile_storage_nbd_connected=0
+hostile_storage_nbd_server_executable=
+hostile_storage_nbd_server_pid=
+hostile_storage_nbd_server_start_time=
+hostile_storage_nbd_server_started=0
+hostile_storage_nbd_server_stopped=0
 hostile_storage_clients=()
 hostile_storage_client_start_times=()
 hostile_storage_client_prefixes=()
@@ -621,7 +637,8 @@ signal_exact_background_process() {
 
   [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 &&
     "$start_time" =~ ^[0-9]+$ &&
-    ( "$signal_number" == 9 || "$signal_number" == 15 ) ]] || return 1
+    ( "$signal_number" == 9 || "$signal_number" == 15 ||
+      "$signal_number" == 18 || "$signal_number" == 19 ) ]] || return 1
   /usr/bin/python3 -c '
 import os
 import signal
@@ -661,6 +678,129 @@ terminate_exact_background_process() {
 
 kill_exact_background_process() {
   signal_exact_background_process "$1" "$2" 9
+}
+
+hostile_storage_nbd_server_is_exact() {
+  local current_executable
+  local current_start_time
+  local current_uid
+
+  [[ "$hostile_storage_nbd_server_started" == 1 &&
+    "$hostile_storage_nbd_server_pid" =~ ^[0-9]+$ &&
+    "$hostile_storage_nbd_server_pid" -gt 1 &&
+    "$hostile_storage_nbd_server_start_time" =~ ^[0-9]+$ &&
+    "$hostile_storage_nbd_server_executable" == /usr/bin/qemu-nbd ]] ||
+    return 1
+  current_start_time="$(
+    process_start_time "$hostile_storage_nbd_server_pid" 2>/dev/null
+  )" || return 1
+  [[ "$current_start_time" == "$hostile_storage_nbd_server_start_time" ]] ||
+    return 1
+  current_executable="$(
+    readlink -f "/proc/$hostile_storage_nbd_server_pid/exe" 2>/dev/null
+  )" || return 1
+  [[ "$current_executable" == "$hostile_storage_nbd_server_executable" ]] ||
+    return 1
+  current_uid="$(
+    awk '$1 == "Uid:" { print $2; exit }' \
+      "/proc/$hostile_storage_nbd_server_pid/status"
+  )" || return 1
+  [[ "$current_uid" == "$(id -u)" ]]
+}
+
+hostile_storage_nbd_server_state_is() {
+  local expected_state=$1
+  local stat_line
+  local -a stat_fields=()
+
+  [[ "$expected_state" == R || "$expected_state" == S ||
+    "$expected_state" == T ]] || return 1
+  hostile_storage_nbd_server_is_exact || return 1
+  stat_line="$(<"/proc/$hostile_storage_nbd_server_pid/stat")" || return 1
+  [[ "$stat_line" == *") "* ]] || return 1
+  IFS=' ' read -r -a stat_fields <<<"${stat_line##*) }"
+  [[ "${#stat_fields[@]}" -gt 0 &&
+    "${stat_fields[0]}" == "$expected_state" ]]
+}
+
+hostile_storage_nbd_server_is_resumed() {
+  local stat_line
+  local -a stat_fields=()
+
+  hostile_storage_nbd_server_is_exact || return 1
+  stat_line="$(<"/proc/$hostile_storage_nbd_server_pid/stat")" || return 1
+  [[ "$stat_line" == *") "* ]] || return 1
+  IFS=' ' read -r -a stat_fields <<<"${stat_line##*) }"
+  [[ "${#stat_fields[@]}" -gt 0 &&
+    "${stat_fields[0]}" != T &&
+    "${stat_fields[0]}" != t &&
+    "${stat_fields[0]}" != X &&
+    "${stat_fields[0]}" != x &&
+    "${stat_fields[0]}" != Z ]]
+}
+
+hostile_storage_nbd_server_process_is_gone() {
+  local stat_line
+  local -a stat_fields=()
+
+  [[ "$hostile_storage_nbd_server_pid" =~ ^[0-9]+$ &&
+    "$hostile_storage_nbd_server_pid" -gt 1 &&
+    "$hostile_storage_nbd_server_start_time" =~ ^[0-9]+$ ]] || return 1
+  if process_identity_is_gone \
+    "$hostile_storage_nbd_server_pid" \
+    "$hostile_storage_nbd_server_start_time"; then
+    return 0
+  fi
+  stat_line="$(<"/proc/$hostile_storage_nbd_server_pid/stat")" || return 1
+  [[ "$stat_line" == *") "* ]] || return 1
+  IFS=' ' read -r -a stat_fields <<<"${stat_line##*) }"
+  [[ "${#stat_fields[@]}" -gt 0 && "${stat_fields[0]}" == Z ]] || return 1
+  wait "$hostile_storage_nbd_server_pid" 2>/dev/null || true
+  return 0
+}
+
+signal_exact_hostile_storage_nbd_server() {
+  local signal_number=$1
+
+  [[ "$signal_number" == 18 || "$signal_number" == 19 ]] || return 1
+  hostile_storage_nbd_server_is_exact || return 1
+  signal_exact_background_process \
+    "$hostile_storage_nbd_server_pid" \
+    "$hostile_storage_nbd_server_start_time" \
+    "$signal_number"
+}
+
+hostile_storage_nbd_listener_is_exact() {
+  hostile_storage_nbd_server_is_exact || return 1
+  /usr/bin/python3 - \
+    "$hostile_storage_nbd_server_pid" \
+    "$hostile_storage_nbd_port" <<'NBD_LISTENER_PYTHON'
+import os
+from pathlib import Path
+import sys
+
+pid = int(sys.argv[1])
+port = int(sys.argv[2])
+socket_inodes = set()
+for descriptor in (Path("/proc") / str(pid) / "fd").iterdir():
+    try:
+        target = os.readlink(descriptor)
+    except FileNotFoundError:
+        continue
+    if target.startswith("socket:[") and target.endswith("]"):
+        socket_inodes.add(target[8:-1])
+
+wanted_address = f"0100007F:{port:04X}"
+matches = []
+with open("/proc/net/tcp", encoding="ascii") as tcp_table:
+    next(tcp_table)
+    for line in tcp_table:
+        fields = line.split()
+        if len(fields) >= 10 and fields[1] == wanted_address and fields[3] == "0A":
+            matches.append(fields[9])
+if len(matches) != 1 or matches[0] not in socket_inodes:
+    raise SystemExit(1)
+NBD_LISTENER_PYTHON
 }
 
 memory_sampler_process_is_live() {
@@ -898,27 +1038,33 @@ record_hostile_storage_device_identity() {
 }
 
 resume_hostile_storage_for_cleanup() {
-  local suspended_value
+  local resume_deadline
 
   [[ "$hostile_storage_test_enabled" == 1 ]] || return 0
-  [[ "$hostile_storage_dm_created" == 1 ]] || return 0
-  if [[ ! "$hostile_storage_suspended_path" =~ \
-    ^/sys/dev/block/[0-9]+:[0-9]+/dm/suspended$ ]]; then
-    record_hostile_storage_device_identity || return 1
+  [[ "$hostile_storage_nbd_server_started" == 1 ]] || return 0
+  if hostile_storage_nbd_server_process_is_gone; then
+    hostile_storage_nbd_server_started=0
+    hostile_storage_nbd_server_stopped=0
+    return 0
   fi
-  suspended_value="$(hostile_storage_suspended_value)" || return 1
-  [[ "$suspended_value" == 0 || "$suspended_value" == 1 ]] || return 1
-  if [[ "$suspended_value" == 1 ]]; then
-    timeout --signal=TERM --kill-after=5s 10s \
-      sudo dmsetup resume "$hostile_storage_name" || return 1
+  hostile_storage_nbd_server_is_exact || return 1
+  if [[ "$hostile_storage_nbd_server_stopped" == 1 ]] ||
+    hostile_storage_nbd_server_state_is T; then
+    signal_exact_hostile_storage_nbd_server 18 || return 1
   fi
-  [[ "$(hostile_storage_suspended_value)" == 0 ]] || return 1
-  hostile_storage_dm_suspended=0
+  resume_deadline=$((SECONDS + 5))
+  while ! hostile_storage_nbd_server_is_resumed &&
+    ((SECONDS < resume_deadline)); do
+    sleep 0.02
+  done
+  hostile_storage_nbd_server_is_resumed || return 1
+  hostile_storage_nbd_server_stopped=0
 }
 
 cleanup_hostile_storage_stack() {
   local command_status
   local mount_count
+  local server_exit_deadline
 
   [[ "$hostile_storage_test_enabled" == 1 ]] || return 0
   if [[ "$hostile_storage_share_mounted" == 1 ]]; then
@@ -967,27 +1113,78 @@ cleanup_hostile_storage_stack() {
     fi
   fi
 
-  if [[ "$hostile_storage_loop_attached" == 1 ]]; then
-    [[ "$hostile_storage_loop" =~ ^/dev/loop[0-9]+$ ]] || {
+  if [[ "$hostile_storage_nbd_connected" == 1 ]]; then
+    [[ "$hostile_storage_nbd_device" == /dev/nbd0 ]] || {
       cleanup_problem \
-        "refusing unsafe hostile-storage loop detach: $hostile_storage_loop"
+        "refusing unsafe hostile-storage NBD disconnect: $hostile_storage_nbd_device"
       workspace_removal_safe=0
       return 1
     }
-    sudo losetup --detach "$hostile_storage_loop"
+    timeout --signal=TERM --kill-after=5s 10s \
+      sudo nbd-client -d "$hostile_storage_nbd_device"
     command_status=$?
     if [[ "$command_status" != 0 ]]; then
       cleanup_problem \
-        "could not detach hostile-storage loop (status $command_status)"
+        "could not disconnect hostile-storage NBD device (status $command_status)"
       workspace_removal_safe=0
       return 1
     fi
-    hostile_storage_loop_attached=0
-    if sudo losetup "$hostile_storage_loop" >/dev/null 2>&1; then
-      cleanup_problem "hostile-storage loop remains attached"
+    hostile_storage_nbd_connected=0
+    sudo nbd-client -c "$hostile_storage_nbd_device" >/dev/null 2>&1
+    command_status=$?
+    if [[ "$command_status" == 0 ]]; then
+      cleanup_problem "hostile-storage NBD device remains connected"
       workspace_removal_safe=0
       return 1
     fi
+    if [[ "$command_status" != 1 ]]; then
+      cleanup_problem \
+        "could not verify hostile-storage NBD disconnect (status $command_status)"
+      workspace_removal_safe=0
+      return 1
+    fi
+  fi
+
+  if [[ "$hostile_storage_nbd_server_started" == 1 ]]; then
+    if ! hostile_storage_nbd_server_is_exact; then
+      cleanup_problem \
+        "hostile-storage NBD server identity changed before cleanup"
+      workspace_removal_safe=0
+      return 1
+    fi
+    if ! terminate_exact_background_process \
+      "$hostile_storage_nbd_server_pid" \
+      "$hostile_storage_nbd_server_start_time"; then
+      cleanup_problem "could not terminate the exact hostile-storage NBD server"
+      workspace_removal_safe=0
+      return 1
+    fi
+    server_exit_deadline=$((SECONDS + 5))
+    while ! hostile_storage_nbd_server_process_is_gone &&
+      ((SECONDS < server_exit_deadline)); do
+      sleep 0.02
+    done
+    if ! hostile_storage_nbd_server_process_is_gone; then
+      if ! kill_exact_background_process \
+        "$hostile_storage_nbd_server_pid" \
+        "$hostile_storage_nbd_server_start_time"; then
+        cleanup_problem "could not kill the exact hostile-storage NBD server"
+        workspace_removal_safe=0
+        return 1
+      fi
+      server_exit_deadline=$((SECONDS + 2))
+      while ! hostile_storage_nbd_server_process_is_gone &&
+        ((SECONDS < server_exit_deadline)); do
+        sleep 0.02
+      done
+    fi
+    if ! hostile_storage_nbd_server_process_is_gone; then
+      cleanup_problem "hostile-storage NBD server remains after exact SIGKILL"
+      workspace_removal_safe=0
+      return 1
+    fi
+    hostile_storage_nbd_server_started=0
+    hostile_storage_nbd_server_stopped=0
   fi
 }
 
@@ -1030,7 +1227,7 @@ cleanup() {
 
   if ! resume_hostile_storage_for_cleanup; then
     cleanup_problem \
-      "could not resume the isolated hostile-storage mapping; the disposable VM must be terminated"
+      "could not resume the isolated hostile-storage NBD server; the disposable VM must be terminated"
     exit 1
   fi
   cleanup_cgroup_memory_sampler
@@ -2988,8 +3185,14 @@ service_is_deactivating() {
 
 setup_hostile_storage_share() {
   local device_identity
-  local loop_identity
+  local nbd_connection_status
   local mount_evidence
+  local nbd_client_pid
+  local nbd_identity
+  local nbd_listener_count
+  local nbd_server_deadline
+  local nbd_server_pid_metadata
+  local nbd_server_pid_file_value
   local sectors
   local table
 
@@ -3003,13 +3206,40 @@ setup_hostile_storage_share() {
   if sudo dmsetup info "$hostile_storage_name" >/dev/null 2>&1; then
     fail "hostile-storage mapping already exists"
   fi
+  [[ ! -e "$hostile_storage_nbd_pid_file" &&
+    ! -L "$hostile_storage_nbd_pid_file" ]] ||
+    fail "hostile-storage NBD PID path already exists"
+  nbd_listener_count="$(
+    sudo ss -H -ltn "sport = :$hostile_storage_nbd_port" |
+      awk 'END { print NR + 0 }'
+  )" || fail "could not inspect the hostile-storage NBD port"
+  [[ "$nbd_listener_count" == 0 ]] ||
+    fail "hostile-storage NBD port is already bound"
 
-  sudo modprobe loop
+  sudo modprobe nbd nbds_max=1 max_part=0
   sudo modprobe dm_mod
   sudo udevadm settle --timeout=10 ||
     fail "udev did not settle after hostile-storage module loading"
-  sudo test -c /dev/loop-control ||
-    fail "isolated VM loop-control device is unavailable"
+  [[ "$(sudo cat /sys/module/nbd/parameters/nbds_max)" == 1 &&
+    "$(sudo cat /sys/module/nbd/parameters/max_part)" == 0 ]] ||
+    fail "isolated VM NBD module parameters are not exact"
+  [[ "$(find /sys/block -maxdepth 1 -type l -name 'nbd*' -print)" == \
+    /sys/block/nbd0 ]] ||
+    fail "isolated VM does not expose exactly one NBD device"
+  sudo test -b "$hostile_storage_nbd_device" ||
+    fail "isolated VM NBD device is unavailable"
+  if sudo nbd-client -c \
+    "$hostile_storage_nbd_device" >/dev/null 2>&1; then
+    nbd_connection_status=0
+  else
+    nbd_connection_status=$?
+  fi
+  case "$nbd_connection_status" in
+    0) fail "isolated VM NBD device is already connected" ;;
+    1) ;;
+    *) fail \
+      "could not prove the isolated VM NBD device is disconnected" ;;
+  esac
   sudo test -c /dev/mapper/control ||
     fail "isolated VM device-mapper control node is unavailable"
   sudo dmsetup targets |
@@ -3018,24 +3248,117 @@ setup_hostile_storage_share() {
 
   truncate -s 268435456 "$hostile_storage_backing"
   chmod 0600 "$hostile_storage_backing"
-  hostile_storage_loop="$(
-    sudo losetup --find --show "$hostile_storage_backing"
-  )" || fail "could not attach hostile-storage loop"
-  [[ "$hostile_storage_loop" =~ ^/dev/loop[0-9]+$ ]] ||
-    fail "losetup returned an unsafe loop path: $hostile_storage_loop"
-  hostile_storage_loop_attached=1
-  sectors="$(sudo blockdev --getsz "$hostile_storage_loop")" ||
-    fail "could not inspect hostile-storage loop size"
-  [[ "$sectors" =~ ^[0-9]+$ && "$sectors" -eq 524288 ]] ||
-    fail "hostile-storage loop has unexpected sectors: $sectors"
-  loop_identity="$(
-    lsblk --noheadings --nodeps --output MAJ:MIN "$hostile_storage_loop" |
-      tr -d '[:space:]'
-  )" || fail "could not inspect hostile-storage loop identity"
-  [[ "$loop_identity" =~ ^[0-9]+:[0-9]+$ ]] ||
-    fail "hostile-storage loop identity is malformed: $loop_identity"
+  hostile_storage_nbd_server_executable="$(
+    readlink -f "$(command -v qemu-nbd)"
+  )" || fail "could not resolve the hostile-storage NBD server executable"
+  [[ "$hostile_storage_nbd_server_executable" == /usr/bin/qemu-nbd ]] ||
+    fail \
+      "unexpected hostile-storage NBD server: $hostile_storage_nbd_server_executable"
+  [[ ! -e "$hostile_storage_nbd_log" &&
+    ! -L "$hostile_storage_nbd_log" ]] ||
+    fail "hostile-storage NBD log path already exists"
+  install -m 0600 /dev/null "$hostile_storage_nbd_log"
+  "$hostile_storage_nbd_server_executable" \
+    --persistent \
+    --shared=1 \
+    --bind=127.0.0.1 \
+    --port="$hostile_storage_nbd_port" \
+    --export-name="$hostile_storage_nbd_export" \
+    --format=raw \
+    --cache=none \
+    --aio=threads \
+    --pid-file="$hostile_storage_nbd_pid_file" \
+    "$hostile_storage_backing" \
+    >/dev/null 2>"$hostile_storage_nbd_log" &
+  hostile_storage_nbd_server_pid=$!
+  hostile_storage_nbd_server_start_time="$(
+    process_start_time "$hostile_storage_nbd_server_pid"
+  )" || {
+    wait "$hostile_storage_nbd_server_pid" 2>/dev/null || true
+    sed -n '1,20p' "$hostile_storage_nbd_log" >&2
+    fail "could not record the hostile-storage NBD server identity"
+  }
+  hostile_storage_nbd_server_started=1
+  nbd_server_deadline=$((SECONDS + 5))
+  while ! hostile_storage_nbd_server_is_exact &&
+    ((SECONDS < nbd_server_deadline)); do
+    if hostile_storage_nbd_server_process_is_gone; then
+      sed -n '1,20p' "$hostile_storage_nbd_log" >&2
+      fail "hostile-storage NBD server exited before exact identity capture"
+    fi
+    sleep 0.02
+  done
+  hostile_storage_nbd_server_is_exact ||
+    fail "hostile-storage NBD server identity is unsafe"
+  while [[ ! -f "$hostile_storage_nbd_pid_file" ]] &&
+    ((SECONDS < nbd_server_deadline)); do
+    hostile_storage_nbd_server_is_exact || {
+      sed -n '1,20p' "$hostile_storage_nbd_log" >&2
+      fail "hostile-storage NBD server exited before creating its PID file"
+    }
+    sleep 0.02
+  done
+  [[ -f "$hostile_storage_nbd_pid_file" &&
+    ! -L "$hostile_storage_nbd_pid_file" ]] ||
+    fail "hostile-storage NBD server did not create a safe PID file"
+  nbd_server_pid_metadata="$(
+    stat -c '%u:%h' "$hostile_storage_nbd_pid_file"
+  )" || fail "could not inspect the hostile-storage NBD PID file"
+  [[ "$nbd_server_pid_metadata" == "$(id -u):1" ]] ||
+    fail \
+      "hostile-storage NBD PID file metadata is unsafe: $nbd_server_pid_metadata"
+  nbd_server_pid_file_value="$(
+    tr -d '[:space:]' <"$hostile_storage_nbd_pid_file"
+  )" || fail "could not read the hostile-storage NBD server PID"
+  [[ "$nbd_server_pid_file_value" =~ ^[0-9]+$ &&
+    "$nbd_server_pid_file_value" -gt 1 &&
+    "$nbd_server_pid_file_value" == \
+      "$hostile_storage_nbd_server_pid" ]] ||
+    fail "hostile-storage NBD server PID is invalid"
+  hostile_storage_nbd_server_is_exact ||
+    fail "hostile-storage NBD server identity is unsafe"
+  while ! hostile_storage_nbd_listener_is_exact &&
+    ((SECONDS < nbd_server_deadline)); do
+    sleep 0.02
+  done
+  if ! hostile_storage_nbd_listener_is_exact; then
+    sed -n '1,20p' "$hostile_storage_nbd_log" >&2
+    fail "hostile-storage NBD server is not the exact loopback listener"
+  fi
 
-  table="0 $sectors linear $loop_identity 0"
+  if ! timeout --signal=TERM --kill-after=5s 10s \
+    sudo nbd-client \
+      127.0.0.1 \
+      "$hostile_storage_nbd_port" \
+      "$hostile_storage_nbd_device" \
+      -N "$hostile_storage_nbd_export"; then
+    if sudo nbd-client -c \
+      "$hostile_storage_nbd_device" >/dev/null 2>&1; then
+      hostile_storage_nbd_connected=1
+    fi
+    fail "could not connect the hostile-storage NBD device"
+  fi
+  hostile_storage_nbd_connected=1
+  nbd_client_pid="$(
+    sudo nbd-client -c "$hostile_storage_nbd_device" | tr -d '[:space:]'
+  )" || fail "could not verify the hostile-storage NBD connection"
+  [[ "$nbd_client_pid" =~ ^[0-9]+$ && "$nbd_client_pid" -gt 1 ]] ||
+    fail "hostile-storage NBD client PID is invalid: $nbd_client_pid"
+  [[ "$(sudo cat /sys/block/nbd0/pid)" == "$nbd_client_pid" ]] ||
+    fail "hostile-storage NBD kernel identity changed"
+  sectors="$(sudo blockdev --getsz "$hostile_storage_nbd_device")" ||
+    fail "could not inspect hostile-storage NBD size"
+  [[ "$sectors" =~ ^[0-9]+$ && "$sectors" -eq 524288 ]] ||
+    fail "hostile-storage NBD device has unexpected sectors: $sectors"
+  nbd_identity="$(
+    lsblk --noheadings --nodeps --output MAJ:MIN \
+      "$hostile_storage_nbd_device" |
+      tr -d '[:space:]'
+  )" || fail "could not inspect hostile-storage NBD identity"
+  [[ "$nbd_identity" == 43:0 ]] ||
+    fail "hostile-storage NBD identity is unexpected: $nbd_identity"
+
+  table="0 $sectors linear $nbd_identity 0"
   if ! sudo dmsetup create "$hostile_storage_name" --table "$table"; then
     if sudo dmsetup info "$hostile_storage_name" >/dev/null 2>&1; then
       hostile_storage_dm_created=1
@@ -3821,15 +4144,19 @@ if [[ "$hostile_storage_test_enabled" == 1 ]]; then
   printf '3\n' | sudo tee /proc/sys/vm/drop_caches >/dev/null
   [[ "$(hostile_storage_suspended_value)" == 0 ]] ||
     fail "hostile-storage mapping was suspended before the test"
-  if ! sudo dmsetup suspend --nolockfs --noflush "$hostile_storage_name"; then
-    if [[ "$(hostile_storage_suspended_value 2>/dev/null || true)" == 1 ]]; then
-      hostile_storage_dm_suspended=1
-    fi
-    fail "could not suspend the hostile-storage mapping"
-  fi
-  hostile_storage_dm_suspended=1
-  [[ "$(hostile_storage_suspended_value)" == 1 ]] ||
-    fail "device-mapper did not report the hostile-storage suspension"
+  hostile_storage_nbd_server_is_exact ||
+    fail "hostile-storage NBD server identity changed before fault injection"
+  hostile_storage_nbd_listener_is_exact ||
+    fail "hostile-storage NBD loopback listener changed before fault injection"
+  hostile_storage_nbd_server_stopped=1
+  signal_exact_hostile_storage_nbd_server 19 ||
+    fail "could not stop the exact hostile-storage NBD server"
+  hostile_nbd_stop_deadline=$((SECONDS + 5))
+  wait_until_before "hostile-storage NBD server stop" \
+    "$hostile_nbd_stop_deadline" \
+    hostile_storage_nbd_server_state_is T
+  [[ "$(hostile_storage_suspended_value)" == 0 ]] ||
+    fail "hostile-storage mapping, rather than its NBD server, was suspended"
 
   hostile_blocked_deadline=$((SECONDS + 8))
   for _ in {1..4}; do
@@ -3962,13 +4289,18 @@ if [[ "$hostile_storage_test_enabled" == 1 ]]; then
   assert_hostile_storage_worker_boundaries kill-pending 1
   wait_until "unchanged management sentinel during pending restart" \
     sentinel_is_unchanged
-  [[ "$(hostile_storage_suspended_value)" == 1 ]] ||
-    fail "hostile-storage mapping resumed without operator action"
-
-  sudo dmsetup resume "$hostile_storage_name"
+  hostile_storage_nbd_server_state_is T ||
+    fail "hostile-storage NBD server resumed without operator action"
   [[ "$(hostile_storage_suspended_value)" == 0 ]] ||
-    fail "hostile-storage mapping did not resume"
-  hostile_storage_dm_suspended=0
+    fail "hostile-storage mapping changed during the NBD fault"
+
+  signal_exact_hostile_storage_nbd_server 18 ||
+    fail "could not resume the exact hostile-storage NBD server"
+  hostile_nbd_resume_deadline=$((SECONDS + 5))
+  wait_until_before "hostile-storage NBD server resume" \
+    "$hostile_nbd_resume_deadline" \
+    hostile_storage_nbd_server_is_resumed
+  hostile_storage_nbd_server_stopped=0
   hostile_recovery_deadline=$((SECONDS + 30))
   for hostile_worker_index in "${!hostile_worker_pids[@]}"; do
     wait_until_before \
@@ -4013,7 +4345,7 @@ if [[ "$hostile_storage_test_enabled" == 1 ]]; then
   wait_until "unchanged management sentinel after hostile-storage recovery" \
     sentinel_is_unchanged
   printf \
-    'real device-mapper D-state recovery passed: workers=4 tasks=%s memory=%s\n' \
+    'real loopback-NBD D-state recovery passed: workers=4 tasks=%s memory=%s\n' \
     "$hostile_tasks_current" "$hostile_memory_current"
 fi
 

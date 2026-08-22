@@ -27,9 +27,9 @@ the privileged management daemon. The standalone coordinator delegates
 bootstrap, list, open, and read operations to bounded same-binary workers and
 retains no readable share file. This is the candidate blocking-I/O boundary, but
 [Issue #25](https://github.com/EdmundFu-233/ReCasaOS/issues/25) remains a
-production public-readiness blocker until the remaining real FUSE or
-remote-backed storage cases and the exact target-host matrix prove the complete
-deployment boundary.
+production public-readiness blocker until the remaining real FUSE,
+cross-host/permanent-failure storage cases, and the exact target-host matrix
+prove the complete deployment boundary.
 
 The portal is deliberately limited:
 
@@ -252,25 +252,28 @@ staged control for
 [Issue #22](https://github.com/EdmundFu-233/ReCasaOS/issues/22), not proof that
 the isolated portal process can safely contain every blocking storage failure.
 The bounded worker protocol is implemented. The Debian 11 QEMU qualification
-job additionally creates a dedicated 256 MiB loop-backed ext4 filesystem behind
-a device-mapper linear target entirely inside the disposable guest. After the
-production portal has pinned that root, the job drops the guest's clean caches
-and suspends only that test mapping with `--nolockfs --noflush`. Four concurrent
-authenticated directory operations must enter real kernel D-state. Their fixed
-operation deadlines must each return 503 with `Retry-After`, leave the exact
-pidfd-signalled child in D-state, and trip the four-worker quarantine threshold
-without creating a fifth child. The job records live unit task and memory
-headroom, proves that the independent management sentinel is unchanged, and
-requests a non-blocking portal restart. systemd must remain in deactivation
-behind the four reparented D-state children until an explicit mapper resume;
-after that operator action the exact old workers must disappear, a new portal
-invocation must pass the isolation checks, and the original file bytes must be
-readable. Cleanup always attempts the exact mapper resume before stopping any
-unit, then unmounts and removes only the recorded mapping and loop device.
+job is configured to create a dedicated 256 MiB raw image, export it from an
+unprivileged `qemu-nbd` process bound only to guest `127.0.0.1`, attach the
+export to the kernel's exact `/dev/nbd0`, and place a device-mapper linear target
+and ext4 filesystem above it. After the production portal has pinned that root,
+the job drops the guest's clean caches and stops only the recorded NBD server
+through a pidfd. Four concurrent authenticated directory operations must enter
+real kernel D-state. Their fixed operation deadlines must each return 503 with
+`Retry-After`, leave the exact pidfd-signalled child in D-state, and trip the
+four-worker quarantine threshold without creating a fifth child. The job
+records live unit task and memory headroom, proves that the independent
+management sentinel is unchanged, and requests a non-blocking portal restart.
+systemd must remain in deactivation behind the four reparented D-state children
+until an explicit pidfd `SIGCONT`; after that operator action the exact old
+workers must disappear, a new portal invocation must pass the isolation checks,
+and the original file bytes must be readable. Cleanup first resumes the exact
+server if necessary, then stops the units, unmounts the share, removes only the
+recorded mapper, disconnects `/dev/nbd0`, and terminates the recorded server.
 
-This is real recoverable device-mapper D-state evidence, not proof for FUSE,
-NBD/iSCSI, a permanently failed device, every kernel fault, or the exact target
-host. Those separate gates remain required by
+This is a recoverable loopback-TCP NBD remote-block protocol case with real
+kernel D-state, not proof for FUSE, iSCSI, a cross-host network partition, a
+permanently failed device, every kernel fault, or the exact target host. Those
+separate gates remain required by
 [Issue #25](https://github.com/EdmundFu-233/ReCasaOS/issues/25).
 The hosted systemd job uses the production build for activation, sandbox and
 API smoke checks. For deterministic worker saturation and coordinator cleanup,
@@ -429,8 +432,8 @@ usable.
 > only an archive of the clean exact commit plus the pinned Go toolchain, and
 > reruns the live isolation suite inside the guest. It exercises the three
 > read-only effective-limit binds, readiness, restart, cancellation, cleanup,
-> worker capacity, resource headroom, and the isolated recoverable
-> device-mapper D-state scenario described above. Its eight-worker aggregate
+> worker capacity, resource headroom, and the isolated recoverable loopback-NBD
+> D-state scenario described above. Its eight-worker aggregate
 > orchestration window is 30 seconds under QEMU TCG, versus 15 seconds on the
 > native hosted runner. The eight holders are launched without serializing
 > each admission, then every client, stopped worker, and exact event chain must
@@ -446,7 +449,7 @@ usable.
 > which is at least the sampled peak. A skipped or failed VM job is not
 > compatibility evidence.
 > Keep Issue #25 open, and do not enable public routing merely because this VM
-> job passes: real FUSE or remote-backed block behavior, permanent-failure
+> job passes: real FUSE, cross-host remote-block behavior, permanent-failure
 > handling, and the exact target-host recovery matrix remain separate release
 > gates.
 > Debian 11 is a compatibility target, not a recommended new deployment
@@ -1112,14 +1115,14 @@ token in the URL. Also verify:
 | TLS | Trusted chain and hostname; TLS 1.2/1.3; renewal tested and monitored. |
 | Authentication | Missing, malformed, duplicate, wrong, and query-string tokens fail without revealing why. After atomic verifier publication and a controlled restart, the old bearer returns 401 and the new bearer returns 200. |
 | Credential isolation | The raw `rc1_` bearer was generated off-host, its only durable operator copy is in the password manager, and the host provisions only the exact versioned verifier through `recasaos-public-file-verifier`; authorized requests still place the bearer transiently in edge and portal memory. `LimitCORE=0` is active. Missing or malformed verifier input and every non-empty legacy `RECASAOS_PUBLIC_FILE_*` environment setting fail startup. Bidirectional bind-alias and rollback tests fail closed. |
-| Process isolation | systemd owns the Internet-facing loopback socket; the coordinator and workers run under the dedicated non-root `recasaos-public` identity, have no capability or CasaOS-service dependency, cannot create IP sockets, see only the minimal root, read-only share, credential, and three read-only effective cgroup limit files, and can fail/restart without changing the management daemon PID or health. Before loading the credential, the coordinator proves exact service cgroup membership and the source, mount identity, filesystem, read-only flag, and value of all three limit files. It becomes nondumpable; its retained storage and authentication state is limited to the verifier digest, an `O_PATH` root descriptor, fixed mount metadata, and bounded worker-manager state. It reports readiness only after bootstrap and HTTP accept. Bootstrap, list, open, classification, and read run in same-binary workers which inherit neither the AF_INET listener nor raw bearer. At most eight workers are active. Pre-response overload and list/open timeout return 503 with `Retry-After`; a mid-stream read timeout aborts the response connection because its success headers are already committed. Pidfd cancellation and `KillMode=control-group` clean normally killable children. A non-ESRCH pidfd signaling error closes later admission without a numeric-PID fallback. The repository's isolated Debian/QEMU job must prove the recoverable device-mapper D-state case, but this row and Issue #25 remain open until FUSE or remote-backed behavior and the exact target host prove the same admission, resource, restart, and recovery bounds. |
+| Process isolation | systemd owns the Internet-facing loopback socket; the coordinator and workers run under the dedicated non-root `recasaos-public` identity, have no capability or CasaOS-service dependency, cannot create IP sockets, see only the minimal root, read-only share, credential, and three read-only effective cgroup limit files, and can fail/restart without changing the management daemon PID or health. Before loading the credential, the coordinator proves exact service cgroup membership and the source, mount identity, filesystem, read-only flag, and value of all three limit files. It becomes nondumpable; its retained storage and authentication state is limited to the verifier digest, an `O_PATH` root descriptor, fixed mount metadata, and bounded worker-manager state. It reports readiness only after bootstrap and HTTP accept. Bootstrap, list, open, classification, and read run in same-binary workers which inherit neither the AF_INET listener nor raw bearer. At most eight workers are active. Pre-response overload and list/open timeout return 503 with `Retry-After`; a mid-stream read timeout aborts the response connection because its success headers are already committed. Pidfd cancellation and `KillMode=control-group` clean normally killable children. A non-ESRCH pidfd signaling error closes later admission without a numeric-PID fallback. The repository's isolated Debian/QEMU job must prove the recoverable loopback-TCP NBD D-state case, but this row and Issue #25 remain open until FUSE, cross-host/permanent-failure behavior, and the exact target host prove the same admission, resource, restart, and recovery bounds. |
 | Platform floor | The exact release candidate passes the `Debian 11 systemd 247 PID1 VM` job under PID 1 on a pristine, ephemeral Debian 11/systemd 247 host with Linux 5.8 or newer and unified cgroup v2. Record the exact commit and image digest, manager and kernel versions, the three cgroup-control-file mount identities, cgroup2/read-only provenance, effective values, readiness, restart, cancellation, cleanup, and version-appropriate resource-headroom evidence. A skipped job, Ubuntu 24.04-only, parser-only, or ordinary-container evidence does not satisfy this row. |
 | Path confinement | Absolute/parent/encoded traversal, hidden names, symlinks, hardlinks, mount points, devices, pipes, and sockets cannot be listed or downloaded. |
 | Root filesystem | Startup records the mount ID and allowlisted filesystem type from the pinned root FD. FUSE, network, overlay, ZFS, and unknown roots are rejected before the listener is usable; replacing or remounting the configured pathname does not redirect the live portal away from its original descriptor. |
 | Browser boundary | CSP has no inline/eval allowance; the supplied client is designed not to write the bearer to a URL, Referer, history, cookie, Cache API, Web Storage, or IndexedDB, while page, Worker, header, edge, and server request memory remain transient handling boundaries. In stable Chromium, Firefox, and WebKit over real HTTPS, verify storage, DevTools, proxy/application logs, and crash artifacts do not retain it; verify a large download starts without full-body buffering and preserves bytes/filename; replay, another tab, Worker restart, logout, rotation, redirect, and malformed messages fail closed. Record memory measurements and initial Range, retry/resume, and cancellation results. |
 | Response handling | GET, HEAD, and one byte range work, including offsets above 4 GiB; multi-range work is rejected; 401/404/416/503 and successful private-file responses retain `no-store` and `nosniff`. A progressing transfer can cross the base write timeout, while idle and below-budget clients are terminated. |
 | Client cancellation | After a large response starts, abort the client and verify that the chosen edge promptly closes its loopback upstream request and releases portal download capacity. Test both HTTP/1.1 and HTTP/2 at the public edge when both are enabled. |
-| Resource bounds | Eight concurrent storage workers succeed while a ninth request returns 503 with `Retry-After`; `TasksCurrent` and `MemoryCurrent` remain below the reviewed unit headroom. Record `MemoryPeak` when the manager exposes it; systemd 247 instead requires separately reviewed guest-side peak sampling or equivalent version-appropriate evidence, and the missing property is not itself a pass. Workers expose neither the AF_INET listener nor raw bearer, all non-stdio descriptors are close-on-exec, and normally killable workers are reaped after cancellation and coordinator SIGKILL. Injected pidfd-signaling failure must close admission and retain capacity until reap. The isolated recoverable device-mapper D-state case must prove the four-worker quarantine admission threshold, `TasksMax=256`, `MemoryMax=512M`, `MemorySwapMax=0`, pending restart behavior, and explicit-resume recovery. Real FUSE or remote-backed and permanent-failure cases must reproduce the relevant bounds before public exposure. `LimitNOFILE` and worker RLIMITs are per-process rather than an aggregate cgroup FD cap. Oversized directory and request-body tests fail; Nginx rate/connection limits or the separately reviewed Caddy-fronting limiter are exercised. |
+| Resource bounds | Eight concurrent storage workers succeed while a ninth request returns 503 with `Retry-After`; `TasksCurrent` and `MemoryCurrent` remain below the reviewed unit headroom. Record `MemoryPeak` when the manager exposes it; systemd 247 instead requires separately reviewed guest-side peak sampling or equivalent version-appropriate evidence, and the missing property is not itself a pass. Workers expose neither the AF_INET listener nor raw bearer, all non-stdio descriptors are close-on-exec, and normally killable workers are reaped after cancellation and coordinator SIGKILL. Injected pidfd-signaling failure must close admission and retain capacity until reap. The isolated recoverable loopback-TCP NBD D-state case must prove the four-worker quarantine admission threshold, `TasksMax=256`, `MemoryMax=512M`, `MemorySwapMax=0`, pending restart behavior, and explicit-resume recovery. Real FUSE, cross-host remote-block, and permanent-failure cases must reproduce the relevant bounds before public exposure. `LimitNOFILE` and worker RLIMITs are per-process rather than an aggregate cgroup FD cap. Oversized directory and request-body tests fail; Nginx rate/connection limits or the separately reviewed Caddy-fronting limiter are exercised. |
 | Logs | No bearer, verifier, query, private host path, file content, cookie, or personal data appears in edge/application logs or crash artifacts. Because Caddy/Nginx runtime errors may include the URI/query independently of access-log formatting, an exact-version filter or reviewed disable/drop policy is active and fault injection proves upstream failures, timeouts, aborts, malformed requests, and TLS/routing errors remain query-free in every collected sink. Without that evidence this row fails. |
 | Backups | Share and configuration can be restored to an isolated host with recorded checksums and acceptable RPO/RTO. |
 

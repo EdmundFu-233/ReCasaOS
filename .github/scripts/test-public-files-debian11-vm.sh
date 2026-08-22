@@ -277,7 +277,9 @@ packages:
   - file
   - iproute2
   - kmod
+  - nbd-client
   - procps
+  - qemu-utils
   - sudo
   - udev
   - util-linux

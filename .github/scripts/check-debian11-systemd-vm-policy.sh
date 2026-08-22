@@ -176,7 +176,7 @@ require_text "$vm_script" \
 require_text "$vm_script" \
   'RECASAOS_HOSTILE_STORAGE_VM_CI=1' \
   "guest hostile-storage opt-in is missing"
-for guest_package in dmsetup e2fsprogs kmod udev; do
+for guest_package in dmsetup e2fsprogs kmod nbd-client qemu-utils udev; do
   require_exact_line "$vm_script" "  - $guest_package" \
     "guest hostile-storage package is missing: $guest_package"
 done
@@ -283,8 +283,23 @@ require_exact_line "$systemd_script" \
   '    hostile_storage_test_enabled=1' \
   "Debian VM does not enable hostile-storage testing"
 require_text "$systemd_script" \
-  'sudo dmsetup suspend --nolockfs --noflush "$hostile_storage_name"' \
-  "hostile-storage suspension does not avoid filesystem sync and I/O flush"
+  'sudo modprobe nbd nbds_max=1 max_part=0' \
+  "hostile-storage phase does not load one exact partitionless NBD device"
+require_text "$systemd_script" \
+  'fail "isolated VM NBD module parameters are not exact"' \
+  "hostile-storage phase does not verify the loaded NBD module parameters"
+require_text "$systemd_script" \
+  '--bind=127.0.0.1 \' \
+  "hostile-storage NBD server is not bound to exact loopback"
+require_text "$systemd_script" \
+  'sudo nbd-client \' \
+  "hostile-storage phase does not attach a kernel NBD client"
+require_text "$systemd_script" \
+  'signal_exact_hostile_storage_nbd_server 19' \
+  "hostile-storage phase does not stop the exact NBD server"
+require_text "$systemd_script" \
+  'fail "hostile-storage mapping, rather than its NBD server, was suspended"' \
+  "hostile-storage phase does not prove the mapper remains active"
 require_text "$systemd_script" \
   'storage_workers_are_in_d_state 4' \
   "hostile-storage phase does not require four real D-state workers"
@@ -398,6 +413,120 @@ expected = """  hostile_blocked_deadline=$((SECONDS + 8))
 """
 if formation != expected:
     raise SystemExit("hostile-storage live formation sequence changed")
+
+def unique_slice(start, end, label):
+    if source.count(start) != 1 or source.count(end) != 1:
+        raise SystemExit(f"{label} sentinels are not unique")
+    return source.split(start, 1)[1].split(end, 1)[0]
+
+def require_order(scope, fragments, label):
+    positions = []
+    for fragment in fragments:
+        if scope.count(fragment) != 1:
+            raise SystemExit(f"{label} proof is not unique: {fragment!r}")
+        positions.append(scope.index(fragment))
+    if positions != sorted(positions):
+        raise SystemExit(f"{label} ordering changed")
+
+setup = unique_slice(
+    "setup_hostile_storage_share() {",
+    "\n}\n\nrunner_uid=",
+    "hostile-storage NBD setup",
+)
+require_order(
+    setup,
+    (
+        "sudo modprobe nbd nbds_max=1 max_part=0",
+        '"$hostile_storage_nbd_server_executable" \\\n    --persistent',
+        "hostile_storage_nbd_server_pid=$!",
+        "nbd_server_deadline=$((SECONDS + 5))",
+        "while ! hostile_storage_nbd_server_is_exact &&\n"
+        "    ((SECONDS < nbd_server_deadline)); do",
+        "if hostile_storage_nbd_server_process_is_gone; then",
+        "sudo nbd-client \\\n      127.0.0.1",
+        'table="0 $sectors linear $nbd_identity 0"',
+        'sudo dmsetup create "$hostile_storage_name" --table "$table"',
+    ),
+    "hostile-storage NBD setup",
+)
+for setup_proof in (
+    "--shared=1 \\",
+    "--bind=127.0.0.1 \\",
+    '--port="$hostile_storage_nbd_port" \\',
+    '--export-name="$hostile_storage_nbd_export" \\',
+    "--format=raw \\",
+    "--cache=none \\",
+    "--aio=threads \\",
+    '--pid-file="$hostile_storage_nbd_pid_file" \\',
+    'fail "hostile-storage NBD server exited before exact identity capture"',
+    '[[ "$nbd_identity" == 43:0 ]]',
+):
+    if setup.count(setup_proof) != 1:
+        raise SystemExit(f"hostile-storage NBD setup proof changed: {setup_proof!r}")
+
+for identity_proof in (
+    'readlink -f "/proc/$hostile_storage_nbd_server_pid/exe"',
+    '"/proc/$hostile_storage_nbd_server_pid/status"',
+    'wanted_address = f"0100007F:{port:04X}"',
+    "matches[0] not in socket_inodes",
+    '"$hostile_storage_nbd_server_start_time" \\\n    "$signal_number"',
+):
+    if source.count(identity_proof) != 1:
+        raise SystemExit(
+            f"hostile-storage NBD identity proof changed: {identity_proof!r}"
+        )
+
+full_live_phase = unique_slice(
+    phase_start,
+    "\nfi\n\nfor blocked_file in",
+    "hostile-storage complete live phase",
+)
+require_order(
+    full_live_phase,
+    (
+        "signal_exact_hostile_storage_nbd_server 19",
+        'wait_until_before "hostile-storage NBD server stop"',
+        launch_start,
+        "assert_hostile_storage_worker_boundaries kill-pending 1",
+        "signal_exact_hostile_storage_nbd_server 18",
+        'wait_until_before "hostile-storage NBD server resume"',
+    ),
+    "hostile-storage NBD fault/recovery",
+)
+
+cleanup_main = unique_slice(
+    "\ncleanup() {",
+    "\n}\ntrap cleanup EXIT",
+    "hostile-storage main cleanup",
+)
+require_order(
+    cleanup_main,
+    (
+        "if ! resume_hostile_storage_for_cleanup; then",
+        "cleanup_cgroup_memory_sampler",
+        'for unit in "$socket_unit" "$service_unit" "$sentinel_unit"; do\n'
+        '    cleanup_control_groups["$unit"]="$(',
+        'if [[ "$nested_mount_cleanup_required" == 1 ]]; then',
+        "cleanup_hostile_storage_stack",
+    ),
+    "hostile-storage main cleanup",
+)
+
+cleanup_stack = unique_slice(
+    "cleanup_hostile_storage_stack() {",
+    "\n}\n\ncleanup_public_port_is_unbound",
+    "hostile-storage stack cleanup",
+)
+require_order(
+    cleanup_stack,
+    (
+        'sudo umount -- "$share"',
+        'sudo dmsetup remove --retry "$hostile_storage_name"',
+        'sudo nbd-client -d "$hostile_storage_nbd_device"',
+        "if ! terminate_exact_background_process \\",
+    ),
+    "hostile-storage stack cleanup",
+)
 PYTHON
 then
   fail "hostile-storage formation sequence changed"
@@ -422,15 +551,18 @@ require_text "$systemd_script" \
   "hostile-storage restart does not prove orphaned D-state worker identity"
 require_text "$systemd_script" \
   'if ! resume_hostile_storage_for_cleanup; then' \
-  "hostile-storage cleanup does not resume I/O before stopping systemd"
+  "hostile-storage cleanup does not resume NBD I/O before stopping systemd"
 require_text "$systemd_script" \
   'sudo dmsetup remove --retry "$hostile_storage_name"' \
   "hostile-storage cleanup does not remove the exact device mapping"
 require_text "$systemd_script" \
-  'sudo losetup --detach "$hostile_storage_loop"' \
-  "hostile-storage cleanup does not detach the exact loop device"
+  'sudo nbd-client -d "$hostile_storage_nbd_device"' \
+  "hostile-storage cleanup does not disconnect the exact NBD device"
 require_text "$systemd_script" \
-  'real device-mapper D-state recovery passed:' \
+  'terminate_exact_background_process \' \
+  "hostile-storage cleanup does not terminate by recorded process identity"
+require_text "$systemd_script" \
+  'real loopback-NBD D-state recovery passed:' \
   "hostile-storage phase has no explicit success evidence"
 
 for sampler_proof in \

@@ -121,9 +121,18 @@ expect_rejection memory-peak-fail-open systemd \
 expect_rejection host-hostile-storage-enable systemd \
   '    hostile_storage_test_enabled=0' \
   '    hostile_storage_test_enabled=1'
-expect_rejection hostile-storage-flushing-suspend systemd \
-  'sudo dmsetup suspend --nolockfs --noflush "$hostile_storage_name"' \
-  'sudo dmsetup suspend "$hostile_storage_name"'
+expect_rejection hostile-storage-nbd-non-loopback systemd \
+  '--bind=127.0.0.1 \' \
+  '--bind=0.0.0.0 \'
+expect_rejection hostile-storage-multiple-nbd-devices systemd \
+  'sudo modprobe nbd nbds_max=1 max_part=0' \
+  'sudo modprobe nbd nbds_max=16 max_part=16'
+expect_rejection hostile-storage-wrong-stop-signal systemd \
+  'signal_exact_hostile_storage_nbd_server 19' \
+  'signal_exact_hostile_storage_nbd_server 15'
+expect_rejection hostile-storage-nbd-exec-race systemd \
+  'while ! hostile_storage_nbd_server_is_exact &&' \
+  'while ! hostile_storage_nbd_server_is_exact && false &&'
 expect_rejection hostile-storage-fake-state systemd \
   'if task_state == b"D":' \
   'if task_state == b"T":'
