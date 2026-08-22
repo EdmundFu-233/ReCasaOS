@@ -5,19 +5,24 @@ import (
 	"net/http"
 	"strconv"
 
+	commonjwt "github.com/IceWhaleTech/CasaOS-Common/utils/jwt"
 	"github.com/IceWhaleTech/CasaOS/codegen"
 	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
 	"github.com/labstack/echo/v4"
 )
 
 func (c *CasaOS) CheckUploadChunk(ctx echo.Context, params codegen.CheckUploadChunkParams) error {
+	principalID, err := authenticatedUploadPrincipalID(ctx)
+	if err != nil {
+		return err
+	}
 	identifier := ctx.QueryParam("identifier")
 	chunkNumber, err := strconv.ParseInt(ctx.QueryParam("chunkNumber"), 10, 64)
 	if err != nil {
 		return ctx.NoContent(http.StatusBadRequest)
 	}
 
-	err = c.fileUploadService.TestChunk(ctx, identifier, chunkNumber)
+	err = c.fileUploadService.TestChunk(ctx, principalID, identifier, chunkNumber)
 	if err != nil {
 		return ctx.NoContent(http.StatusNoContent)
 	}
@@ -25,6 +30,10 @@ func (c *CasaOS) CheckUploadChunk(ctx echo.Context, params codegen.CheckUploadCh
 }
 
 func (c *CasaOS) PostUploadFile(ctx echo.Context) error {
+	principalID, err := authenticatedUploadPrincipalID(ctx)
+	if err != nil {
+		return err
+	}
 	const multipartOverheadAllowance int64 = 1 << 20
 	const multipartMemory = 32 << 20
 	requestLimit := filesecurity.MaxUploadChunkSize + multipartOverheadAllowance
@@ -79,6 +88,7 @@ func (c *CasaOS) PostUploadFile(ctx echo.Context) error {
 
 	err = c.fileUploadService.UploadFile(
 		ctx,
+		principalID,
 		path,
 		chunkNumber,
 		chunkSize,
@@ -94,6 +104,21 @@ func (c *CasaOS) PostUploadFile(ctx echo.Context) error {
 		return respondUploadMutationFailure(ctx, err)
 	}
 	return ctx.NoContent(http.StatusOK)
+}
+
+// authenticatedUploadPrincipalID accepts only the typed claims installed by
+// echo-jwt after access-token validation. Request headers are deliberately not
+// authentication evidence, and the optional loopback bypass has no principal
+// to bind a resumable upload to, so both cases fail closed here.
+func authenticatedUploadPrincipalID(ctx echo.Context) (int, error) {
+	if ctx == nil {
+		return 0, echo.ErrUnauthorized
+	}
+	claims, ok := ctx.Get("user").(*commonjwt.Claims)
+	if !ok || claims == nil || claims.ID < 1 {
+		return 0, echo.ErrUnauthorized
+	}
+	return claims.ID, nil
 }
 
 func respondUploadMutationFailure(ctx echo.Context, err error) error {

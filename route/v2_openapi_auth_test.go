@@ -254,6 +254,26 @@ func TestInitV2RouterAuthenticatesBeforeOpenAPIValidation(t *testing.T) {
 	}
 }
 
+func TestInitV2RouterRejectsPrincipalLessLoopbackUpload(t *testing.T) {
+	t.Setenv(httpsecurity.TrustLoopbackAuthBypassEnv, "1")
+
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"http://device.test"+V2APIPath+"/file/upload",
+		strings.NewReader("--test-boundary--\r\n"),
+	)
+	request.RemoteAddr = "127.0.0.1:43120"
+	request.Header.Set(echo.HeaderContentType, "multipart/form-data; boundary=test-boundary")
+	request.Header.Set("user_id", "1")
+	response := httptest.NewRecorder()
+
+	InitV2Router().ServeHTTP(response, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d; body = %s", response.Code, http.StatusUnauthorized, response.Body.String())
+	}
+}
+
 func TestInitV2RouterRejectsRepeatedScalarQueryValues(t *testing.T) {
 	t.Setenv(httpsecurity.TrustLoopbackAuthBypassEnv, "1")
 
