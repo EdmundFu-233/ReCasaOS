@@ -2,6 +2,20 @@
 
 set -eu
 
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd -P)
+cd -- "$repo_root"
+
+command -v go >/dev/null 2>&1 || {
+    echo "Release policy violation: Go is unavailable for the component-lock checker." >&2
+    exit 1
+}
+env \
+    CGO_ENABLED=0 \
+    GOTOOLCHAIN=local \
+    GOWORK=off \
+    go run -mod=readonly .github/scripts/check-component-lock.go
+
 update_path="build/sysroot/usr/share/casaos/shell/update.sh"
 migration_path="build/scripts/migration"
 for scan_path in "$update_path" "$migration_path"; do
@@ -32,31 +46,5 @@ for scan_path in "$update_path" "$migration_path"; do
             echo "Release policy violation: could not inspect $scan_path (grep status $grep_status)." >&2
             exit 1
         fi
-    fi
-done
-
-for config in .goreleaser.yaml .goreleaser.debug.yaml; do
-    if ! awk '
-        $0 == "release:" {
-            in_release = 1
-            release_sections++
-            next
-        }
-        in_release && /^[^[:space:]#]/ {
-            in_release = 0
-        }
-        in_release &&
-            /^[[:space:]]+disable:[[:space:]]+true[[:space:]]*$/ {
-            disabled_release_sections++
-        }
-        END {
-            if (release_sections != 1 ||
-                disabled_release_sections != 1) {
-                exit 1
-            }
-        }
-    ' "$config"; then
-        echo "Release policy violation: $config must keep release.disable: true." >&2
-        exit 1
     fi
 done

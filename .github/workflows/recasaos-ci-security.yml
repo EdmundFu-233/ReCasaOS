@@ -48,8 +48,12 @@ jobs:
       - name: Exercise SMB2 module boundary fixtures
         run: .github/scripts/test-smb2-module-boundary.sh
 
-      - name: Enforce offline release and migration policy
+      - name: Enforce offline release, migration, and component-lock policy
         run: .github/scripts/check-release-policy.sh
+
+      - name: Exercise component-lock policy negative cases
+        shell: bash
+        run: bash .github/scripts/test-component-lock-policy.sh
 
       - name: Verify trusted privileged exact-SHA policy
         run: .github/scripts/test-trusted-privileged-workflow.sh

@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "publication_state": "hold",
+  "components": [
+    {
+      "name": "app-management",
+      "state": "locked",
+      "source_repository": "https://example.invalid/recasaos/app-management",
+      "source_revision": "1111111111111111111111111111111111111111",
+      "artifact_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "license": "Apache-2.0",
+      "api_schema": "not-applicable",
+      "compatibility_status": "passed"
+    },
+    {
+      "name": "gateway",
+      "state": "unresolved",
+      "reason": "Test fixture: unresolved."
+    },
+    {
+      "name": "user-service",
+      "state": "unresolved",
+      "reason": "Test fixture: unresolved."
+    },
+    {
+      "name": "message-bus",
+      "state": "unresolved",
+      "reason": "Test fixture: unresolved."
+    },
+    {
+      "name": "administrative-ui",
+      "state": "unresolved",
+      "reason": "Test fixture: unresolved."
+    },
+    {
+      "name": "installer",
+      "state": "unresolved",
+      "reason": "Test fixture: unresolved."
+    }
+  ]
+}

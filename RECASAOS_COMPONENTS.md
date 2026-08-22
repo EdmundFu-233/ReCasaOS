@@ -61,11 +61,22 @@ be hand-edited.
    The local root specification, generator version, and remote Message Bus
    specification commit are explicit. Verify regenerated output whenever one
    of those pins changes.
-6. Release automation should consume a committed component manifest containing
-   component name, repository, commit/digest, artifact SHA-256, API/schema
-   version, license, and compatibility status. Until that manifest and the
-   missing UI lock exist, builds from this root are development builds, not a
-   reproducible full-stack release.
+6. Release automation validates the fixed required-component inventory in
+   `release/components.lock.json`. Its JSON gate requires valid UTF-8, accepts
+   only the exact lowercase schema keys, and rejects unknown or duplicate keys,
+   including case variants. An unresolved entry carries only a truthful HOLD
+   reason and no revision or digest. A locked entry must contain its
+   repository, immutable commit, artifact SHA-256, API/schema version, license,
+   and passed compatibility status. This policy slice fixes
+   `publication_state` at `hold` and always requires both GoReleaser
+   configurations to keep publication disabled, even if every component later
+   becomes structurally locked. The gate parses each GoReleaser file as exactly
+   one YAML document, requires one explicit boolean `release.disable: true`,
+   and rejects BOMs plus release aliases, anchors, and merge keys. Changing
+   the publication state requires a separate reviewed release-policy change
+   after the full-stack SBOM,
+   signatures, provenance, installer, and compatibility evidence exist. This
+   inventory is therefore a fail-closed release gate, not a readiness claim.
 
 ## Compatibility and update rules
 
