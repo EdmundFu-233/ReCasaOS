@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	commonjwt "github.com/IceWhaleTech/CasaOS-Common/utils/jwt"
 	"github.com/IceWhaleTech/CasaOS/model"
 	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
 	"github.com/IceWhaleTech/CasaOS/pkg/httpsecurity"
@@ -638,6 +639,10 @@ func PostCreateFile(ctx echo.Context) error {
 // @Success 200 {string} string "ok"
 // @Router /file/upload [get]
 func GetFileUpload(ctx echo.Context) error {
+	principalID, err := authenticatedV1UploadPrincipalID(ctx)
+	if err != nil {
+		return err
+	}
 	relative := ctx.QueryParam("relativePath")
 	fileName := ctx.QueryParam("filename")
 	totalChunks, chunkNumber, err := parseUploadChunks(ctx.QueryParam("totalChunks"), ctx.QueryParam("chunkNumber"))
@@ -649,7 +654,7 @@ func GetFileUpload(ctx echo.Context) error {
 	if err != nil {
 		return ctx.JSON(http.StatusServiceUnavailable, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR)})
 	}
-	paths, err := buildV1UploadPaths(roots, ctx.QueryParam("path"), relative, fileName, totalChunks, chunkNumber)
+	paths, err := buildV1UploadPaths(roots, principalID, ctx.QueryParam("path"), relative, fileName, totalChunks, chunkNumber)
 	if err != nil {
 		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS), Data: err.Error()})
 	}
@@ -692,6 +697,10 @@ func GetFileUpload(ctx echo.Context) error {
 // @Success 200 {string} string "ok"
 // @Router /file/upload [post]
 func PostFileUpload(ctx echo.Context) error {
+	principalID, err := authenticatedV1UploadPrincipalID(ctx)
+	if err != nil {
+		return err
+	}
 	const multipartOverheadAllowance int64 = 1 << 20
 	request := ctx.Request()
 	request.Body = http.MaxBytesReader(ctx.Response().Writer, request.Body, filesecurity.MaxUploadChunkSize+multipartOverheadAllowance)
@@ -726,7 +735,7 @@ func PostFileUpload(ctx echo.Context) error {
 	if err != nil {
 		return ctx.JSON(http.StatusServiceUnavailable, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR)})
 	}
-	paths, err := buildV1UploadPaths(roots, base, relative, fileName, totalChunks, chunkNumber)
+	paths, err := buildV1UploadPaths(roots, principalID, base, relative, fileName, totalChunks, chunkNumber)
 	if err != nil {
 		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS), Data: err.Error()})
 	}
@@ -768,7 +777,7 @@ func PostFileUpload(ctx echo.Context) error {
 	uploadSession.stagingClean = false
 	// Recheck after creating parents so a pre-existing symlink cannot turn a
 	// previously missing prefix into an escape.
-	if checked, err := roots.MatchChild(base, relative); err != nil || checked.Canonical != paths.target {
+	if checked, err := roots.MatchChild(paths.base, paths.targetRelative); err != nil || checked.Canonical != paths.target {
 		if err == nil {
 			err = filesecurity.ErrUnsafePath
 		}
@@ -779,12 +788,12 @@ func PostFileUpload(ctx echo.Context) error {
 		return respondV1UploadFailure(ctx, changedV1UploadErrorIf(namespaceMayHaveChanged, "upload directories may have changed before chunk publication failed", err))
 	}
 
-	complete, err := allV1ChunksPresent(roots, base, paths.tempRelative, totalChunks)
+	complete, err := allV1ChunksPresent(roots, paths.base, paths.tempRelative, totalChunks)
 	if err != nil {
 		return respondV1UploadFailure(ctx, changedV1UploadError("upload chunk published before chunk-set validation failed", err))
 	}
 	if complete {
-		assemblyResult, assemblyErr := assembleV1Upload(roots, base, relative, paths.tempRelative, paths.assembly, paths.target, totalChunks)
+		assemblyResult, assemblyErr := assembleV1Upload(roots, paths.base, paths.targetRelative, paths.tempRelative, paths.assembly, paths.target, totalChunks)
 		if assemblyResult.TargetPublished {
 			uploadSession.completed = true
 			uploadSession.completedAt = time.Now()
@@ -817,11 +826,14 @@ func PostFileUpload(ctx echo.Context) error {
 var errUploadTooLarge = errors.New("upload chunk exceeds 256 MiB")
 
 type v1UploadPaths struct {
-	target       string
-	tempDir      string
-	tempRelative string
-	chunk        string
-	assembly     string
+	principalID    int
+	base           string
+	target         string
+	targetRelative string
+	tempDir        string
+	tempRelative   string
+	chunk          string
+	assembly       string
 }
 
 const (
@@ -834,8 +846,12 @@ const (
 type v1UploadSession struct {
 	lock               sync.Mutex
 	closed             bool
+	principalID        int
+	base               string
 	target             string
+	targetRelative     string
 	tempDir            string
+	tempRelative       string
 	totalChunks        int64
 	lastActivity       time.Time
 	cleanupErr         error
@@ -899,7 +915,16 @@ func (r *v1UploadSessionRegistry) acquire(paths v1UploadPaths, totalChunks int64
 			r.mu.Unlock()
 			return nil, errors.New("too many retained upload sessions")
 		}
-		session = &v1UploadSession{target: paths.target, tempDir: paths.tempDir, totalChunks: totalChunks, lastActivity: now}
+		session = &v1UploadSession{
+			principalID:    paths.principalID,
+			base:           paths.base,
+			target:         paths.target,
+			targetRelative: paths.targetRelative,
+			tempDir:        paths.tempDir,
+			tempRelative:   paths.tempRelative,
+			totalChunks:    totalChunks,
+			lastActivity:   now,
+		}
 		r.sessions[paths.tempDir] = session
 		cleanupErr := r.removeUploadTree(paths.tempDir)
 		if cleanupErr != nil {
@@ -913,7 +938,7 @@ func (r *v1UploadSessionRegistry) acquire(paths v1UploadPaths, totalChunks int64
 	r.mu.Unlock()
 
 	session.lock.Lock()
-	if session.target != paths.target || session.tempDir != paths.tempDir || session.totalChunks != totalChunks {
+	if !sameV1UploadMetadata(session, paths, totalChunks) {
 		session.lock.Unlock()
 		return nil, errors.New("upload session metadata changed")
 	}
@@ -940,7 +965,7 @@ func (r *v1UploadSessionRegistry) lockCompleted(paths v1UploadPaths, totalChunks
 	if session == nil || !session.lock.TryLock() {
 		return nil, false, nil
 	}
-	if session.target != paths.target || session.tempDir != paths.tempDir || session.totalChunks != totalChunks {
+	if !sameV1UploadMetadata(session, paths, totalChunks) {
 		session.lock.Unlock()
 		return nil, false, errors.New("upload session metadata changed")
 	}
@@ -1049,6 +1074,14 @@ func (r *v1UploadSessionRegistry) removeUploadTree(path string) error {
 	return err
 }
 
+func sameV1UploadMetadata(session *v1UploadSession, paths v1UploadPaths, totalChunks int64) bool {
+	return session != nil && session.principalID == paths.principalID &&
+		session.base == paths.base && session.target == paths.target &&
+		session.targetRelative == paths.targetRelative &&
+		session.tempDir == paths.tempDir && session.tempRelative == paths.tempRelative &&
+		session.totalChunks == totalChunks
+}
+
 func (r *v1UploadSessionRegistry) pruneCompletedLocked(now time.Time) {
 	type cleanCompletion struct {
 		key         string
@@ -1119,9 +1152,12 @@ func parseUploadChunks(totalValue, chunkValue string) (int64, int64, error) {
 	return totalChunks, chunkNumber, nil
 }
 
-func buildV1UploadPaths(roots *filesecurity.ManagedRoots, base, relative, fileName string, totalChunks, chunkNumber int64) (v1UploadPaths, error) {
+func buildV1UploadPaths(roots *filesecurity.ManagedRoots, principalID int, base, relative, fileName string, totalChunks, chunkNumber int64) (v1UploadPaths, error) {
 	if roots == nil {
 		return v1UploadPaths{}, errors.New("management file roots are unavailable")
+	}
+	if principalID < 1 {
+		return v1UploadPaths{}, errors.New("authenticated upload principal is required")
 	}
 	if fileName == "" || fileName == "." || fileName == ".." || filepath.Base(fileName) != fileName {
 		return v1UploadPaths{}, fmt.Errorf("invalid filename")
@@ -1137,30 +1173,58 @@ func buildV1UploadPaths(roots *filesecurity.ManagedRoots, base, relative, fileNa
 		return v1UploadPaths{}, err
 	}
 
-	targetLocation, err := roots.MatchChild(base, cleanRelative)
+	baseLocation, err := roots.Match(base)
+	if err != nil {
+		return v1UploadPaths{}, err
+	}
+	basePath := baseLocation.Canonical
+	targetLocation, err := roots.MatchChild(basePath, cleanRelative)
 	if err != nil {
 		return v1UploadPaths{}, err
 	}
 	target := targetLocation.Canonical
-	uploadHash := v1UploadNamespaceHash([]byte(cleanRelative + "\x00" + fileName))
+	// Do not probe, migrate, or remove the legacy unscoped upload namespace.
+	// Its chunks have no trustworthy owner and must remain unreachable until an
+	// operator performs an explicit orphan cleanup after upgrading.
+	uploadHash := v1UploadNamespaceHash([]byte("jwt-user\x00" + strconv.Itoa(principalID) + "\x00" + target + "\x00" + strconv.FormatInt(totalChunks, 10)))
 	tempRelative := filepath.Join(".temp", "upload-"+uploadHash+"-"+strconv.FormatInt(totalChunks, 10), filepath.Dir(cleanRelative))
-	tempLocation, err := roots.MatchChild(base, tempRelative)
+	tempLocation, err := roots.MatchChild(basePath, tempRelative)
 	if err != nil {
 		return v1UploadPaths{}, err
 	}
 	tempDir := tempLocation.Canonical
-	chunkLocation, err := roots.MatchChild(base, filepath.Join(tempRelative, strconv.FormatInt(chunkNumber, 10)))
+	chunkLocation, err := roots.MatchChild(basePath, filepath.Join(tempRelative, strconv.FormatInt(chunkNumber, 10)))
 	if err != nil {
 		return v1UploadPaths{}, err
 	}
 	chunk := chunkLocation.Canonical
-	assemblyLocation, err := roots.MatchChild(base, filepath.Join(tempRelative, ".complete"))
+	assemblyLocation, err := roots.MatchChild(basePath, filepath.Join(tempRelative, ".complete"))
 	if err != nil {
 		return v1UploadPaths{}, err
 	}
 	assembly := assemblyLocation.Canonical
 
-	return v1UploadPaths{target: target, tempDir: tempDir, tempRelative: tempRelative, chunk: chunk, assembly: assembly}, nil
+	return v1UploadPaths{
+		principalID:    principalID,
+		base:           basePath,
+		target:         target,
+		targetRelative: cleanRelative,
+		tempDir:        tempDir,
+		tempRelative:   tempRelative,
+		chunk:          chunk,
+		assembly:       assembly,
+	}, nil
+}
+
+func authenticatedV1UploadPrincipalID(ctx echo.Context) (int, error) {
+	if ctx == nil {
+		return 0, echo.ErrUnauthorized
+	}
+	claims, ok := ctx.Get("user").(*commonjwt.Claims)
+	if !ok || claims == nil || claims.ID < 1 {
+		return 0, echo.ErrUnauthorized
+	}
+	return claims.ID, nil
 }
 
 func v1UploadNamespaceHash(content []byte) string {

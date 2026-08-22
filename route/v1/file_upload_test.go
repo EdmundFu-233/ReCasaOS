@@ -5,14 +5,223 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	commonjwt "github.com/IceWhaleTech/CasaOS-Common/utils/jwt"
 	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
+	"github.com/labstack/echo/v4"
 )
+
+type trackingV1UploadBody struct {
+	read bool
+}
+
+func (body *trackingV1UploadBody) Read([]byte) (int, error) {
+	body.read = true
+	return 0, io.EOF
+}
+
+func TestAuthenticatedV1UploadPrincipalRequiresPositiveTypedClaims(t *testing.T) {
+	var nilClaims *commonjwt.Claims
+	tests := []struct {
+		name    string
+		value   interface{}
+		setUser bool
+		wantID  int
+	}{
+		{name: "missing"},
+		{name: "wrong type", value: "1", setUser: true},
+		{name: "typed nil", value: nilClaims, setUser: true},
+		{name: "zero id", value: &commonjwt.Claims{ID: 0, Username: "admin"}, setUser: true},
+		{name: "negative id", value: &commonjwt.Claims{ID: -1, Username: "admin"}, setUser: true},
+		{name: "verified id", value: &commonjwt.Claims{ID: 42, Username: "admin"}, setUser: true, wantID: 42},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "/v1/file/upload", nil)
+			request.Header.Set("user_id", "999")
+			ctx := echo.New().NewContext(request, httptest.NewRecorder())
+			if test.setUser {
+				ctx.Set("user", test.value)
+			}
+			actual, err := authenticatedV1UploadPrincipalID(ctx)
+			if test.wantID == 0 {
+				if err != echo.ErrUnauthorized || actual != 0 {
+					t.Fatalf("principal = %d, %v; want unauthorized", actual, err)
+				}
+				return
+			}
+			if err != nil || actual != test.wantID {
+				t.Fatalf("principal = %d, %v; want %d", actual, err, test.wantID)
+			}
+		})
+	}
+}
+
+func TestV1UploadHandlersRejectPrincipalLessRequestsBeforeMultipartOrStorage(t *testing.T) {
+	body := &trackingV1UploadBody{}
+	postRequest := httptest.NewRequest(http.MethodPost, "/v1/file/upload", body)
+	postRequest.Header.Set("user_id", "999")
+	postContext := echo.New().NewContext(postRequest, httptest.NewRecorder())
+	if err := PostFileUpload(postContext); err != echo.ErrUnauthorized {
+		t.Fatalf("POST error = %v, want unauthorized", err)
+	}
+	if body.read {
+		t.Fatal("principal-less POST read the multipart body")
+	}
+
+	getRequest := httptest.NewRequest(http.MethodGet, "/v1/file/upload?totalChunks=1&chunkNumber=1", nil)
+	getRequest.Header.Set("user_id", "999")
+	getContext := echo.New().NewContext(getRequest, httptest.NewRecorder())
+	if err := GetFileUpload(getContext); err != echo.ErrUnauthorized {
+		t.Fatalf("GET error = %v, want unauthorized", err)
+	}
+}
+
+func TestV1UploadPrincipalBindingRemainsStableAcrossRenewedClaims(t *testing.T) {
+	principal := func(username string) int {
+		ctx := echo.New().NewContext(httptest.NewRequest(http.MethodGet, "/", nil), httptest.NewRecorder())
+		ctx.Set("user", &commonjwt.Claims{ID: 42, Username: username})
+		id, err := authenticatedV1UploadPrincipalID(ctx)
+		if err != nil {
+			t.Fatalf("principal for %q: %v", username, err)
+		}
+		return id
+	}
+	if first, renewed := principal("admin"), principal("renamed-admin"); first != renewed || first != 42 {
+		t.Fatalf("renewed claims principals = %d and %d", first, renewed)
+	}
+}
+
+func testV1UploadPaths(base string, principalID int, namespace string) v1UploadPaths {
+	targetRelative := filepath.Join("files", "target.bin")
+	tempRelative := filepath.Join(".temp", "upload-"+namespace)
+	return v1UploadPaths{
+		principalID:    principalID,
+		base:           base,
+		target:         filepath.Join(base, targetRelative),
+		targetRelative: targetRelative,
+		tempDir:        filepath.Join(base, tempRelative),
+		tempRelative:   tempRelative,
+		chunk:          filepath.Join(base, tempRelative, "1"),
+		assembly:       filepath.Join(base, tempRelative, ".complete"),
+	}
+}
+
+func completedV1UploadSession(paths v1UploadPaths, totalChunks int64, completedAt, lastActivity time.Time) *v1UploadSession {
+	return &v1UploadSession{
+		closed:         true,
+		principalID:    paths.principalID,
+		base:           paths.base,
+		target:         paths.target,
+		targetRelative: paths.targetRelative,
+		tempDir:        paths.tempDir,
+		tempRelative:   paths.tempRelative,
+		totalChunks:    totalChunks,
+		lastActivity:   lastActivity,
+		completed:      true,
+		completedAt:    completedAt,
+		stagingClean:   true,
+	}
+}
+
+func TestV1UploadSessionMetadataIncludesPrincipalAndCanonicalPaths(t *testing.T) {
+	paths := testV1UploadPaths("/managed", 41, "principal-41")
+	session := completedV1UploadSession(paths, 2, time.Now(), time.Now())
+	if !sameV1UploadMetadata(session, paths, 2) {
+		t.Fatal("matching immutable upload metadata was rejected")
+	}
+
+	tests := map[string]func(*v1UploadPaths){
+		"principal":       func(changed *v1UploadPaths) { changed.principalID++ },
+		"base":            func(changed *v1UploadPaths) { changed.base += "-changed" },
+		"target":          func(changed *v1UploadPaths) { changed.target += "-changed" },
+		"target relative": func(changed *v1UploadPaths) { changed.targetRelative += "-changed" },
+		"temp directory":  func(changed *v1UploadPaths) { changed.tempDir += "-changed" },
+		"temp relative":   func(changed *v1UploadPaths) { changed.tempRelative += "-changed" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			changed := paths
+			mutate(&changed)
+			if sameV1UploadMetadata(session, changed, 2) {
+				t.Fatal("changed immutable upload metadata was accepted")
+			}
+		})
+	}
+	if sameV1UploadMetadata(session, paths, 3) {
+		t.Fatal("changed total chunk count was accepted")
+	}
+}
+
+func TestV1UploadProbeAndRegistryTTLArePrincipalIsolated(t *testing.T) {
+	registry := v1UploadSessionRegistry{sessions: make(map[string]*v1UploadSession), removeTree: os.RemoveAll}
+	base := t.TempDir()
+	firstPaths := testV1UploadPaths(base, 41, "principal-41")
+	secondPaths := testV1UploadPaths(base, 42, "principal-42")
+	lastActivity := time.Now().Add(-time.Hour)
+	firstSession := completedV1UploadSession(firstPaths, 2, time.Now(), lastActivity)
+	registry.sessions[firstPaths.tempDir] = firstSession
+
+	if completed, ok, err := registry.lockCompleted(secondPaths, 2); err != nil || ok || completed != nil {
+		t.Fatalf("cross-principal completed probe = %p, %v, %v; want no match", completed, ok, err)
+	}
+	if !firstSession.lastActivity.Equal(lastActivity) {
+		t.Fatalf("cross-principal probe renewed activity from %v to %v", lastActivity, firstSession.lastActivity)
+	}
+
+	forgedPaths := firstPaths
+	forgedPaths.principalID = secondPaths.principalID
+	if completed, ok, err := registry.lockCompleted(forgedPaths, 2); err == nil || ok || completed != nil {
+		t.Fatalf("same-namespace forged probe = %p, %v, %v; want metadata error", completed, ok, err)
+	}
+	if !firstSession.lastActivity.Equal(lastActivity) {
+		t.Fatalf("forged probe renewed activity from %v to %v", lastActivity, firstSession.lastActivity)
+	}
+	if acquired, err := registry.acquire(forgedPaths, 2); err == nil || acquired != nil {
+		t.Fatalf("same-namespace forged acquire = %p, %v; want metadata error", acquired, err)
+	}
+	if !firstSession.lastActivity.Equal(lastActivity) {
+		t.Fatalf("forged acquire renewed activity from %v to %v", lastActivity, firstSession.lastActivity)
+	}
+
+	completed, ok, err := registry.lockCompleted(firstPaths, 2)
+	if err != nil || !ok || completed != firstSession {
+		t.Fatalf("same-principal completed probe = %p, %v, %v", completed, ok, err)
+	}
+	completed.lock.Unlock()
+}
+
+func TestV1CompletedUploadExpiryPrunesOnlyExpiredPrincipal(t *testing.T) {
+	registry := v1UploadSessionRegistry{sessions: make(map[string]*v1UploadSession), removeTree: os.RemoveAll}
+	base := t.TempDir()
+	now := time.Now()
+	expiredPaths := testV1UploadPaths(base, 41, "principal-41")
+	currentPaths := testV1UploadPaths(base, 42, "principal-42")
+	registry.sessions[expiredPaths.tempDir] = completedV1UploadSession(
+		expiredPaths,
+		2,
+		now.Add(-v1UploadCompletionTTL-time.Minute),
+		now.Add(time.Hour),
+	)
+	currentSession := completedV1UploadSession(currentPaths, 2, now, now.Add(-time.Hour))
+	registry.sessions[currentPaths.tempDir] = currentSession
+
+	registry.cleanup(now)
+	if registry.sessions[expiredPaths.tempDir] != nil {
+		t.Fatal("expired principal completion survived its completion TTL")
+	}
+	if registry.sessions[currentPaths.tempDir] != currentSession {
+		t.Fatal("current principal completion was pruned with another principal")
+	}
+}
 
 type recordingV1CompletedIdentityVerifier struct {
 	path     string
