@@ -135,6 +135,11 @@ func TestV1UploadPrincipalNamespacesPreventMixedChunkAssembly(t *testing.T) {
 	if firstChunkOne.tempDir == secondChunkOne.tempDir || firstChunkOne.tempRelative == secondChunkOne.tempRelative || firstChunkOne.chunk == secondChunkOne.chunk || firstChunkOne.assembly == secondChunkOne.assembly {
 		t.Fatalf("different principals share upload staging: first=%+v second=%+v", firstChunkOne, secondChunkOne)
 	}
+	// PostFileUpload creates the target parent before it publishes chunks. Keep
+	// this direct assembly fixture faithful to that handler ordering on Linux.
+	if err := roots.MkdirAll(filepath.Dir(firstChunkOne.target), 0o750); err != nil {
+		t.Fatal(err)
+	}
 
 	for _, tempDir := range []string{firstChunkOne.tempDir, secondChunkOne.tempDir} {
 		if err := roots.MkdirAll(tempDir, 0o700); err != nil {
