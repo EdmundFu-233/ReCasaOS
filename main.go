@@ -205,19 +205,13 @@ func main() {
 		time.Sleep(time.Second)
 	}
 
-	go func() {
-		time.Sleep(time.Second * 2)
-		// v0.3.6
-		if config.ServerInfo.HttpPort != "" {
-			changePort := model.ChangePortRequest{}
-			changePort.Port = config.ServerInfo.HttpPort
-			err := service.MyService.Gateway().ChangePort(&changePort)
-			if err == nil {
-				config.Cfg.Section("server").Key("HttpPort").SetValue("")
-				config.Cfg.SaveTo(config.SystemConfigInfo.ConfigPath)
-			}
-		}
-	}()
+	// v0.3.6 legacy port migration is a startup gate: do not advertise Ready
+	// while the Gateway port and durable configuration disagree.
+	if err := config.MigrateLegacyHTTPPort(config.ServerInfo.HttpPort, 1, 0, func(port string) error {
+		return service.EnsureGatewayPort(service.MyService.Gateway(), port)
+	}); err != nil {
+		panic(err)
+	}
 
 	urlFilePath := filepath.Join(config.CommonInfo.RuntimePath, "casaos.url")
 	if err := file.CreateFileAndWriteContent(urlFilePath, "http://"+listener.Addr().String()); err != nil {

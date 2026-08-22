@@ -38,7 +38,8 @@ https://recasaos.example.invalid {
 
 	encode zstd gzip
 
-	# The portal is GET/HEAD-only; reject unexpected bodies before proxying.
+	# Native browser streaming uses one bounded same-origin POST containing only
+	# a short-lived navigation proof. Reject oversized bodies before proxying.
 	request_body {
 		max_size 1MB
 	}
@@ -51,7 +52,7 @@ https://recasaos.example.invalid {
 		X-Frame-Options "DENY"
 		Referrer-Policy "no-referrer"
 		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
-		Content-Security-Policy "default-src 'none'; script-src 'self'; worker-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+		Content-Security-Policy "default-src 'none'; script-src 'self'; worker-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
 	}
 
 	@portal path /public-files /public-files/*
