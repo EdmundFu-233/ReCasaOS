@@ -270,6 +270,7 @@ package_update: true
 package_upgrade: false
 packages:
   - acl
+  - bindfs
   - ca-certificates
   - curl
   - dmsetup

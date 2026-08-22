@@ -117,7 +117,12 @@ memory_sampler_stop="${workspace}/memory-current-sampler-stop"
 memory_sampler_failure="${workspace}/memory-current-sampler-failure"
 nested_backing="${workspace}/nested-backing"
 nested_mount="${share}/covered"
-hostile_storage_backing="${workspace}/hostile-storage.img"
+hostile_storage_fuse_source="${workspace}/hostile-storage-fuse-source"
+hostile_storage_fuse_mount="${workspace}/hostile-storage-fuse-mount"
+hostile_storage_fuse_log="${workspace}/hostile-storage-fuse.log"
+hostile_storage_fuse_options='nodev,nosuid,noexec,attr_timeout=0,entry_timeout=0,negative_timeout=0'
+hostile_storage_backing_source="${hostile_storage_fuse_source}/hostile-storage.img"
+hostile_storage_backing="${hostile_storage_fuse_mount}/hostile-storage.img"
 hostile_storage_name="recasaos-dstate-${run_key}"
 hostile_storage_mapper="/dev/mapper/${hostile_storage_name}"
 hostile_storage_nbd_device=/dev/nbd0
@@ -143,6 +148,13 @@ storage_worker_address_space_minimum_reserve=134217728
 [[ "$hostile_storage_name" =~ ^recasaos-dstate-[0-9]+-[0-9]+$ &&
   "$hostile_storage_mapper" == "/dev/mapper/$hostile_storage_name" ]] ||
   fail "refusing unsafe hostile-storage device name: $hostile_storage_name"
+[[ "$hostile_storage_fuse_source" == "$workspace/hostile-storage-fuse-source" &&
+  "$hostile_storage_fuse_mount" == "$workspace/hostile-storage-fuse-mount" &&
+  "$hostile_storage_fuse_log" == "$workspace/hostile-storage-fuse.log" &&
+  "$hostile_storage_fuse_options" == 'nodev,nosuid,noexec,attr_timeout=0,entry_timeout=0,negative_timeout=0' &&
+  "$hostile_storage_backing_source" == "$hostile_storage_fuse_source/hostile-storage.img" &&
+  "$hostile_storage_backing" == "$hostile_storage_fuse_mount/hostile-storage.img" ]] ||
+  fail "refusing unsafe hostile-storage FUSE identity"
 [[ "$hostile_storage_nbd_device" == /dev/nbd0 &&
   "$hostile_storage_nbd_export" =~ ^recasaos-hostile-[0-9]+-[0-9]+$ &&
   "$hostile_storage_nbd_log" == "$workspace/hostile-storage-nbd.log" &&
@@ -164,15 +176,16 @@ if getent passwd recasaos-public >/dev/null ||
   fail "the recasaos-public account unexpectedly already exists"
 fi
 for required_tool in \
-  cmp find getfacl go mktemp mount pgrep ps readlink sort ss systemctl \
-  truncate umount
+  cmp find findmnt getfacl go mktemp mount pgrep ps readlink sort ss systemctl \
+  truncate umount wc
 do
   command -v "$required_tool" >/dev/null 2>&1 ||
     fail "required mount test tool is unavailable: $required_tool"
 done
 if [[ "$hostile_storage_test_enabled" == 1 ]]; then
   for required_tool in \
-    blockdev dmsetup lsblk mkfs.ext4 modprobe nbd-client qemu-nbd sync udevadm
+    bindfs blockdev dmsetup fusermount lsblk mkfs.ext4 modprobe \
+    nbd-client qemu-nbd sync udevadm
   do
     command -v "$required_tool" >/dev/null 2>&1 ||
       fail "required hostile-storage VM tool is unavailable: $required_tool"
@@ -307,6 +320,15 @@ hostile_storage_nbd_server_pid=
 hostile_storage_nbd_server_start_time=
 hostile_storage_nbd_server_started=0
 hostile_storage_nbd_server_stopped=0
+hostile_storage_fuse_connection=
+hostile_storage_fuse_control_mounted=0
+hostile_storage_fuse_daemon_executable=
+hostile_storage_fusermount_executable=
+hostile_storage_fuse_daemon_pid=
+hostile_storage_fuse_daemon_start_time=
+hostile_storage_fuse_daemon_started=0
+hostile_storage_fuse_daemon_stopped=0
+hostile_storage_fuse_mounted=0
 hostile_storage_clients=()
 hostile_storage_client_start_times=()
 hostile_storage_client_prefixes=()
@@ -680,6 +702,152 @@ kill_exact_background_process() {
   signal_exact_background_process "$1" "$2" 9
 }
 
+hostile_storage_fuse_daemon_is_exact() {
+  local argument
+  local capability_value
+  local current_executable
+  local current_start_time
+  local uid_value
+  local -a current_arguments=()
+
+  [[ "$hostile_storage_fuse_daemon_started" == 1 &&
+    "$hostile_storage_fuse_daemon_pid" =~ ^[0-9]+$ &&
+    "$hostile_storage_fuse_daemon_pid" -gt 1 &&
+    "$hostile_storage_fuse_daemon_start_time" =~ ^[0-9]+$ &&
+    "$hostile_storage_fuse_daemon_executable" == /usr/bin/bindfs &&
+    "$runner_uid" =~ ^[0-9]+$ && "$runner_uid" -gt 0 ]] || return 1
+  current_start_time="$(
+    process_start_time "$hostile_storage_fuse_daemon_pid" 2>/dev/null
+  )" || return 1
+  [[ "$current_start_time" == "$hostile_storage_fuse_daemon_start_time" ]] ||
+    return 1
+  current_executable="$(
+    readlink -f "/proc/$hostile_storage_fuse_daemon_pid/exe" 2>/dev/null
+  )" || return 1
+  [[ "$current_executable" == "$hostile_storage_fuse_daemon_executable" ]] ||
+    return 1
+  while IFS= read -r -d '' argument; do
+    current_arguments+=("$argument")
+  done <"/proc/$hostile_storage_fuse_daemon_pid/cmdline"
+  [[ "${#current_arguments[@]}" == 7 &&
+    "${current_arguments[0]}" == /usr/bin/bindfs &&
+    "${current_arguments[1]}" == -f &&
+    "${current_arguments[2]}" == --no-allow-other &&
+    "${current_arguments[3]}" == -o &&
+    "${current_arguments[4]}" == "$hostile_storage_fuse_options" &&
+    "${current_arguments[5]}" == "$hostile_storage_fuse_source" &&
+    "${current_arguments[6]}" == "$hostile_storage_fuse_mount" ]] || return 1
+  uid_value="$(
+    awk '$1 == "Uid:" { print $2 ":" $3 ":" $4 ":" $5 }' \
+      "/proc/$hostile_storage_fuse_daemon_pid/status"
+  )" || return 1
+  capability_value="$(
+    awk '$1 == "CapEff:" { print $2 }' \
+      "/proc/$hostile_storage_fuse_daemon_pid/status"
+  )" || return 1
+  [[ "$uid_value" == "$runner_uid:$runner_uid:$runner_uid:$runner_uid" &&
+    "$capability_value" == 0000000000000000 ]]
+}
+
+hostile_storage_fuse_daemon_state_is() {
+  local expected_state=$1
+  local stat_line
+  local -a stat_fields=()
+
+  [[ "$expected_state" == T ]] || return 1
+  hostile_storage_fuse_daemon_is_exact || return 1
+  stat_line="$(<"/proc/$hostile_storage_fuse_daemon_pid/stat")" || return 1
+  [[ "$stat_line" == *") "* ]] || return 1
+  IFS=' ' read -r -a stat_fields <<<"${stat_line##*) }"
+  [[ "${#stat_fields[@]}" -gt 0 &&
+    "${stat_fields[0]}" == "$expected_state" ]]
+}
+
+hostile_storage_fuse_daemon_is_resumed() {
+  local stat_line
+  local -a stat_fields=()
+
+  hostile_storage_fuse_daemon_is_exact || return 1
+  stat_line="$(<"/proc/$hostile_storage_fuse_daemon_pid/stat")" || return 1
+  [[ "$stat_line" == *") "* ]] || return 1
+  IFS=' ' read -r -a stat_fields <<<"${stat_line##*) }"
+  [[ "${#stat_fields[@]}" -gt 0 ]] || return 1
+  case "${stat_fields[0]}" in
+    T | t | X | x | Z) return 1 ;;
+    R | S | D | I) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+hostile_storage_fuse_daemon_process_is_gone() {
+  local current_start_time
+  local stat_line
+  local -a stat_fields=()
+
+  [[ "$hostile_storage_fuse_daemon_pid" =~ ^[0-9]+$ &&
+    "$hostile_storage_fuse_daemon_pid" -gt 1 &&
+    "$hostile_storage_fuse_daemon_start_time" =~ ^[0-9]+$ ]] || return 1
+  current_start_time="$(
+    process_start_time "$hostile_storage_fuse_daemon_pid" 2>/dev/null
+  )" || return 0
+  if [[ "$current_start_time" != "$hostile_storage_fuse_daemon_start_time" ]]; then
+    return 0
+  fi
+  stat_line="$(<"/proc/$hostile_storage_fuse_daemon_pid/stat")" || return 1
+  [[ "$stat_line" == *") "* ]] || return 1
+  IFS=' ' read -r -a stat_fields <<<"${stat_line##*) }"
+  [[ "${#stat_fields[@]}" -gt 0 && "${stat_fields[0]}" == Z ]] || return 1
+  wait "$hostile_storage_fuse_daemon_pid" 2>/dev/null || true
+  current_start_time="$(
+    process_start_time "$hostile_storage_fuse_daemon_pid" 2>/dev/null
+  )" || return 0
+  [[ "$current_start_time" != "$hostile_storage_fuse_daemon_start_time" ]]
+}
+
+signal_exact_hostile_storage_fuse_daemon() {
+  local signal_number=$1
+
+  [[ "$signal_number" == 18 || "$signal_number" == 19 ]] || return 1
+  hostile_storage_fuse_daemon_is_exact || return 1
+  signal_exact_background_process \
+    "$hostile_storage_fuse_daemon_pid" \
+    "$hostile_storage_fuse_daemon_start_time" \
+    "$signal_number"
+}
+
+hostile_storage_fuse_waiting_value() {
+  local waiting_path
+  local waiting_value
+
+  [[ "$hostile_storage_fuse_connection" =~ ^[0-9]+$ ]] || return 1
+  waiting_path="/sys/fs/fuse/connections/$hostile_storage_fuse_connection/waiting"
+  [[ "$waiting_path" =~ ^/sys/fs/fuse/connections/[0-9]+/waiting$ ]] ||
+    return 1
+  [[ -f "$waiting_path" && ! -L "$waiting_path" && -r "$waiting_path" ]] ||
+    return 1
+  waiting_value="$(<"$waiting_path")" || return 1
+  [[ "$waiting_value" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$waiting_value"
+}
+
+hostile_storage_fuse_has_waiting_request() {
+  local waiting_value
+
+  hostile_storage_fuse_daemon_state_is T || return 1
+  hostile_storage_nbd_server_is_resumed || return 1
+  waiting_value="$(hostile_storage_fuse_waiting_value)" || return 1
+  [[ "$waiting_value" -ge 1 ]]
+}
+
+hostile_storage_fuse_is_recovered() {
+  local waiting_value
+
+  hostile_storage_fuse_daemon_is_resumed || return 1
+  hostile_storage_nbd_server_is_resumed || return 1
+  waiting_value="$(hostile_storage_fuse_waiting_value)" || return 1
+  [[ "$waiting_value" == 0 ]]
+}
+
 hostile_storage_nbd_server_is_exact() {
   local current_executable
   local current_start_time
@@ -1037,7 +1205,31 @@ record_hostile_storage_device_identity() {
     ^/sys/dev/block/[0-9]+:[0-9]+/dm/suspended$ ]]
 }
 
-resume_hostile_storage_for_cleanup() {
+resume_hostile_storage_fuse_for_cleanup() {
+  local resume_deadline
+
+  [[ "$hostile_storage_test_enabled" == 1 ]] || return 0
+  [[ "$hostile_storage_fuse_daemon_started" == 1 ]] || return 0
+  if hostile_storage_fuse_daemon_process_is_gone; then
+    hostile_storage_fuse_daemon_started=0
+    hostile_storage_fuse_daemon_stopped=0
+    return 0
+  fi
+  hostile_storage_fuse_daemon_is_exact || return 1
+  if [[ "$hostile_storage_fuse_daemon_stopped" == 1 ]] ||
+    hostile_storage_fuse_daemon_state_is T; then
+    signal_exact_hostile_storage_fuse_daemon 18 || return 1
+  fi
+  resume_deadline=$((SECONDS + 5))
+  while ! hostile_storage_fuse_daemon_is_resumed &&
+    ((SECONDS < resume_deadline)); do
+    sleep 0.02
+  done
+  hostile_storage_fuse_daemon_is_resumed || return 1
+  hostile_storage_fuse_daemon_stopped=0
+}
+
+resume_hostile_storage_nbd_for_cleanup() {
   local resume_deadline
 
   [[ "$hostile_storage_test_enabled" == 1 ]] || return 0
@@ -1061,8 +1253,17 @@ resume_hostile_storage_for_cleanup() {
   hostile_storage_nbd_server_stopped=0
 }
 
+resume_hostile_storage_for_cleanup() {
+  [[ "$hostile_storage_test_enabled" == 1 ]] || return 0
+  resume_hostile_storage_fuse_for_cleanup || return 1
+  resume_hostile_storage_nbd_for_cleanup
+}
+
 cleanup_hostile_storage_stack() {
   local command_status
+  local connection_count
+  local fuse_exit_deadline
+  local fuse_mount_evidence
   local mount_count
   local server_exit_deadline
 
@@ -1186,6 +1387,161 @@ cleanup_hostile_storage_stack() {
     hostile_storage_nbd_server_started=0
     hostile_storage_nbd_server_stopped=0
   fi
+
+  fuse_mount_evidence="$(
+    awk -v target="$hostile_storage_fuse_mount" '
+      {
+        separator = 0
+        for (field_index = 7; field_index <= NF; field_index++)
+          if ($field_index == "-") {
+            separator = field_index
+            break
+          }
+        if ($5 != target)
+          next
+        matches++
+        if (separator == 0 || $(separator + 1) != "fuse.bindfs")
+          invalid++
+      }
+      END { printf "%d:%d\n", matches + 0, invalid + 0 }
+    ' /proc/self/mountinfo
+  )"
+  command_status=$?
+  if [[ "$command_status" != 0 ||
+    ! "$fuse_mount_evidence" =~ ^[0-9]+:[0-9]+$ ||
+    ( "$fuse_mount_evidence" != 0:0 &&
+      "$fuse_mount_evidence" != 1:0 ) ]]; then
+    cleanup_problem \
+      "hostile-storage FUSE mount identity is unsafe: ${fuse_mount_evidence:-invalid}"
+    workspace_removal_safe=0
+    return 1
+  fi
+  mount_count="${fuse_mount_evidence%%:*}"
+  if [[ "$mount_count" == 1 ]]; then
+    if [[ "$hostile_storage_fuse_daemon_started" == 1 ]] &&
+      ! hostile_storage_fuse_daemon_process_is_gone &&
+      ! hostile_storage_fuse_daemon_is_exact; then
+      cleanup_problem \
+        "hostile-storage FUSE daemon identity changed before unmount"
+      workspace_removal_safe=0
+      return 1
+    fi
+    [[ "$hostile_storage_fusermount_executable" == \
+      /usr/bin/fusermount ]] || {
+      cleanup_problem \
+        "refusing an unsafe hostile-storage FUSE unmount executable"
+      workspace_removal_safe=0
+      return 1
+    }
+    timeout --signal=TERM --kill-after=2s 5s \
+      "$hostile_storage_fusermount_executable" \
+      -u "$hostile_storage_fuse_mount"
+    command_status=$?
+    if [[ "$command_status" != 0 ]]; then
+      cleanup_problem \
+        "could not unmount hostile-storage FUSE backing (status $command_status)"
+      workspace_removal_safe=0
+      return 1
+    fi
+  fi
+  hostile_storage_fuse_mounted=0
+  mount_count="$(
+    awk -v target="$hostile_storage_fuse_mount" \
+      '$5 == target { count++ } END { print count + 0 }' \
+      /proc/self/mountinfo
+  )"
+  command_status=$?
+  if [[ "$command_status" != 0 || "$mount_count" != 0 ]]; then
+    cleanup_problem \
+      "hostile-storage FUSE mount remains: count=${mount_count:-invalid}"
+    workspace_removal_safe=0
+    return 1
+  fi
+
+  if [[ "$hostile_storage_fuse_daemon_started" == 1 ]]; then
+    if ! hostile_storage_fuse_daemon_process_is_gone; then
+      if ! hostile_storage_fuse_daemon_is_exact; then
+        cleanup_problem \
+          "hostile-storage FUSE daemon identity changed before cleanup"
+        workspace_removal_safe=0
+        return 1
+      fi
+      if ! terminate_exact_background_process \
+        "$hostile_storage_fuse_daemon_pid" \
+        "$hostile_storage_fuse_daemon_start_time"; then
+        cleanup_problem \
+          "could not terminate the exact hostile-storage FUSE daemon"
+        workspace_removal_safe=0
+        return 1
+      fi
+    fi
+    fuse_exit_deadline=$((SECONDS + 5))
+    while ! hostile_storage_fuse_daemon_process_is_gone &&
+      ((SECONDS < fuse_exit_deadline)); do
+      sleep 0.02
+    done
+    if ! hostile_storage_fuse_daemon_process_is_gone; then
+      if ! kill_exact_background_process \
+        "$hostile_storage_fuse_daemon_pid" \
+        "$hostile_storage_fuse_daemon_start_time"; then
+        cleanup_problem \
+          "could not kill the exact hostile-storage FUSE daemon"
+        workspace_removal_safe=0
+        return 1
+      fi
+      fuse_exit_deadline=$((SECONDS + 2))
+      while ! hostile_storage_fuse_daemon_process_is_gone &&
+        ((SECONDS < fuse_exit_deadline)); do
+        sleep 0.02
+      done
+    fi
+    if ! hostile_storage_fuse_daemon_process_is_gone; then
+      cleanup_problem \
+        "hostile-storage FUSE daemon remains after exact SIGKILL"
+      workspace_removal_safe=0
+      return 1
+    fi
+    hostile_storage_fuse_daemon_started=0
+    hostile_storage_fuse_daemon_stopped=0
+  fi
+
+  if [[ "$hostile_storage_fuse_connection" =~ ^[0-9]+$ &&
+    -e "/sys/fs/fuse/connections/$hostile_storage_fuse_connection" ]]; then
+    cleanup_problem \
+      "hostile-storage FUSE connection remains after exact teardown"
+    workspace_removal_safe=0
+    return 1
+  fi
+  connection_count="$(
+    find /sys/fs/fuse/connections -mindepth 1 -maxdepth 1 \
+      -type d -printf . | wc -c
+  )"
+  command_status=$?
+  if [[ "$command_status" != 0 || ! "$connection_count" =~ ^[0-9]+$ ||
+    "$connection_count" != 0 ]]; then
+    cleanup_problem \
+      "FUSE connections remain after hostile-storage teardown: ${connection_count:-invalid}"
+    workspace_removal_safe=0
+    return 1
+  fi
+  hostile_storage_fuse_connection=
+  if [[ "$hostile_storage_fuse_control_mounted" == 1 ]]; then
+    sudo umount -- /sys/fs/fuse/connections
+    command_status=$?
+    if [[ "$command_status" != 0 ]]; then
+      cleanup_problem \
+        "could not unmount the test-owned FUSE control filesystem (status $command_status)"
+      workspace_removal_safe=0
+      return 1
+    fi
+    hostile_storage_fuse_control_mounted=0
+    if [[ "$(findmnt -n -o FSTYPE -- /sys/fs/fuse/connections 2>/dev/null)" == \
+      fusectl ]]; then
+      cleanup_problem "test-owned FUSE control filesystem remains mounted"
+      workspace_removal_safe=0
+      return 1
+    fi
+  fi
 }
 
 cleanup_public_port_is_unbound() {
@@ -1227,7 +1583,7 @@ cleanup() {
 
   if ! resume_hostile_storage_for_cleanup; then
     cleanup_problem \
-      "could not resume the isolated hostile-storage NBD server; the disposable VM must be terminated"
+      "could not resume the exact FUSE/NBD hostile-storage stack; the disposable VM must be terminated"
     exit 1
   fi
   cleanup_cgroup_memory_sampler
@@ -3195,6 +3551,166 @@ service_is_deactivating() {
   )" == deactivating ]]
 }
 
+setup_hostile_storage_fuse_backing() {
+  local connection
+  local daemon_deadline
+  local device_metadata
+  local fuse_control_type
+  local mount_count
+  local mount_evidence
+  local -a fuse_connections=()
+
+  [[ "$hostile_storage_test_enabled" == 1 ]] || return 0
+  [[ -d "$hostile_storage_fuse_source" &&
+    ! -L "$hostile_storage_fuse_source" &&
+    -d "$hostile_storage_fuse_mount" &&
+    ! -L "$hostile_storage_fuse_mount" ]] ||
+    fail "hostile-storage FUSE directories are unsafe"
+  [[ -z "$(find "$hostile_storage_fuse_source" -mindepth 1 -print -quit)" &&
+    -z "$(find "$hostile_storage_fuse_mount" -mindepth 1 -print -quit)" ]] ||
+    fail "hostile-storage FUSE directories are not empty"
+  [[ ! -e "$hostile_storage_fuse_log" &&
+    ! -L "$hostile_storage_fuse_log" ]] ||
+    fail "hostile-storage FUSE log path already exists"
+
+  sudo modprobe fuse
+  sudo udevadm settle --timeout=10 ||
+    fail "udev did not settle after FUSE module loading"
+  sudo test -c /dev/fuse || fail "isolated VM FUSE device is unavailable"
+  device_metadata="$(stat -c '%t:%T:%u:%g:%a' /dev/fuse)" ||
+    fail "could not inspect the isolated VM FUSE device"
+  [[ "$device_metadata" == a:e5:0:0:666 ]] ||
+    fail "isolated VM FUSE device metadata is unsafe: $device_metadata"
+
+  fuse_control_type="$(stat -fc %T /sys/fs/fuse/connections)" ||
+    fail "could not inspect the FUSE control path"
+  if [[ "$fuse_control_type" != fusectl ]]; then
+    mount_count="$(
+      awk '$5 == "/sys/fs/fuse/connections" { count++ }
+        END { print count + 0 }' /proc/self/mountinfo
+    )" || fail "could not inspect the FUSE control mount"
+    [[ "$mount_count" == 0 ]] ||
+      fail "an unexpected filesystem covers the FUSE control path"
+    sudo mount -t fusectl -o nodev,nosuid,noexec \
+      fusectl /sys/fs/fuse/connections
+    hostile_storage_fuse_control_mounted=1
+  fi
+  [[ "$(stat -fc %T /sys/fs/fuse/connections)" == fusectl ]] ||
+    fail "FUSE control filesystem is unavailable"
+  mapfile -t fuse_connections < <(
+    find /sys/fs/fuse/connections -mindepth 1 -maxdepth 1 \
+      -type d -printf '%f\n' | LC_ALL=C sort
+  )
+  [[ "${#fuse_connections[@]}" == 0 ]] ||
+    fail "isolated VM already has a FUSE connection"
+
+  truncate -s 268435456 "$hostile_storage_backing_source"
+  chmod 0600 "$hostile_storage_backing_source"
+  install -m 0600 /dev/null "$hostile_storage_fuse_log"
+  hostile_storage_fuse_daemon_executable="$(
+    readlink -f "$(command -v bindfs)"
+  )" || fail "could not resolve the hostile-storage FUSE daemon"
+  [[ "$hostile_storage_fuse_daemon_executable" == /usr/bin/bindfs ]] ||
+    fail "unexpected hostile-storage FUSE daemon: $hostile_storage_fuse_daemon_executable"
+  hostile_storage_fusermount_executable="$(
+    readlink -f "$(command -v fusermount)"
+  )" || fail "could not resolve the hostile-storage FUSE unmount helper"
+  [[ "$hostile_storage_fusermount_executable" == /usr/bin/fusermount ]] ||
+    fail \
+      "unexpected hostile-storage FUSE unmount helper: $hostile_storage_fusermount_executable"
+  "$hostile_storage_fuse_daemon_executable" \
+    -f \
+    --no-allow-other \
+    -o "$hostile_storage_fuse_options" \
+    "$hostile_storage_fuse_source" \
+    "$hostile_storage_fuse_mount" \
+    >"$hostile_storage_fuse_log" 2>&1 &
+  hostile_storage_fuse_daemon_pid=$!
+  hostile_storage_fuse_daemon_start_time="$(
+    process_start_time "$hostile_storage_fuse_daemon_pid"
+  )" || {
+    wait "$hostile_storage_fuse_daemon_pid" 2>/dev/null || true
+    sed -n '1,20p' "$hostile_storage_fuse_log" >&2
+    fail "could not record the hostile-storage FUSE daemon identity"
+  }
+  hostile_storage_fuse_daemon_started=1
+  daemon_deadline=$((SECONDS + 5))
+  while ! hostile_storage_fuse_daemon_is_exact &&
+    ((SECONDS < daemon_deadline)); do
+    if hostile_storage_fuse_daemon_process_is_gone; then
+      sed -n '1,20p' "$hostile_storage_fuse_log" >&2
+      fail "hostile-storage FUSE daemon exited before exact identity capture"
+    fi
+    sleep 0.02
+  done
+  hostile_storage_fuse_daemon_is_exact ||
+    fail "hostile-storage FUSE daemon identity is unsafe"
+
+  while [[ "$(
+    awk -v target="$hostile_storage_fuse_mount" \
+      '$5 == target { count++ } END { print count + 0 }' \
+      /proc/self/mountinfo
+  )" != 1 ]] && ((SECONDS < daemon_deadline)); do
+    hostile_storage_fuse_daemon_is_exact ||
+      fail "hostile-storage FUSE daemon changed before mount readiness"
+    sleep 0.02
+  done
+  mount_evidence="$(
+    awk -v target="$hostile_storage_fuse_mount" \
+      -v expected_uid="$runner_uid" -v expected_gid="$runner_gid" '
+      function has_option(options, wanted, count, values, option_index) {
+        count = split(options, values, ",")
+        for (option_index = 1; option_index <= count; option_index++)
+          if (values[option_index] == wanted)
+            return 1
+        return 0
+      }
+      {
+        separator = 0
+        for (field_index = 7; field_index <= NF; field_index++)
+          if ($field_index == "-") {
+            separator = field_index
+            break
+          }
+        if ($5 != target)
+          next
+        matches++
+        if (!has_option($6, "rw") ||
+            !has_option($6, "nodev") ||
+            !has_option($6, "nosuid") ||
+            !has_option($6, "noexec") ||
+            separator == 0 ||
+            $(separator + 1) != "fuse.bindfs" ||
+            !has_option($(separator + 3), "user_id=" expected_uid) ||
+            !has_option($(separator + 3), "group_id=" expected_gid))
+          invalid++
+      }
+      END { printf "%d:%d\n", matches + 0, invalid + 0 }
+    ' /proc/self/mountinfo
+  )" || fail "could not inspect hostile-storage FUSE mount"
+  [[ "$mount_evidence" == 1:0 ]] ||
+    fail "hostile-storage FUSE mount evidence is unsafe: $mount_evidence"
+  hostile_storage_fuse_mounted=1
+
+  mapfile -t fuse_connections < <(
+    find /sys/fs/fuse/connections -mindepth 1 -maxdepth 1 \
+      -type d -printf '%f\n' | LC_ALL=C sort
+  )
+  [[ "${#fuse_connections[@]}" == 1 ]] ||
+    fail "hostile-storage FUSE connection count is unsafe"
+  connection="${fuse_connections[0]}"
+  [[ "$connection" =~ ^[0-9]+$ ]] ||
+    fail "hostile-storage FUSE connection identity is unsafe: $connection"
+  hostile_storage_fuse_connection=$connection
+  [[ "$(hostile_storage_fuse_waiting_value)" == 0 ]] ||
+    fail "new hostile-storage FUSE connection already has waiting requests"
+  hostile_storage_fuse_daemon_is_resumed ||
+    fail "new hostile-storage FUSE daemon is not runnable"
+  [[ -f "$hostile_storage_backing" && ! -L "$hostile_storage_backing" &&
+    "$(stat -c %s "$hostile_storage_backing")" == 268435456 ]] ||
+    fail "hostile-storage FUSE backing file is unsafe"
+}
+
 setup_hostile_storage_share() {
   local device_identity
   local nbd_connection_status
@@ -3213,7 +3729,10 @@ setup_hostile_storage_share() {
     fail "hostile-storage share target is unsafe"
   [[ -z "$(find "$share" -mindepth 1 -print -quit)" ]] ||
     fail "hostile-storage share target is not empty"
-  [[ ! -e "$hostile_storage_backing" && ! -L "$hostile_storage_backing" ]] ||
+  [[ ! -e "$hostile_storage_backing_source" &&
+    ! -L "$hostile_storage_backing_source" &&
+    ! -e "$hostile_storage_backing" &&
+    ! -L "$hostile_storage_backing" ]] ||
     fail "hostile-storage backing path already exists"
   if sudo dmsetup info "$hostile_storage_name" >/dev/null 2>&1; then
     fail "hostile-storage mapping already exists"
@@ -3228,6 +3747,7 @@ setup_hostile_storage_share() {
   [[ "$nbd_listener_count" == 0 ]] ||
     fail "hostile-storage NBD port is already bound"
 
+  setup_hostile_storage_fuse_backing
   sudo modprobe nbd nbds_max=1 max_part=0
   sudo modprobe dm_mod
   sudo udevadm settle --timeout=10 ||
@@ -3258,8 +3778,6 @@ setup_hostile_storage_share() {
     awk '$1 == "linear" { found = 1 } END { exit found ? 0 : 1 }' ||
     fail "device-mapper linear target is unavailable"
 
-  truncate -s 268435456 "$hostile_storage_backing"
-  chmod 0600 "$hostile_storage_backing"
   hostile_storage_nbd_server_executable="$(
     readlink -f "$(command -v qemu-nbd)"
   )" || fail "could not resolve the hostile-storage NBD server executable"
@@ -3439,7 +3957,10 @@ setup_hostile_storage_share() {
 
 runner_uid="$(id -u)"
 runner_gid="$(id -g)"
-sudo install -d -o "$runner_uid" -g "$runner_gid" -m 0755 "$workspace"
+sudo install -d -o "$runner_uid" -g "$runner_gid" -m 0755 \
+  "$workspace" \
+  "$hostile_storage_fuse_source" \
+  "$hostile_storage_fuse_mount"
 sudo install -d -o root -g root -m 0755 \
   "$rootfs" "$rootfs/usr" "$rootfs/usr/bin" "$rootfs/srv" \
   "$rootfs/proc" "$rootfs/sys" "$rootfs/dev" "$rootfs/run" \
@@ -4359,6 +4880,260 @@ if [[ "$hostile_storage_test_enabled" == 1 ]]; then
   printf \
     'real loopback-NBD D-state recovery passed: workers=4 tasks=%s memory=%s\n' \
     "$hostile_tasks_current" "$hostile_memory_current"
+
+  wait_until "storage workers before FUSE hostile-storage test" \
+    storage_worker_count_is 0
+  sudo sync
+  printf '3\n' | sudo tee /proc/sys/vm/drop_caches >/dev/null
+  [[ "$(hostile_storage_suspended_value)" == 0 ]] ||
+    fail "hostile-storage mapping was suspended before the FUSE test"
+  hostile_storage_fuse_daemon_is_exact ||
+    fail "hostile-storage FUSE daemon identity changed before fault injection"
+  hostile_storage_fuse_daemon_is_resumed ||
+    fail "hostile-storage FUSE daemon was not runnable before fault injection"
+  [[ "$(hostile_storage_fuse_waiting_value)" == 0 ]] ||
+    fail "hostile-storage FUSE connection was not idle before fault injection"
+  hostile_storage_nbd_server_is_exact ||
+    fail "hostile-storage NBD server identity changed before the FUSE fault"
+  hostile_storage_nbd_server_is_resumed ||
+    fail "hostile-storage NBD server was not runnable before the FUSE fault"
+  hostile_storage_nbd_listener_is_exact ||
+    fail "hostile-storage NBD listener changed before the FUSE fault"
+
+  hostile_storage_fuse_daemon_stopped=1
+  signal_exact_hostile_storage_fuse_daemon 19 ||
+    fail "could not stop the exact hostile-storage FUSE daemon"
+  hostile_fuse_stop_deadline=$((SECONDS + 5))
+  wait_until_before "hostile-storage FUSE daemon stop" \
+    "$hostile_fuse_stop_deadline" \
+    hostile_storage_fuse_daemon_state_is T
+  hostile_storage_nbd_server_is_resumed ||
+    fail "FUSE fault unexpectedly stopped the hostile-storage NBD server"
+  hostile_storage_nbd_listener_is_exact ||
+    fail "FUSE fault changed the hostile-storage NBD listener"
+  [[ "$(hostile_storage_suspended_value)" == 0 ]] ||
+    fail "hostile-storage mapping, rather than its FUSE daemon, was suspended"
+
+  hostile_fuse_blocked_deadline=$((SECONDS + 8))
+  for _ in {1..4}; do
+    start_hostile_storage_client
+  done
+  wait_until_before "four live FUSE hostile-storage clients" \
+    "$hostile_fuse_blocked_deadline" \
+    hostile_storage_clients_are_live
+  wait_until_before "FUSE kernel waiting request" \
+    "$hostile_fuse_blocked_deadline" \
+    hostile_storage_fuse_has_waiting_request
+  wait_until_before "four FUSE hostile-storage workers" \
+    "$hostile_fuse_blocked_deadline" \
+    storage_worker_count_is 4
+  wait_until_before "four real FUSE-backed D-state storage workers" \
+    "$hostile_fuse_blocked_deadline" \
+    storage_workers_are_in_d_state 4
+  mapfile -t hostile_worker_pids < <(storage_worker_pids)
+  [[ "${#hostile_worker_pids[@]}" == 4 ]] ||
+    fail "FUSE hostile-storage load did not retain exactly four workers"
+  for hostile_worker_pid in "${hostile_worker_pids[@]}"; do
+    hostile_worker_start_time="$(
+      process_start_time "$hostile_worker_pid"
+    )" || fail "could not capture FUSE hostile-storage worker identity"
+    hostile_worker_start_times+=("$hostile_worker_start_time")
+  done
+  assert_hostile_storage_worker_boundaries blocked "$portal_pid"
+  hostile_storage_fuse_has_waiting_request ||
+    fail "FUSE kernel waiting evidence disappeared during blocked inspection"
+  hostile_storage_nbd_server_is_resumed ||
+    fail "NBD server was not runnable during the FUSE-backed D-state fault"
+  hostile_storage_nbd_listener_is_exact ||
+    fail "NBD listener changed during the FUSE-backed D-state fault"
+  [[ "$(hostile_storage_suspended_value)" == 0 ]] ||
+    fail "hostile-storage mapping changed during the FUSE fault"
+  hostile_storage_clients_are_live ||
+    fail "FUSE hostile-storage clients exited during blocked worker inspection"
+
+  hostile_fuse_timeout_deadline=$((SECONDS + 18))
+  wait_until_before "four bounded FUSE hostile-storage timeouts" \
+    "$hostile_fuse_timeout_deadline" \
+    hostile_storage_clients_are_complete
+  assert_hostile_storage_client_responses
+  assert_hostile_storage_worker_boundaries kill-pending "$portal_pid"
+  [[ "$(storage_worker_count)" == 4 ]] ||
+    fail "FUSE hostile-storage timeout did not retain exactly four D-state workers"
+  hostile_storage_fuse_has_waiting_request ||
+    fail "FUSE kernel waiting evidence disappeared after bounded timeouts"
+
+  hostile_fuse_quarantine_headers="${workspace}/hostile-fuse-quarantine.headers"
+  hostile_fuse_quarantine_body="${workspace}/hostile-fuse-quarantine.body"
+  for quarantine_path in \
+    "$hostile_fuse_quarantine_headers" "$hostile_fuse_quarantine_body"
+  do
+    [[ ! -e "$quarantine_path" && ! -L "$quarantine_path" ]] ||
+      fail "FUSE hostile-storage quarantine response path already exists"
+    install -m 0600 /dev/null "$quarantine_path"
+  done
+  hostile_fuse_quarantine_started=$SECONDS
+  hostile_fuse_quarantine_status="$(
+    printf 'Authorization: Bearer %s\n' "$test_bearer" |
+      curl -q -sS \
+        --connect-timeout 2 \
+        --max-time 5 \
+        -H @- \
+        -H 'Connection: close' \
+        -D "$hostile_fuse_quarantine_headers" \
+        -o "$hostile_fuse_quarantine_body" \
+        -w '%{http_code}' \
+        'http://127.0.0.1:39777/public-files/api/list?path='
+  )"
+  hostile_fuse_quarantine_elapsed=$((
+    SECONDS - hostile_fuse_quarantine_started
+  ))
+  [[ "$hostile_fuse_quarantine_status" == 503 &&
+    "$hostile_fuse_quarantine_elapsed" -le 5 ]] ||
+    fail \
+      "FUSE quarantine admission returned $hostile_fuse_quarantine_status after ${hostile_fuse_quarantine_elapsed}s"
+  [[ "$(<"$hostile_fuse_quarantine_body")" == \
+    '{"error":"storage capacity unavailable"}' ]] ||
+    fail "FUSE quarantine admission returned an unexpected body"
+  [[ "$(
+    awk '
+      {
+        line = $0
+        sub(/\r$/, "", line)
+        separator = index(line, ":")
+        if (separator == 0)
+          next
+        name = tolower(substr(line, 1, separator - 1))
+        if (name != "retry-after")
+          next
+        count++
+        value = substr(line, separator + 1)
+        sub(/^[[:space:]]+/, "", value)
+        sub(/[[:space:]]+$/, "", value)
+        if (value != "5")
+          invalid++
+      }
+      END { printf "%d:%d\n", count + 0, invalid + 0 }
+    ' "$hostile_fuse_quarantine_headers"
+  )" == 1:0 ]] ||
+    fail "FUSE quarantine admission lacked one exact Retry-After value 5"
+  if grep -aFq -- 'rc1_' \
+    "$hostile_fuse_quarantine_headers" "$hostile_fuse_quarantine_body"; then
+    fail "FUSE quarantine response retained a bearer-shaped value"
+  fi
+  [[ "$(storage_worker_count)" == 4 ]] ||
+    fail "FUSE quarantine admission started an additional storage worker"
+  assert_hostile_storage_worker_boundaries kill-pending "$portal_pid"
+  wait_until "static portal during FUSE storage quarantine" page_is_ready
+
+  hostile_fuse_tasks_current="$(
+    sudo systemctl show --property=TasksCurrent --value "$service_unit"
+  )"
+  hostile_fuse_memory_current="$(
+    sudo systemctl show --property=MemoryCurrent --value "$service_unit"
+  )"
+  [[ "$hostile_fuse_tasks_current" =~ ^[0-9]+$ &&
+    "$hostile_fuse_tasks_current" -le 224 ]] ||
+    fail \
+      "FUSE D-state TasksCurrent=$hostile_fuse_tasks_current leaves insufficient headroom"
+  [[ "$hostile_fuse_memory_current" =~ ^[0-9]+$ &&
+    "$hostile_fuse_memory_current" -le 469762048 ]] ||
+    fail \
+      "FUSE D-state MemoryCurrent=$hostile_fuse_memory_current leaves insufficient headroom"
+  assert_service_cgroup_limits
+  wait_until "unchanged management sentinel during FUSE D-state" \
+    sentinel_is_unchanged
+
+  hostile_fuse_old_portal_pid=$portal_pid
+  hostile_fuse_old_portal_invocation=$portal_invocation
+  hostile_fuse_old_portal_start_time="$(
+    process_start_time "$hostile_fuse_old_portal_pid"
+  )" || fail "could not capture the pre-FUSE-restart portal identity"
+  sudo systemctl restart --no-block "$service_unit"
+  hostile_fuse_restart_pending_deadline=$((SECONDS + 8))
+  wait_until_before "old portal exit during FUSE D-state restart" \
+    "$hostile_fuse_restart_pending_deadline" \
+    process_identity_is_gone \
+    "$hostile_fuse_old_portal_pid" \
+    "$hostile_fuse_old_portal_start_time"
+  wait_until_before "service deactivation behind FUSE D-state workers" \
+    "$hostile_fuse_restart_pending_deadline" \
+    service_is_deactivating
+  assert_hostile_storage_worker_boundaries kill-pending 1
+  wait_until "unchanged management sentinel during pending FUSE restart" \
+    sentinel_is_unchanged
+  hostile_storage_fuse_daemon_state_is T ||
+    fail "hostile-storage FUSE daemon resumed without operator action"
+  hostile_storage_fuse_has_waiting_request ||
+    fail "FUSE kernel waiting evidence disappeared during pending restart"
+  hostile_storage_nbd_server_is_resumed ||
+    fail "NBD server stopped during the pending FUSE restart"
+  hostile_storage_nbd_listener_is_exact ||
+    fail "NBD listener changed during the pending FUSE restart"
+  [[ "$(hostile_storage_suspended_value)" == 0 ]] ||
+    fail "hostile-storage mapping changed during the pending FUSE restart"
+
+  signal_exact_hostile_storage_fuse_daemon 18 ||
+    fail "could not resume the exact hostile-storage FUSE daemon"
+  hostile_fuse_resume_deadline=$((SECONDS + 10))
+  wait_until_before "hostile-storage FUSE daemon and request recovery" \
+    "$hostile_fuse_resume_deadline" \
+    hostile_storage_fuse_is_recovered
+  hostile_storage_fuse_daemon_stopped=0
+  hostile_fuse_recovery_deadline=$((SECONDS + 30))
+  for hostile_worker_index in "${!hostile_worker_pids[@]}"; do
+    wait_until_before \
+      "FUSE hostile-storage worker ${hostile_worker_pids[$hostile_worker_index]} reap" \
+      "$hostile_fuse_recovery_deadline" \
+      process_identity_is_gone \
+      "${hostile_worker_pids[$hostile_worker_index]}" \
+      "${hostile_worker_start_times[$hostile_worker_index]}"
+  done
+  wait_until_before "public service recovery after FUSE hostile storage" \
+    "$hostile_fuse_recovery_deadline" \
+    service_has_new_pid
+  wait_until_before "public portal recovery after FUSE hostile storage" \
+    "$hostile_fuse_recovery_deadline" \
+    page_is_ready
+  portal_pid="$(
+    sudo systemctl show --property=MainPID --value "$service_unit"
+  )"
+  portal_invocation="$(
+    sudo systemctl show --property=InvocationID --value "$service_unit"
+  )"
+  [[ "$portal_pid" =~ ^[0-9]+$ && "$portal_pid" -gt 1 &&
+    "$portal_pid" != "$hostile_fuse_old_portal_pid" &&
+    -n "$portal_invocation" &&
+    "$portal_invocation" != "$hostile_fuse_old_portal_invocation" ]] ||
+    fail "FUSE hostile-storage recovery did not create a new portal invocation"
+  hostile_worker_pids=()
+  hostile_worker_start_times=()
+  wait_until "storage workers after FUSE hostile-storage recovery" \
+    storage_worker_count_is 0
+
+  printf 'Authorization: Bearer %s\n' "$test_bearer" |
+    curl -q -sS -H @- \
+      'http://127.0.0.1:39777/public-files/api/file?path=report.txt' \
+      -o "$response_file"
+  printf '%s\n' 'systemd isolation fixture' |
+    cmp - "$response_file" ||
+    fail "post-FUSE-D-state downloaded bytes differ from the approved file"
+  hostile_storage_fuse_is_recovered ||
+    fail "FUSE connection was not idle after byte-correct recovery"
+  hostile_storage_nbd_server_is_exact ||
+    fail "NBD server identity changed after FUSE recovery"
+  hostile_storage_nbd_listener_is_exact ||
+    fail "NBD listener changed after FUSE recovery"
+  [[ "$(hostile_storage_suspended_value)" == 0 ]] ||
+    fail "hostile-storage mapping changed after FUSE recovery"
+  assert_service_cgroup_limits
+  assert_systemd_credential_for_pid "$portal_pid"
+  assert_service_api_vfs_isolation "$portal_pid"
+  wait_until \
+    "unchanged management sentinel after FUSE hostile-storage recovery" \
+    sentinel_is_unchanged
+  printf \
+    'real FUSE-backed NBD D-state recovery passed: workers=4 waiting>=1 tasks=%s memory=%s\n' \
+    "$hostile_fuse_tasks_current" "$hostile_fuse_memory_current"
 fi
 
 for blocked_file in \

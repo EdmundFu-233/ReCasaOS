@@ -94,6 +94,9 @@ expect_rejection stale-sha vm \
 expect_rejection hostile-storage-opt-in vm \
   '      RECASAOS_HOSTILE_STORAGE_VM_CI=1 \' \
   '      RECASAOS_HOSTILE_STORAGE_VM_CI=0 \'
+expect_rejection hostile-storage-missing-bindfs vm \
+  '  - bindfs' \
+  '  # bindfs omitted'
 expect_rejection debian-noexec-workspace systemd \
   '    workspace_parent=/var/lib' \
   '    workspace_parent=/run'
@@ -127,9 +130,27 @@ expect_rejection hostile-storage-nbd-non-loopback systemd \
 expect_rejection hostile-storage-multiple-nbd-devices systemd \
   'sudo modprobe nbd nbds_max=1 max_part=0' \
   'sudo modprobe nbd nbds_max=16 max_part=16'
+expect_rejection hostile-storage-fuse-bypass systemd \
+  'hostile_storage_backing="${hostile_storage_fuse_mount}/hostile-storage.img"' \
+  'hostile_storage_backing="${hostile_storage_fuse_source}/hostile-storage.img"'
+expect_rejection hostile-storage-fuse-command-bypass systemd \
+  $'    "$hostile_storage_backing" \\\n    >/dev/null 2>"$hostile_storage_nbd_log" &' \
+  $'    "$hostile_storage_backing_source" \\\n    >/dev/null 2>"$hostile_storage_nbd_log" &'
+expect_rejection hostile-storage-fuse-allow-other systemd \
+  '--no-allow-other' \
+  '--allow-other'
 expect_rejection hostile-storage-wrong-stop-signal systemd \
   'signal_exact_hostile_storage_nbd_server 19' \
   'signal_exact_hostile_storage_nbd_server 15'
+expect_rejection hostile-storage-fuse-wrong-stop-signal systemd \
+  'signal_exact_hostile_storage_fuse_daemon 19' \
+  'signal_exact_hostile_storage_fuse_daemon 15'
+expect_rejection hostile-storage-fuse-fake-waiting systemd \
+  '[[ "$waiting_value" -ge 1 ]]' \
+  '[[ "$waiting_value" -ge 0 ]]'
+expect_rejection hostile-storage-fuse-waiting-without-live-nbd systemd \
+  $'hostile_storage_fuse_daemon_state_is T || return 1\n  hostile_storage_nbd_server_is_resumed || return 1' \
+  $'hostile_storage_fuse_daemon_state_is T || return 1\n  : # live NBD proof skipped'
 expect_rejection hostile-storage-nbd-exec-race systemd \
   'while ! hostile_storage_nbd_server_is_exact &&' \
   'while ! hostile_storage_nbd_server_is_exact && false &&'
@@ -151,6 +172,9 @@ expect_rejection hostile-storage-leader-only-d-state systemd \
 expect_rejection hostile-storage-three-d-state-workers systemd \
   'storage_workers_are_in_d_state 4' \
   'storage_workers_are_in_d_state 3'
+expect_rejection hostile-storage-fuse-three-d-state-workers systemd \
+  $'  wait_until_before "four real FUSE-backed D-state storage workers" \\\n    "$hostile_fuse_blocked_deadline" \\\n    storage_workers_are_in_d_state 4' \
+  $'  wait_until_before "four real FUSE-backed D-state storage workers" \\\n    "$hostile_fuse_blocked_deadline" \\\n    storage_workers_are_in_d_state 3'
 expect_rejection hostile-storage-split-formation-deadline systemd \
   '    "$hostile_blocked_deadline" \' \
   '    "$hostile_timeout_deadline" \'
@@ -172,6 +196,15 @@ expect_rejection hostile-storage-missing-post-inspection-client-check systemd \
 expect_rejection hostile-storage-cleanup-without-resume systemd \
   'if ! resume_hostile_storage_for_cleanup; then' \
   'if false; then'
+expect_rejection hostile-storage-cleanup-without-fuse-resume systemd \
+  '  resume_hostile_storage_fuse_for_cleanup || return 1' \
+  '  : # exact FUSE resume skipped'
+expect_rejection hostile-storage-cleanup-nbd-before-fuse systemd \
+  $'  resume_hostile_storage_fuse_for_cleanup || return 1\n  resume_hostile_storage_nbd_for_cleanup' \
+  $'  resume_hostile_storage_nbd_for_cleanup || return 1\n  resume_hostile_storage_fuse_for_cleanup'
+expect_rejection hostile-storage-cleanup-without-fuse-unmount systemd \
+  $'      "$hostile_storage_fusermount_executable" \\\n      -u "$hostile_storage_fuse_mount"' \
+  '      true # FUSE unmount skipped'
 expect_rejection sampler-symlink-follow sampler \
   'source_flags |= os.O_NOFOLLOW' \
   'source_flags |= 0'
