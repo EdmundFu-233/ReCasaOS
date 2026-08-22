@@ -1324,7 +1324,9 @@ cleanup_hostile_storage_stack() {
       return 1
     }
     timeout --signal=TERM --kill-after=5s 10s \
-      sudo nbd-client -d "$hostile_storage_nbd_device"
+      sudo nbd-client \
+        --nonetlink \
+        -d "$hostile_storage_nbd_device"
     command_status=$?
     if [[ "$command_status" != 0 ]]; then
       cleanup_problem \
@@ -3716,8 +3718,13 @@ setup_hostile_storage_fuse_backing() {
 setup_hostile_storage_share() {
   local device_identity
   local nbd_connection_status
+  local nbd_client_deadline
+  local nbd_client_executable
+  local nbd_client_expected_executable
   local mount_evidence
   local nbd_client_pid
+  local nbd_client_start_time
+  local nbd_client_uid
   local nbd_identity
   local nbd_listener_count
   local nbd_server_deadline
@@ -3858,8 +3865,12 @@ setup_hostile_storage_share() {
     fail "hostile-storage NBD server is not the exact loopback listener"
   fi
 
+  # Debian 11 nbd-client defaults to netlink and exits after handing its
+  # socket to the kernel. Force the long-lived ioctl client so the kernel PID
+  # attribute is a stable, live client identity throughout the fault test.
   if ! timeout --signal=TERM --kill-after=5s 10s \
     sudo nbd-client \
+      --nonetlink \
       127.0.0.1 \
       "$hostile_storage_nbd_port" \
       "$hostile_storage_nbd_device" \
@@ -3871,13 +3882,46 @@ setup_hostile_storage_share() {
     fail "could not connect the hostile-storage NBD device"
   fi
   hostile_storage_nbd_connected=1
-  nbd_client_pid="$(
-    sudo nbd-client -c "$hostile_storage_nbd_device" | tr -d '[:space:]'
-  )" || fail "could not verify the hostile-storage NBD connection"
+  nbd_client_expected_executable="$(
+    readlink -f "$(command -v nbd-client)"
+  )" || fail "could not resolve the hostile-storage NBD client"
+  [[ "$nbd_client_expected_executable" == /usr/sbin/nbd-client ]] ||
+    fail "unexpected hostile-storage NBD client: $nbd_client_expected_executable"
+  nbd_client_deadline=$((SECONDS + 5))
+  nbd_client_pid=
+  while ((SECONDS < nbd_client_deadline)); do
+    if nbd_client_pid="$(
+      sudo nbd-client -c "$hostile_storage_nbd_device" |
+        tr -d '[:space:]'
+    )" && [[ "$nbd_client_pid" =~ ^[0-9]+$ && "$nbd_client_pid" -gt 1 ]]; then
+      break
+    fi
+    nbd_client_pid=
+    hostile_storage_nbd_server_is_exact ||
+      fail "hostile-storage NBD server changed before client readiness"
+    hostile_storage_nbd_listener_is_exact ||
+      fail "hostile-storage NBD listener changed before client readiness"
+    sleep 0.02
+  done
   [[ "$nbd_client_pid" =~ ^[0-9]+$ && "$nbd_client_pid" -gt 1 ]] ||
     fail "hostile-storage NBD client PID is invalid: $nbd_client_pid"
+  nbd_client_start_time="$(process_start_time "$nbd_client_pid")" ||
+    fail "could not capture the hostile-storage NBD client identity"
+  nbd_client_executable="$(
+    sudo readlink -f "/proc/$nbd_client_pid/exe"
+  )" || fail "could not inspect the hostile-storage NBD client executable"
+  nbd_client_uid="$(
+    awk '$1 == "Uid:" { print $2 ":" $3 ":" $4 ":" $5; exit }' \
+      "/proc/$nbd_client_pid/status"
+  )" || fail "could not inspect the hostile-storage NBD client UID"
+  [[ "$nbd_client_executable" == "$nbd_client_expected_executable" &&
+    "$nbd_client_uid" == 0:0:0:0 ]] ||
+    fail "hostile-storage NBD client process identity is unsafe"
   [[ "$(sudo cat /sys/block/nbd0/pid)" == "$nbd_client_pid" ]] ||
     fail "hostile-storage NBD kernel identity changed"
+  [[ "$(process_start_time "$nbd_client_pid")" == \
+    "$nbd_client_start_time" ]] ||
+    fail "hostile-storage NBD client process identity changed"
   sectors="$(sudo blockdev --getsz "$hostile_storage_nbd_device")" ||
     fail "could not inspect hostile-storage NBD size"
   [[ "$sectors" =~ ^[0-9]+$ && "$sectors" -eq 524288 ]] ||

@@ -130,6 +130,30 @@ expect_rejection hostile-storage-nbd-non-loopback systemd \
 expect_rejection hostile-storage-multiple-nbd-devices systemd \
   'sudo modprobe nbd nbds_max=1 max_part=0' \
   'sudo modprobe nbd nbds_max=16 max_part=16'
+expect_rejection hostile-storage-nbd-netlink-connect systemd \
+  $'sudo nbd-client \\\n      --nonetlink \\\n      127.0.0.1' \
+  $'sudo nbd-client \\\n      127.0.0.1'
+expect_rejection hostile-storage-nbd-netlink-cleanup systemd \
+  $'sudo nbd-client \\\n        --nonetlink \\\n        -d "$hostile_storage_nbd_device"' \
+  $'sudo nbd-client \\\n        -d "$hostile_storage_nbd_device"'
+expect_rejection hostile-storage-nbd-readiness-bypass systemd \
+  'while ((SECONDS < nbd_client_deadline)); do' \
+  'while false && ((SECONDS < nbd_client_deadline)); do'
+expect_rejection hostile-storage-nbd-readiness-window systemd \
+  'nbd_client_deadline=$((SECONDS + 5))' \
+  'nbd_client_deadline=$((SECONDS + 10))'
+expect_rejection hostile-storage-nbd-duplicate-readiness-deadline systemd \
+  '  nbd_client_deadline=$((SECONDS + 5))' \
+  $'  nbd_client_deadline=$((SECONDS + 5))\n  nbd_client_deadline=$((SECONDS + 1000))'
+expect_rejection hostile-storage-nbd-client-exec-bypass systemd \
+  '[[ "$nbd_client_expected_executable" == /usr/sbin/nbd-client ]]' \
+  '[[ -n "$nbd_client_expected_executable" ]]'
+expect_rejection hostile-storage-nbd-client-uid-bypass systemd \
+  '    "$nbd_client_uid" == 0:0:0:0 ]] ||' \
+  '    -n "$nbd_client_uid" ]] ||'
+expect_rejection hostile-storage-nbd-client-identity-fail-open systemd \
+  $'    "$nbd_client_uid" == 0:0:0:0 ]] ||\n    fail "hostile-storage NBD client process identity is unsafe"' \
+  $'    "$nbd_client_uid" == 0:0:0:0 ]] || true ||\n    fail "hostile-storage NBD client process identity is unsafe"'
 expect_rejection hostile-storage-fuse-bypass systemd \
   'hostile_storage_backing="${hostile_storage_fuse_mount}/hostile-storage.img"' \
   'hostile_storage_backing="${hostile_storage_fuse_source}/hostile-storage.img"'

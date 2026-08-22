@@ -511,12 +511,85 @@ require_order(
         "while ! hostile_storage_nbd_server_is_exact &&\n"
         "    ((SECONDS < nbd_server_deadline)); do",
         "if hostile_storage_nbd_server_process_is_gone; then",
-        "sudo nbd-client \\\n      127.0.0.1",
+        "sudo nbd-client \\\n      --nonetlink \\\n      127.0.0.1",
+        'nbd_client_expected_executable="$(',
+        '[[ "$nbd_client_expected_executable" == /usr/sbin/nbd-client ]]',
+        "nbd_client_deadline=$((SECONDS + 5))",
+        "while ((SECONDS < nbd_client_deadline)); do",
+        ')" && [[ "$nbd_client_pid" =~ ^[0-9]+$ && '
+        '"$nbd_client_pid" -gt 1 ]]; then',
+        "hostile_storage_nbd_server_is_exact ||\n"
+        '      fail "hostile-storage NBD server changed before client readiness"',
+        "hostile_storage_nbd_listener_is_exact ||\n"
+        '      fail "hostile-storage NBD listener changed before client readiness"',
+        'nbd_client_start_time="$(process_start_time "$nbd_client_pid")"',
+        'sudo readlink -f "/proc/$nbd_client_pid/exe"',
+        '"/proc/$nbd_client_pid/status"',
+        '[[ "$nbd_client_executable" == "$nbd_client_expected_executable" &&',
+        '    "$nbd_client_uid" == 0:0:0:0 ]] ||',
+        '[[ "$(sudo cat /sys/block/nbd0/pid)" == "$nbd_client_pid" ]]',
+        '[[ "$(process_start_time "$nbd_client_pid")" == \\\n    "$nbd_client_start_time" ]]',
         'table="0 $sectors linear $nbd_identity 0"',
         'sudo dmsetup create "$hostile_storage_name" --table "$table"',
     ),
     "hostile-storage NBD setup",
 )
+nbd_client_identity_start = '  nbd_client_expected_executable="$('
+nbd_client_identity_end = (
+    '  sectors="$(sudo blockdev --getsz "$hostile_storage_nbd_device")" ||'
+)
+nbd_client_identity = (
+    nbd_client_identity_start
+    + unique_slice(
+        nbd_client_identity_start,
+        nbd_client_identity_end,
+        "hostile-storage NBD client identity",
+    )
+    + nbd_client_identity_end
+)
+expected_nbd_client_identity = r'''  nbd_client_expected_executable="$(
+    readlink -f "$(command -v nbd-client)"
+  )" || fail "could not resolve the hostile-storage NBD client"
+  [[ "$nbd_client_expected_executable" == /usr/sbin/nbd-client ]] ||
+    fail "unexpected hostile-storage NBD client: $nbd_client_expected_executable"
+  nbd_client_deadline=$((SECONDS + 5))
+  nbd_client_pid=
+  while ((SECONDS < nbd_client_deadline)); do
+    if nbd_client_pid="$(
+      sudo nbd-client -c "$hostile_storage_nbd_device" |
+        tr -d '[:space:]'
+    )" && [[ "$nbd_client_pid" =~ ^[0-9]+$ && "$nbd_client_pid" -gt 1 ]]; then
+      break
+    fi
+    nbd_client_pid=
+    hostile_storage_nbd_server_is_exact ||
+      fail "hostile-storage NBD server changed before client readiness"
+    hostile_storage_nbd_listener_is_exact ||
+      fail "hostile-storage NBD listener changed before client readiness"
+    sleep 0.02
+  done
+  [[ "$nbd_client_pid" =~ ^[0-9]+$ && "$nbd_client_pid" -gt 1 ]] ||
+    fail "hostile-storage NBD client PID is invalid: $nbd_client_pid"
+  nbd_client_start_time="$(process_start_time "$nbd_client_pid")" ||
+    fail "could not capture the hostile-storage NBD client identity"
+  nbd_client_executable="$(
+    sudo readlink -f "/proc/$nbd_client_pid/exe"
+  )" || fail "could not inspect the hostile-storage NBD client executable"
+  nbd_client_uid="$(
+    awk '$1 == "Uid:" { print $2 ":" $3 ":" $4 ":" $5; exit }' \
+      "/proc/$nbd_client_pid/status"
+  )" || fail "could not inspect the hostile-storage NBD client UID"
+  [[ "$nbd_client_executable" == "$nbd_client_expected_executable" &&
+    "$nbd_client_uid" == 0:0:0:0 ]] ||
+    fail "hostile-storage NBD client process identity is unsafe"
+  [[ "$(sudo cat /sys/block/nbd0/pid)" == "$nbd_client_pid" ]] ||
+    fail "hostile-storage NBD kernel identity changed"
+  [[ "$(process_start_time "$nbd_client_pid")" == \
+    "$nbd_client_start_time" ]] ||
+    fail "hostile-storage NBD client process identity changed"
+  sectors="$(sudo blockdev --getsz "$hostile_storage_nbd_device")" ||'''
+if nbd_client_identity != expected_nbd_client_identity:
+    raise SystemExit("hostile-storage NBD client identity control flow changed")
 for setup_proof in (
     "--shared=1 \\",
     "--bind=127.0.0.1 \\",
@@ -718,7 +791,7 @@ require_order(
     (
         'sudo umount -- "$share"',
         'sudo dmsetup remove --retry "$hostile_storage_name"',
-        'sudo nbd-client -d "$hostile_storage_nbd_device"',
+        'sudo nbd-client \\\n        --nonetlink \\\n        -d "$hostile_storage_nbd_device"',
         'if ! terminate_exact_background_process \\\n      "$hostile_storage_nbd_server_pid"',
         '"$hostile_storage_fusermount_executable" \\\n      -u "$hostile_storage_fuse_mount"',
         'if ! terminate_exact_background_process \\\n        "$hostile_storage_fuse_daemon_pid"',
@@ -774,7 +847,9 @@ require_text "$systemd_script" \
   'sudo dmsetup remove --retry "$hostile_storage_name"' \
   "hostile-storage cleanup does not remove the exact device mapping"
 require_text "$systemd_script" \
-  'sudo nbd-client -d "$hostile_storage_nbd_device"' \
+  'sudo nbd-client \
+        --nonetlink \
+        -d "$hostile_storage_nbd_device"' \
   "hostile-storage cleanup does not disconnect the exact NBD device"
 require_text "$systemd_script" \
   'terminate_exact_background_process \' \
