@@ -344,6 +344,27 @@ signal_policy = """    pending_values = []
 """
 if worker_python.count(signal_policy) != 1:
     raise SystemExit("hostile-storage pending-signal policy changed")
+executable_policy = '''    try:
+        worker_executable = os.stat(Path("/proc") / str(pid) / "exe")
+    except FileNotFoundError:
+        # After a group-wide SIGKILL, Linux can tear down the thread-group
+        # leader's executable while a sibling task remains blocked in D-state.
+        # The blocked phase already proved the image, and this phase still
+        # proves the recorded PID/start time, D-state task, credentials, and
+        # pending SIGKILL before accepting that narrow kernel state.
+        if phase != "kill-pending":
+            raise RuntimeError(
+                f"hostile-storage worker {pid} image disappeared before cancellation"
+            ) from None
+    else:
+        if (
+            worker_executable.st_dev != reviewed_binary.st_dev
+            or worker_executable.st_ino != reviewed_binary.st_ino
+        ):
+            raise RuntimeError("hostile-storage worker image identity changed")
+'''
+if worker_python.count(executable_policy) != 1:
+    raise SystemExit("hostile-storage executable teardown policy changed")
 for task_proof in (
     'task_root = Path("/proc") / str(pid) / "task"',
     'if task_state == b"D":',

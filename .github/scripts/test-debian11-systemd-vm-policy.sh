@@ -157,6 +157,9 @@ expect_rejection hostile-storage-split-formation-deadline systemd \
 expect_rejection hostile-storage-blocked-allows-pending-kill systemd \
   'if phase == "blocked" and kill_is_pending:' \
   'if phase == "blocked" and false:'
+expect_rejection hostile-storage-missing-exe-fail-open systemd \
+  '        if phase != "kill-pending":' \
+  '        if False:'
 expect_rejection hostile-storage-incomplete-inspection systemd \
   'or len(worker_pairs) != 4' \
   'or len(worker_pairs) != 1'

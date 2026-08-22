@@ -2015,12 +2015,24 @@ for pair in worker_pairs:
     d_tid, d_start_before = find_d_state_task(pid)
     d_tasks.append(f"{pid}:{d_tid}")
 
-    worker_executable = os.stat(Path("/proc") / str(pid) / "exe")
-    if (
-        worker_executable.st_dev != reviewed_binary.st_dev
-        or worker_executable.st_ino != reviewed_binary.st_ino
-    ):
-        raise RuntimeError("hostile-storage worker image identity changed")
+    try:
+        worker_executable = os.stat(Path("/proc") / str(pid) / "exe")
+    except FileNotFoundError:
+        # After a group-wide SIGKILL, Linux can tear down the thread-group
+        # leader's executable while a sibling task remains blocked in D-state.
+        # The blocked phase already proved the image, and this phase still
+        # proves the recorded PID/start time, D-state task, credentials, and
+        # pending SIGKILL before accepting that narrow kernel state.
+        if phase != "kill-pending":
+            raise RuntimeError(
+                f"hostile-storage worker {pid} image disappeared before cancellation"
+            ) from None
+    else:
+        if (
+            worker_executable.st_dev != reviewed_binary.st_dev
+            or worker_executable.st_ino != reviewed_binary.st_ino
+        ):
+            raise RuntimeError("hostile-storage worker image identity changed")
 
     status = read_status(pid)
     user_ids = status.get(b"Uid", b"").split()
