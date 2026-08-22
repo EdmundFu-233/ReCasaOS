@@ -10,6 +10,8 @@ import (
 	"io"
 	"io/fs"
 	"mime/multipart"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +19,7 @@ import (
 	"time"
 
 	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
+	"github.com/labstack/echo/v4"
 	"golang.org/x/sys/unix"
 )
 
@@ -431,4 +434,140 @@ func TestV2UploadParentAndStagingCreationFailuresAreTerminalAndConservative(t *t
 			t.Fatalf("failed staging session was retained: %+v", upload.uploadStatus)
 		}
 	})
+}
+
+func TestV2UploadSessionRejectsSameTargetThroughDifferentBaseBeforeMutation(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "nested"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := filesecurity.OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	upload := NewFileUploadService()
+	upload.managementRoots = func() (*filesecurity.ManagedRoots, error) { return roots, nil }
+	upload.removeTree = os.RemoveAll
+
+	firstChunk := multipartFileHeader(t, "target.bin", "a")
+	err = upload.UploadFile(
+		nil,
+		root,
+		1,
+		1,
+		1,
+		2,
+		2,
+		"same-target-alias",
+		filepath.Join("nested", "target.bin"),
+		"target.bin",
+		firstChunk,
+	)
+	if err != nil {
+		t.Fatalf("first upload chunk failed: %v", err)
+	}
+	target := filepath.Join(root, "nested", "target.bin")
+	key := boundUploadIdentifier("same-target-alias", target)
+	session := upload.uploadStatus[key]
+	if session == nil || session.uploadedChunkNum != 1 {
+		t.Fatalf("first upload session = %+v", session)
+	}
+	originalStaging := session.tempDir
+	if _, err := os.Stat(filepath.Join(originalStaging, "1")); err != nil {
+		t.Fatalf("first staging chunk is missing: %v", err)
+	}
+
+	canonicalRetry := multipartFileHeader(t, "target.bin", "a")
+	err = upload.UploadFile(
+		nil,
+		root+string(filepath.Separator),
+		1,
+		1,
+		1,
+		2,
+		2,
+		"same-target-alias",
+		filepath.Join("nested", "target.bin"),
+		"target.bin",
+		canonicalRetry,
+	)
+	if err != nil {
+		t.Fatalf("canonical retry failed: %v", err)
+	}
+	if upload.uploadStatus[key] != session || session.uploadedChunkNum != 1 {
+		t.Fatal("canonical retry replaced or duplicated the upload generation")
+	}
+
+	aliasBase := filepath.Join(root, "nested")
+	aliasStaging := filepath.Join(aliasBase, ".temp", "v2-upload-"+key)
+	activityBeforeAlias := session.lastActivity
+	aliasChunk := multipartFileHeader(t, "target.bin", "a")
+	err = upload.UploadFile(
+		nil,
+		aliasBase,
+		1,
+		1,
+		1,
+		2,
+		2,
+		"same-target-alias",
+		"target.bin",
+		"target.bin",
+		aliasChunk,
+	)
+	if err == nil || !strings.Contains(err.Error(), "different upload metadata") {
+		t.Fatalf("same target through a different base was not rejected: %v", err)
+	}
+	if upload.uploadStatus[key] != session || session.uploadedChunkNum != 1 {
+		t.Fatal("alias request changed the existing upload generation")
+	}
+	if !session.lastActivity.Equal(activityBeforeAlias) {
+		t.Fatal("alias request refreshed the existing upload session TTL")
+	}
+	if _, err := os.Stat(aliasStaging); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("alias request created untracked staging: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(originalStaging, "1")); err != nil {
+		t.Fatalf("alias rejection changed the owned staging chunk: %v", err)
+	}
+
+	query := make(url.Values)
+	query.Set("path", aliasBase)
+	query.Set("relativePath", "target.bin")
+	request := httptest.NewRequest("GET", "/v2/file/upload?"+query.Encode(), nil)
+	context := echo.New().NewContext(request, httptest.NewRecorder())
+	activityBeforeProbe := session.lastActivity
+	if err := upload.TestChunk(context, "same-target-alias", 1); err == nil {
+		t.Fatal("same target alias reported the bound chunk as uploaded")
+	}
+	if !session.lastActivity.Equal(activityBeforeProbe) {
+		t.Fatal("alias chunk probe refreshed the existing upload session TTL")
+	}
+}
+
+func multipartFileHeader(t *testing.T, name, contents string) *multipart.FileHeader {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(part, contents); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	form, err := multipart.NewReader(&body, writer.Boundary()).ReadForm(int64(body.Len()) + 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = form.RemoveAll() })
+	files := form.File["file"]
+	if len(files) != 1 {
+		t.Fatalf("multipart fixture produced %d files", len(files))
+	}
+	return files[0]
 }
