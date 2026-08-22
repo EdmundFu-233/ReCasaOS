@@ -30,6 +30,7 @@ func TestManagedProductionDescriptorsUseApprovedOpaqueNames(t *testing.T) {
 		"managedTransferTransactionDescriptorName":          {value: "<managed-transfer-transaction>", uses: 1},
 		"managedReplacementDirectoryDescriptorName":         {value: "<managed-replacement-directory>", uses: 1},
 		"managedRecoveryTransactionDescriptorName":          {value: "<managed-recovery-transaction>", uses: 1},
+		"managedArchiveChildDescriptorName":                 {value: "<managed-archive-child>", uses: 1},
 	}
 	if violations := managedDescriptorPolicyViolations(managedProductionSources(t), rules); len(violations) != 0 {
 		t.Fatal(strings.Join(violations, "\n"))

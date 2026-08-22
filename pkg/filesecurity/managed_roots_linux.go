@@ -80,6 +80,8 @@ type ManagedRoots struct {
 	inventoryAfterOpen            func(int, string) error
 	transferFilesystemEligibility func(int) (int64, bool, error)
 	rewriteBeforePublish          func() error
+	archiveAfterChildSnapshot     func(string) error
+	archiveMountIDAt              func(int, string, int) (uint64, error)
 }
 
 func RemoveManagementTree(path string) error {
