@@ -311,6 +311,7 @@ func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *test
 		"window.location.assign(",
 		"window.stop()",
 		"state.frame.src=",
+		"Download stream completed",
 	} {
 		if strings.Contains(script, forbidden) {
 			t.Errorf("app.js contains forbidden credential or buffering primitive %q", forbidden)
@@ -319,6 +320,12 @@ func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *test
 	for _, required := range []string{
 		"const protocolVersion=2",
 		"const fallbackByteLimit=32*1024*1024",
+		"const workerPreparationWaitMs=2*workerReplyTimeoutMs+1000",
+		"let authorizationSession=null",
+		"let workerGeneration=0",
+		"let workerPreparation=null",
+		"const workerGenerationWaiters=new Set()",
+		"let downloadIntent=null",
 		"response.body.getReader()",
 		"received>fallbackByteLimit",
 		"setTimeout(()=>revokeFallbackObjectURL(objectURL),60000)",
@@ -328,7 +335,16 @@ func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *test
 		"credentials:'omit'",
 		"referrerPolicy:'no-referrer'",
 		"Download handed to the browser",
-		"Download stream completed",
+		"workerPreparation.generation===workerGeneration",
+		"const record={generation:generation,promise:preparation}",
+		"if(workerPreparation===record)workerPreparation=null",
+		"workerGenerationWaiters.add(generationChanged)",
+		"workerGenerationWaiters.delete(generationChanged)",
+		"if(generation===workerGeneration)invalidateWorkerPreparation()",
+		"const intent=reserveDownloadIntent(path,entry,session)",
+		"sessionIsActive(intent.session)",
+		"api('api/file',path,intent.session,controller.signal)",
+		"sessionIsActive(pending.session)",
 		"recasaos-download-prepare",
 		"recasaos-download-cancel",
 		"state.navigationProof",
@@ -341,13 +357,109 @@ func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *test
 		"form.submit()",
 		"handed:false",
 		"state.handed&&status.status==='completed'",
-		"boundedDownload(path,entry).catch(showError);",
+		"boundedDownload(path,entry,intent).catch(showError);",
 		"Token forgotten after page restore",
 		"const bearerPattern=/^rc1_[A-Za-z0-9_-]{43}$/",
 		"bearerPattern.test(candidate)",
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("app.js is missing %q", required)
+		}
+	}
+}
+
+func TestPublicDownloadPreparationIsTokenFreeSessionBoundAndDeadlineBounded(t *testing.T) {
+	portal := &Portal{}
+	recorder := httptest.NewRecorder()
+	portal.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, BasePath+"/app.js", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("app.js status = %d, want 200", recorder.Code)
+	}
+	script := recorder.Body.String()
+
+	prepareStart := strings.Index(script, "function prepareWorker(){")
+	prepareEnd := strings.Index(script, "async function waitForNativeStreaming(intent){")
+	if prepareStart < 0 || prepareEnd <= prepareStart {
+		t.Fatal("worker preparation lifecycle is unavailable")
+	}
+	preparation := script[prepareStart:prepareEnd]
+	for _, forbidden := range []string{"accessToken", "Authorization", "Bearer ", "token()"} {
+		if strings.Contains(preparation, forbidden) {
+			t.Errorf("worker preparation carries credential primitive %q", forbidden)
+		}
+	}
+
+	downloadStart := strings.Index(script, "async function download(path,entry,session){")
+	downloadEnd := strings.Index(script, "function denyPort(port)")
+	if downloadStart < 0 || downloadEnd <= downloadStart {
+		t.Fatal("download intent lifecycle is unavailable")
+	}
+	download := script[downloadStart:downloadEnd]
+	reserveIndex := strings.Index(download, "const intent=reserveDownloadIntent(path,entry,session)")
+	waitIndex := strings.Index(download, "await waitForNativeStreaming(intent)")
+	revalidateIndex := strings.Index(download, "downloadIntent!==intent||!sessionIsActive(intent.session)")
+	startIndex := strings.Index(download, "nativeReady&&canUseNativeStreaming())await startNativeDownload(path,entry,intent)")
+	if reserveIndex < 0 || waitIndex <= reserveIndex || revalidateIndex <= waitIndex || startIndex <= revalidateIndex {
+		t.Fatal("download does not reserve, wait, revalidate, and start in fail-closed order")
+	}
+
+	waitStart := strings.Index(script, "async function waitForNativeStreaming(intent){")
+	waitEnd := strings.Index(script, "async function load(path,session){")
+	if waitStart < 0 || waitEnd <= waitStart {
+		t.Fatal("worker wait lifecycle is unavailable")
+	}
+	wait := script[waitStart:waitEnd]
+	remainingIndex := strings.Index(wait, "const remaining=deadline-Date.now()")
+	prepareIndex := strings.Index(wait, "const preparation=prepareWorker()")
+	if remainingIndex < 0 || prepareIndex <= remainingIndex {
+		t.Fatal("worker wait can start a new preparation after its deadline")
+	}
+
+	boundedStart := strings.Index(script, "async function boundedDownload(path,entry,intent){")
+	boundedEnd := strings.Index(script, "function reserveDownloadIntent(path,entry,session){")
+	if boundedStart < 0 || boundedEnd <= boundedStart {
+		t.Fatal("bounded fallback lifecycle is unavailable")
+	}
+	bounded := script[boundedStart:boundedEnd]
+	readIndex := strings.Index(bounded, "const result=await reader.read()")
+	revokeIndex := strings.Index(bounded, "revokeFallbackObjectURL()")
+	if readIndex < 0 || revokeIndex < 0 {
+		t.Fatal("bounded fallback byte lifecycle is unavailable")
+	}
+	readSessionIndex := strings.Index(bounded[readIndex:], "if(!sessionIsActive(intent.session))")
+	if readSessionIndex >= 0 {
+		readSessionIndex += readIndex
+	}
+	finalSessionIndex := strings.LastIndex(bounded[:revokeIndex], "if(!sessionIsActive(intent.session))")
+	if readSessionIndex <= readIndex || finalSessionIndex <= readSessionIndex {
+		t.Fatal("bounded fallback can consume or hand off bytes after its authorization session becomes stale")
+	}
+
+	challengeStart := strings.Index(script, "function handleWorkerChallenge(event){")
+	challengeEnd := strings.Index(script, "function showError(error)")
+	if challengeStart < 0 || challengeEnd <= challengeStart {
+		t.Fatal("worker challenge lifecycle is unavailable")
+	}
+	challenge := script[challengeStart:challengeEnd]
+	sessionIndex := strings.Index(challenge, "sessionIsActive(pending.session)")
+	tokenIndex := strings.Index(challenge, "token:accessToken")
+	if sessionIndex < 0 || tokenIndex <= sessionIndex {
+		t.Fatal("worker challenge can send a token before validating its authorization session")
+	}
+
+	for _, required := range []string{
+		"const workerPreparationWaitMs=2*workerReplyTimeoutMs+1000",
+		"timer=setTimeout(()=>finish('timeout'),timeoutMs)",
+		"for(const wake of workerGenerationWaiters)wake()",
+		"if(generation===workerGeneration)invalidateWorkerPreparation()",
+		"navigator.serviceWorker.addEventListener('controllerchange',()=>{clearNativeState();invalidateWorkerPreparation()",
+		"function invalidateAuthorizationSession(){",
+		"accessToken='';authorizationSession=null;downloadIntent=null",
+		"clearBrowserListing()",
+		"if(sessionIsActive(session))download(child,entry,session)",
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("bounded preparation lifecycle is missing %q", required)
 		}
 	}
 }

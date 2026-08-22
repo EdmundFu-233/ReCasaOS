@@ -34,6 +34,7 @@ const portalJavaScript = `'use strict';
 const protocolVersion=2;
 const fallbackByteLimit=32*1024*1024;
 const workerReplyTimeoutMs=3000;
+const workerPreparationWaitMs=2*workerReplyTimeoutMs+1000;
 const nativeRequestLifetimeMs=10000;
 const bearerPattern=/^rc1_[A-Za-z0-9_-]{43}$/;
 const login=document.getElementById('login');
@@ -44,21 +45,31 @@ const statusNode=document.getElementById('status');
 const pathNode=document.getElementById('path');
 const upButton=document.getElementById('up');
 let accessToken='';
+let authorizationSession=null;
 let currentPath='';
 let workerReady=false;
 let workerController=null;
+let workerGeneration=0;
+let workerPreparation=null;
+const workerGenerationWaiters=new Set();
+let downloadIntent=null;
 let pendingNative=null;
 let activeNative=null;
 let activeFallback=null;
 let fallbackObjectURL='';
 
 function token(){return accessToken;}
+function sessionIsActive(session){return session!==null&&authorizationSession===session&&accessToken!==''&&login.hidden&&!browser.hidden;}
 function apiURL(endpoint,path){const u=new URL(endpoint,window.location.href);u.search='';u.hash='';u.searchParams.set('path',path);return u;}
 function nativeURL(path,nonce){const u=apiURL('api/file',path);u.hash=nonce;return u.href;}
 function responseIsNoStore(response){return (response.headers.get('Cache-Control')||'').split(',').some(value=>value.trim().toLowerCase()==='no-store');}
 function responseHeaderIsOnly(response,name,expected){const values=(response.headers.get(name)||'').split(',').map(value=>value.trim().toLowerCase()).filter(Boolean);return values.length>0&&values.every(value=>value===expected);}
-async function api(endpoint,path,signal){
-  const response=await fetch(apiURL(endpoint,path),{headers:{Authorization:'Bearer '+token()},credentials:'omit',cache:'no-store',redirect:'error',referrerPolicy:'no-referrer',signal:signal});
+async function api(endpoint,path,session,signal){
+  if(!sessionIsActive(session))return null;
+  let response;
+  try{response=await fetch(apiURL(endpoint,path),{headers:{Authorization:'Bearer '+token()},credentials:'omit',cache:'no-store',redirect:'error',referrerPolicy:'no-referrer',signal:signal});}
+  catch(error){if(!sessionIsActive(session))return null;throw error;}
+  if(!sessionIsActive(session)){if(response.body)try{response.body.cancel().catch(()=>{});}catch(_error){}return null;}
   if(response.status===401){forgetAuthorization('Authorization failed');throw new Error('authorization failed');}
   if(!response.ok)throw new Error('Request failed ('+response.status+')');
   if(!responseIsNoStore(response)||!responseHeaderIsOnly(response,'X-Content-Type-Options','nosniff'))throw new Error('Response security policy is missing');
@@ -73,11 +84,21 @@ function clearNativeState(){
   if(pendingNative){clearTimeout(pendingNative.timer);cancelNativeTransport(pendingNative);pendingNative=null;}
   if(activeNative){clearTimeout(activeNative.timer);cancelNativeTransport(activeNative);activeNative=null;}
 }
+function invalidateWorkerPreparation(){
+  workerGeneration+=1;workerReady=false;workerController=null;workerPreparation=null;
+  for(const wake of workerGenerationWaiters)wake();
+  workerGenerationWaiters.clear();
+}
+function clearBrowserListing(){currentPath='';pathNode.textContent='/';upButton.disabled=true;entries.replaceChildren();}
+function invalidateAuthorizationSession(){
+  accessToken='';authorizationSession=null;downloadIntent=null;
+  clearNativeState();invalidateWorkerPreparation();
+  if(activeFallback){activeFallback.abort();activeFallback=null;}
+  clearBrowserListing();
+}
 function revokeFallbackObjectURL(value){const target=value||fallbackObjectURL;if(!target)return;if(fallbackObjectURL===target)fallbackObjectURL='';URL.revokeObjectURL(target);}
 function forgetAuthorization(message){
-  accessToken='';
-  clearNativeState();
-  if(activeFallback){activeFallback.abort();activeFallback=null;}
+  invalidateAuthorizationSession();
   revokeFallbackObjectURL();
   showLogin(message);
 }
@@ -108,21 +129,75 @@ function workerHandshake(controller){
     try{controller.postMessage({type:'recasaos-download-protocol',version:protocolVersion},[channel.port2]);}catch(_error){finish(false);}
   });
 }
-async function prepareWorker(){
-  if(!('serviceWorker' in navigator))return;
-  try{
-    await navigator.serviceWorker.register('download-worker.js',{scope:'/public-files/',updateViaCache:'none'});
-    await navigator.serviceWorker.ready;
-    const controller=await waitForController(workerReplyTimeoutMs);
-    if(!controller)return;
-    const ready=await workerHandshake(controller);
-    if(ready&&currentWorker()===controller){workerController=controller;workerReady=true;}
-  }catch(_error){workerController=null;workerReady=false;}
+function settleWorkerPreparation(preparation,generation,timeoutMs){
+  return new Promise(resolve=>{
+    let settled=false;let timer=0;
+    const generationChanged=()=>finish('stale');
+    const finish=value=>{if(settled)return;settled=true;clearTimeout(timer);workerGenerationWaiters.delete(generationChanged);resolve(value);};
+    timer=setTimeout(()=>finish('timeout'),timeoutMs);
+    workerGenerationWaiters.add(generationChanged);
+    if(generation!==workerGeneration){finish('stale');return;}
+    preparation.then(value=>finish(value===true?'ready':'failed'),()=>finish('failed'));
+  });
 }
-async function load(path){
+function prepareWorker(){
+  if(!('serviceWorker' in navigator)||!sessionIsActive(authorizationSession))return Promise.resolve(false);
+  if(canUseNativeStreaming())return Promise.resolve(true);
+  if(workerPreparation&&workerPreparation.generation===workerGeneration)return workerPreparation.promise;
+  const generation=workerGeneration;
+  const preparation=(async()=>{
+    try{
+      await navigator.serviceWorker.register('download-worker.js',{scope:'/public-files/',updateViaCache:'none'});
+      await navigator.serviceWorker.ready;
+      if(generation!==workerGeneration||!sessionIsActive(authorizationSession))return false;
+      const controller=await waitForController(workerReplyTimeoutMs);
+      if(!controller||generation!==workerGeneration||!sessionIsActive(authorizationSession))return false;
+      const ready=await workerHandshake(controller);
+      if(ready&&generation===workerGeneration&&sessionIsActive(authorizationSession)&&currentWorker()===controller){workerController=controller;workerReady=true;return true;}
+    }catch(_error){}
+    if(generation===workerGeneration){workerController=null;workerReady=false;}
+    return false;
+  })();
+  const record={generation:generation,promise:preparation};
+  workerPreparation=record;
+  preparation.then(()=>{if(workerPreparation===record)workerPreparation=null;},()=>{if(workerPreparation===record)workerPreparation=null;});
+  return preparation;
+}
+async function waitForNativeStreaming(intent){
+  const deadline=Date.now()+workerPreparationWaitMs;
+  while(sessionIsActive(intent.session)&&downloadIntent===intent){
+    const remaining=deadline-Date.now();
+    if(remaining<=0){
+      invalidateWorkerPreparation();
+      return false;
+    }
+    if(canUseNativeStreaming())return true;
+    const generation=workerGeneration;
+    const preparation=prepareWorker();
+    const outcome=await settleWorkerPreparation(preparation,generation,remaining);
+    if(!sessionIsActive(intent.session)||downloadIntent!==intent)return false;
+    if(Date.now()>=deadline){
+      if(generation===workerGeneration)invalidateWorkerPreparation();
+      return false;
+    }
+    if(outcome==='ready'&&generation===workerGeneration&&canUseNativeStreaming())return true;
+    if(outcome==='stale'||generation!==workerGeneration)continue;
+    if(outcome==='timeout'){
+      if(generation===workerGeneration)invalidateWorkerPreparation();
+      return false;
+    }
+    return false;
+  }
+  return false;
+}
+async function load(path,session){
+  if(!sessionIsActive(session))return;
   statusNode.textContent='Loading…';
-  const response=await api('api/list',path);
-  const body=await response.json();
+  const response=await api('api/list',path,session);
+  if(!response||!sessionIsActive(session))return;
+  let body;
+  try{body=await response.json();}catch(error){if(!sessionIsActive(session))return;throw error;}
+  if(!sessionIsActive(session))return;
   currentPath=body.path;
   pathNode.textContent='/'+currentPath;
   upButton.disabled=!currentPath;
@@ -133,8 +208,8 @@ async function load(path){
     const child=currentPath?currentPath+'/'+entry.name:entry.name;
     link.href='#';
     link.textContent=(entry.type==='directory'?'📁 ':'📄 ')+entry.name;
-    if(entry.type==='directory')link.addEventListener('click',event=>{event.preventDefault();load(child).catch(showError);});
-    else link.addEventListener('click',event=>{event.preventDefault();download(child,entry).catch(showError);});
+    if(entry.type==='directory')link.addEventListener('click',event=>{event.preventDefault();if(sessionIsActive(session))load(child,session).catch(showError);});
+    else link.addEventListener('click',event=>{event.preventDefault();if(sessionIsActive(session))download(child,entry,session).catch(showError);});
     item.append(link);
     if(entry.type==='file'){const size=document.createElement('span');size.className='size';size.textContent=humanSize(entry.size);item.append(size);}
     entries.append(item);
@@ -158,43 +233,46 @@ function submitNativeDownload(state){
   const proof=document.createElement('input');proof.type='hidden';proof.name='proof';proof.value=state.navigationProof;form.append(proof);document.body.append(form);
   try{form.submit();state.navigationProof='';form.remove();return true;}catch(_error){form.remove();return false;}
 }
-async function startNativeDownload(path,entry){
+async function startNativeDownload(path,entry,intent){
   if(pendingNative||activeNative||activeFallback)throw new Error('Another download is already being prepared');
+  if(!sessionIsActive(intent.session))return;
   const controller=currentWorker();
   if(!controller||controller!==workerController)throw new Error('Secure browser streaming is not ready');
   const nonce=randomNonce();
-  const state={nonce:nonce,navigationProof:randomNonce(),path:path,name:entry.name,requestURL:nativeURL(path,nonce),controller:controller,expiresAt:Date.now()+nativeRequestLifetimeMs,timer:null};
+  const state={nonce:nonce,navigationProof:randomNonce(),path:path,name:entry.name,requestURL:nativeURL(path,nonce),controller:controller,session:intent.session,expiresAt:Date.now()+nativeRequestLifetimeMs,timer:null};
   pendingNative=state;
   statusNode.textContent='Preparing secure browser stream for '+entry.name+'…';
   const prepared=await reserveNativeDownload(controller,state);
-  if(pendingNative!==state||!accessToken){cancelNativeTransport(state);return;}
+  if(pendingNative!==state||!sessionIsActive(state.session)){cancelNativeTransport(state);return;}
   if(!prepared||currentWorker()!==controller){
     cancelNativeTransport(state);
     pendingNative=null;
-    await boundedDownload(path,entry);
+    await boundedDownload(path,entry,intent);
     return;
   }
   state.timer=setTimeout(()=>{
     if(pendingNative!==state)return;
     cancelNativeTransport(state);
     pendingNative=null;
-    boundedDownload(path,entry).catch(showError);
+    boundedDownload(path,entry,intent).catch(showError);
   },workerReplyTimeoutMs);
   statusNode.textContent='Handing '+entry.name+' to the browser…';
   if(!submitNativeDownload(state)){
     clearTimeout(state.timer);cancelNativeTransport(state);pendingNative=null;
-    await boundedDownload(path,entry);
+    await boundedDownload(path,entry,intent);
   }
 }
-async function boundedDownload(path,entry){
+async function boundedDownload(path,entry,intent){
   if(pendingNative||activeNative||activeFallback)throw new Error('Another download is already being prepared');
+  if(!sessionIsActive(intent.session))return;
   if(!Number.isSafeInteger(entry.size)||entry.size<0||entry.size>fallbackByteLimit){
     throw new Error('This browser cannot safely download this file in memory; use a reviewed Authorization-header client');
   }
   const controller=new AbortController();activeFallback=controller;
   statusNode.textContent='Preparing bounded download '+entry.name+'…';
   try{
-    const response=await api('api/file',path,controller.signal);
+    const response=await api('api/file',path,intent.session,controller.signal);
+    if(!response||!sessionIsActive(intent.session))return;
     const disposition=response.headers.get('Content-Disposition')||'';
     const contentType=(response.headers.get('Content-Type')||'').split(';',1)[0].trim().toLowerCase();
     if(!/^attachment(?:\s*;|$)/i.test(disposition)||contentType!=='application/octet-stream'||!responseHeaderIsOnly(response,'Accept-Ranges','bytes'))throw new Error('Download response policy is invalid');
@@ -206,7 +284,9 @@ async function boundedDownload(path,entry){
     const reader=response.body.getReader();const chunks=[];let received=0;
     try{
       for(;;){
-        const result=await reader.read();if(result.done)break;
+        const result=await reader.read();
+        if(!sessionIsActive(intent.session)){try{reader.cancel().catch(()=>{});}catch(_error){}return;}
+        if(result.done)break;
         if(!(result.value instanceof Uint8Array))throw new Error('Unexpected download data');
         received+=result.value.byteLength;
         if(received>expectedLength||received>fallbackByteLimit)throw new Error('Download exceeded its declared limit');
@@ -214,29 +294,45 @@ async function boundedDownload(path,entry){
       }
     }catch(error){try{await reader.cancel();}catch(_cancelError){}throw error;}
     if(received!==expectedLength)throw new Error('Download ended before the declared length');
+    if(!sessionIsActive(intent.session)){try{reader.cancel().catch(()=>{});}catch(_error){}return;}
     revokeFallbackObjectURL();
     const objectURL=URL.createObjectURL(new Blob(chunks,{type:'application/octet-stream'}));fallbackObjectURL=objectURL;
     const link=document.createElement('a');link.href=objectURL;link.download=entry.name;link.referrerPolicy='no-referrer';link.rel='noopener';
     document.body.append(link);link.click();link.remove();
     setTimeout(()=>revokeFallbackObjectURL(objectURL),60000);
     statusNode.textContent='Download handed to the browser: '+entry.name;
-  }finally{if(activeFallback===controller)activeFallback=null;}
+  }catch(error){if(sessionIsActive(intent.session))throw error;}
+  finally{if(activeFallback===controller)activeFallback=null;}
 }
-async function download(path,entry){if(canUseNativeStreaming())await startNativeDownload(path,entry);else await boundedDownload(path,entry);}
+function reserveDownloadIntent(path,entry,session){
+  if(downloadIntent||pendingNative||activeNative||activeFallback)throw new Error('Another download is already being prepared');
+  if(!sessionIsActive(session))throw new Error('Authorization is unavailable');
+  const intent={session:session,path:path,name:entry.name};downloadIntent=intent;return intent;
+}
+async function download(path,entry,session){
+  const intent=reserveDownloadIntent(path,entry,session);
+  try{
+    let nativeReady=canUseNativeStreaming();
+    if(!nativeReady){statusNode.textContent='Preparing secure browser streaming for '+entry.name+'…';nativeReady=await waitForNativeStreaming(intent);}
+    if(downloadIntent!==intent||!sessionIsActive(intent.session))return;
+    if(nativeReady&&canUseNativeStreaming())await startNativeDownload(path,entry,intent);else await boundedDownload(path,entry,intent);
+  }catch(error){if(sessionIsActive(intent.session))throw error;}
+  finally{if(downloadIntent===intent)downloadIntent=null;}
+}
 function denyPort(port){try{port.postMessage({type:'recasaos-download-denied',version:protocolVersion});}catch(_error){}try{port.close();}catch(_error){}}
 function handleWorkerChallenge(event){
   const data=event.data;const port=event.ports&&event.ports.length===1?event.ports[0]:null;const pending=pendingNative;
   if(!port)return;
-  if(!pending||!exactKeys(data,['nonce','path','requestURL','type','version'])||data.type!=='recasaos-download-auth'||data.version!==protocolVersion||event.source!==pending.controller||currentWorker()!==pending.controller||Date.now()>pending.expiresAt||data.nonce!==pending.nonce||data.path!==pending.path||data.requestURL!==pending.requestURL||!accessToken){denyPort(port);return;}
+  if(!pending||!exactKeys(data,['nonce','path','requestURL','type','version'])||data.type!=='recasaos-download-auth'||data.version!==protocolVersion||event.source!==pending.controller||currentWorker()!==pending.controller||Date.now()>pending.expiresAt||data.nonce!==pending.nonce||data.path!==pending.path||data.requestURL!==pending.requestURL||!sessionIsActive(pending.session)){denyPort(port);return;}
   clearTimeout(pending.timer);pendingNative=null;
-  const state={nonce:pending.nonce,path:pending.path,name:pending.name,requestURL:pending.requestURL,controller:pending.controller,port:port,timer:null,handed:false};
+  const state={nonce:pending.nonce,path:pending.path,name:pending.name,requestURL:pending.requestURL,controller:pending.controller,session:pending.session,port:port,timer:null,handed:false};
   state.timer=setTimeout(()=>{if(activeNative===state){cancelNativeTransport(state);activeNative=null;showError(new Error('The browser did not accept the download in time'));}},nativeRequestLifetimeMs);
   activeNative=state;
   port.onmessage=statusEvent=>{
     const status=statusEvent.data;
     if(activeNative!==state||!exactKeys(status,['httpStatus','nonce','path','status','type','version'])||status.type!=='recasaos-download-status'||status.version!==protocolVersion||status.nonce!==state.nonce||status.path!==state.path)return;
     if(status.status==='handed'&&!state.handed&&(status.httpStatus===200||status.httpStatus===206)){clearTimeout(state.timer);state.timer=null;state.handed=true;statusNode.textContent='Download handed to the browser: '+state.name;return;}
-    if(state.handed&&status.status==='completed'&&(status.httpStatus===200||status.httpStatus===206)){activeNative=null;port.close();statusNode.textContent='Download stream completed: '+state.name;return;}
+    if(state.handed&&status.status==='completed'&&(status.httpStatus===200||status.httpStatus===206)){activeNative=null;port.close();return;}
     if(state.handed&&status.status==='canceled'&&(status.httpStatus===200||status.httpStatus===206)){activeNative=null;port.close();statusNode.textContent='Download stopped: '+state.name;return;}
     clearTimeout(state.timer);activeNative=null;port.close();
     cancelNativeTransport(state);
@@ -245,17 +341,18 @@ function handleWorkerChallenge(event){
   };
   port.onmessageerror=()=>{if(activeNative===state){clearTimeout(state.timer);cancelNativeTransport(state);activeNative=null;showError(new Error('Secure download authorization failed'));}};
   port.start();
+  if(activeNative!==state||!sessionIsActive(state.session)){clearTimeout(state.timer);activeNative=null;denyPort(port);return;}
   port.postMessage({type:'recasaos-download-auth-response',version:protocolVersion,nonce:pending.nonce,path:pending.path,token:accessToken});
 }
 function showError(error){if(!browser.hidden)statusNode.textContent=error&&error.message?error.message:'Request failed';}
-login.addEventListener('submit',event=>{event.preventDefault();const candidate=tokenInput.value;tokenInput.value='';if(!bearerPattern.test(candidate)){showLogin('A valid rc1_ access token is required');return;}accessToken=candidate;login.hidden=true;browser.hidden=false;load('').catch(showError);prepareWorker();});
-upButton.addEventListener('click',()=>{const parts=currentPath.split('/');parts.pop();load(parts.join('/')).catch(showError);});
+login.addEventListener('submit',event=>{event.preventDefault();const candidate=tokenInput.value;tokenInput.value='';if(!bearerPattern.test(candidate)){forgetAuthorization('A valid rc1_ access token is required');return;}invalidateAuthorizationSession();revokeFallbackObjectURL();authorizationSession=Object.freeze({});accessToken=candidate;login.hidden=true;browser.hidden=false;load('',authorizationSession).catch(showError);prepareWorker();});
+upButton.addEventListener('click',()=>{const parts=currentPath.split('/');parts.pop();load(parts.join('/'),authorizationSession).catch(showError);});
 document.getElementById('logout').addEventListener('click',()=>forgetAuthorization('Token forgotten for this page'));
 if('serviceWorker' in navigator){
   navigator.serviceWorker.addEventListener('message',handleWorkerChallenge);
-  navigator.serviceWorker.addEventListener('controllerchange',()=>{clearNativeState();workerReady=false;workerController=null;prepareWorker();});
+  navigator.serviceWorker.addEventListener('controllerchange',()=>{clearNativeState();invalidateWorkerPreparation();if(sessionIsActive(authorizationSession))prepareWorker();});
 }
-window.addEventListener('pagehide',()=>{accessToken='';clearNativeState();if(activeFallback)activeFallback.abort();revokeFallbackObjectURL();});
+window.addEventListener('pagehide',()=>{invalidateAuthorizationSession();revokeFallbackObjectURL();});
 window.addEventListener('pageshow',event=>{if(event.persisted&&!accessToken)showLogin('Token forgotten after page restore');});
 showLogin('');
 `

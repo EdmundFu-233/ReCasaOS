@@ -60,6 +60,23 @@ and server request memory. Logout, page exit, and reload clear the page's
 reference, but static source tests cannot prove that a browser, extension,
 DevTools session, proxy, operating system, or crash reporter retained no copy.
 
+On the first authorized download click, the page reuses one token-free Worker
+preparation for the current controller generation and waits at most seven
+seconds for it. That fixed budget covers the existing three-second controller
+wait, the three-second protocol handshake, and one second of browser scheduling
+margin. After every wait, the page revalidates the exact authorization-session
+object, login state, and current controller before any file request or bearer
+handoff. Logout makes the old session and click stale. A controller change wakes
+the waiter, retires the old generation, and starts one deduplicated handshake for
+the new controller. A preparation that does not settle by the deadline is
+retired for future clicks; its late result cannot start a download.
+
+If native streaming is still unavailable at that deadline, the only fallback
+remains one in-memory download capped at 32 MiB using the advertised and observed
+byte counts. Larger files fail closed without a file request. The preparation
+lifecycle never receives, stores, or sends the bearer; only a nonce/proof-bound
+Worker challenge for a currently active download can request it.
+
 For a large file, a scoped Service Worker first records a 192-bit random,
 single-use correlation nonce and a separate 192-bit navigation proof bound to
 the exact top-level portal client, relative path, and same-origin file URL for
@@ -86,7 +103,10 @@ a one-chunk, backpressure-preserving monitor without calling `blob()`,
 abort handle and status port until EOF, cancellation, or an error. Forgetting
 the token therefore aborts the upstream fetch even after the response has been
 handed to the browser, while normal completion releases the page and Worker
-state. A restart loses all transient reservations and therefore fails closed.
+state. The page deliberately keeps the user-visible wording at “handed to the
+browser”: upstream EOF proves browser handoff and stream consumption, not that
+the browser persisted the file to disk. A restart loses all transient
+reservations and therefore fails closed.
 Invalid controlled navigations receive an empty `204` without
 consuming a valid reservation. If the POST reaches the server because the
 Worker was replaced or bypassed, its browser-generated navigation metadata also
