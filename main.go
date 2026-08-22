@@ -207,8 +207,8 @@ func main() {
 
 	// v0.3.6 legacy port migration is a startup gate: do not advertise Ready
 	// while the Gateway port and durable configuration disagree.
-	if err := config.MigrateLegacyHTTPPort(config.ServerInfo.HttpPort, 10, time.Second, func(port string) error {
-		return service.MyService.Gateway().ChangePort(&model.ChangePortRequest{Port: port})
+	if err := config.MigrateLegacyHTTPPort(config.ServerInfo.HttpPort, 1, 0, func(port string) error {
+		return service.EnsureGatewayPort(service.MyService.Gateway(), port)
 	}); err != nil {
 		panic(err)
 	}

@@ -22,6 +22,15 @@ OLD_CONF_PATH=/etc/casaos.conf
 CONF_FILE=${CONF_PATH}/${APP_NAME}.conf
 CONF_FILE_SAMPLE=${CONF_PATH}/${APP_NAME}.conf.sample
 
+CONF_TMP=""
+cleanup_config_tmp() {
+    if [ -n "${CONF_TMP}" ]; then
+        rm -f -- "${CONF_TMP}"
+    fi
+}
+trap cleanup_config_tmp EXIT
+trap 'exit 1' HUP INT TERM
+
 
 if [ -L "${CONF_FILE}" ] || { [ -e "${CONF_FILE}" ] && [ ! -f "${CONF_FILE}" ]; }; then
     echo "Refusing unsafe config path: ${CONF_FILE}" >&2
@@ -45,7 +54,20 @@ if [ ! -e "${CONF_FILE}" ]; then
         echo "Refusing unsafe config source: ${CONF_SOURCE}" >&2
         exit 1
     fi
-    install -o root -g root -m 0600 -- "${CONF_SOURCE}" "${CONF_FILE}"
+
+    # Publish a complete file in one namespace operation. A crash while
+    # copying leaves only the private temporary file; a concurrent creator of
+    # CONF_FILE makes ln fail instead of being overwritten.
+    CONF_TMP=$(mktemp "${CONF_PATH}/.${APP_NAME}.conf.tmp.XXXXXX")
+    install -o root -g root -m 0600 -- "${CONF_SOURCE}" "${CONF_TMP}"
+    sync -f "${CONF_TMP}"
+    if ! ln -- "${CONF_TMP}" "${CONF_FILE}"; then
+        echo "Refusing to replace config created concurrently: ${CONF_FILE}" >&2
+        exit 1
+    fi
+    rm -f -- "${CONF_TMP}"
+    CONF_TMP=""
+    sync -f "${CONF_PATH}"
 fi
 
 chown root:root -- "${CONF_FILE}"

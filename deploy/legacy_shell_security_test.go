@@ -48,10 +48,15 @@ func TestCasaOSSetupNeverOverwritesCurrentConfigWithLegacyConfig(t *testing.T) {
 		}
 		for _, required := range []string{
 			"umask 077",
+			`trap cleanup_config_tmp EXIT`,
 			`if [ -L "${CONF_FILE}" ] || { [ -e "${CONF_FILE}" ] && [ ! -f "${CONF_FILE}" ]; }; then`,
 			`if [ ! -f "${OLD_CONF_PATH}" ] || [ -L "${OLD_CONF_PATH}" ]; then`,
 			`if [ ! -f "${CONF_SOURCE}" ] || [ -L "${CONF_SOURCE}" ]; then`,
-			`install -o root -g root -m 0600 -- "${CONF_SOURCE}" "${CONF_FILE}"`,
+			`CONF_TMP=$(mktemp "${CONF_PATH}/.${APP_NAME}.conf.tmp.XXXXXX")`,
+			`install -o root -g root -m 0600 -- "${CONF_SOURCE}" "${CONF_TMP}"`,
+			`sync -f "${CONF_TMP}"`,
+			`if ! ln -- "${CONF_TMP}" "${CONF_FILE}"; then`,
+			`sync -f "${CONF_PATH}"`,
 			`chown root:root -- "${CONF_FILE}"`,
 			`chmod 0600 -- "${CONF_FILE}"`,
 			"rm -f -- /etc/systemd/system/casaos.service",
@@ -65,11 +70,22 @@ func TestCasaOSSetupNeverOverwritesCurrentConfigWithLegacyConfig(t *testing.T) {
 			`cp -v "${CONF_FILE_SAMPLE}" "${CONF_FILE}"`,
 			`install -o root -g root -m 0600 "${OLD_CONF_PATH}" "${CONF_FILE}"`,
 			`install -o root -g root -m 0600 "${CONF_FILE_SAMPLE}" "${CONF_FILE}"`,
+			`install -o root -g root -m 0600 -- "${CONF_SOURCE}" "${CONF_FILE}"`,
 			"rm -rf /etc/systemd/system/casaos.service",
 		} {
 			if strings.Contains(script, forbidden) {
 				t.Errorf("%s still contains unsafe setup operation %q", path, forbidden)
 			}
 		}
+	}
+}
+
+func TestLegacyHTTPPortMigrationUsesOneReplaySafeChangeAttempt(t *testing.T) {
+	mainSource := repositoryFile(t, "main.go")
+	if !strings.Contains(mainSource, `config.MigrateLegacyHTTPPort(config.ServerInfo.HttpPort, 1, 0, func(port string) error`) {
+		t.Fatal("legacy HTTP port migration must make only one Gateway change attempt per service start")
+	}
+	if !strings.Contains(mainSource, `return service.EnsureGatewayPort(service.MyService.Gateway(), port)`) {
+		t.Fatal("legacy HTTP port migration must reconcile an already-applied Gateway change")
 	}
 }
