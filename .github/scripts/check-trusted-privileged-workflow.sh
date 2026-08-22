@@ -10,8 +10,11 @@ die() {
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd -- "$script_dir/../.." && pwd -P)"
 workflow="${1:-$repo_root/.github/workflows/trusted-privileged-ci.yml}"
+primary_workflow="${2:-$repo_root/.github/workflows/recasaos-ci-security.yml}"
 
 [[ -f "$workflow" ]] || die "workflow is missing: $workflow"
+[[ -f "$primary_workflow" ]] ||
+  die "primary workflow is missing: $primary_workflow"
 
 require_text() {
   local text="$1"
@@ -27,8 +30,9 @@ forbid_text() {
   fi
 }
 
-job_block() {
-  local job="$1"
+job_block_from() {
+  local workflow_path="$1"
+  local job="$2"
   awk -v header="  ${job}:" '
     $0 == header {
       found = 1
@@ -45,7 +49,11 @@ job_block() {
         exit 2
       }
     }
-  ' "$workflow" || die "job is missing: $job"
+  ' "$workflow_path" || die "job is missing: $job"
+}
+
+job_block() {
+  job_block_from "$workflow" "$1"
 }
 
 require_block_text() {
@@ -62,6 +70,54 @@ forbid_block_text() {
   if grep -Fq -- "$text" <<<"$block"; then
     die "$reason"
   fi
+}
+
+block_text_count() {
+  local block="$1"
+  local needle="$2"
+  local count=0
+  local remainder="$block"
+
+  [[ -n "$needle" ]] || die "cannot count an empty policy fragment"
+  while [[ "$remainder" == *"$needle"* ]]; do
+    remainder="${remainder#*"$needle"}"
+    count=$((count + 1))
+  done
+  printf '%d\n' "$count"
+}
+
+require_block_text_count() {
+  local block="$1"
+  local text="$2"
+  local expected="$3"
+  local reason="$4"
+  local actual
+
+  actual="$(block_text_count "$block" "$text")"
+  [[ "$actual" == "$expected" ]] ||
+    die "$reason (found $actual, expected $expected)"
+}
+
+step_block() {
+  local block="$1"
+  local step="$2"
+  awk -v header="      - name: ${step}" '
+    $0 == header {
+      found = 1
+      capture = 1
+    }
+    capture && $0 != header && $0 ~ /^      - name:/ {
+      exit
+    }
+    capture {
+      print
+    }
+    END {
+      if (!found) {
+        exit 2
+      }
+    }
+  ' <<<"$block" || die "step is missing: $step"
 }
 
 require_text 'name: Trusted privileged exact-SHA' \
@@ -95,6 +151,171 @@ prepare_block="$(job_block prepare-promotion)"
 privileged_block="$(job_block privileged-promotion)"
 publish_block="$(job_block publish-promotion)"
 cleanup_block="$(job_block cleanup-promotion)"
+primary_privileged_block="$(
+  job_block_from "$primary_workflow" privileged-mount-tests
+)"
+
+primary_compile_step="$(
+  step_block "$primary_privileged_block" \
+    'Compile privileged test binaries without root'
+)"
+trusted_compile_step="$(
+  step_block "$privileged_block" \
+    'Compile all trusted test binaries without root'
+)"
+management_step_name='Exercise management mount-boundary regressions'
+primary_management_step="$(
+  step_block "$primary_privileged_block" "$management_step_name"
+)"
+trusted_management_step="$(
+  step_block "$privileged_block" "$management_step_name"
+)"
+
+# These comparisons freeze the reviewed YAML step templates. They deliberately
+# do not claim to parse or prove the semantics of arbitrary shell source.
+expected_primary_compile_step="$(cat <<'EOF'
+      - name: Compile privileged test binaries without root
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          umask 022
+          CGO_ENABLED=0 go test -c \
+            -o "$RUNNER_TEMP/recasaos-filesecurity.test" \
+            ./pkg/filesecurity
+          CGO_ENABLED=0 go test -c \
+            -o "$RUNNER_TEMP/recasaos-publicfiles.test" \
+            ./pkg/publicfiles
+          test -x "$RUNNER_TEMP/recasaos-filesecurity.test"
+          test -x "$RUNNER_TEMP/recasaos-publicfiles.test"
+EOF
+)"
+expected_trusted_compile_step="$(cat <<'EOF'
+      - name: Compile all trusted test binaries without root
+        timeout-minutes: 5
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.prepare-promotion.outputs.head_sha }}
+          EXPECTED_TREE: ${{ needs.prepare-promotion.outputs.tree_sha }}
+        run: |
+          set -Eeuo pipefail
+          IFS=$'\n\t'
+          umask 022
+          CGO_ENABLED=0 go test -c \
+            -o "$RUNNER_TEMP/recasaos-samba.test" \
+            ./pkg/samba
+          CGO_ENABLED=0 go test -c \
+            -o "$RUNNER_TEMP/recasaos-sqlite.test" \
+            ./pkg/sqlite
+          CGO_ENABLED=0 go test -c \
+            -o "$RUNNER_TEMP/recasaos-filesecurity.test" \
+            ./pkg/filesecurity
+          CGO_ENABLED=0 go test -c \
+            -o "$RUNNER_TEMP/recasaos-publicfiles.test" \
+            ./pkg/publicfiles
+          for test_binary in \
+            "$RUNNER_TEMP/recasaos-samba.test" \
+            "$RUNNER_TEMP/recasaos-sqlite.test" \
+            "$RUNNER_TEMP/recasaos-filesecurity.test" \
+            "$RUNNER_TEMP/recasaos-publicfiles.test"
+          do
+            test -x "$test_binary"
+          done
+          [[ "$(git rev-parse HEAD)" == "$EXPECTED_SHA" ]]
+          [[ "$(git show -s --format=%T HEAD)" == "$EXPECTED_TREE" ]]
+          [[ -z "$(git status --short)" ]]
+EOF
+)"
+expected_primary_management_step="$(cat <<'EOF'
+      - name: Exercise management mount-boundary regressions
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          required_management_tests=(
+            TestManagedDirectDirectoryRenameRejectsNestedBindMount
+            TestManagedRemoveAllPreflightsNestedMountBeforeDeletingSibling
+            TestManagedRootsTreeSizeRejectsNestedBindMount
+            TestManagedDirectoryCopyRejectsBindMountAliasIntoSource
+            TestManagedRegularCopyRejectsDestinationBindAliasIntoAnotherConfiguredRoot
+            TestManagedReplaceCleanupRejectsBindAliasAncestorOfConfiguredRoot
+            TestWalkManagedArchiveRejectsChildMountReplacement
+            TestWalkManagedArchiveAllowsStableNestedMount
+          )
+          for required_test in "${required_management_tests[@]}"; do
+            listed="$(
+              "$RUNNER_TEMP/recasaos-filesecurity.test" \
+                -test.list "^${required_test}$"
+            )"
+            if [[ "$listed" != "$required_test" ]]; then
+              printf 'required privileged test is missing: %s\n' \
+                "$required_test" >&2
+              exit 1
+            fi
+          done
+          sudo unshare --mount --propagation private --fork --kill-child=KILL \
+            env \
+              PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+              RECASAOS_PRIVILEGED_MOUNT_TEST=1 \
+              "$RUNNER_TEMP/recasaos-filesecurity.test" \
+                -test.count=1 \
+                -test.run '^(TestManagedDirectDirectoryRenameRejectsNestedBindMount|TestManagedRemoveAllPreflightsNestedMountBeforeDeletingSibling|TestManagedRootsTreeSizeRejectsNestedBindMount|TestManagedDirectoryCopyRejectsBindMountAliasIntoSource|TestManagedRegularCopyRejectsDestinationBindAliasIntoAnotherConfiguredRoot|TestManagedReplaceCleanupRejectsBindAliasAncestorOfConfiguredRoot|TestWalkManagedArchiveRejectsChildMountReplacement|TestWalkManagedArchiveAllowsStableNestedMount)$' \
+                -test.timeout=4m \
+                -test.v
+EOF
+)"
+expected_trusted_management_step="$(cat <<'EOF'
+      - name: Exercise management mount-boundary regressions
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          IFS=$'\n\t'
+          required_management_tests=(
+            TestManagedDirectDirectoryRenameRejectsNestedBindMount
+            TestManagedRemoveAllPreflightsNestedMountBeforeDeletingSibling
+            TestManagedRootsTreeSizeRejectsNestedBindMount
+            TestManagedDirectoryCopyRejectsBindMountAliasIntoSource
+            TestManagedRegularCopyRejectsDestinationBindAliasIntoAnotherConfiguredRoot
+            TestManagedReplaceCleanupRejectsBindAliasAncestorOfConfiguredRoot
+            TestWalkManagedArchiveRejectsChildMountReplacement
+            TestWalkManagedArchiveAllowsStableNestedMount
+          )
+          for required_test in "${required_management_tests[@]}"; do
+            listed="$(
+              "$RUNNER_TEMP/recasaos-filesecurity.test" \
+                -test.list "^${required_test}$"
+            )"
+            if [[ "$listed" != "$required_test" ]]; then
+              printf 'required privileged test is missing: %s\n' \
+                "$required_test" >&2
+              exit 1
+            fi
+          done
+          sudo unshare --mount --propagation private --fork --kill-child=KILL \
+            env \
+              PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+              RECASAOS_PRIVILEGED_MOUNT_TEST=1 \
+              "$RUNNER_TEMP/recasaos-filesecurity.test" \
+                -test.count=1 \
+                -test.run '^(TestManagedDirectDirectoryRenameRejectsNestedBindMount|TestManagedRemoveAllPreflightsNestedMountBeforeDeletingSibling|TestManagedRootsTreeSizeRejectsNestedBindMount|TestManagedDirectoryCopyRejectsBindMountAliasIntoSource|TestManagedRegularCopyRejectsDestinationBindAliasIntoAnotherConfiguredRoot|TestManagedReplaceCleanupRejectsBindAliasAncestorOfConfiguredRoot|TestWalkManagedArchiveRejectsChildMountReplacement|TestWalkManagedArchiveAllowsStableNestedMount)$' \
+                -test.timeout=4m \
+                -test.v
+EOF
+)"
+
+[[ "$primary_compile_step" == "$expected_primary_compile_step" ]] ||
+  die "primary privileged compile step drifted"
+[[ "$trusted_compile_step" == "$expected_trusted_compile_step" ]] ||
+  die "trusted privileged compile step drifted"
+[[ "$primary_management_step" == "$expected_primary_management_step" ]] ||
+  die "primary management step drifted from the exact executable template"
+[[ "$trusted_management_step" == "$expected_trusted_management_step" ]] ||
+  die "trusted management step drifted from the exact executable template"
+require_block_text_count "$primary_privileged_block" \
+  'recasaos-filesecurity.test' 4 \
+  "primary privileged job contains an extra filesecurity binary reference"
+require_block_text_count "$privileged_block" \
+  'recasaos-filesecurity.test' 4 \
+  "trusted privileged job contains an extra filesecurity binary reference"
 
 for block_name in attest prepare publish cleanup; do
   case "$block_name" in
@@ -228,9 +449,6 @@ require_block_text "$privileged_block" \
 require_block_text "$privileged_block" \
   'sudo unshare --mount --propagation private --fork --kill-child=KILL' \
   "privileged matrix lost its private mount namespace"
-require_block_text "$privileged_block" \
-  '^(TestManagedDirectDirectoryRenameRejectsNestedBindMount|TestManagedRemoveAllPreflightsNestedMountBeforeDeletingSibling|TestManagedRootsTreeSizeRejectsNestedBindMount|TestManagedDirectoryCopyRejectsBindMountAliasIntoSource|TestManagedRegularCopyRejectsDestinationBindAliasIntoAnotherConfiguredRoot|TestManagedReplaceCleanupRejectsBindAliasAncestorOfConfiguredRoot)$' \
-  "management mount regression matrix drifted"
 require_block_text "$privileged_block" \
   '^(TestPublicVerifierBindAliasDisclosureCannotAuthenticate|TestPinnedPublicRootSurvivesBindMountReplacement|TestPublicRootRejectsNestedBindMount|TestPublicRootAcceptsTmpfsInIsolatedNamespace|TestPublicRootAllowlistedFilesystemCompatibilityMatrix)$' \
   "public-root mount regression matrix drifted"
