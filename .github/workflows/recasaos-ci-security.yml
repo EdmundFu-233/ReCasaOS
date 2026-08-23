@@ -200,7 +200,7 @@ jobs:
               -run '^TestPrepareSecureDatabaseDirectoryRejectsForeignOwnedChildInStickyAncestor$'
 
       - name: Run security-sensitive race tests
-        run: go test -race ./cmd/recasaos-public-files ./pkg/authsecurity ./pkg/filesecurity ./pkg/httpsecurity ./pkg/netsecurity ./pkg/publicfiles ./pkg/samba ./pkg/sqlite ./pkg/utils/file ./pkg/utils/httper ./route/v1 ./service
+        run: go test -race ./cmd/recasaos-public-files ./pkg/authsecurity ./pkg/filesecurity ./pkg/httpsecurity ./pkg/netsecurity ./pkg/publicfiles ./pkg/samba ./pkg/smbcredentials ./pkg/sqlite ./pkg/utils/file ./pkg/utils/httper ./route/v1 ./service
 
       - name: Run vet
         run: go vet ./...
