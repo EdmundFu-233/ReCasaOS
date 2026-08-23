@@ -95,6 +95,7 @@ workspace="${workspace_parent}/recasaos-public-files-ci-${run_key}"
 service_unit="recasaos-public-files.service"
 socket_unit="recasaos-public-files.socket"
 sentinel_unit="recasaos-ci-management-${run_key}.service"
+service_cgroup_threads="/sys/fs/cgroup/system.slice/${service_unit}/cgroup.threads"
 service_path="/run/systemd/system/${service_unit}"
 socket_path="/run/systemd/system/${socket_unit}"
 override_dir="/run/systemd/system/${service_unit}.d"
@@ -1712,6 +1713,7 @@ assert_hostile_storage_worker_boundaries() {
     "$expected_parent" \
     "$service_uid" \
     "$rootfs/usr/bin/recasaos-public-files" \
+    "$service_cgroup_threads" \
     "${hostile_worker_identity_arguments[@]}" <<'HOSTILE_PYTHON'
 import os
 from pathlib import Path
@@ -1722,13 +1724,17 @@ phase = sys.argv[1]
 expected_parent = int(sys.argv[2])
 expected_uid = int(sys.argv[3])
 reviewed_binary_path = Path(sys.argv[4])
-worker_pairs = sys.argv[5:]
+cgroup_threads_path = Path(sys.argv[5])
+worker_pairs = sys.argv[6:]
+proc_root = Path("/proc")
 
 if (
     phase not in {"blocked", "kill-pending"}
     or expected_parent < 1
     or expected_uid < 1
     or not reviewed_binary_path.is_absolute()
+    or not cgroup_threads_path.is_absolute()
+    or cgroup_threads_path.name != "cgroup.threads"
     or len(worker_pairs) != 4
 ):
     raise SystemExit("unsafe hostile-storage worker evidence arguments")
@@ -1745,7 +1751,7 @@ if (
 
 
 def read_identity(pid):
-    data = (Path("/proc") / str(pid) / "stat").read_bytes()
+    data = (proc_root / str(pid) / "stat").read_bytes()
     marker = data.rfind(b") ")
     fields = data[marker + 2 :].split() if marker >= 0 else []
     if len(fields) <= 19 or not fields[1].isdigit() or not fields[19].isdigit():
@@ -1755,15 +1761,15 @@ def read_identity(pid):
 
 def read_status(pid):
     values = {}
-    for line in (Path("/proc") / str(pid) / "status").read_bytes().splitlines():
+    for line in (proc_root / str(pid) / "status").read_bytes().splitlines():
         if b":" in line:
             key, value = line.split(b":", 1)
             values[key] = value.strip()
     return values
 
 
-def read_task_identity(pid, tid):
-    data = (Path("/proc") / str(pid) / "task" / str(tid) / "stat").read_bytes()
+def read_task_identity(tid):
+    data = (proc_root / str(tid) / "stat").read_bytes()
     marker = data.rfind(b") ")
     fields = data[marker + 2 :].split() if marker >= 0 else []
     if len(fields) <= 19 or not fields[19].isdigit():
@@ -1771,15 +1777,30 @@ def read_task_identity(pid, tid):
     return fields[0], fields[19]
 
 
+def read_cgroup_tids():
+    tids = set()
+    for value in cgroup_threads_path.read_bytes().splitlines():
+        if not value.isdigit() or int(value) <= 1:
+            raise RuntimeError("invalid service cgroup thread identity")
+        tids.add(int(value))
+    if not tids:
+        raise RuntimeError("service cgroup has no thread identities")
+    return tids
+
+
 def find_d_state_task(pid):
-    task_root = Path("/proc") / str(pid) / "task"
     candidates = []
-    for task in task_root.iterdir():
-        if not task.name.isdecimal():
-            continue
-        tid = int(task.name)
+    for tid in read_cgroup_tids():
         try:
-            task_state, task_start = read_task_identity(pid, tid)
+            thread_status = read_status(tid)
+        except FileNotFoundError:
+            continue
+        if thread_status.get(b"Tgid") != str(pid).encode("ascii"):
+            continue
+        if thread_status.get(b"Pid") != str(tid).encode("ascii"):
+            raise RuntimeError("service cgroup thread identity changed")
+        try:
+            task_state, task_start = read_task_identity(tid)
         except FileNotFoundError:
             continue
         if task_state == b"D":
@@ -1791,8 +1812,34 @@ def find_d_state_task(pid):
     return min(candidates)
 
 
+def missing_leader_executable_is_expected(
+    phase,
+    state,
+    parent,
+    start,
+    expected_parent,
+    expected_start,
+    pid,
+    d_tid,
+):
+    # Linux intentionally makes /proc/<tgid>/exe unavailable after a
+    # multithreaded process's main thread exits. Permit the surviving-thread
+    # evidence path only after SIGKILL has been requested and only while the
+    # original leader remains a zombie with its pinned parent and start time.
+    # The caller still has to prove the surviving task's executable identity.
+    return (
+        phase == "kill-pending"
+        and state == b"Z"
+        and parent == expected_parent
+        and start == expected_start
+        and d_tid != pid
+    )
+
+
 seen = set()
 d_tasks = []
+image_evidence = []
+leader_state_evidence = []
 kill_bit = 1 << (9 - 1)
 for pair in worker_pairs:
     pid_text, separator, expected_start = pair.partition(":")
@@ -1818,14 +1865,47 @@ for pair in worker_pairs:
     d_tid, d_start_before = find_d_state_task(pid)
     d_tasks.append(f"{pid}:{d_tid}")
 
-    worker_executable = os.stat(Path("/proc") / str(pid) / "exe")
+    status_pid = pid
+    leader_executable_missing = False
+    try:
+        worker_executable = os.stat(proc_root / str(pid) / "exe")
+    except FileNotFoundError as error:
+        state_without_executable, parent_without_executable, start_without_executable = (
+            read_identity(pid)
+        )
+        if not missing_leader_executable_is_expected(
+            phase,
+            state_without_executable,
+            parent_without_executable,
+            start_without_executable,
+            expected_parent,
+            start_before,
+            pid,
+            d_tid,
+        ):
+            raise RuntimeError(
+                "hostile-storage worker executable disappeared outside the "
+                "reviewed main-thread-exit lifecycle"
+            ) from error
+        worker_executable = os.stat(proc_root / str(d_tid) / "exe")
+        status_pid = d_tid
+        leader_executable_missing = True
+        image_evidence.append(f"{pid}:surviving-tid-{d_tid}")
+        leader_state_evidence.append(f"{pid}:{state_without_executable.decode('ascii')}")
+    else:
+        image_evidence.append(f"{pid}:leader")
+        leader_state_evidence.append(f"{pid}:{state.decode('ascii')}")
     if (
         worker_executable.st_dev != reviewed_binary.st_dev
         or worker_executable.st_ino != reviewed_binary.st_ino
     ):
         raise RuntimeError("hostile-storage worker image identity changed")
 
-    status = read_status(pid)
+    status = read_status(status_pid)
+    if status.get(b"Tgid") != str(pid).encode("ascii"):
+        raise RuntimeError("hostile-storage worker thread group identity changed")
+    if status.get(b"Pid") != str(status_pid).encode("ascii"):
+        raise RuntimeError("hostile-storage worker status PID changed")
     user_ids = status.get(b"Uid", b"").split()
     if user_ids != [str(expected_uid).encode("ascii")] * 4:
         raise RuntimeError("hostile-storage worker UID boundary changed")
@@ -1854,14 +1934,31 @@ for pair in worker_pairs:
         or start_after != start_before
     ):
         raise RuntimeError("hostile-storage worker changed during inspection")
-    d_state_after, d_start_after = read_task_identity(pid, d_tid)
+    if leader_executable_missing and state_after != b"Z":
+        raise RuntimeError(
+            "hostile-storage worker executable remained unavailable after "
+            "the main-thread-exit state changed"
+        )
+    d_state_after, d_start_after = read_task_identity(d_tid)
     if d_state_after != b"D" or d_start_after != d_start_before:
         raise RuntimeError("hostile-storage D-state task changed during inspection")
+    if d_tid not in read_cgroup_tids():
+        raise RuntimeError("hostile-storage D-state task left the service cgroup")
+
+if not (
+    len(seen) == 4
+    and len(d_tasks) == 4
+    and len(image_evidence) == 4
+    and len(leader_state_evidence) == 4
+):
+    raise RuntimeError("hostile-storage worker evidence set is incomplete")
 
 print(
     "hostile-storage worker evidence: "
     f"phase={phase} parent={expected_parent} count={len(seen)} "
-    f"state=D tasks={','.join(d_tasks)}"
+    f"state=D tasks={','.join(d_tasks)} "
+    f"image-source={','.join(image_evidence)} "
+    f"leader-state={','.join(leader_state_evidence)}"
 )
 HOSTILE_PYTHON
   then

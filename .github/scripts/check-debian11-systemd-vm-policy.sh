@@ -299,10 +299,20 @@ require_exact_count "$systemd_script" \
 command -v python3 >/dev/null 2>&1 ||
   fail "Python is unavailable for hostile-storage policy parsing"
 if ! python3 - "$systemd_script" <<'PYTHON'
+import hashlib
 from pathlib import Path
 import sys
 
 source = Path(sys.argv[1]).read_text(encoding="utf-8")
+# The root-capable integration harness is one reviewed policy unit. Pinning the
+# complete source prevents shell-level early returns or later function
+# redefinitions from bypassing checks that only inspect the embedded Python.
+expected_systemd_script_sha256 = (
+    "f2f5c7d3cde897c9673d10c1c031a948e3d7fb09c191348459e671c50847b857"
+)
+actual_systemd_script_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
+if actual_systemd_script_sha256 != expected_systemd_script_sha256:
+    raise SystemExit("reviewed systemd integration policy source changed")
 python_start = "<<'HOSTILE_PYTHON'\nimport os"
 python_end = "\nHOSTILE_PYTHON\n  then"
 if source.count(python_start) != 1 or source.count(python_end) != 1:
@@ -310,6 +320,15 @@ if source.count(python_start) != 1 or source.count(python_end) != 1:
 worker_python = "import os" + source.split(python_start, 1)[1].split(
     python_end, 1
 )[0]
+compile(worker_python, "assert_hostile_storage_worker_boundaries.py", "exec")
+expected_worker_python_sha256 = (
+    "b6417fb7908c15af307b93f5384ad8061f5207570126bc2c0d19c37bf504bd1a"
+)
+actual_worker_python_sha256 = hashlib.sha256(
+    worker_python.encode("utf-8")
+).hexdigest()
+if actual_worker_python_sha256 != expected_worker_python_sha256:
+    raise SystemExit("hostile-storage worker evidence source changed")
 signal_policy = """    pending_values = []
     for name in (b"SigPnd", b"ShdPnd"):
         value = status.get(name, b"")
@@ -330,14 +349,132 @@ signal_policy = """    pending_values = []
 if worker_python.count(signal_policy) != 1:
     raise SystemExit("hostile-storage pending-signal policy changed")
 for task_proof in (
-    'task_root = Path("/proc") / str(pid) / "task"',
+    'cgroup_threads_path = Path(sys.argv[5])',
+    'worker_pairs = sys.argv[6:]',
+    'for value in cgroup_threads_path.read_bytes().splitlines():',
+    'for tid in read_cgroup_tids():',
+    'thread_status = read_status(tid)',
+    'if thread_status.get(b"Tgid") != str(pid).encode("ascii"):',
+    'if thread_status.get(b"Pid") != str(tid).encode("ascii"):',
     'if task_state == b"D":',
     'f"hostile-storage worker {pid} has no D-state task"',
     "d_tid, d_start_before = find_d_state_task(pid)",
+    "d_state_after, d_start_after = read_task_identity(d_tid)",
     'if d_state_after != b"D" or d_start_after != d_start_before:',
+    'if d_tid not in read_cgroup_tids():',
 ):
     if worker_python.count(task_proof) != 1:
         raise SystemExit("hostile-storage thread-level D-state proof changed")
+
+executable_lifecycle_helper = '''def missing_leader_executable_is_expected(
+    phase,
+    state,
+    parent,
+    start,
+    expected_parent,
+    expected_start,
+    pid,
+    d_tid,
+):
+    # Linux intentionally makes /proc/<tgid>/exe unavailable after a
+    # multithreaded process's main thread exits. Permit the surviving-thread
+    # evidence path only after SIGKILL has been requested and only while the
+    # original leader remains a zombie with its pinned parent and start time.
+    # The caller still has to prove the surviving task's executable identity.
+    return (
+        phase == "kill-pending"
+        and state == b"Z"
+        and parent == expected_parent
+        and start == expected_start
+        and d_tid != pid
+    )
+'''
+if worker_python.count(executable_lifecycle_helper) != 1:
+    raise SystemExit("hostile-storage executable lifecycle helper changed")
+helper_namespace = {}
+exec(
+    compile(
+        executable_lifecycle_helper,
+        "missing_executable_is_expected.py",
+        "exec",
+    ),
+    helper_namespace,
+)
+missing_leader_executable_is_expected = helper_namespace[
+    "missing_leader_executable_is_expected"
+]
+if not missing_leader_executable_is_expected(
+    "kill-pending", b"Z", 41, b"9001", 41, b"9001", 51, 52
+):
+    raise SystemExit("reviewed main-thread-exit lifecycle was rejected")
+for rejected_lifecycle in (
+    ("blocked", b"Z", 41, b"9001", 41, b"9001", 51, 52),
+    ("kill-pending", b"D", 41, b"9001", 41, b"9001", 51, 52),
+    ("kill-pending", b"Z", 1, b"9001", 41, b"9001", 51, 52),
+    ("kill-pending", b"Z", 41, b"9002", 41, b"9001", 51, 52),
+    ("kill-pending", b"Z", 41, b"9001", 41, b"9001", 51, 51),
+):
+    if missing_leader_executable_is_expected(*rejected_lifecycle):
+        raise SystemExit("unsafe missing-executable lifecycle was accepted")
+
+executable_inspection_policy = '''    status_pid = pid
+    leader_executable_missing = False
+    try:
+        worker_executable = os.stat(proc_root / str(pid) / "exe")
+    except FileNotFoundError as error:
+        state_without_executable, parent_without_executable, start_without_executable = (
+            read_identity(pid)
+        )
+        if not missing_leader_executable_is_expected(
+            phase,
+            state_without_executable,
+            parent_without_executable,
+            start_without_executable,
+            expected_parent,
+            start_before,
+            pid,
+            d_tid,
+        ):
+            raise RuntimeError(
+                "hostile-storage worker executable disappeared outside the "
+                "reviewed main-thread-exit lifecycle"
+            ) from error
+        worker_executable = os.stat(proc_root / str(d_tid) / "exe")
+        status_pid = d_tid
+        leader_executable_missing = True
+        image_evidence.append(f"{pid}:surviving-tid-{d_tid}")
+        leader_state_evidence.append(f"{pid}:{state_without_executable.decode('ascii')}")
+    else:
+        image_evidence.append(f"{pid}:leader")
+        leader_state_evidence.append(f"{pid}:{state.decode('ascii')}")
+    if (
+        worker_executable.st_dev != reviewed_binary.st_dev
+        or worker_executable.st_ino != reviewed_binary.st_ino
+    ):
+        raise RuntimeError("hostile-storage worker image identity changed")
+
+    status = read_status(status_pid)
+    if status.get(b"Tgid") != str(pid).encode("ascii"):
+        raise RuntimeError("hostile-storage worker thread group identity changed")
+    if status.get(b"Pid") != str(status_pid).encode("ascii"):
+        raise RuntimeError("hostile-storage worker status PID changed")
+'''
+if worker_python.count(executable_inspection_policy) != 1:
+    raise SystemExit("hostile-storage executable inspection policy changed")
+for lifecycle_proof in (
+    'if leader_executable_missing and state_after != b"Z":',
+    '''if not (
+    len(seen) == 4
+    and len(d_tasks) == 4
+    and len(image_evidence) == 4
+    and len(leader_state_evidence) == 4
+):
+    raise RuntimeError("hostile-storage worker evidence set is incomplete")''',
+    'f"image-source={\',\'.join(image_evidence)} "',
+    'f"leader-state={\',\'.join(leader_state_evidence)}"',
+):
+    if worker_python.count(lifecycle_proof) != 1:
+        raise SystemExit("hostile-storage executable lifecycle proof changed")
 
 poll_start = (
     "<<'D_STATE_PYTHON' \\\n"
