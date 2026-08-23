@@ -1,13 +1,16 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/IceWhaleTech/CasaOS-Common/utils/logger"
 	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
@@ -19,6 +22,11 @@ import (
 const cloudMountRoot = "/mnt"
 
 const maxCloudConfigsPerScan = 256
+
+const (
+	defaultCloudSettleTimeout  = 3 * time.Second
+	defaultCloudSettleInterval = 100 * time.Millisecond
+)
 
 type StorageService interface {
 	MountStorage(mountPoint, fs string) error
@@ -35,13 +43,17 @@ type storageStruct struct {
 	// rclone's config and mount endpoints are separate operations. Keep every
 	// state-changing sequence serialized so a concurrent request cannot remount
 	// a remote between the final unmount check and config deletion.
-	mu     sync.Mutex
-	rclone cloudRcloneClient
-	roots  func(string) (cloudManagedRoots, error)
+	mu             sync.Mutex
+	rclone         cloudRcloneClient
+	roots          func(string) (cloudManagedRoots, error)
+	settleTimeout  time.Duration
+	settleInterval time.Duration
+	settleClock    cloudSettleClock
 }
 
 type cloudRcloneClient interface {
 	GetMountList() (httper.MountList, error)
+	GetMountListContext(context.Context) (httper.MountList, error)
 	Mount(string, string) error
 	Unmount(string) error
 	CreateConfig(map[string]string, string, string) error
@@ -61,6 +73,9 @@ type defaultCloudRcloneClient struct{}
 
 func (defaultCloudRcloneClient) GetMountList() (httper.MountList, error) {
 	return httper.GetMountList()
+}
+func (defaultCloudRcloneClient) GetMountListContext(ctx context.Context) (httper.MountList, error) {
+	return httper.GetMountListContext(ctx)
 }
 func (defaultCloudRcloneClient) Mount(mountPoint, filesystem string) error {
 	return httper.Mount(mountPoint, filesystem)
@@ -86,6 +101,68 @@ func (s *storageStruct) rcloneClient() cloudRcloneClient {
 		return s.rclone
 	}
 	return defaultCloudRcloneClient{}
+}
+
+type cloudSettleClock interface {
+	Now() time.Time
+	Wait(context.Context, time.Duration) error
+}
+
+type realCloudSettleClock struct{}
+
+func (realCloudSettleClock) Now() time.Time {
+	return time.Now()
+}
+
+func (realCloudSettleClock) Wait(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type cloudMountObservation struct {
+	mounted        bool
+	listed         bool
+	mountErr       error
+	listErr        error
+	unsafeTopology error
+}
+
+type cloudMountTopologyEntry struct {
+	mountPoint string
+	remote     string
+	remotePath string
+}
+
+type cloudMountSettlement struct {
+	converged   bool
+	samples     int
+	last        cloudMountObservation
+	deadlineErr error
+}
+
+func (s *storageStruct) cloudSettleSettings() (time.Duration, time.Duration, cloudSettleClock) {
+	timeout := s.settleTimeout
+	if timeout <= 0 {
+		timeout = defaultCloudSettleTimeout
+	}
+	interval := s.settleInterval
+	if interval <= 0 {
+		interval = defaultCloudSettleInterval
+	}
+	if interval > timeout {
+		interval = timeout
+	}
+	clock := s.settleClock
+	if clock == nil {
+		clock = realCloudSettleClock{}
+	}
+	return timeout, interval, clock
 }
 
 // CloudMountPointForRemote binds each rclone remote to exactly one mount path.
@@ -220,6 +297,166 @@ func mountListContains(list httper.MountList, mountPoint, remote string) (bool, 
 	return found, nil
 }
 
+func canonicalCloudMountTopology(list httper.MountList) []cloudMountTopologyEntry {
+	topology := make([]cloudMountTopologyEntry, 0, len(list.MountPoints))
+	for _, mounted := range list.MountPoints {
+		topology = append(topology, cloudMountTopologyEntry{
+			mountPoint: mounted.MountPoint,
+			remote:     mounted.Fs,
+			remotePath: mounted.FsPath,
+		})
+	}
+	sort.Slice(topology, func(left, right int) bool {
+		if topology[left].mountPoint != topology[right].mountPoint {
+			return topology[left].mountPoint < topology[right].mountPoint
+		}
+		if topology[left].remote != topology[right].remote {
+			return topology[left].remote < topology[right].remote
+		}
+		return topology[left].remotePath < topology[right].remotePath
+	})
+	return topology
+}
+
+func sameCloudMountTopology(first, second httper.MountList) bool {
+	left := canonicalCloudMountTopology(first)
+	right := canonicalCloudMountTopology(second)
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+// observeCloudMountState brackets the kernel lookup with two rclone snapshots.
+// A frame is usable only when both complete mount topologies are identical,
+// rejecting frames with an observable topology change across the kernel
+// lookup. A privileged cross-process actor can still create an ABA race; this
+// bounded settle slice does not claim operation identity or crash recovery.
+func observeCloudMountState(ctx context.Context, client cloudRcloneClient, roots cloudManagedRoots, mountPoint, remote string) cloudMountObservation {
+	observation := cloudMountObservation{}
+	before, beforeErr := client.GetMountListContext(ctx)
+	observation.mounted, observation.mountErr = managedMountState(roots, mountPoint)
+	after, afterErr := client.GetMountListContext(ctx)
+
+	if observation.mountErr != nil {
+		observation.mountErr = fmt.Errorf("inspect kernel mount boundary: %w", observation.mountErr)
+	}
+	if beforeErr != nil || afterErr != nil {
+		if beforeErr != nil {
+			beforeErr = fmt.Errorf("query rclone mount list before kernel sample: %w", beforeErr)
+		}
+		if afterErr != nil {
+			afterErr = fmt.Errorf("query rclone mount list after kernel sample: %w", afterErr)
+		}
+		observation.listErr = errors.Join(beforeErr, afterErr)
+		return observation
+	}
+
+	listedBefore, beforeTopologyErr := mountListContains(before, mountPoint, remote)
+	listedAfter, afterTopologyErr := mountListContains(after, mountPoint, remote)
+	if beforeTopologyErr != nil || afterTopologyErr != nil {
+		var topologyErrors []error
+		if beforeTopologyErr != nil {
+			topologyErrors = append(topologyErrors, fmt.Errorf("validate rclone mount topology before kernel sample: %w", beforeTopologyErr))
+		}
+		if afterTopologyErr != nil {
+			topologyErrors = append(topologyErrors, fmt.Errorf("validate rclone mount topology after kernel sample: %w", afterTopologyErr))
+		}
+		observation.listErr = errors.Join(topologyErrors...)
+		observation.unsafeTopology = observation.listErr
+		return observation
+	}
+	if !sameCloudMountTopology(before, after) || listedBefore != listedAfter {
+		observation.listErr = errors.New("rclone mount topology changed across kernel sample")
+		return observation
+	}
+	observation.listed = listedAfter
+	return observation
+}
+
+// settleCloudMountState polls both independent authorities under one total
+// deadline. Each rclone list request inherits only the remaining budget, so a
+// slow listmounts handler cannot multiply its ordinary 30-second client
+// timeout by the number of samples. Mutation endpoints are never called here.
+func (s *storageStruct) settleCloudMountState(roots cloudManagedRoots, mountPoint, remote string, expected bool) cloudMountSettlement {
+	timeout, interval, clock := s.cloudSettleSettings()
+	deadline := clock.Now().Add(timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	result := cloudMountSettlement{}
+	consecutive := 0
+	for {
+		remaining := deadline.Sub(clock.Now())
+		if remaining <= 0 {
+			result.deadlineErr = context.DeadlineExceeded
+			return result
+		}
+
+		sampleCtx, sampleCancel := context.WithTimeout(ctx, remaining)
+		observation := observeCloudMountState(sampleCtx, s.rcloneClient(), roots, mountPoint, remote)
+		sampleCancel()
+		result.samples++
+		result.last = observation
+		if observation.unsafeTopology != nil {
+			return result
+		}
+		if observation.mountErr == nil && observation.listErr == nil && observation.mounted == expected && observation.listed == expected {
+			consecutive++
+			if consecutive >= 2 {
+				result.converged = true
+				return result
+			}
+		} else {
+			consecutive = 0
+		}
+
+		if ctx.Err() != nil {
+			result.deadlineErr = ctx.Err()
+			return result
+		}
+		remaining = deadline.Sub(clock.Now())
+		if remaining <= 0 {
+			result.deadlineErr = context.DeadlineExceeded
+			return result
+		}
+		delay := interval
+		if delay > remaining {
+			delay = remaining
+		}
+		if err := clock.Wait(ctx, delay); err != nil {
+			result.deadlineErr = err
+			return result
+		}
+	}
+}
+
+func (result cloudMountSettlement) unresolvedError(operation string, expected bool) error {
+	errorsToJoin := []error{fmt.Errorf(
+		"%s unresolved after %d sample(s) (expected=%t, rclone=%t, mount-boundary=%t)",
+		operation,
+		result.samples,
+		expected,
+		result.last.listed,
+		result.last.mounted,
+	)}
+	if result.last.mountErr != nil {
+		errorsToJoin = append(errorsToJoin, fmt.Errorf("last kernel mount sample: %w", result.last.mountErr))
+	}
+	if result.last.listErr != nil {
+		errorsToJoin = append(errorsToJoin, fmt.Errorf("last rclone mount sample: %w", result.last.listErr))
+	}
+	if result.deadlineErr != nil {
+		errorsToJoin = append(errorsToJoin, fmt.Errorf("settle deadline: %w", result.deadlineErr))
+	}
+	return errors.Join(errorsToJoin...)
+}
+
 func (s *storageStruct) MountStorage(mountPoint, remoteFS string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -286,28 +523,23 @@ func (s *storageStruct) mountStorageLocked(mountPoint, remoteFS string) error {
 		return err
 	}
 	mountErr := s.rcloneClient().Mount(mountPoint, remoteFS)
-	mounted, verifyErr := managedMountState(roots, mountPoint)
-	refreshed, listErr := s.rcloneClient().GetMountList()
-	listed = false
-	if listErr == nil {
-		listed, listErr = mountListContains(refreshed, mountPoint, remote)
-	}
-	if verifyErr == nil && listErr == nil && mounted && listed {
+	mountSettlement := s.settleCloudMountState(roots, mountPoint, remote, true)
+	if mountSettlement.converged {
 		// A lost RC response is ambiguous, but the independently verified final
 		// state is authoritative and exactly matches the requested operation.
 		return nil
 	}
-	if verifyErr == nil && listErr == nil && !mounted && !listed && mountErr != nil {
-		return mountErr
-	}
-	rollbackErr := s.rcloneClient().Unmount(mountPoint)
-	if verifyErr != nil {
-		return errors.Join(mountErr, fmt.Errorf("verify mounted cloud storage: %w", verifyErr), listErr, rollbackErr)
-	}
-	if listErr != nil {
-		return errors.Join(mountErr, fmt.Errorf("verify rclone mount list after mount: %w", listErr), rollbackErr)
-	}
-	return errors.Join(mountErr, fmt.Errorf("rclone mount did not reach a consistent state (rclone=%t, mount-boundary=%t)", listed, mounted), rollbackErr)
+	mountUnresolved := mountSettlement.unresolvedError("cloud mount reconciliation", true)
+	// Even an exact remote/path match cannot prove that the observed mount was
+	// caused by this request: another privileged actor can create the same
+	// mapping while the response is ambiguous. Until rclone provides an
+	// operation identity or cancellation token, every path-only compensating
+	// unmount risks removing that actor's mount and is therefore withheld.
+	return errors.Join(
+		mountErr,
+		mountUnresolved,
+		errors.New("automatic rollback withheld until operation identity/cancellation exists"),
+	)
 }
 
 func requireEmptyManagedDirectory(roots cloudManagedRoots, mountPoint string) error {
@@ -376,23 +608,20 @@ func (s *storageStruct) unmountStorageLocked(mountPoint string) error {
 	if !listed && mounted {
 		return fmt.Errorf("refusing inconsistent cloud unmount state (rclone=%t, mount-boundary=%t)", listed, mounted)
 	}
+	var unmountErr error
 	if listed {
-		unmountErr := s.rcloneClient().Unmount(mountPoint)
-		mounted, stateErr = managedMountState(roots, mountPoint)
-		if stateErr != nil {
-			return errors.Join(unmountErr, fmt.Errorf("verify cloud unmount: %w", stateErr))
-		}
-		refreshed, err := s.rcloneClient().GetMountList()
-		if err != nil {
-			return errors.Join(unmountErr, fmt.Errorf("verify rclone mount list after unmount: %w", err))
-		}
-		stillListed, err := mountListContains(refreshed, mountPoint, remote)
-		if err != nil {
-			return errors.Join(unmountErr, err)
-		}
-		if mounted || stillListed {
-			return errors.Join(unmountErr, fmt.Errorf("cloud storage remained mounted after rclone unmount (rclone=%t, mount-boundary=%t)", stillListed, mounted))
-		}
+		unmountErr = s.rcloneClient().Unmount(mountPoint)
+	}
+	// Even an initially absent mount needs two stable dual-source frames before
+	// RemoveStorage may delete its config. This also catches delayed completion
+	// from an earlier privileged operation without issuing a speculative
+	// unmount when the pre-state did not identify our exact target.
+	unmountSettlement := s.settleCloudMountState(roots, mountPoint, remote, false)
+	if !unmountSettlement.converged {
+		return errors.Join(
+			unmountErr,
+			unmountSettlement.unresolvedError("cloud unmount reconciliation", false),
+		)
 	}
 	// Keep the mountpoint directory. Releasing this transaction and then
 	// reacquiring the ManagedRoots mutation lock to remove an empty directory
@@ -680,24 +909,13 @@ func (s *storageStruct) deleteConfigByNameLocked(name string) error {
 	if _, err := s.getConfigByNameLocked(name); err != nil {
 		return err
 	}
-	listedMounts, err := s.rcloneClient().GetMountList()
-	if err != nil {
-		return fmt.Errorf("list rclone mounts before config deletion: %w", err)
-	}
-	listed, err := mountListContains(listedMounts, mountPoint, name)
-	if err != nil {
-		return err
-	}
 	roots, err := s.managedRootsForMount(mountPoint)
 	if err != nil {
 		return err
 	}
-	mounted, err := managedMountState(roots, mountPoint)
-	if err != nil {
-		return fmt.Errorf("inspect cloud mount before config deletion: %w", err)
-	}
-	if listed || mounted {
-		return fmt.Errorf("refusing to delete config for mounted remote %q", name)
+	deletionSettlement := s.settleCloudMountState(roots, mountPoint, name, false)
+	if !deletionSettlement.converged {
+		return deletionSettlement.unresolvedError("cloud config deletion precondition", false)
 	}
 	deleteErr := s.rcloneClient().DeleteConfigByName(name)
 	if deleteErr == nil {
