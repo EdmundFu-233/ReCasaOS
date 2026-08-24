@@ -2,10 +2,14 @@
 
 package smbcredentials
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestSystemdCredentialLoaderIsUnavailableOffLinux(t *testing.T) {
-	if keyring, err := LoadSystemdKeyring(); keyring != nil || err == nil {
+	t.Setenv(systemdCredentialsDirectoryEnvironment, "/configured-but-unsupported")
+	if keyring, err := LoadSystemdKeyring(); keyring != nil || err == nil || errors.Is(err, ErrSystemdCredentialNotProvided) {
 		if keyring != nil {
 			keyring.Destroy()
 		}
