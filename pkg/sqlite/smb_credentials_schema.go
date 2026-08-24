@@ -268,20 +268,15 @@ func verifySMBCredentialSchema(database *gorm.DB) error {
 }
 
 // verifyLegacyOnlySMBCredentialState is the downgrade/partial-deployment gate
-// for this expand-only release. The legacy DAO still performs whole-row Save,
-// so allowing any sealed or migration-marked row to reach it could erase a
-// future envelope. The cutover release must replace this gate atomically with
-// its complete legacy/sealed classifier before it writes the first envelope.
+// for this expand-only, write-contained release. Mutations are limited to
+// legacy rows, but the runtime still reads plaintext passwords and loads no
+// keyring. Sealed or migration-marked state must therefore fail before service
+// construction. The cutover release must replace this gate atomically with its
+// complete legacy/sealed classifier before it writes the first envelope.
 func verifyLegacyOnlySMBCredentialState(database *gorm.DB) error {
 	var nonLegacyRows int64
-	if err := database.Raw(`SELECT count(*) FROM o_connections
-		WHERE (credential_id IS NOT NULL AND credential_id <> '')
-			OR (credential_format IS NOT NULL AND credential_format <> '')
-			OR (password_envelope IS NOT NULL AND (
-				typeof(password_envelope) <> 'blob'
-				OR length(CAST(password_envelope AS BLOB)) <> 0
-			))
-			OR row_revision <> 0`).Scan(&nonLegacyRows).Error; err != nil {
+	if err := database.Raw(`SELECT count(*) FROM o_connections WHERE NOT ` +
+		model2.LegacySMBCredentialRowPredicateSQL).Scan(&nonLegacyRows).Error; err != nil {
 		return fmt.Errorf("classify o_connections rows: %w", err)
 	}
 	if nonLegacyRows != 0 {

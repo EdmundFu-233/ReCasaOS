@@ -273,7 +273,13 @@ func restoreSambaConnectionMounts(managementRoots *filesecurity.ManagedRoots, co
 	connection.BootID = currentBootID
 	connection.MountIDs = encodedMountIDs
 	connection.Directories = strings.Join(directories, ",")
-	if err := service.MyService.Connections().UpdateConnection(connection); err != nil {
+	if err := service.MyService.Connections().UpdateConnectionMountState(
+		connection.ID,
+		connection.Port,
+		connection.Directories,
+		connection.BootID,
+		connection.MountIDs,
+	); err != nil {
 		return fail(err)
 	}
 	releaseMutation()
