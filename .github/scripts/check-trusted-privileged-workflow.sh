@@ -122,7 +122,11 @@ for trusted_path in \
   .github/scripts/test-debian11-systemd-vm-policy.sh \
   .github/scripts/test-public-files-debian11-vm.sh \
   .github/scripts/test-public-files-systemd.sh \
-  .github/scripts/test-trusted-privileged-workflow.sh
+  .github/scripts/test-smb-credential-admission-checker.sh \
+  .github/scripts/test-smb-credential-startup-dispatch.sh \
+  .github/scripts/test-smb-credential-systemd-admission.sh \
+  .github/scripts/test-trusted-privileged-workflow.sh \
+  deploy/systemd/check-smb-credential-admission.sh
 do
   require_block_text "$attest_block" "$trusted_path" \
     "automatic attestor does not freeze policy file: $trusted_path"

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,6 +42,29 @@ func newCredentialDirectory(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return directory
+}
+
+func countCredentialDirectoryDescriptors(t *testing.T, directory string) int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix := directory + string(filepath.Separator)
+	count := 0
+	for _, entry := range entries {
+		target, err := os.Readlink(filepath.Join("/proc/self/fd", entry.Name()))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if target == directory || strings.HasPrefix(target, prefix) {
+			count++
+		}
+	}
+	return count
 }
 
 func TestLoadKeyringDirectoryAcceptsPinnedCanonicalCredential(t *testing.T) {
@@ -120,6 +144,69 @@ func TestLoadSystemdKeyringRequiresCredentialDirectory(t *testing.T) {
 	t.Setenv("CREDENTIALS_DIRECTORY", "")
 	if _, err := LoadSystemdKeyring(); err == nil {
 		t.Fatal("missing CREDENTIALS_DIRECTORY was accepted")
+	}
+}
+
+func TestLoadSystemdKeyringAdmitsCanonicalCredentialForStartup(t *testing.T) {
+	directory := newCredentialDirectory(t)
+	data := writeTestCredential(t, directory, 0o400)
+	t.Setenv(systemdCredentialsDirectoryEnvironment, directory)
+
+	keyring, err := LoadSystemdKeyring()
+	if err != nil || keyring == nil {
+		t.Fatalf("configured admission keyring=%v err=%v", keyring, err)
+	}
+	encoded, marshalErr := keyring.Marshal()
+	keyring.Destroy()
+	defer clear(encoded)
+	if marshalErr != nil || !bytes.Equal(encoded, data) {
+		t.Fatalf("admitted keyring mismatch: err=%v", marshalErr)
+	}
+}
+
+func TestLoadSystemdKeyringDoesNotLeakDescriptorsAcrossRepeatedAdmission(t *testing.T) {
+	for name, data := range map[string][]byte{
+		"valid":     nil,
+		"malformed": []byte("malformed-ReCasaOS-SMB-keyring"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			directory := newCredentialDirectory(t)
+			if data == nil {
+				writeTestCredential(t, directory, 0o400)
+			} else {
+				credentialPath := filepath.Join(directory, CredentialName)
+				if err := os.WriteFile(credentialPath, data, 0o400); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(credentialPath, 0o400); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv(systemdCredentialsDirectoryEnvironment, directory)
+			before := countCredentialDirectoryDescriptors(t, directory)
+			for range 128 {
+				keyring, err := LoadSystemdKeyring()
+				if data == nil {
+					if err != nil || keyring == nil {
+						if keyring != nil {
+							keyring.Destroy()
+						}
+						t.Fatalf("valid repeated admission keyring=%v err=%v", keyring, err)
+					}
+					keyring.Destroy()
+				} else {
+					if keyring != nil {
+						keyring.Destroy()
+					}
+					if err == nil {
+						t.Fatal("malformed repeated admission unexpectedly succeeded")
+					}
+				}
+			}
+			if after := countCredentialDirectoryDescriptors(t, directory); after != before {
+				t.Fatalf("credential descriptor count=%d before=%d", after, before)
+			}
+		})
 	}
 }
 

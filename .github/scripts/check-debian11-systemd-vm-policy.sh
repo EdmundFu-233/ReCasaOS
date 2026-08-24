@@ -13,8 +13,9 @@ workflow="${1:-$repository/.github/workflows/recasaos-ci-security.yml}"
 vm_script="${2:-$repository/.github/scripts/test-public-files-debian11-vm.sh}"
 systemd_script="${3:-$repository/.github/scripts/test-public-files-systemd.sh}"
 sampler="${4:-$repository/.github/scripts/sample-cgroup-memory.py}"
+admission_script="${5:-$repository/.github/scripts/test-smb-credential-systemd-admission.sh}"
 
-for file in "$workflow" "$vm_script" "$systemd_script" "$sampler"; do
+for file in "$workflow" "$vm_script" "$systemd_script" "$sampler" "$admission_script"; do
   [[ -f "$file" && ! -L "$file" ]] ||
     fail "required policy file is missing or symbolic: $file"
 done
@@ -176,9 +177,90 @@ require_text "$vm_script" \
 require_text "$vm_script" \
   'RECASAOS_HOSTILE_STORAGE_VM_CI=1' \
   "guest hostile-storage opt-in is missing"
+require_text "$vm_script" \
+  '/opt/recasaos-src/.github/scripts/test-smb-credential-systemd-admission.sh' \
+  "guest does not run the SMB credential admission qualification"
 for guest_package in dmsetup e2fsprogs kmod udev; do
   require_exact_line "$vm_script" "  - $guest_package" \
     "guest hostile-storage package is missing: $guest_package"
+done
+
+require_text "$admission_script" \
+  '[[ "${RECASAOS_SYSTEMD_TEST_TARGET:-}" == debian-11-systemd-247-qemu ]]' \
+  "SMB admission test is not bound to the exact Debian target"
+require_text "$admission_script" \
+  '[[ "$(cat /proc/1/comm)" == systemd ]]' \
+  "SMB admission test does not require systemd PID 1"
+require_text "$admission_script" \
+  '[[ "$systemd_version" == 247 ]]' \
+  "SMB admission test does not require systemd 247"
+require_text "$admission_script" \
+  'LoadCredential=recasaos-smb-keyring:/etc/recasaos/recasaos-smb-keyring' \
+  "SMB admission test does not fix the staged credential binding"
+require_text "$admission_script" \
+  "fail 'staged drop-in drifted from the reviewed credential binding'" \
+  "SMB admission test does not reject staged drop-in drift"
+require_text "$admission_script" \
+  'fail "refusing to replace pre-existing test target: $target"' \
+  "SMB admission test does not protect pre-existing host targets"
+for systemd_root in \
+  /etc/systemd/system \
+  /run/systemd/system \
+  /usr/local/lib/systemd/system \
+  /usr/lib/systemd/system
+do
+  require_exact_line "$admission_script" "  $systemd_root \\" \
+    "SMB admission test omits a systemd unit load path: $systemd_root"
+done
+require_exact_line "$admission_script" '  /lib/systemd/system' \
+  "SMB admission test omits the final systemd unit load path"
+require_text "$admission_script" \
+  'if systemctl cat "$unit_name" >/dev/null 2>&1; then' \
+  "SMB admission test does not reject an existing unit on another load path"
+require_text "$admission_script" \
+  '[[ "$unit_load_state" == not-found ]]' \
+  "SMB admission test does not reject an existing loaded or transient unit"
+require_text "$admission_script" \
+  '[[ "$owned_source_path" == 0 ]] || sudo rm -f -- "$source_path"' \
+  "SMB admission cleanup is not ownership-gated"
+require_text "$admission_script" \
+  'ProvisionSystemKeyringSource()' \
+  "SMB admission test does not use the reviewed provisioner"
+require_exact_line "$admission_script" 'RemainAfterExit=yes' \
+  "SMB admission test does not keep the oneshot active for restart coverage"
+require_exact_count "$admission_script" \
+  'sudo systemctl restart "$unit_name"' 1 \
+  "SMB admission test does not exercise exactly one successful active-unit restart"
+require_exact_count "$admission_script" \
+  'if sudo systemctl restart "$unit_name" >/dev/null 2>&1; then' 2 \
+  "SMB admission test does not exercise both failing active-unit restarts"
+require_text "$admission_script" \
+  "fail 'missing configured source unexpectedly started'" \
+  "SMB admission test lacks the missing-source negative"
+require_text "$admission_script" \
+  "fail 'malformed configured credential unexpectedly started'" \
+  "SMB admission test lacks the malformed-source negative"
+require_text "$admission_script" \
+  "fail 'could not read the SMB admission test journal'" \
+  "SMB admission test does not fail closed when journal collection fails"
+require_text "$admission_script" \
+  'sudo systemctl show --property=InvocationID --value "$unit_name"' \
+  "SMB admission test journal is not bound to the malformed invocation"
+require_text "$admission_script" \
+  '[[ "$malformed_invocation_id" =~ ^[0-9a-f]{32}$ ]]' \
+  "SMB admission test does not validate the malformed invocation identity"
+require_text "$admission_script" \
+  '"_SYSTEMD_INVOCATION_ID=$malformed_invocation_id"' \
+  "SMB admission journal query is not scoped to the malformed invocation"
+require_text "$admission_script" \
+  "fail 'malformed credential failure was absent from the journal'" \
+  "SMB admission test does not require positive redaction evidence"
+require_text "$admission_script" \
+  "fail 'malformed credential bytes appeared in the journal'" \
+  "SMB admission test does not enforce journal redaction"
+for forbidden in 'eval ' /dev/kvm --privileged 'docker run' 'podman run'; do
+  forbid_text "$admission_script" "$forbidden" \
+    "SMB admission test contains forbidden indirection or host escape: $forbidden"
 done
 for identity_proof in \
   '[[ "$guest_release" == debian:11 ]]' \

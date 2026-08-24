@@ -15,9 +15,15 @@ import (
 const maxKeyringBytes = len(keyringMagic) + 1 + 1 + keyIDSize + maxKeys*(keyIDSize+keySize)
 
 // LoadSystemdKeyring reads the fixed credential name only from the directory
-// supplied by systemd. It never accepts key bytes from argv or the environment.
+// supplied by systemd. An unset CREDENTIALS_DIRECTORY returns exactly
+// ErrSystemdCredentialNotProvided; any configured-invalid state is a distinct
+// hard error. It never accepts key bytes from argv or the environment. The
+// caller owns a successful result and must call Destroy.
 func LoadSystemdKeyring() (*Keyring, error) {
-	directory := os.Getenv("CREDENTIALS_DIRECTORY")
+	directory, configured := os.LookupEnv(systemdCredentialsDirectoryEnvironment)
+	if !configured {
+		return nil, ErrSystemdCredentialNotProvided
+	}
 	if directory == "" {
 		return nil, errors.New("ReCasaOS SMB systemd credential directory is unavailable")
 	}

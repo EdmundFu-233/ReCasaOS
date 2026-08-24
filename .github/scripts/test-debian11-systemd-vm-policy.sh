@@ -14,13 +14,14 @@ workflow="$repository/.github/workflows/recasaos-ci-security.yml"
 vm_script="$repository/.github/scripts/test-public-files-debian11-vm.sh"
 systemd_script="$repository/.github/scripts/test-public-files-systemd.sh"
 sampler="$repository/.github/scripts/sample-cgroup-memory.py"
+admission_script="$repository/.github/scripts/test-smb-credential-systemd-admission.sh"
 
 [[ -x "$checker" ]] || fail "policy checker is not executable"
 command -v perl >/dev/null 2>&1 || fail "perl is unavailable"
 workspace="$(mktemp -d "${TMPDIR:-/tmp}/recasaos-debian-vm-policy.XXXXXX")"
 trap 'rm -rf -- "$workspace"' EXIT
 
-"$checker" "$workflow" "$vm_script" "$systemd_script" "$sampler"
+"$checker" "$workflow" "$vm_script" "$systemd_script" "$sampler" "$admission_script"
 
 replace_once() {
   local file=$1
@@ -48,6 +49,7 @@ expect_rejection() {
   local candidate_vm="$candidate_directory/vm.sh"
   local candidate_systemd="$candidate_directory/systemd.sh"
   local candidate_sampler="$candidate_directory/sampler.py"
+  local candidate_admission="$candidate_directory/admission.sh"
   local mutation_file
 
   mkdir "$candidate_directory"
@@ -55,11 +57,13 @@ expect_rejection() {
   cp -- "$vm_script" "$candidate_vm"
   cp -- "$systemd_script" "$candidate_systemd"
   cp -- "$sampler" "$candidate_sampler"
+  cp -- "$admission_script" "$candidate_admission"
   case "$target" in
     workflow) mutation_file=$candidate_workflow ;;
     vm) mutation_file=$candidate_vm ;;
     systemd) mutation_file=$candidate_systemd ;;
     sampler) mutation_file=$candidate_sampler ;;
+    admission) mutation_file=$candidate_admission ;;
     *) fail "unknown mutation target: $target" ;;
   esac
   replace_once "$mutation_file" "$needle" "$replacement"
@@ -68,6 +72,7 @@ expect_rejection() {
     "$candidate_vm" \
     "$candidate_systemd" \
     "$candidate_sampler" \
+    "$candidate_admission" \
     >"$candidate_directory/result.log" 2>&1; then
     fail "unsafe mutation was accepted: $label"
   fi
@@ -91,6 +96,45 @@ expect_rejection hardware-acceleration vm \
 expect_rejection stale-sha vm \
   '[[ "$actual_sha" == "$RECASAOS_EXPECTED_SHA" ]]' \
   '[[ -n "$actual_sha" ]]'
+expect_rejection admission-target admission \
+  '[[ "${RECASAOS_SYSTEMD_TEST_TARGET:-}" == debian-11-systemd-247-qemu ]]' \
+  '[[ -n "${RECASAOS_SYSTEMD_TEST_TARGET:-}" ]]'
+expect_rejection admission-staged-binding admission \
+  'LoadCredential=recasaos-smb-keyring:/etc/recasaos/recasaos-smb-keyring' \
+  'LoadCredential=recasaos-smb-keyring:/tmp/unreviewed-keyring'
+expect_rejection admission-preexisting-target admission \
+  'fail "refusing to replace pre-existing test target: $target"' \
+  ': # pre-existing target accepted'
+expect_rejection admission-cleanup-ownership admission \
+  '[[ "$owned_source_path" == 0 ]] || sudo rm -f -- "$source_path"' \
+  'sudo rm -f -- "$source_path"'
+expect_rejection admission-existing-unit admission \
+  'if systemctl cat "$unit_name" >/dev/null 2>&1; then' \
+  'if false; then'
+expect_rejection admission-loaded-unit admission \
+  '[[ "$unit_load_state" == not-found ]]' \
+  '[[ -n "$unit_load_state" ]]'
+expect_rejection admission-run-unit-root admission \
+  '  /run/systemd/system \' \
+  '  /run/systemd/ignored \'
+expect_rejection admission-journal-read admission \
+  "fail 'could not read the SMB admission test journal'" \
+  ': # journal read failure accepted'
+expect_rejection admission-journal-invocation admission \
+  'sudo systemctl show --property=InvocationID --value "$unit_name"' \
+  'sudo systemctl show --property=Description --value "$unit_name"'
+expect_rejection admission-journal-scope admission \
+  '"_SYSTEMD_INVOCATION_ID=$malformed_invocation_id"' \
+  '"_SYSTEMD_UNIT=$unit_name"'
+expect_rejection admission-journal-evidence admission \
+  "fail 'malformed credential failure was absent from the journal'" \
+  ': # missing redaction evidence accepted'
+expect_rejection admission-remain-active admission \
+  'RemainAfterExit=yes' \
+  'RemainAfterExit=no'
+expect_rejection admission-real-restart admission \
+  $'\nsudo systemctl restart "$unit_name"\n' \
+  $'\nsudo systemctl start "$unit_name"\n'
 expect_rejection hostile-storage-opt-in vm \
   '      RECASAOS_HOSTILE_STORAGE_VM_CI=1 \' \
   '      RECASAOS_HOSTILE_STORAGE_VM_CI=0 \'

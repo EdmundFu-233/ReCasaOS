@@ -453,6 +453,30 @@ timeout --signal=TERM --kill-after=120s 22m \
       /bin/bash --noprofile --norc \
         /opt/recasaos-src/.github/scripts/test-public-files-systemd.sh
 
+timeout --signal=TERM --kill-after=30s 8m \
+  ssh "${ssh_common[@]}" -p "$ssh_port" debian@127.0.0.1 \
+    env -i \
+      HOME=/home/debian \
+      USER=debian \
+      LOGNAME=debian \
+      SHELL=/bin/bash \
+      PATH=/usr/local/go/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      GOTOOLCHAIN=local \
+      GOCACHE=/home/debian/.cache/go-build \
+      GOPATH=/home/debian/go \
+      CI=true \
+      GITHUB_ACTIONS=true \
+      GITHUB_REPOSITORY=EdmundFu-233/ReCasaOS \
+      GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+      GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+      GITHUB_WORKSPACE=/opt/recasaos-src \
+      RUNNER_OS=Linux \
+      RECASAOS_TRUSTED_SYSTEMD_CI=1 \
+      RECASAOS_RUNNER_ENVIRONMENT=github-hosted-vm \
+      RECASAOS_SYSTEMD_TEST_TARGET=debian-11-systemd-247-qemu \
+      /bin/bash --noprofile --norc \
+        /opt/recasaos-src/.github/scripts/test-smb-credential-systemd-admission.sh
+
 ssh "${ssh_common[@]}" -p "$ssh_port" debian@127.0.0.1 \
   'sudo systemctl poweroff' >/dev/null 2>&1 || true
 shutdown_deadline=$((SECONDS + 90))

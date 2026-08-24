@@ -94,6 +94,46 @@ This is designed for a systemd-v247-compatible root-service boundary. The
 directory loader alone does not prove the runtime directory's ancestor or PID 1
 provenance.
 
+The production `casaos` startup now distinguishes exactly one
+legacy-compatible loader result: the process environment has no
+`CREDENTIALS_DIRECTORY` entry and `LoadSystemdKeyring` returns
+`ErrSystemdCredentialNotProvided` directly. Once that environment entry
+exists, an empty directory value, a missing fixed credential, unsafe metadata,
+malformed bytes, or an unsupported platform is a hard startup failure before
+configuration, database, service, route, or READY side effects. A valid
+credential is parsed, then its `Keyring` is immediately destroyed before
+startup continues because this expand-only release has no sealed DAO or other
+authorized key consumer. Internal probe and version-only invocations bypass
+this admission path.
+
+The packaged base `casaos.service` deliberately contains no active credential
+directive so an unprovisioned legacy installation can still reach the existing
+strict legacy-only database gate. The exact `LoadCredential=` drop-in is staged
+under `/usr/share/recasaos/systemd/casaos.service.d/` and is not installed in a
+systemd search path. Activating it is a separate operator gate after durable
+source provisioning and audit; once active, a missing source is intentionally
+a systemd start failure.
+
+The packaging checker fixes the reviewed base unit, rejects alternate active
+`casaos.service` files, and requires both CasaOS-specific and type-wide
+`service.d` drop-ins to be empty. It also inspects system-manager configuration
+for credential or environment injection. Packaged system and
+system-environment generators are disallowed because their output cannot be
+proven by static inspection. This claim is limited to the packaged sysroot
+systemd configuration and generator paths inspected by the checker; setup or
+maintainer scripts require separate review. Runtime manager environment
+changes, kernel command-line injection, and operator-created units remain
+external configured inputs and therefore fail closed rather than being treated
+as legacy absence.
+
+Successful startup admission proves only that one bounded runtime payload was
+safely opened and canonically parsed during that call. It does not prove PID 1
+or source-file provenance, source durability, provisioning history, continued
+path identity, database/keyring correspondence, sealed-row readiness, or
+credential activation. The legacy-only database classifier remains
+authoritative, and the admitted key is not retained or used to encrypt,
+decrypt, migrate, rewrap, or scrub any row.
+
 ## Source provisioning boundary
 
 On Linux, `ProvisionSystemKeyringSource` can generate and create only the fixed
