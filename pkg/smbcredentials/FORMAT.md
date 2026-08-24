@@ -92,10 +92,49 @@ bounded before strict parsing.
 
 This is designed for a systemd-v247-compatible root-service boundary. The
 directory loader alone does not prove the runtime directory's ancestor or PID 1
-provenance. The package does not provision or validate the `/etc` source
-keyring, install `LoadCredential=`, support a future non-root unit's ACL model,
-or prove a real PID 1 integration. Those remain separate install and runtime
-validation gates.
+provenance.
+
+## Source provisioning boundary
+
+On Linux, `ProvisionSystemKeyringSource` can generate and create only the fixed
+`/etc/recasaos/recasaos-smb-keyring` source. It requires an already-existing
+root-owned path boundary, never replaces or parses an existing destination, and
+publishes a fully synchronized canonical keyring with kernel-enforced
+no-replace semantics. Its result distinguishes a created-but-not-proven-durable
+destination and an unresolved named staging object; either state is a hard
+operator-recovery HOLD and must not be retried by generating another key.
+Before the named fallback can rename, it synchronizes both the completed
+candidate and the directory containing its fixed marker. On a filesystem that
+honors these synchronization guarantees, a later machine crash therefore
+recovers either the marker or the published target rather than silently
+forgetting a generated, reachable key.
+An occupied destination is likewise an unvalidated hard HOLD, not idempotent
+success: the provisioner deliberately does not open, parse, repair, chmod, or
+remove it.
+If a publication syscall or subsequent namespace inspection has an ambiguous
+outcome, the result conservatively reports the key as created with unknown
+durability; a named-candidate ambiguity also reports cleanup required. These
+states can overstate what reached disk, but they prevent an unsafe retry from
+generating a second unrelated key.
+
+The root-owned mode-`0700` namespace is also the serialization boundary for the
+named fallback and operator recovery. Protocol-conforming concurrent callers
+stop when the fixed `O_EXCL` marker exists. Recovery must be serialized with all
+provisioning and other recovery activity: Linux has no single operation that
+can conditionally rename or unlink a pathname only if it still names a
+previously inspected inode. A concurrent out-of-protocol root process could
+replace the marker between the identity check and the name-based operation;
+root can already directly alter this source namespace.
+
+The provisioner is deliberately not called by the service, installer, package
+scripts, or units. It strictly parses a bounded readback only to validate the
+published bytes, then destroys that parser state. It does not install
+`LoadCredential=`, update a running systemd credential, expose a key ID,
+return or activate the generated keyring as a runtime credential, access the
+database, or migrate credentials. Those remain separate install, restart,
+migration, and runtime validation gates. A future cutover must provision
+durably, install and validate the unit boundary, restart into the new systemd
+credential, and only then begin an atomic database migration.
 
 ## Boundary
 
