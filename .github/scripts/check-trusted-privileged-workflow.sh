@@ -12,6 +12,25 @@ repo_root="$(cd -- "$script_dir/../.." && pwd -P)"
 workflow="${1:-$repo_root/.github/workflows/trusted-privileged-ci.yml}"
 
 [[ -f "$workflow" ]] || die "workflow is missing: $workflow"
+command -v python3 >/dev/null 2>&1 ||
+  die "Python is unavailable for trusted workflow hashing"
+
+# Treat the write-capable workflow as one reviewed policy unit. Exact-line
+# checks alone cannot distinguish an executed shell list from identical text
+# hidden in an inert heredoc, so any source change requires a reviewed digest
+# update in this independently frozen checker.
+expected_workflow_sha256=09a13760df38f503c528913406baa77a4540829e2d29feb721017edab3fe8ad8
+actual_workflow_sha256="$(
+  python3 - "$workflow" <<'PYTHON'
+import hashlib
+from pathlib import Path
+import sys
+
+print(hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest())
+PYTHON
+)"
+[[ "$actual_workflow_sha256" == "$expected_workflow_sha256" ]] ||
+  die "reviewed trusted workflow source changed"
 
 require_text() {
   local text="$1"
@@ -53,6 +72,13 @@ require_block_text() {
   local text="$2"
   local reason="$3"
   grep -Fq -- "$text" <<<"$block" || die "$reason"
+}
+
+require_block_exact_line() {
+  local block="$1"
+  local text="$2"
+  local reason="$3"
+  grep -Fxq -- "$text" <<<"$block" || die "$reason"
 }
 
 forbid_block_text() {
@@ -120,11 +146,18 @@ for trusted_path in \
   .github/scripts/sample-cgroup-memory.py \
   .github/scripts/test-cgroup-memory-sampler.sh \
   .github/scripts/test-debian11-systemd-vm-policy.sh \
+  .github/scripts/test-hostile-worker-exe-lifecycle.py \
   .github/scripts/test-public-files-debian11-vm.sh \
   .github/scripts/test-public-files-systemd.sh \
   .github/scripts/test-trusted-privileged-workflow.sh
 do
-  require_block_text "$attest_block" "$trusted_path" \
+  if [[ "$trusted_path" == \
+    .github/scripts/test-trusted-privileged-workflow.sh ]]; then
+    trusted_path_line="            $trusted_path"
+  else
+    trusted_path_line="            $trusted_path \\"
+  fi
+  require_block_exact_line "$attest_block" "$trusted_path_line" \
     "automatic attestor does not freeze policy file: $trusted_path"
 done
 require_block_text "$attest_block" \

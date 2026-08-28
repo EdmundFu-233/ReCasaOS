@@ -49,6 +49,21 @@ expect_rejection() {
   fi
 }
 
+expect_relocated_trusted_path_rejection() {
+  local candidate="$work_dir/hostile-worker-lifecycle-policy-relocated.yml"
+
+  cp -- "$workflow" "$candidate"
+  replace_once "$candidate" \
+    $'            .github/scripts/test-hostile-worker-exe-lifecycle.py \\\n' \
+    ''
+  replace_once "$candidate" \
+    '          for trusted_path in \' \
+    $'          : <<\'INERT_TRUSTED_PATH\'\n            .github/scripts/test-hostile-worker-exe-lifecycle.py \\\n          INERT_TRUSTED_PATH\n          for trusted_path in \\'
+  if "$checker" "$candidate" >"$work_dir/relocated-policy.log" 2>&1; then
+    die "unsafe relocated trusted policy path was accepted"
+  fi
+}
+
 expect_rejection pull-request-target \
   '  workflow_run:' \
   $'  pull_request_target:\n  workflow_run:'
@@ -85,6 +100,13 @@ expect_rejection unsafe-cleanup \
 expect_rejection changed-trusted-workflow \
   '            [[ "$head_policy_blob" == "$default_policy_blob" ]]' \
   '            [[ -n "$head_policy_blob" ]]'
+expect_rejection hostile-worker-lifecycle-policy-unfrozen \
+  $'            .github/scripts/test-hostile-worker-exe-lifecycle.py \\\n' \
+  ''
+expect_rejection hostile-worker-lifecycle-policy-renamed \
+  '            .github/scripts/test-hostile-worker-exe-lifecycle.py \' \
+  '            .github/scripts/test-hostile-worker-exe-lifecycle.py.disabled \'
+expect_relocated_trusted_path_rejection
 expect_rejection compatibility-job-omitted \
   "          compatibility_job='Debian 11 systemd 247 PID1 VM'" \
   "          compatibility_job='untrusted compatibility result'"
