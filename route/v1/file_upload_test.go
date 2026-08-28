@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
+	"github.com/labstack/echo/v4"
 )
 
 type recordingV1CompletedIdentityVerifier struct {
@@ -259,5 +262,18 @@ func TestV1CompletedUploadTombstonesAreBoundedWithoutEvictingActive(t *testing.T
 	}
 	if registry.sessions["completed-000"] != nil {
 		t.Fatal("oldest clean completion tombstone was not evicted")
+	}
+}
+
+func TestV1UploadSpaceFailureUsesStorageStatus(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/v1/file/upload", nil)
+	response := httptest.NewRecorder()
+	context := echo.New().NewContext(request, response)
+
+	if err := respondV1UploadFailure(context, filesecurity.ErrUploadSpaceInsufficient); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != http.StatusInsufficientStorage {
+		t.Fatalf("status = %d, want %d; body = %s", response.Code, http.StatusInsufficientStorage, response.Body.String())
 	}
 }

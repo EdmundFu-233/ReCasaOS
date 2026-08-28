@@ -313,7 +313,16 @@ func (s *FileUploadService) UploadFile(
 		fileInfo.lock.Unlock()
 		return changedServiceUploadErrorIf(namespaceMayHaveChanged || hadPublishedChunks, "upload namespace changed before multipart chunk open failed", err)
 	}
-	writeResult, writeErr := writeValidatedServiceChunk(roots, chunkPath, source, currentChunkSize)
+	chunkSpaceRelease, spaceErr := filesecurity.ReserveUploadSpace(roots, filepath.Dir(targetPath), uint64(currentChunkSize))
+	if spaceErr != nil {
+		_ = source.Close()
+		fileInfo.lock.Unlock()
+		return spaceErr
+	}
+	writeResult, writeErr := func() (serviceChunkWriteResult, error) {
+		defer chunkSpaceRelease()
+		return writeValidatedServiceChunk(roots, chunkPath, source, currentChunkSize)
+	}()
 	if writeErr != nil && !writeResult.Published {
 		fileInfo.lock.Unlock()
 		return changedServiceUploadErrorIf(namespaceMayHaveChanged || hadPublishedChunks, "upload namespace changed before chunk publication failed", writeErr)
@@ -333,7 +342,15 @@ func (s *FileUploadService) UploadFile(
 		return writeErr
 	}
 
-	assemblyResult, assemblyErr := assembleServiceUpload(fileInfo)
+	assemblySpaceRelease, spaceErr := filesecurity.ReserveUploadSpace(roots, filepath.Dir(targetPath), uint64(fileInfo.totalSize))
+	if spaceErr != nil {
+		fileInfo.lock.Unlock()
+		return changedServiceUploadError("upload chunks published before assembly space admission failed", spaceErr)
+	}
+	assemblyResult, assemblyErr := func() (serviceAssemblyResult, error) {
+		defer assemblySpaceRelease()
+		return assembleServiceUpload(fileInfo)
+	}()
 	if assemblyResult.TargetPublished {
 		fileInfo.completed = true
 		fileInfo.completedAt = time.Now()
