@@ -308,7 +308,7 @@ source = Path(sys.argv[1]).read_text(encoding="utf-8")
 # complete source prevents shell-level early returns or later function
 # redefinitions from bypassing checks that only inspect the embedded Python.
 expected_systemd_script_sha256 = (
-    "f2f5c7d3cde897c9673d10c1c031a948e3d7fb09c191348459e671c50847b857"
+    "c4afedd41ed8931e28bec596f937d5164d1ee2ee116bee0c9e2a65530f5d67db"
 )
 actual_systemd_script_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
 if actual_systemd_script_sha256 != expected_systemd_script_sha256:
