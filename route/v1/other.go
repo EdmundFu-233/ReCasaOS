@@ -13,13 +13,20 @@ import (
 
 const maxSearchRequestBodySize int64 = 8 << 10
 
-type searchRequest struct {
-	URL string `json:"url"`
+func bindSearchRequest(ctx echo.Context) (map[string]string, error) {
+	request := ctx.Request()
+	request.Body = http.MaxBytesReader(ctx.Response().Writer, request.Body, maxSearchRequestBodySize)
+
+	values := make(map[string]string)
+	if err := ctx.Bind(&values); err != nil {
+		return nil, err
+	}
+	return values, nil
 }
 
 func GetSearchResult(ctx echo.Context) error {
-	request := searchRequest{}
-	if err := bindBoundedFileJSON(ctx, &request, maxSearchRequestBodySize); err != nil {
+	values, err := bindSearchRequest(ctx)
+	if err != nil {
 		status := http.StatusBadRequest
 		var maxBytesError *http.MaxBytesError
 		if errors.As(err, &maxBytesError) {
@@ -32,11 +39,12 @@ func GetSearchResult(ctx echo.Context) error {
 		})
 	}
 
-	if request.URL == "" {
+	url := values["url"]
+	if url == "" {
 		return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS), Data: "key is empty"})
 	}
 	// data, err := service.MyService.Other().Search(key)
-	data, err := service.MyService.Other().AgentSearch(request.URL)
+	data, err := service.MyService.Other().AgentSearch(url)
 	if err != nil {
 		fmt.Println(err)
 		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
