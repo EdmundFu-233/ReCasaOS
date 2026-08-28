@@ -217,18 +217,40 @@ schema, in `DELETE` or `WAL` journal mode. On one pinned `database/sql`
 connection it sets and reads back `trusted_schema=OFF`,
 `writable_schema=OFF`, `ignore_check_constraints=OFF`, `foreign_keys=ON`,
 `recursive_triggers=OFF`, `synchronous=FULL`, and `secure_delete=ON`, then uses
-`BEGIN IMMEDIATE`. Before materializing credential fields it rejects
-case-insensitive temporary schema shadows; main or temporary triggers directly
+`BEGIN IMMEDIATE`. A SQL-only aggregate first bounds the database-list row
+count, storage classes, schema-alias bytes, and file-path bytes before the
+authoritative `PRAGMA database_list` scan. Before materializing credential
+fields it rejects case-insensitive temporary schema shadows, including the
+credential-identity index name; main or temporary triggers directly
 attached to the connection, marker, or key-control tables; any foreign key
 whose child or parent is one of those tables; hidden/generated or unknown
 connection columns; conflicting security schema; mixed/partial rows; unknown
-markers; and resource bounds. Unrelated triggers and unrelated foreign-key
+markers; and resource bounds. Every mutated table has exactly its pinned index
+set: the canonical credential-identity index for `o_connections`, and only the
+implicit primary-key index for each exact `WITHOUT ROWID` state table. Extra
+indexes are executable SQLite schema and are rejected before DML. Historical
+`o_connections` DDL may differ in quoting and `AUTOINCREMENT`, but `CHECK` and
+`COLLATE` clauses are rejected in addition to the exact column/default/rowid,
+trigger, foreign-key, and index checks. This prevents compact expression-index,
+constraint, or collation definitions from amplifying a bounded write into an
+unbounded index key or callback. Unrelated triggers and unrelated foreign-key
 graphs remain allowed because the cutover cannot make them fire or cascade.
+
+Before reading schema SQL, PRAGMA metadata, marker text, or control-key bytes
+into Go memory, SQL-only aggregate preflights bound the relevant object count,
+DDL size, identifier/type/default size, connection-index count, singleton row
+count, storage classes, and field lengths. The later exact-schema and
+exact-state checks remain authoritative; these earlier bounds prevent a
+tampered database from forcing unbounded values through those scans.
 
 The preflight permits at most 4,096 rows and 4 MiB of total plaintext password
 data. It also bounds every password to 1,024 bytes, username and host to 255
-bytes, directories to 16 KiB, envelope-v1 blobs to their exact 158..1,182-byte
-range, and all other materialized metadata both per field and in aggregate.
+bytes, status to 255 bytes, directories and mount point to 16 KiB, envelope-v1
+blobs to their exact 158..1,182-byte range, and all other metadata both per
+field and in aggregate. `updated`, `created`, `status`, and `mount_point` receive
+strict storage checks even though the cutover does not change their values:
+SQLite rebuilds and journals the complete physical record for each credential
+update, so carried columns are part of the same resource boundary.
 After the bounded read but before any credential-row, marker-row, or control-row
 write, the core applies the same username/password/host/port, directory, and
 mount-ownership semantics consumed by the runtime. A SQL `NULL` port is invalid
@@ -261,10 +283,14 @@ authenticated wrapping-key ID equals the singleton control value before the
 pending marker can commit. Before `COMMIT`, an operation error uses a separate,
 bounded cleanup context to roll the marker, control table, and every row back
 together. A rollback failure discards the physical connection and reports an
-unknown transaction outcome. A `COMMIT` error is also outcome-unknown: the
+unknown transaction outcome through a distinct machine-readable error sentinel
+that also preserves the generic cutover error. A `COMMIT` error is also
+outcome-unknown: the
 connection is discarded and a caller must close, durably reopen, and classify
 the database before deciding what happened. It must never generate new UUIDs
-or envelopes as a blind retry. A pending retry makes no durable state change
+or envelopes as a blind retry. A failed `BEGIN IMMEDIATE` performs a bounded
+best-effort rollback and always retires its physical connection before returning
+the ordinary retry-safe admission error. A pending retry makes no durable state change
 and requires the same active key plus another authoritative full scan, although
 it still takes the immediate writer lock for one stable classification.
 

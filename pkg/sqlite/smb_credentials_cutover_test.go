@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -27,22 +29,30 @@ import (
 
 type cutoverTestCredential struct {
 	ID          int64
+	Updated     int64
+	Created     int64
 	Username    string
 	Password    string
 	Host        string
 	Port        string
+	Status      string
 	Directories string
+	MountPoint  string
 	BootID      string
 	MountIDs    string
 }
 
 type cutoverTestStoredRow struct {
 	ID               int64          `gorm:"column:id"`
+	Updated          int64          `gorm:"column:updated"`
+	Created          int64          `gorm:"column:created"`
 	Username         string         `gorm:"column:username"`
 	Password         sql.NullString `gorm:"column:password"`
 	Host             string         `gorm:"column:host"`
 	Port             string         `gorm:"column:port"`
+	Status           string         `gorm:"column:status"`
 	Directories      string         `gorm:"column:directories"`
+	MountPoint       string         `gorm:"column:mount_point"`
 	BootID           string         `gorm:"column:boot_id"`
 	MountIDs         string         `gorm:"column:mount_ids"`
 	CredentialID     string         `gorm:"column:credential_id"`
@@ -97,7 +107,10 @@ func TestSMBCredentialCutoverAtomicallySealsLegacyRowsAndStopsPending(t *testing
 			for index := range storedRows {
 				stored := storedRows[index]
 				original := credentials[index]
-				if stored.ID != original.ID || stored.Username != original.Username || stored.Host != original.Host || stored.Directories != original.Directories || stored.BootID != original.BootID || stored.MountIDs != original.MountIDs {
+				if stored.ID != original.ID || stored.Updated != 1000+original.ID || stored.Created != 900+original.ID ||
+					stored.Username != original.Username || stored.Host != original.Host || stored.Status != "ready" ||
+					stored.Directories != original.Directories || stored.MountPoint != "/mnt/"+original.Host ||
+					stored.BootID != original.BootID || stored.MountIDs != original.MountIDs {
 					t.Fatalf("non-credential fields changed for row %d", original.ID)
 				}
 				if stored.Password.Valid || stored.PasswordType != "null" || stored.EnvelopeType != "blob" || stored.CredentialFormat != smbcredentials.EnvelopeFormat || stored.RowRevision != 1 || stored.Port != "445" {
@@ -232,6 +245,8 @@ func TestSMBCredentialCutoverRejectsWrongAndRotatedActiveKeysWithoutWriting(t *t
 		t.Fatal(err)
 	}
 	before := snapshotCutoverDatabase(t, database)
+	fullBefore := cutoverFullStateFingerprint(t, database)
+	changesBefore := cutoverTotalChanges(t, database)
 
 	wrongKeyring := newCutoverTestKeyring(t)
 	if _, err := cutoverSMBCredentials(database, wrongKeyring); !errors.Is(err, errSMBCredentialCutover) {
@@ -239,6 +254,12 @@ func TestSMBCredentialCutoverRejectsWrongAndRotatedActiveKeysWithoutWriting(t *t
 	}
 	if after := snapshotCutoverDatabase(t, database); !reflect.DeepEqual(before, after) {
 		t.Fatal("wrong key changed pending state")
+	}
+	if after := cutoverFullStateFingerprint(t, database); after != fullBefore {
+		t.Fatal("wrong key changed complete database state")
+	}
+	if changesAfter := cutoverTotalChanges(t, database); changesAfter != changesBefore {
+		t.Fatalf("wrong-key total_changes=%d, want %d", changesAfter, changesBefore)
 	}
 
 	rotated, err := keyring.Rotate()
@@ -254,6 +275,12 @@ func TestSMBCredentialCutoverRejectsWrongAndRotatedActiveKeysWithoutWriting(t *t
 	}
 	if after := snapshotCutoverDatabase(t, database); !reflect.DeepEqual(before, after) {
 		t.Fatal("rotated active key changed pending state")
+	}
+	if after := cutoverFullStateFingerprint(t, database); after != fullBefore {
+		t.Fatal("rotated active key changed complete database state")
+	}
+	if changesAfter := cutoverTotalChanges(t, database); changesAfter != changesBefore {
+		t.Fatalf("rotated-key total_changes=%d, want %d", changesAfter, changesBefore)
 	}
 }
 
@@ -309,11 +336,19 @@ func TestSMBCredentialCutoverRejectsAADAndEnvelopeTamperingWithoutWriting(t *tes
 				t.Fatal(err)
 			}
 			before := snapshotCutoverDatabase(t, database)
+			fullBefore := cutoverFullStateFingerprint(t, database)
+			changesBefore := cutoverTotalChanges(t, database)
 			if _, err := cutoverSMBCredentials(database, keyring); !errors.Is(err, errSMBCredentialCutover) {
 				t.Fatalf("tamper error = %v", err)
 			}
 			if after := snapshotCutoverDatabase(t, database); !reflect.DeepEqual(before, after) {
 				t.Fatal("failed tamper authentication changed durable state")
+			}
+			if after := cutoverFullStateFingerprint(t, database); after != fullBefore {
+				t.Fatal("failed tamper authentication changed complete database state")
+			}
+			if changesAfter := cutoverTotalChanges(t, database); changesAfter != changesBefore {
+				t.Fatalf("tamper rejection total_changes=%d, want %d", changesAfter, changesBefore)
 			}
 		})
 	}
@@ -329,15 +364,20 @@ func TestSMBCredentialCutoverRollsBackEveryRowMarkerAndControlOnLateFailure(t *t
 				{ID: 2, Username: "bob", Password: "rollback-password-sentinel-two", Host: "two.internal", Port: "445", Directories: "two"},
 			}
 			insertCutoverTestCredentials(t, database, credentials)
-			// The first row can take this partial unique value, while the second row
-			// fails after the transaction has already sealed and updated row one.
-			if err := database.Exec(`CREATE UNIQUE INDEX fail_second_smb_cutover
-				ON o_connections(credential_format)
-				WHERE credential_format IS NOT NULL`).Error; err != nil {
-				t.Fatal(err)
-			}
+			before := cutoverFullStateFingerprint(t, database)
 			keyring := newCutoverTestKeyring(t)
-			_, err := cutoverSMBCredentials(database, keyring)
+			dependencies := defaultSMBCredentialCutoverDependencies()
+			openCalls := 0
+			dependencies.Open = func(keyring *smbcredentials.Keyring, context smbcredentials.Context, envelope []byte) ([]byte, error) {
+				openCalls++
+				// Both per-row seal/open checks and both row UPDATEs have run.
+				// Fail the first authoritative post-migration authentication.
+				if openCalls == len(credentials)+1 {
+					return nil, errors.New("private injected final authentication failure")
+				}
+				return keyring.Open(context, envelope)
+			}
+			_, err := cutoverSMBCredentialsWithDependencies(database, keyring, dependencies)
 			if !errors.Is(err, errSMBCredentialCutover) {
 				t.Fatalf("late failure error = %v", err)
 			}
@@ -347,19 +387,82 @@ func TestSMBCredentialCutoverRollsBackEveryRowMarkerAndControlOnLateFailure(t *t
 				}
 			}
 			assertLegacyCutoverRollback(t, database, credentials)
+			if after := cutoverFullStateFingerprint(t, database); after != before {
+				t.Fatal("late failure did not restore the complete database state")
+			}
+			assertCutoverIntegrity(t, database)
 			assertCutoverWriterAvailable(t, database)
 			closeSMBCredentialSchemaDatabase(t, handle)
 			reopened, reopenedHandle := openSMBCredentialSchemaDatabaseAt(t, path)
 			defer closeSMBCredentialSchemaDatabase(t, reopenedHandle)
 			assertLegacyCutoverRollback(t, reopened, credentials)
-			if err := reopened.Exec("DROP INDEX fail_second_smb_cutover").Error; err != nil {
-				t.Fatal(err)
+			if after := cutoverFullStateFingerprint(t, reopened); after != before {
+				t.Fatal("reopened database did not preserve the complete rollback state")
 			}
+			assertCutoverIntegrity(t, reopened)
 			retry, retryErr := cutoverSMBCredentials(reopened, keyring)
 			if retryErr != nil || !retry.Migrated || !retry.Pending || retry.Rows != len(credentials) {
 				t.Fatalf("late-failure retry result=%+v err=%v", retry, retryErr)
 			}
 		})
+	}
+}
+
+func TestSMBCredentialCutoverRollsBackSealAndRoundTripFailures(t *testing.T) {
+	for _, failure := range []string{"second seal", "second round trip"} {
+		for _, journalMode := range []string{"DELETE", "WAL"} {
+			t.Run(failure+"/"+journalMode, func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "crypto-failure.db")
+				database, handle := openExpandedSMBCredentialCutoverTestDatabaseAt(t, path, journalMode)
+				credentials := []cutoverTestCredential{
+					{ID: 1, Username: "seal-one", Password: "seal-sentinel-one", Host: "one", Port: "445", Directories: "one"},
+					{ID: 2, Username: "seal-two", Password: "seal-sentinel-two", Host: "two", Port: "445", Directories: "two"},
+				}
+				insertCutoverTestCredentials(t, database, credentials)
+				before := cutoverFullStateFingerprint(t, database)
+				keyring := newCutoverTestKeyring(t)
+				dependencies := defaultSMBCredentialCutoverDependencies()
+				sealCalls := 0
+				openCalls := 0
+				if failure == "second seal" {
+					dependencies.Seal = func(keyring *smbcredentials.Keyring, context smbcredentials.Context, password []byte) ([]byte, error) {
+						sealCalls++
+						if sealCalls == 2 {
+							return nil, errors.New("private injected seal entropy failure")
+						}
+						return keyring.Seal(context, password)
+					}
+				} else {
+					dependencies.Open = func(keyring *smbcredentials.Keyring, context smbcredentials.Context, envelope []byte) ([]byte, error) {
+						openCalls++
+						if openCalls == 2 {
+							return nil, errors.New("private injected round-trip failure")
+						}
+						return keyring.Open(context, envelope)
+					}
+				}
+				_, cutoverErr := cutoverSMBCredentialsWithDependencies(database, keyring, dependencies)
+				if !errors.Is(cutoverErr, errSMBCredentialCutover) || errors.Is(cutoverErr, errSMBCredentialTransactionOutcomeUnknown) {
+					t.Fatalf("injected crypto failure error = %v", cutoverErr)
+				}
+				for _, forbidden := range []string{"private injected", credentials[0].Password, credentials[1].Password} {
+					if strings.Contains(cutoverErr.Error(), forbidden) {
+						t.Fatal("injected crypto failure leaked private content")
+					}
+				}
+				if after := cutoverFullStateFingerprint(t, database); after != before {
+					t.Fatal("injected crypto failure did not restore complete state")
+				}
+				assertCutoverIntegrity(t, database)
+				closeSMBCredentialSchemaDatabase(t, handle)
+				reopened, reopenedHandle := openSMBCredentialSchemaDatabaseAt(t, path)
+				defer closeSMBCredentialSchemaDatabase(t, reopenedHandle)
+				if after := cutoverFullStateFingerprint(t, reopened); after != before {
+					t.Fatal("reopened database did not preserve crypto-failure rollback")
+				}
+				assertCutoverIntegrity(t, reopened)
+			})
+		}
 	}
 }
 
@@ -473,6 +576,8 @@ func TestSMBCredentialCutoverRejectsIncompatibleStatesWithoutMutation(t *testing
 			database := newSMBCredentialCutoverTestDatabase(t, "DELETE")
 			arrange(t, database)
 			before := snapshotCutoverDatabase(t, database)
+			fullBefore := cutoverFullStateFingerprint(t, database)
+			changesBefore := cutoverTotalChanges(t, database)
 			keyring := newCutoverTestKeyring(t)
 			if _, err := cutoverSMBCredentials(database, keyring); !errors.Is(err, errSMBCredentialCutover) {
 				t.Fatalf("incompatible state error = %v", err)
@@ -480,6 +585,12 @@ func TestSMBCredentialCutoverRejectsIncompatibleStatesWithoutMutation(t *testing
 			after := snapshotCutoverDatabase(t, database)
 			if !reflect.DeepEqual(before, after) {
 				t.Fatal("incompatible state was mutated")
+			}
+			if afterFull := cutoverFullStateFingerprint(t, database); afterFull != fullBefore {
+				t.Fatal("incompatible state changed complete database state")
+			}
+			if changesAfter := cutoverTotalChanges(t, database); changesAfter != changesBefore {
+				t.Fatalf("incompatible-state total_changes=%d, want %d", changesAfter, changesBefore)
 			}
 			assertCutoverControlTableCount(t, database, 0)
 		})
@@ -518,6 +629,8 @@ func TestSMBCredentialCutoverRejectsRuntimeIncompatibleLegacyRowsWithoutWriting(
 			database := newSMBCredentialCutoverTestDatabase(t, "DELETE")
 			arrange(t, database)
 			before := snapshotCutoverDatabase(t, database)
+			fullBefore := cutoverFullStateFingerprint(t, database)
+			changesBefore := cutoverTotalChanges(t, database)
 			keyring := newCutoverTestKeyring(t)
 			if _, err := cutoverSMBCredentials(database, keyring); !errors.Is(err, errSMBCredentialCutover) {
 				t.Fatalf("runtime validation error = %v", err)
@@ -525,7 +638,119 @@ func TestSMBCredentialCutoverRejectsRuntimeIncompatibleLegacyRowsWithoutWriting(
 			if after := snapshotCutoverDatabase(t, database); !reflect.DeepEqual(before, after) {
 				t.Fatal("runtime-incompatible legacy row was mutated")
 			}
+			if after := cutoverFullStateFingerprint(t, database); after != fullBefore {
+				t.Fatal("runtime-incompatible row changed complete database state")
+			}
+			if changesAfter := cutoverTotalChanges(t, database); changesAfter != changesBefore {
+				t.Fatalf("runtime rejection total_changes=%d, want %d", changesAfter, changesBefore)
+			}
 			assertCutoverControlTableCount(t, database, 0)
+		})
+	}
+}
+
+func TestSMBCredentialCutoverRejectsNonTextLegacyStorageClassesWithoutWriting(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		statement string
+	}{
+		{name: "BLOB updated", statement: "UPDATE main.o_connections SET updated = CAST(updated AS BLOB) WHERE id = 1"},
+		{name: "BLOB created", statement: "UPDATE main.o_connections SET created = CAST(created AS BLOB) WHERE id = 1"},
+		{name: "BLOB username", statement: "UPDATE main.o_connections SET username = CAST(username AS BLOB) WHERE id = 1"},
+		{name: "BLOB password", statement: "UPDATE main.o_connections SET password = CAST(password AS BLOB) WHERE id = 1"},
+		{name: "BLOB host", statement: "UPDATE main.o_connections SET host = CAST(host AS BLOB) WHERE id = 1"},
+		{name: "BLOB port", statement: "UPDATE main.o_connections SET port = CAST(port AS BLOB) WHERE id = 1"},
+		{name: "BLOB status", statement: "UPDATE main.o_connections SET status = CAST(status AS BLOB) WHERE id = 1"},
+		{name: "BLOB directories", statement: "UPDATE main.o_connections SET directories = CAST(directories AS BLOB) WHERE id = 1"},
+		{name: "BLOB mount point", statement: "UPDATE main.o_connections SET mount_point = CAST(mount_point AS BLOB) WHERE id = 1"},
+		{name: "BLOB boot ID", statement: "UPDATE main.o_connections SET boot_id = CAST(boot_id AS BLOB) WHERE id = 1"},
+		{name: "BLOB mount IDs", statement: "UPDATE main.o_connections SET mount_ids = CAST(mount_ids AS BLOB) WHERE id = 1"},
+		{name: "BLOB empty credential ID", statement: "UPDATE main.o_connections SET credential_id = zeroblob(0) WHERE id = 1"},
+		{name: "BLOB empty credential format", statement: "UPDATE main.o_connections SET credential_format = zeroblob(0) WHERE id = 1"},
+		{name: "TEXT empty envelope", statement: "UPDATE main.o_connections SET password_envelope = '' WHERE id = 1"},
+		{name: "BLOB row revision", statement: "UPDATE main.o_connections SET row_revision = CAST(X'30' AS BLOB) WHERE id = 1"},
+		{name: "NULL updated", statement: "UPDATE main.o_connections SET updated = NULL WHERE id = 1"},
+		{name: "NULL created", statement: "UPDATE main.o_connections SET created = NULL WHERE id = 1"},
+		{name: "NULL username", statement: "UPDATE main.o_connections SET username = NULL WHERE id = 1"},
+		{name: "NULL password", statement: "UPDATE main.o_connections SET password = NULL WHERE id = 1"},
+		{name: "NULL host", statement: "UPDATE main.o_connections SET host = NULL WHERE id = 1"},
+		{name: "NULL port", statement: "UPDATE main.o_connections SET port = NULL WHERE id = 1"},
+		{name: "NULL status", statement: "UPDATE main.o_connections SET status = NULL WHERE id = 1"},
+		{name: "NULL directories", statement: "UPDATE main.o_connections SET directories = NULL WHERE id = 1"},
+		{name: "NULL mount point", statement: "UPDATE main.o_connections SET mount_point = NULL WHERE id = 1"},
+		{name: "NULL boot ID", statement: "UPDATE main.o_connections SET boot_id = NULL WHERE id = 1"},
+		{name: "NULL mount IDs", statement: "UPDATE main.o_connections SET mount_ids = NULL WHERE id = 1"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			database := newSMBCredentialCutoverTestDatabase(t, "DELETE")
+			insertCutoverTestCredentials(t, database, []cutoverTestCredential{{
+				ID: 1, Username: "storage-user", Password: "storage-secret", Host: "storage.internal", Port: "445", Directories: "media",
+			}})
+			if err := database.Exec(testCase.statement).Error; err != nil {
+				t.Fatal(err)
+			}
+			before := cutoverConnectionStorageFingerprint(t, database)
+			changesBefore := cutoverTotalChanges(t, database)
+			keyring := newCutoverTestKeyring(t)
+			if _, err := cutoverSMBCredentials(database, keyring); !errors.Is(err, errSMBCredentialCutover) {
+				t.Fatalf("storage-class error = %v", err)
+			}
+			if after := cutoverConnectionStorageFingerprint(t, database); after != before {
+				t.Fatalf("storage-class rejection changed row: before=%q after=%q", before, after)
+			}
+			if changesAfter := cutoverTotalChanges(t, database); changesAfter != changesBefore {
+				t.Fatalf("storage-class rejection total_changes=%d, want %d", changesAfter, changesBefore)
+			}
+			assertCutoverMarkerCount(t, database, 0)
+			assertCutoverControlTableCount(t, database, 0)
+		})
+	}
+}
+
+func TestSMBCredentialCutoverRejectsMalformedSealedStorageClassesWithoutWriting(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		statement string
+	}{
+		{name: "BLOB updated", statement: "UPDATE main.o_connections SET updated = CAST(updated AS BLOB) WHERE id = 1"},
+		{name: "BLOB created", statement: "UPDATE main.o_connections SET created = CAST(created AS BLOB) WHERE id = 1"},
+		{name: "BLOB username", statement: "UPDATE main.o_connections SET username = CAST(username AS BLOB) WHERE id = 1"},
+		{name: "TEXT password", statement: "UPDATE main.o_connections SET password = 'sealed-storage-sentinel' WHERE id = 1"},
+		{name: "BLOB host", statement: "UPDATE main.o_connections SET host = CAST(host AS BLOB) WHERE id = 1"},
+		{name: "BLOB port", statement: "UPDATE main.o_connections SET port = CAST(port AS BLOB) WHERE id = 1"},
+		{name: "BLOB status", statement: "UPDATE main.o_connections SET status = CAST(status AS BLOB) WHERE id = 1"},
+		{name: "BLOB directories", statement: "UPDATE main.o_connections SET directories = CAST(directories AS BLOB) WHERE id = 1"},
+		{name: "BLOB mount point", statement: "UPDATE main.o_connections SET mount_point = CAST(mount_point AS BLOB) WHERE id = 1"},
+		{name: "BLOB boot ID", statement: "UPDATE main.o_connections SET boot_id = CAST(boot_id AS BLOB) WHERE id = 1"},
+		{name: "BLOB mount IDs", statement: "UPDATE main.o_connections SET mount_ids = CAST(mount_ids AS BLOB) WHERE id = 1"},
+		{name: "BLOB credential ID", statement: "UPDATE main.o_connections SET credential_id = CAST(credential_id AS BLOB) WHERE id = 1"},
+		{name: "BLOB credential format", statement: "UPDATE main.o_connections SET credential_format = CAST(credential_format AS BLOB) WHERE id = 1"},
+		{name: "TEXT envelope", statement: "UPDATE main.o_connections SET password_envelope = CAST(password_envelope AS TEXT) WHERE id = 1"},
+		{name: "BLOB row revision", statement: "UPDATE main.o_connections SET row_revision = CAST(X'31' AS BLOB) WHERE id = 1"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			database := newSMBCredentialCutoverTestDatabase(t, "DELETE")
+			insertCutoverTestCredentials(t, database, []cutoverTestCredential{{
+				ID: 1, Username: "sealed-storage-user", Password: "sealed-storage-secret", Host: "sealed.internal", Port: "445", Directories: "media",
+			}})
+			keyring := newCutoverTestKeyring(t)
+			if _, err := cutoverSMBCredentials(database, keyring); err != nil {
+				t.Fatal(err)
+			}
+			if err := database.Exec(testCase.statement).Error; err != nil {
+				t.Fatal(err)
+			}
+			before := cutoverFullStateFingerprint(t, database)
+			changesBefore := cutoverTotalChanges(t, database)
+			if _, err := cutoverSMBCredentials(database, keyring); !errors.Is(err, errSMBCredentialCutover) {
+				t.Fatalf("sealed storage-class error = %v", err)
+			}
+			if after := cutoverFullStateFingerprint(t, database); after != before {
+				t.Fatal("sealed storage-class rejection changed database state")
+			}
+			if changesAfter := cutoverTotalChanges(t, database); changesAfter != changesBefore {
+				t.Fatalf("sealed storage-class total_changes=%d, want %d", changesAfter, changesBefore)
+			}
 		})
 	}
 }
@@ -558,6 +783,10 @@ func TestSMBCredentialCutoverRejectsCaseVariantPasswordCaptureTriggers(t *testin
 				t.Fatal(err)
 			}
 			before := snapshotCutoverDatabase(t, database)
+			mainSchemaBefore := cutoverSchemaFingerprint(t, database, "main")
+			tempSchemaBefore := cutoverSchemaFingerprint(t, database, "temp")
+			mainVersionBefore := cutoverSchemaVersion(t, database, "main")
+			tempVersionBefore := cutoverSchemaVersion(t, database, "temp")
 			changesBefore := cutoverTotalChanges(t, database)
 			keyring := newCutoverTestKeyring(t)
 			if _, err := cutoverSMBCredentials(database, keyring); !errors.Is(err, errSMBCredentialCutover) {
@@ -569,6 +798,18 @@ func TestSMBCredentialCutoverRejectsCaseVariantPasswordCaptureTriggers(t *testin
 			if changesAfter := cutoverTotalChanges(t, database); changesAfter != changesBefore {
 				t.Fatalf("trigger rejection total_changes=%d, want %d", changesAfter, changesBefore)
 			}
+			if after := cutoverSchemaFingerprint(t, database, "main"); after != mainSchemaBefore {
+				t.Fatal("trigger rejection changed main schema")
+			}
+			if after := cutoverSchemaFingerprint(t, database, "temp"); after != tempSchemaBefore {
+				t.Fatal("trigger rejection changed temporary schema")
+			}
+			if after := cutoverSchemaVersion(t, database, "main"); after != mainVersionBefore {
+				t.Fatalf("trigger rejection main schema_version=%d, want %d", after, mainVersionBefore)
+			}
+			if after := cutoverSchemaVersion(t, database, "temp"); after != tempVersionBefore {
+				t.Fatalf("trigger rejection temp schema_version=%d, want %d", after, tempVersionBefore)
+			}
 			var captured int64
 			if err := database.Raw("SELECT count(*) FROM " + captureTable).Scan(&captured).Error; err != nil || captured != 0 {
 				t.Fatalf("captured rows=%d err=%v", captured, err)
@@ -578,36 +819,160 @@ func TestSMBCredentialCutoverRejectsCaseVariantPasswordCaptureTriggers(t *testin
 	}
 }
 
+func TestSMBCredentialCutoverRejectsTriggersOnMarkerAndControlTables(t *testing.T) {
+	for _, target := range []struct {
+		name      string
+		table     string
+		precreate bool
+	}{
+		{name: "marker", table: "O_SECURITY_MIGRATIONS"},
+		{name: "control", table: "O_SMB_CREDENTIAL_KEY_CONTROL", precreate: true},
+	} {
+		for _, temporary := range []bool{false, true} {
+			name := target.name + "/main"
+			if temporary {
+				name = target.name + "/temporary"
+			}
+			t.Run(name, func(t *testing.T) {
+				database := newSMBCredentialCutoverTestDatabase(t, "DELETE")
+				insertCutoverTestCredentials(t, database, []cutoverTestCredential{{
+					ID: 1, Username: "state-trigger-user", Password: "state-trigger-secret", Host: "nas", Port: "445", Directories: "media",
+				}})
+				if target.precreate {
+					if err := database.Exec(createSMBCredentialControlTableSQL).Error; err != nil {
+						t.Fatal(err)
+					}
+				}
+				statement := fmt.Sprintf(`CREATE TRIGGER protected_state_trigger
+					AFTER INSERT ON %s BEGIN SELECT 1; END`, target.table)
+				if temporary {
+					statement = fmt.Sprintf(`CREATE TEMP TRIGGER protected_state_trigger
+						AFTER INSERT ON main.%s BEGIN SELECT 1; END`, target.table)
+				}
+				if err := database.Exec(statement).Error; err != nil {
+					t.Fatal(err)
+				}
+				before := snapshotCutoverDatabase(t, database)
+				mainSchemaBefore := cutoverSchemaFingerprint(t, database, "main")
+				tempSchemaBefore := cutoverSchemaFingerprint(t, database, "temp")
+				mainVersionBefore := cutoverSchemaVersion(t, database, "main")
+				tempVersionBefore := cutoverSchemaVersion(t, database, "temp")
+				changesBefore := cutoverTotalChanges(t, database)
+				keyring := newCutoverTestKeyring(t)
+				if _, err := cutoverSMBCredentials(database, keyring); !errors.Is(err, errSMBCredentialCutover) {
+					t.Fatalf("protected state trigger error = %v", err)
+				}
+				if after := snapshotCutoverDatabase(t, database); !reflect.DeepEqual(before, after) {
+					t.Fatal("protected state trigger rejection changed durable state")
+				}
+				if changesAfter := cutoverTotalChanges(t, database); changesAfter != changesBefore {
+					t.Fatalf("protected state trigger total_changes=%d, want %d", changesAfter, changesBefore)
+				}
+				if after := cutoverSchemaFingerprint(t, database, "main"); after != mainSchemaBefore {
+					t.Fatal("protected state trigger changed main schema")
+				}
+				if after := cutoverSchemaFingerprint(t, database, "temp"); after != tempSchemaBefore {
+					t.Fatal("protected state trigger changed temporary schema")
+				}
+				if after := cutoverSchemaVersion(t, database, "main"); after != mainVersionBefore {
+					t.Fatalf("protected state trigger main schema_version=%d, want %d", after, mainVersionBefore)
+				}
+				if after := cutoverSchemaVersion(t, database, "temp"); after != tempVersionBefore {
+					t.Fatalf("protected state trigger temp schema_version=%d, want %d", after, tempVersionBefore)
+				}
+			})
+		}
+	}
+}
+
 func TestSMBCredentialCutoverRejectsInboundForeignKeyCascade(t *testing.T) {
+	for _, target := range []struct {
+		name      string
+		table     string
+		column    string
+		precreate bool
+	}{
+		{name: "connections", table: "O_CONNECTIONS", column: "id"},
+		{name: "marker", table: "O_SECURITY_MIGRATIONS", column: "name"},
+		{name: "control", table: "O_SMB_CREDENTIAL_KEY_CONTROL", column: "singleton", precreate: true},
+	} {
+		t.Run(target.name, func(t *testing.T) {
+			database := newSMBCredentialCutoverTestDatabase(t, "DELETE")
+			if target.precreate {
+				if err := database.Exec(createSMBCredentialControlTableSQL).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := database.Exec(fmt.Sprintf(`CREATE TABLE smb_cutover_child (
+				protected_value REFERENCES %s(%s) ON UPDATE CASCADE
+			)`, target.table, target.column)).Error; err != nil {
+				t.Fatal(err)
+			}
+			before := cutoverFullStateFingerprint(t, database)
+			changesBefore := cutoverTotalChanges(t, database)
+			keyring := newCutoverTestKeyring(t)
+			if _, err := cutoverSMBCredentials(database, keyring); !errors.Is(err, errSMBCredentialCutover) {
+				t.Fatalf("inbound foreign key error = %v", err)
+			}
+			if after := cutoverFullStateFingerprint(t, database); after != before {
+				t.Fatal("inbound foreign-key rejection changed database state")
+			}
+			if changesAfter := cutoverTotalChanges(t, database); changesAfter != changesBefore {
+				t.Fatalf("inbound foreign-key total_changes=%d, want %d", changesAfter, changesBefore)
+			}
+		})
+	}
+}
+
+func TestSMBCredentialCutoverRejectsOutboundForeignKeyWithoutWriting(t *testing.T) {
 	database := newSMBCredentialCutoverTestDatabase(t, "DELETE")
-	if err := database.Exec("PRAGMA foreign_keys = ON").Error; err != nil {
+	if err := database.Exec("DROP TABLE main.o_connections").Error; err != nil {
 		t.Fatal(err)
 	}
-	insertCutoverTestCredentials(t, database, []cutoverTestCredential{{ID: 1, Username: "user", Password: "foreign-key-sentinel", Host: "nas", Port: "445", Directories: "media"}})
-	if err := database.Exec("CREATE UNIQUE INDEX ux_cutover_password_reference ON o_connections(password)").Error; err != nil {
+	if err := database.Exec("CREATE TABLE unrelated_parent(host TEXT PRIMARY KEY)").Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := database.Exec(`CREATE TABLE smb_cutover_child (
-		secret_copy TEXT REFERENCES O_CONNECTIONS(password) ON UPDATE CASCADE
+	if err := database.Exec(`CREATE TABLE main.o_connections (
+		id INTEGER PRIMARY KEY,
+		updated INTEGER,
+		created INTEGER,
+		username TEXT,
+		password TEXT,
+		credential_id TEXT,
+		credential_format TEXT,
+		password_envelope BLOB,
+		row_revision INTEGER NOT NULL DEFAULT 0,
+		host TEXT REFERENCES unrelated_parent(host),
+		port TEXT,
+		status TEXT,
+		directories TEXT,
+		mount_point TEXT,
+		boot_id TEXT,
+		mount_ids TEXT
 	)`).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := database.Exec("INSERT INTO smb_cutover_child(secret_copy) VALUES (?)", "foreign-key-sentinel").Error; err != nil {
+	if err := database.Exec(createCredentialIDIndexSQL).Error; err != nil {
 		t.Fatal(err)
 	}
-	before := snapshotCutoverDatabase(t, database)
+	if err := database.Exec("INSERT INTO unrelated_parent(host) VALUES ('nas')").Error; err != nil {
+		t.Fatal(err)
+	}
+	insertCutoverTestCredentials(t, database, []cutoverTestCredential{{
+		ID: 1, Username: "outbound-fk-user", Password: "outbound-fk-sentinel", Host: "nas", Port: "445", Directories: "media",
+	}})
+	before := cutoverFullStateFingerprint(t, database)
+	changesBefore := cutoverTotalChanges(t, database)
 	keyring := newCutoverTestKeyring(t)
 	if _, err := cutoverSMBCredentials(database, keyring); !errors.Is(err, errSMBCredentialCutover) {
-		t.Fatalf("inbound foreign key error = %v", err)
+		t.Fatalf("outbound foreign key error = %v", err)
 	}
-	if after := snapshotCutoverDatabase(t, database); !reflect.DeepEqual(before, after) {
-		t.Fatal("foreign-key rejection changed credential state")
+	if after := cutoverFullStateFingerprint(t, database); after != before {
+		t.Fatal("outbound foreign-key rejection changed database state")
 	}
-	var childSecret string
-	if err := database.Raw("SELECT secret_copy FROM smb_cutover_child").Scan(&childSecret).Error; err != nil || childSecret != "foreign-key-sentinel" {
-		t.Fatalf("child secret=%q err=%v", childSecret, err)
+	if changesAfter := cutoverTotalChanges(t, database); changesAfter != changesBefore {
+		t.Fatalf("outbound foreign-key total_changes=%d, want %d", changesAfter, changesBefore)
 	}
-	assertCutoverControlTableCount(t, database, 0)
 }
 
 func TestSMBCredentialCutoverAllowsUnrelatedTriggersAndForeignKeys(t *testing.T) {
@@ -685,6 +1050,14 @@ func TestSMBCredentialCutoverPreflightsOversizedValuesBeforeWriting(t *testing.T
 			credential: cutoverTestCredential{ID: 1, Username: "user", Password: "secret", Host: "nas", Port: "445", Directories: strings.Repeat("d", maxSMBCredentialDirectoriesBytes+1)},
 		},
 		{
+			name:       "status carried by row rewrite",
+			credential: cutoverTestCredential{ID: 1, Username: "user", Password: "secret", Host: "nas", Port: "445", Status: strings.Repeat("s", maxSMBCredentialStatusBytes+1), Directories: "media"},
+		},
+		{
+			name:       "mount point carried by row rewrite",
+			credential: cutoverTestCredential{ID: 1, Username: "user", Password: "secret", Host: "nas", Port: "445", Directories: "media", MountPoint: strings.Repeat("m", maxSMBCredentialMountPointBytes+1)},
+		},
+		{
 			name:       "mount IDs",
 			credential: cutoverTestCredential{ID: 1, Username: "user", Password: "secret", Host: "nas", Port: "445", Directories: "media", BootID: "boot", MountIDs: strings.Repeat("m", maxSMBCredentialMountIDsBytes+1)},
 		},
@@ -730,11 +1103,19 @@ func TestSMBCredentialCutoverRejectsCompleteStateBecauseScrubCoordinatorOwnsComp
 		t.Fatalf("arrange complete marker: error=%v rows=%d", result.Error, result.RowsAffected)
 	}
 	before := snapshotCutoverDatabase(t, database)
+	fullBefore := cutoverFullStateFingerprint(t, database)
+	changesBefore := cutoverTotalChanges(t, database)
 	if _, err := cutoverSMBCredentials(database, keyring); !errors.Is(err, errSMBCredentialCutover) {
 		t.Fatalf("complete state error = %v", err)
 	}
 	if after := snapshotCutoverDatabase(t, database); !reflect.DeepEqual(before, after) {
 		t.Fatal("transaction core changed complete state")
+	}
+	if after := cutoverFullStateFingerprint(t, database); after != fullBefore {
+		t.Fatal("transaction core changed complete database state")
+	}
+	if changesAfter := cutoverTotalChanges(t, database); changesAfter != changesBefore {
+		t.Fatalf("complete-state total_changes=%d, want %d", changesAfter, changesBefore)
 	}
 }
 
@@ -749,12 +1130,223 @@ func TestSMBCredentialCutoverRejectsConflictingControlSchemaAndPreservesIt(t *te
 	}
 	insertCutoverTestCredentials(t, database, []cutoverTestCredential{{ID: 1, Username: "user", Password: "schema-sentinel", Host: "nas", Port: "445", Directories: "media"}})
 	before := snapshotCutoverDatabase(t, database)
+	fullBefore := cutoverFullStateFingerprint(t, database)
+	changesBefore := cutoverTotalChanges(t, database)
 	keyring := newCutoverTestKeyring(t)
 	if _, err := cutoverSMBCredentials(database, keyring); !errors.Is(err, errSMBCredentialCutover) {
 		t.Fatalf("conflicting control error = %v", err)
 	}
 	if after := snapshotCutoverDatabase(t, database); !reflect.DeepEqual(before, after) {
 		t.Fatal("conflicting control schema was changed")
+	}
+	if after := cutoverFullStateFingerprint(t, database); after != fullBefore {
+		t.Fatal("conflicting control changed complete database state")
+	}
+	if changesAfter := cutoverTotalChanges(t, database); changesAfter != changesBefore {
+		t.Fatalf("conflicting-control total_changes=%d, want %d", changesAfter, changesBefore)
+	}
+}
+
+func TestSMBCredentialCutoverPreflightsOversizedSchemaMetadataBeforeScanningIt(t *testing.T) {
+	oversizedComment := "/*" + strings.Repeat("s", maxSMBCredentialSchemaSQLBytes+1) + "*/"
+
+	t.Run("connections table SQL", func(t *testing.T) {
+		database := newSMBCredentialCutoverTestDatabase(t, "DELETE")
+		if err := database.Exec("DROP TABLE main.o_connections").Error; err != nil {
+			t.Fatal(err)
+		}
+		statement := fmt.Sprintf(`CREATE TABLE main.o_connections (
+			id INTEGER PRIMARY KEY,
+			updated INTEGER,
+			created INTEGER,
+			username TEXT %s,
+			password TEXT,
+			credential_id TEXT,
+			credential_format TEXT,
+			password_envelope BLOB,
+			row_revision INTEGER NOT NULL DEFAULT 0,
+			host TEXT,
+			port TEXT,
+			status TEXT,
+			directories TEXT,
+			mount_point TEXT,
+			boot_id TEXT,
+			mount_ids TEXT
+		)`, oversizedComment)
+		if err := database.Exec(statement).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := database.Exec(createCredentialIDIndexSQL).Error; err != nil {
+			t.Fatal(err)
+		}
+		var sqlBytes int64
+		if err := database.Raw("SELECT length(CAST(sql AS BLOB)) FROM main.sqlite_master WHERE type = 'table' AND name = 'o_connections'").Scan(&sqlBytes).Error; err != nil {
+			t.Fatal(err)
+		}
+		if sqlBytes <= maxSMBCredentialSchemaSQLBytes {
+			t.Fatalf("arranged connections SQL bytes=%d", sqlBytes)
+		}
+		versionBefore := cutoverSchemaVersion(t, database, "main")
+		changesBefore := cutoverTotalChanges(t, database)
+		keyring := newCutoverTestKeyring(t)
+		if _, err := cutoverSMBCredentials(database, keyring); !errors.Is(err, errSMBCredentialCutover) {
+			t.Fatalf("oversized connections schema error = %v", err)
+		}
+		if changesAfter := cutoverTotalChanges(t, database); changesAfter != changesBefore {
+			t.Fatalf("oversized connections schema total_changes=%d, want %d", changesAfter, changesBefore)
+		}
+		if after := cutoverSchemaVersion(t, database, "main"); after != versionBefore {
+			t.Fatalf("oversized connections schema_version=%d, want %d", after, versionBefore)
+		}
+		var sqlBytesAfter int64
+		if err := database.Raw("SELECT length(CAST(sql AS BLOB)) FROM main.sqlite_master WHERE type = 'table' AND name = 'o_connections'").Scan(&sqlBytesAfter).Error; err != nil || sqlBytesAfter != sqlBytes {
+			t.Fatalf("oversized connections SQL changed: before=%d after=%d err=%v", sqlBytes, sqlBytesAfter, err)
+		}
+		assertCutoverMarkerCount(t, database, 0)
+		assertCutoverControlTableCount(t, database, 0)
+	})
+
+	t.Run("control table SQL", func(t *testing.T) {
+		database := newSMBCredentialCutoverTestDatabase(t, "DELETE")
+		statement := fmt.Sprintf(`CREATE TABLE main.o_smb_credential_key_control (
+			singleton INTEGER NOT NULL PRIMARY KEY CHECK (
+				typeof(singleton) = 'integer' AND singleton = 1
+			),
+			active_key_id BLOB NOT NULL %s CHECK (
+				typeof(active_key_id) = 'blob' AND length(active_key_id) = 32
+			),
+			revision INTEGER NOT NULL CHECK (
+				typeof(revision) = 'integer' AND revision >= 1
+			)
+		) WITHOUT ROWID`, oversizedComment)
+		if err := database.Exec(statement).Error; err != nil {
+			t.Fatal(err)
+		}
+		var sqlBytes int64
+		if err := database.Raw("SELECT length(CAST(sql AS BLOB)) FROM main.sqlite_master WHERE type = 'table' AND name = ?", smbCredentialControlTableName).Scan(&sqlBytes).Error; err != nil {
+			t.Fatal(err)
+		}
+		if sqlBytes <= maxSMBCredentialSchemaSQLBytes {
+			t.Fatalf("arranged control SQL bytes=%d", sqlBytes)
+		}
+		versionBefore := cutoverSchemaVersion(t, database, "main")
+		changesBefore := cutoverTotalChanges(t, database)
+		keyring := newCutoverTestKeyring(t)
+		if _, err := cutoverSMBCredentials(database, keyring); !errors.Is(err, errSMBCredentialCutover) {
+			t.Fatalf("oversized control schema error = %v", err)
+		}
+		if changesAfter := cutoverTotalChanges(t, database); changesAfter != changesBefore {
+			t.Fatalf("oversized control schema total_changes=%d, want %d", changesAfter, changesBefore)
+		}
+		if after := cutoverSchemaVersion(t, database, "main"); after != versionBefore {
+			t.Fatalf("oversized control schema_version=%d, want %d", after, versionBefore)
+		}
+		var sqlBytesAfter int64
+		if err := database.Raw("SELECT length(CAST(sql AS BLOB)) FROM main.sqlite_master WHERE type = 'table' AND name = ?", smbCredentialControlTableName).Scan(&sqlBytesAfter).Error; err != nil || sqlBytesAfter != sqlBytes {
+			t.Fatalf("oversized control SQL changed: before=%d after=%d err=%v", sqlBytes, sqlBytesAfter, err)
+		}
+		assertCutoverMarkerCount(t, database, 0)
+		assertCutoverControlTableCount(t, database, 1)
+	})
+}
+
+func TestSMBCredentialCutoverRejectsExecutableSchemaBeforeWriting(t *testing.T) {
+	const amplificationExpression = "printf('%100000000s', credential_id)"
+	for _, testCase := range []struct {
+		name    string
+		arrange func(*testing.T, *gorm.DB)
+	}{
+		{
+			name: "connection expression index",
+			arrange: func(t *testing.T, database *gorm.DB) {
+				insertCutoverTestCredentials(t, database, []cutoverTestCredential{{
+					ID: 1, Username: "index-bomb-user", Password: "index-bomb-sentinel", Host: "nas", Port: "445", Directories: "media",
+				}})
+				if err := database.Exec(`CREATE INDEX connection_resource_bomb
+					ON o_connections(` + amplificationExpression + `)
+					WHERE credential_id IS NOT NULL`).Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "marker expression index",
+			arrange: func(t *testing.T, database *gorm.DB) {
+				if err := database.Exec(`CREATE INDEX marker_resource_bomb
+					ON o_security_migrations(printf('%100000000s', state))`).Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "control expression index",
+			arrange: func(t *testing.T, database *gorm.DB) {
+				if err := database.Exec(createSMBCredentialControlTableSQL).Error; err != nil {
+					t.Fatal(err)
+				}
+				if err := database.Exec(`CREATE INDEX control_resource_bomb
+					ON o_smb_credential_key_control(printf('%100000000s', revision))`).Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "connection check expression",
+			arrange: func(t *testing.T, database *gorm.DB) {
+				if err := database.Exec("DROP TABLE main.o_connections").Error; err != nil {
+					t.Fatal(err)
+				}
+				if err := database.Exec(`CREATE TABLE main.o_connections (
+					id INTEGER PRIMARY KEY,
+					updated INTEGER,
+					created INTEGER,
+					username TEXT,
+					password TEXT,
+					credential_id TEXT CHECK (
+						credential_id IS NULL OR length(printf('%100000000s', credential_id)) > 0
+					),
+					credential_format TEXT,
+					password_envelope BLOB,
+					row_revision INTEGER NOT NULL DEFAULT 0,
+					host TEXT,
+					port TEXT,
+					status TEXT,
+					directories TEXT,
+					mount_point TEXT,
+					boot_id TEXT,
+					mount_ids TEXT
+				)`).Error; err != nil {
+					t.Fatal(err)
+				}
+				if err := database.Exec(createCredentialIDIndexSQL).Error; err != nil {
+					t.Fatal(err)
+				}
+				insertCutoverTestCredentials(t, database, []cutoverTestCredential{{
+					ID: 1, Username: "check-bomb-user", Password: "check-bomb-sentinel", Host: "nas", Port: "445", Directories: "media",
+				}})
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			database := newSMBCredentialCutoverTestDatabase(t, "DELETE")
+			testCase.arrange(t, database)
+			before := cutoverFullStateFingerprint(t, database)
+			changesBefore := cutoverTotalChanges(t, database)
+			keyring := newCutoverTestKeyring(t)
+			_, cutoverErr := cutoverSMBCredentials(database, keyring)
+			if !errors.Is(cutoverErr, errSMBCredentialCutover) {
+				t.Fatalf("executable schema error = %v", cutoverErr)
+			}
+			if errors.Is(cutoverErr, errSMBCredentialTransactionOutcomeUnknown) {
+				t.Fatal("preflight rejection was reported as an unknown transaction outcome")
+			}
+			if after := cutoverFullStateFingerprint(t, database); after != before {
+				t.Fatal("executable schema rejection changed database state")
+			}
+			if changesAfter := cutoverTotalChanges(t, database); changesAfter != changesBefore {
+				t.Fatalf("executable schema total_changes=%d, want %d", changesAfter, changesBefore)
+			}
+		})
 	}
 }
 
@@ -839,12 +1431,20 @@ func TestSMBCredentialCutoverRejectsEveryMalformedControlRowWithoutWriting(t *te
 				t.Fatal(err)
 			}
 			before := cutoverControlFingerprint(t, database)
+			fullBefore := cutoverFullStateFingerprint(t, database)
+			changesBefore := cutoverTotalChanges(t, database)
 			if _, err := cutoverSMBCredentials(database, keyring); !errors.Is(err, errSMBCredentialCutover) {
 				t.Fatalf("malformed control error = %v", err)
 			}
 			after := cutoverControlFingerprint(t, database)
 			if before != after {
 				t.Fatalf("malformed control changed: before=%q after=%q", before, after)
+			}
+			if afterFull := cutoverFullStateFingerprint(t, database); afterFull != fullBefore {
+				t.Fatal("malformed control changed complete database state")
+			}
+			if changesAfter := cutoverTotalChanges(t, database); changesAfter != changesBefore {
+				t.Fatalf("malformed-control total_changes=%d, want %d", changesAfter, changesBefore)
 			}
 			assertCutoverMarkerCount(t, database, 1)
 		})
@@ -964,6 +1564,9 @@ func TestSMBCredentialCutoverUsesImmediateWriterAdmission(t *testing.T) {
 	if err := databaseB.Exec("PRAGMA busy_timeout = 0").Error; err != nil {
 		t.Fatal(err)
 	}
+	if err := databaseB.Exec("CREATE TEMP TABLE begin_error_connection_probe(value INTEGER)").Error; err != nil {
+		t.Fatal(err)
+	}
 	if err := databaseA.Exec("BEGIN IMMEDIATE").Error; err != nil {
 		t.Fatal(err)
 	}
@@ -981,6 +1584,9 @@ func TestSMBCredentialCutoverUsesImmediateWriterAdmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	locked = false
+	if err := databaseB.Raw("SELECT count(*) FROM temp.begin_error_connection_probe").Scan(new(int64)).Error; err == nil {
+		t.Fatal("BEGIN-error physical connection was returned to the pool")
+	}
 	assertCutoverMarkerCount(t, databaseA, 0)
 	assertCutoverControlTableCount(t, databaseA, 0)
 }
@@ -1073,7 +1679,9 @@ func TestSMBCredentialImmediateTransactionDiscardsConnectionWhenRollbackOutcomeI
 		}
 		return errors.New("private error after manual commit")
 	})
-	if !errors.Is(err, errSMBCredentialCutover) || strings.Contains(err.Error(), "private error") {
+	if !errors.Is(err, errSMBCredentialCutover) ||
+		!errors.Is(err, errSMBCredentialTransactionOutcomeUnknown) ||
+		strings.Contains(err.Error(), "private error") {
 		t.Fatalf("unknown rollback error = %v", err)
 	}
 	var durableRows int64
@@ -1130,24 +1738,88 @@ func TestSMBCredentialCutoverConcurrentMigratorsConvergeOnOnePendingState(t *tes
 }
 
 func TestSMBCredentialCutoverRejectsTemporarySchemaShadows(t *testing.T) {
-	database := newSMBCredentialCutoverTestDatabase(t, "DELETE")
-	insertCutoverTestCredentials(t, database, []cutoverTestCredential{{ID: 1, Username: "user", Password: "temp-shadow-sentinel", Host: "nas", Port: "445", Directories: "media"}})
-	if err := database.Exec("CREATE TEMP TABLE o_connections(id INTEGER PRIMARY KEY)").Error; err != nil {
-		t.Fatal(err)
+	for _, objectType := range []string{"TABLE", "VIEW"} {
+		for _, objectName := range []string{"O_CONNECTIONS", "O_SECURITY_MIGRATIONS", "O_SMB_CREDENTIAL_KEY_CONTROL"} {
+			t.Run(strings.ToLower(objectType+"/"+objectName), func(t *testing.T) {
+				database := newSMBCredentialCutoverTestDatabase(t, "DELETE")
+				insertCutoverTestCredentials(t, database, []cutoverTestCredential{{
+					ID: 1, Username: "user", Password: "temp-shadow-sentinel", Host: "nas", Port: "445", Directories: "media",
+				}})
+				statement := fmt.Sprintf("CREATE TEMP TABLE %s(value INTEGER)", objectName)
+				dropStatement := fmt.Sprintf("DROP TABLE temp.%s", objectName)
+				if objectType == "VIEW" {
+					statement = fmt.Sprintf("CREATE TEMP VIEW %s AS SELECT 1 AS value", objectName)
+					dropStatement = fmt.Sprintf("DROP VIEW temp.%s", objectName)
+				}
+				if err := database.Exec(statement).Error; err != nil {
+					t.Fatal(err)
+				}
+				rowBefore := cutoverConnectionStorageFingerprint(t, database)
+				mainSchemaBefore := cutoverSchemaFingerprint(t, database, "main")
+				tempSchemaBefore := cutoverSchemaFingerprint(t, database, "temp")
+				mainVersionBefore := cutoverSchemaVersion(t, database, "main")
+				tempVersionBefore := cutoverSchemaVersion(t, database, "temp")
+				changesBefore := cutoverTotalChanges(t, database)
+				keyring := newCutoverTestKeyring(t)
+				if _, err := cutoverSMBCredentials(database, keyring); !errors.Is(err, errSMBCredentialCutover) {
+					t.Fatalf("temporary shadow error = %v", err)
+				}
+				if after := cutoverConnectionStorageFingerprint(t, database); after != rowBefore {
+					t.Fatal("temporary shadow rejection changed main credential row")
+				}
+				if changesAfter := cutoverTotalChanges(t, database); changesAfter != changesBefore {
+					t.Fatalf("temporary shadow total_changes=%d, want %d", changesAfter, changesBefore)
+				}
+				if after := cutoverSchemaFingerprint(t, database, "main"); after != mainSchemaBefore {
+					t.Fatal("temporary shadow changed main schema")
+				}
+				if after := cutoverSchemaFingerprint(t, database, "temp"); after != tempSchemaBefore {
+					t.Fatal("temporary shadow changed temporary schema")
+				}
+				if after := cutoverSchemaVersion(t, database, "main"); after != mainVersionBefore {
+					t.Fatalf("temporary shadow main schema_version=%d, want %d", after, mainVersionBefore)
+				}
+				if after := cutoverSchemaVersion(t, database, "temp"); after != tempVersionBefore {
+					t.Fatalf("temporary shadow temp schema_version=%d, want %d", after, tempVersionBefore)
+				}
+				if err := database.Exec(dropStatement).Error; err != nil {
+					t.Fatal(err)
+				}
+				assertCutoverMarkerCount(t, database, 0)
+				assertCutoverControlTableCount(t, database, 0)
+				stored := loadCutoverTestRows(t, database)
+				if len(stored) != 1 || !stored[0].Password.Valid || stored[0].Password.String != "temp-shadow-sentinel" {
+					t.Fatal("temporary shadow failure changed main credential row")
+				}
+			})
+		}
 	}
-	keyring := newCutoverTestKeyring(t)
-	if _, err := cutoverSMBCredentials(database, keyring); !errors.Is(err, errSMBCredentialCutover) {
-		t.Fatalf("temporary shadow error = %v", err)
-	}
-	if err := database.Exec("DROP TABLE temp.o_connections").Error; err != nil {
-		t.Fatal(err)
-	}
-	assertCutoverMarkerCount(t, database, 0)
-	assertCutoverControlTableCount(t, database, 0)
-	stored := loadCutoverTestRows(t, database)
-	if len(stored) != 1 || !stored[0].Password.Valid || stored[0].Password.String != "temp-shadow-sentinel" {
-		t.Fatal("temporary shadow failure changed main credential row")
-	}
+
+	t.Run("credential identity index", func(t *testing.T) {
+		database := newSMBCredentialCutoverTestDatabase(t, "DELETE")
+		insertCutoverTestCredentials(t, database, []cutoverTestCredential{{
+			ID: 1, Username: "index-shadow-user", Password: "index-shadow-sentinel", Host: "nas", Port: "445", Directories: "media",
+		}})
+		if err := database.Exec("CREATE TEMP TABLE index_shadow_probe(credential_id TEXT)").Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := database.Exec(`CREATE UNIQUE INDEX temp.ux_o_connections_credential_id
+			ON index_shadow_probe(credential_id)`).Error; err != nil {
+			t.Fatal(err)
+		}
+		before := cutoverFullStateFingerprint(t, database)
+		changesBefore := cutoverTotalChanges(t, database)
+		keyring := newCutoverTestKeyring(t)
+		if _, err := cutoverSMBCredentials(database, keyring); !errors.Is(err, errSMBCredentialCutover) {
+			t.Fatalf("temporary index shadow error = %v", err)
+		}
+		if after := cutoverFullStateFingerprint(t, database); after != before {
+			t.Fatal("temporary index shadow rejection changed database state")
+		}
+		if changesAfter := cutoverTotalChanges(t, database); changesAfter != changesBefore {
+			t.Fatalf("temporary index shadow total_changes=%d, want %d", changesAfter, changesBefore)
+		}
+	})
 }
 
 func TestSMBCredentialCutoverRejectsAttachedDatabasesWithoutWriting(t *testing.T) {
@@ -1157,9 +1829,17 @@ func TestSMBCredentialCutoverRejectsAttachedDatabasesWithoutWriting(t *testing.T
 	if err := database.Exec("ATTACH DATABASE ? AS auxiliary", attachedPath).Error; err != nil {
 		t.Fatal(err)
 	}
+	fullBefore := cutoverFullStateFingerprint(t, database)
+	changesBefore := cutoverTotalChanges(t, database)
 	keyring := newCutoverTestKeyring(t)
 	if _, err := cutoverSMBCredentials(database, keyring); !errors.Is(err, errSMBCredentialCutover) {
 		t.Fatalf("attached database error = %v", err)
+	}
+	if after := cutoverFullStateFingerprint(t, database); after != fullBefore {
+		t.Fatal("attached-database rejection changed database state")
+	}
+	if changesAfter := cutoverTotalChanges(t, database); changesAfter != changesBefore {
+		t.Fatalf("attached-database total_changes=%d, want %d", changesAfter, changesBefore)
 	}
 	if err := database.Exec("DETACH DATABASE auxiliary").Error; err != nil {
 		t.Fatal(err)
@@ -1167,6 +1847,36 @@ func TestSMBCredentialCutoverRejectsAttachedDatabasesWithoutWriting(t *testing.T
 	stored := loadCutoverTestRows(t, database)
 	if len(stored) != 1 || !stored[0].Password.Valid || stored[0].Password.String != "attached-database-sentinel" {
 		t.Fatal("attached database rejection changed credential state")
+	}
+	assertCutoverMarkerCount(t, database, 0)
+	assertCutoverControlTableCount(t, database, 0)
+}
+
+func TestSMBCredentialCutoverPreflightsOversizedDatabaseAliasBeforeDetailedScan(t *testing.T) {
+	database := newSMBCredentialCutoverTestDatabase(t, "DELETE")
+	insertCutoverTestCredentials(t, database, []cutoverTestCredential{{
+		ID: 1, Username: "alias-user", Password: "alias-password-sentinel", Host: "nas", Port: "445", Directories: "media",
+	}})
+	alias := strings.Repeat("a", 1<<20)
+	if err := database.Exec(`ATTACH DATABASE ':memory:' AS "` + alias + `"`).Error; err != nil {
+		t.Fatal(err)
+	}
+	changesBefore := cutoverTotalChanges(t, database)
+	keyring := newCutoverTestKeyring(t)
+	dependencies := defaultSMBCredentialCutoverDependencies()
+	generated := 0
+	dependencies.NewCredentialID = func() (uuid.UUID, error) {
+		generated++
+		return uuid.NewRandom()
+	}
+	if _, err := cutoverSMBCredentialsWithDependencies(database, keyring, dependencies); !errors.Is(err, errSMBCredentialCutover) {
+		t.Fatalf("oversized database alias error = %v", err)
+	}
+	if generated != 0 {
+		t.Fatalf("oversized database alias generated %d credential IDs", generated)
+	}
+	if changesAfter := cutoverTotalChanges(t, database); changesAfter != changesBefore {
+		t.Fatalf("oversized database alias total_changes=%d, want %d", changesAfter, changesBefore)
 	}
 	assertCutoverMarkerCount(t, database, 0)
 	assertCutoverControlTableCount(t, database, 0)
@@ -1182,9 +1892,17 @@ func TestSMBCredentialCutoverRejectsUnsupportedJournalMode(t *testing.T) {
 		t.Fatalf("arrange journal mode = %q, err = %v", mode, err)
 	}
 	insertCutoverTestCredentials(t, database, []cutoverTestCredential{{ID: 1, Username: "user", Password: "journal-mode-sentinel", Host: "nas", Port: "445", Directories: "media"}})
+	fullBefore := cutoverFullStateFingerprint(t, database)
+	changesBefore := cutoverTotalChanges(t, database)
 	keyring := newCutoverTestKeyring(t)
 	if _, err := cutoverSMBCredentials(database, keyring); !errors.Is(err, errSMBCredentialCutover) {
 		t.Fatalf("unsupported journal error = %v", err)
+	}
+	if after := cutoverFullStateFingerprint(t, database); after != fullBefore {
+		t.Fatal("unsupported-journal rejection changed database state")
+	}
+	if changesAfter := cutoverTotalChanges(t, database); changesAfter != changesBefore {
+		t.Fatalf("unsupported-journal total_changes=%d, want %d", changesAfter, changesBefore)
 	}
 	assertCutoverMarkerCount(t, database, 0)
 	assertCutoverControlTableCount(t, database, 0)
@@ -1236,21 +1954,44 @@ func TestSMBCredentialCutoverNeverEmitsCredentialsToParentInfoLogger(t *testing.
 			if err := expandSMBCredentialSchema(database); err != nil {
 				t.Fatal(err)
 			}
-			credentials := []cutoverTestCredential{{ID: 1, Username: "logger-user-one", Password: "logger-secret-sentinel-one", Host: "logger-one.internal", Port: "445", Directories: "private-one"}}
+			credentials := []cutoverTestCredential{{
+				ID: 1, Username: "logger-user-one", Password: "logger-secret-sentinel-one", Host: "logger-one.internal", Port: "445", Directories: "private-one",
+				BootID: "logger-private-boot-one", MountIDs: `{"private-one":101}`,
+			}}
 			if lateFailure {
-				credentials = append(credentials, cutoverTestCredential{ID: 2, Username: "logger-user-two", Password: "logger-secret-sentinel-two", Host: "logger-two.internal", Port: "445", Directories: "private-two"})
+				credentials = append(credentials, cutoverTestCredential{
+					ID: 2, Username: "logger-user-two", Password: "logger-secret-sentinel-two", Host: "logger-two.internal", Port: "445", Directories: "private-two",
+					BootID: "logger-private-boot-two", MountIDs: `{"private-two":202}`,
+				})
 			}
 			insertCutoverTestCredentials(t, database, credentials)
-			if lateFailure {
-				if err := database.Exec(`CREATE UNIQUE INDEX fail_logged_cutover
-					ON o_connections(credential_format)
-					WHERE credential_format IS NOT NULL`).Error; err != nil {
-					t.Fatal(err)
-				}
-			}
 			output.Reset()
 			keyring := newCutoverTestKeyring(t)
-			_, cutoverErr := cutoverSMBCredentials(database, keyring)
+			credentialIDs := []uuid.UUID{
+				uuid.MustParse("11111111-1111-4111-8111-111111111111"),
+				uuid.MustParse("22222222-2222-4222-8222-222222222222"),
+			}
+			generated := 0
+			dependencies := defaultSMBCredentialCutoverDependencies()
+			dependencies.NewCredentialID = func() (uuid.UUID, error) {
+				if generated >= len(credentialIDs) {
+					return uuid.Nil, errors.New("unexpected credential identity request")
+				}
+				result := credentialIDs[generated]
+				generated++
+				return result, nil
+			}
+			if lateFailure {
+				sealCalls := 0
+				dependencies.Seal = func(keyring *smbcredentials.Keyring, context smbcredentials.Context, password []byte) ([]byte, error) {
+					sealCalls++
+					if sealCalls == 2 {
+						return nil, errors.New("private logger rollback injection")
+					}
+					return keyring.Seal(context, password)
+				}
+			}
+			_, cutoverErr := cutoverSMBCredentialsWithDependencies(database, keyring, dependencies)
 			if lateFailure && !errors.Is(cutoverErr, errSMBCredentialCutover) {
 				t.Fatalf("logged rollback error = %v", cutoverErr)
 			}
@@ -1258,11 +1999,47 @@ func TestSMBCredentialCutoverNeverEmitsCredentialsToParentInfoLogger(t *testing.
 				t.Fatal(cutoverErr)
 			}
 			logged := output.String()
+			activeKeyID, decodeErr := hex.DecodeString(keyring.ActiveID())
+			if decodeErr != nil {
+				t.Fatal(decodeErr)
+			}
+			defer clear(activeKeyID)
+			privateRepresentations := []string{
+				keyring.ActiveID(),
+				strings.ToUpper(keyring.ActiveID()),
+				string(activeKeyID),
+				base64.StdEncoding.EncodeToString(activeKeyID),
+				base64.RawStdEncoding.EncodeToString(activeKeyID),
+			}
+			for _, credentialID := range credentialIDs {
+				privateRepresentations = append(privateRepresentations, credentialID.String())
+			}
 			for _, credential := range credentials {
-				for _, privateValue := range []string{credential.Username, credential.Password, credential.Host, credential.Directories} {
-					if strings.Contains(logged, privateValue) {
-						t.Fatalf("parent logger exposed private value %q", privateValue)
-					}
+				privateRepresentations = append(privateRepresentations,
+					credential.Username,
+					credential.Password,
+					credential.Host,
+					credential.Directories,
+					credential.BootID,
+					credential.MountIDs,
+				)
+			}
+			if !lateFailure {
+				stored := loadCutoverTestRows(t, database.Session(&gorm.Session{Logger: gormlogger.Discard}))
+				for _, row := range stored {
+					privateRepresentations = append(privateRepresentations,
+						row.CredentialID,
+						string(row.PasswordEnvelope),
+						hex.EncodeToString(row.PasswordEnvelope),
+						strings.ToUpper(hex.EncodeToString(row.PasswordEnvelope)),
+						base64.StdEncoding.EncodeToString(row.PasswordEnvelope),
+						base64.RawStdEncoding.EncodeToString(row.PasswordEnvelope),
+					)
+				}
+			}
+			for index, privateValue := range privateRepresentations {
+				if privateValue != "" && strings.Contains(logged, privateValue) {
+					t.Fatalf("parent logger exposed private representation %d", index)
 				}
 			}
 		})
@@ -1275,19 +2052,84 @@ func TestSMBCredentialCutoverHasNoProductionCallSite(t *testing.T) {
 		t.Fatal("locate cutover test source")
 	}
 	directory := filepath.Dir(currentFile)
+	implementationName := "smb_credentials_cutover.go"
+	implementationPath := filepath.Join(directory, implementationName)
+	fileset := token.NewFileSet()
+	implementation, err := parser.ParseFile(fileset, implementationPath, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Every package-level function in the pending-only implementation must stay
+	// isolated in that file. This prevents a future production file from calling
+	// a lower-level mutator and bypassing the two documented entry points.
+	isolatedFunctions := make(map[string]struct{})
+	stageErrorDeclaration := token.NoPos
+	for _, declaration := range implementation.Decls {
+		function, isFunction := declaration.(*ast.FuncDecl)
+		if !isFunction || function.Recv != nil {
+			continue
+		}
+		isolatedFunctions[function.Name.Name] = struct{}{}
+		if function.Name.Name == "cutoverStageError" {
+			stageErrorDeclaration = function.Name.Pos()
+		}
+	}
+	for _, required := range []string{
+		"cutoverSMBCredentials",
+		"cutoverSMBCredentialsWithDependencies",
+		"withImmediateSMBCredentialTransaction",
+		"migrateLegacySMBCredentialRows",
+		"sealLegacySMBCredentialRow",
+	} {
+		if _, exists := isolatedFunctions[required]; !exists {
+			t.Errorf("pending-only function %s is missing from %s", required, implementationName)
+		}
+	}
+
+	allowedStageErrors := map[token.Pos]struct{}{stageErrorDeclaration: {}}
+	stageErrorCalls := 0
+	ast.Inspect(implementation, func(node ast.Node) bool {
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		identifier, isIdentifier := call.Fun.(*ast.Ident)
+		if !isIdentifier || identifier.Name != "cutoverStageError" {
+			return true
+		}
+		allowedStageErrors[identifier.Pos()] = struct{}{}
+		stageErrorCalls++
+		if len(call.Args) != 1 {
+			t.Errorf("cutoverStageError call at %s has %d arguments", fileset.Position(call.Pos()), len(call.Args))
+			return true
+		}
+		literal, isLiteral := call.Args[0].(*ast.BasicLit)
+		if !isLiteral || literal.Kind != token.STRING || literal.Value == `""` {
+			t.Errorf("cutoverStageError call at %s does not use one nonempty string literal", fileset.Position(call.Pos()))
+		}
+		return true
+	})
+	ast.Inspect(implementation, func(node ast.Node) bool {
+		identifier, isIdentifier := node.(*ast.Ident)
+		if !isIdentifier || identifier.Name != "cutoverStageError" {
+			return true
+		}
+		if _, permitted := allowedStageErrors[identifier.Pos()]; !permitted {
+			t.Errorf("non-call reference to cutoverStageError at %s", fileset.Position(identifier.Pos()))
+		}
+		return true
+	})
+	if stageErrorDeclaration == token.NoPos || stageErrorCalls == 0 {
+		t.Errorf("cutoverStageError declaration=%v calls=%d", stageErrorDeclaration, stageErrorCalls)
+	}
+
 	entries, err := os.ReadDir(directory)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fileset := token.NewFileSet()
-	targets := map[string]struct{}{
-		"cutoverSMBCredentials":                 {},
-		"cutoverSMBCredentialsWithDependencies": {},
-	}
-	declarations := make(map[string]int, len(targets))
-	allowedWrapperCalls := 0
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+		if entry.IsDir() || entry.Name() == implementationName || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
 			continue
 		}
 		path := filepath.Join(directory, entry.Name())
@@ -1295,53 +2137,16 @@ func TestSMBCredentialCutoverHasNoProductionCallSite(t *testing.T) {
 		if parseErr != nil {
 			t.Fatal(parseErr)
 		}
-		allowed := make(map[token.Pos]struct{})
-		for _, declaration := range parsed.Decls {
-			function, isFunction := declaration.(*ast.FuncDecl)
-			if !isFunction {
-				continue
-			}
-			if _, target := targets[function.Name.Name]; target {
-				allowed[function.Name.Pos()] = struct{}{}
-				declarations[function.Name.Name]++
-			}
-			if function.Name.Name != "cutoverSMBCredentials" || function.Body == nil {
-				continue
-			}
-			ast.Inspect(function.Body, func(node ast.Node) bool {
-				call, isCall := node.(*ast.CallExpr)
-				if !isCall {
-					return true
-				}
-				identifier, isIdentifier := call.Fun.(*ast.Ident)
-				if isIdentifier && identifier.Name == "cutoverSMBCredentialsWithDependencies" {
-					allowed[identifier.Pos()] = struct{}{}
-					allowedWrapperCalls++
-				}
-				return true
-			})
-		}
 		ast.Inspect(parsed, func(node ast.Node) bool {
 			identifier, isIdentifier := node.(*ast.Ident)
 			if !isIdentifier {
 				return true
 			}
-			if _, target := targets[identifier.Name]; !target {
-				return true
-			}
-			if _, permitted := allowed[identifier.Pos()]; !permitted {
-				t.Errorf("production reference to %s at %s", identifier.Name, fileset.Position(identifier.Pos()))
+			if _, isolated := isolatedFunctions[identifier.Name]; isolated {
+				t.Errorf("production reference to pending-only function %s at %s", identifier.Name, fileset.Position(identifier.Pos()))
 			}
 			return true
 		})
-	}
-	for target := range targets {
-		if declarations[target] != 1 {
-			t.Errorf("production declarations for %s = %d, want 1", target, declarations[target])
-		}
-	}
-	if allowedWrapperCalls != 1 {
-		t.Errorf("wrapper calls to cutoverSMBCredentialsWithDependencies = %d, want 1", allowedWrapperCalls)
 	}
 }
 
@@ -1382,17 +2187,35 @@ func newCutoverTestKeyring(t *testing.T) *smbcredentials.Keyring {
 func insertCutoverTestCredentials(t *testing.T, database *gorm.DB, credentials []cutoverTestCredential) {
 	t.Helper()
 	for _, credential := range credentials {
+		updated := credential.Updated
+		if updated == 0 {
+			updated = 1000 + credential.ID
+		}
+		created := credential.Created
+		if created == 0 {
+			created = 900 + credential.ID
+		}
+		status := credential.Status
+		if status == "" {
+			status = "ready"
+		}
+		mountPoint := credential.MountPoint
+		if mountPoint == "" {
+			mountPoint = "/mnt/" + credential.Host
+		}
 		if err := database.Exec(`INSERT INTO o_connections(
-			id, username, password, host, port, status, directories, mount_point, boot_id, mount_ids
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			id, updated, created, username, password, host, port, status, directories, mount_point, boot_id, mount_ids
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			credential.ID,
+			updated,
+			created,
 			credential.Username,
 			credential.Password,
 			credential.Host,
 			credential.Port,
-			"ready",
+			status,
 			credential.Directories,
-			"/mnt/"+credential.Host,
+			mountPoint,
 			credential.BootID,
 			credential.MountIDs,
 		).Error; err != nil {
@@ -1405,7 +2228,7 @@ func loadCutoverTestRows(t *testing.T, database *gorm.DB) []cutoverTestStoredRow
 	t.Helper()
 	var rows []cutoverTestStoredRow
 	if err := database.Raw(`SELECT
-			id, username, password, host, port, directories, boot_id, mount_ids,
+			id, updated, created, username, password, host, port, status, directories, mount_point, boot_id, mount_ids,
 		coalesce(credential_id, '') AS credential_id,
 		coalesce(credential_format, '') AS credential_format,
 		coalesce(password_envelope, zeroblob(0)) AS password_envelope,
@@ -1509,6 +2332,77 @@ func cutoverTotalChanges(t *testing.T, database *gorm.DB) int64 {
 	return changes
 }
 
+func cutoverConnectionStorageFingerprint(t *testing.T, database *gorm.DB) string {
+	t.Helper()
+	var fingerprint string
+	if err := database.Raw(`SELECT coalesce(group_concat(value, '|'), '') FROM (
+		SELECT printf('%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s',
+			typeof(id), quote(id),
+			typeof(updated), quote(updated),
+			typeof(created), quote(created),
+			typeof(username), quote(username),
+			typeof(password), quote(password),
+			typeof(credential_id), quote(credential_id),
+			typeof(credential_format), quote(credential_format),
+			typeof(password_envelope), quote(password_envelope),
+			typeof(row_revision), quote(row_revision),
+			typeof(host), quote(host),
+			typeof(port), quote(port),
+			typeof(status), quote(status),
+			typeof(directories), quote(directories),
+			typeof(mount_point), quote(mount_point),
+			typeof(boot_id), quote(boot_id),
+			typeof(mount_ids), quote(mount_ids)
+		) AS value
+		FROM main.o_connections
+		ORDER BY id
+	)`).Scan(&fingerprint).Error; err != nil {
+		t.Fatal(err)
+	}
+	return fingerprint
+}
+
+func cutoverFullStateFingerprint(t *testing.T, database *gorm.DB) string {
+	t.Helper()
+	var markerFingerprint string
+	if err := database.Raw(`SELECT coalesce(group_concat(value, '|'), '') FROM (
+		SELECT printf('%s:%s:%s:%s:%s:%s',
+			typeof(name), quote(name),
+			typeof(state), quote(state),
+			typeof(updated), quote(updated)
+		) AS value
+		FROM main.o_security_migrations
+		ORDER BY name
+	)`).Scan(&markerFingerprint).Error; err != nil {
+		t.Fatal(err)
+	}
+	controlFingerprint := "<absent>"
+	var controlTables int64
+	if err := database.Raw("SELECT count(*) FROM main.sqlite_master WHERE type = 'table' AND name = ?", smbCredentialControlTableName).Scan(&controlTables).Error; err != nil {
+		t.Fatal(err)
+	}
+	if controlTables == 1 {
+		controlFingerprint = cutoverControlFingerprint(t, database)
+	}
+	return fmt.Sprintf("rows=%q markers=%q control=%q main_schema=%q temp_schema=%q main_version=%d temp_version=%d",
+		cutoverConnectionStorageFingerprint(t, database),
+		markerFingerprint,
+		controlFingerprint,
+		cutoverSchemaFingerprint(t, database, "main"),
+		cutoverSchemaFingerprint(t, database, "temp"),
+		cutoverSchemaVersion(t, database, "main"),
+		cutoverSchemaVersion(t, database, "temp"),
+	)
+}
+
+func assertCutoverIntegrity(t *testing.T, database *gorm.DB) {
+	t.Helper()
+	var result string
+	if err := database.Raw("PRAGMA main.integrity_check").Scan(&result).Error; err != nil || result != "ok" {
+		t.Fatalf("SQLite integrity_check=%q err=%v", result, err)
+	}
+}
+
 func cutoverSchemaFingerprint(t *testing.T, database *gorm.DB, schema string) string {
 	t.Helper()
 	if schema != "main" && schema != "temp" {
@@ -1545,8 +2439,19 @@ func assertLegacyCutoverRollback(t *testing.T, database *gorm.DB, credentials []
 		t.Fatalf("rows after rollback = %d, want %d", len(stored), len(credentials))
 	}
 	for index := range stored {
-		if !stored[index].Password.Valid ||
+		if stored[index].ID != credentials[index].ID ||
+			stored[index].Updated != 1000+credentials[index].ID ||
+			stored[index].Created != 900+credentials[index].ID ||
+			stored[index].Username != credentials[index].Username ||
+			!stored[index].Password.Valid ||
 			stored[index].Password.String != credentials[index].Password ||
+			stored[index].Host != credentials[index].Host ||
+			stored[index].Port != credentials[index].Port ||
+			stored[index].Status != "ready" ||
+			stored[index].Directories != credentials[index].Directories ||
+			stored[index].MountPoint != "/mnt/"+credentials[index].Host ||
+			stored[index].BootID != credentials[index].BootID ||
+			stored[index].MountIDs != credentials[index].MountIDs ||
 			stored[index].CredentialID != "" ||
 			stored[index].CredentialFormat != "" ||
 			len(stored[index].PasswordEnvelope) != 0 ||

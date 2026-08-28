@@ -31,6 +31,8 @@ const (
 	maxSMBCredentialHostBytes         = 255
 	maxSMBCredentialPortBytes         = 3
 	maxSMBCredentialDirectoriesBytes  = 16 << 10
+	maxSMBCredentialStatusBytes       = 255
+	maxSMBCredentialMountPointBytes   = 16 << 10
 	maxSMBCredentialBootIDBytes       = 255
 	maxSMBCredentialMountIDsBytes     = 64 << 10
 	minSMBCredentialEnvelopeV1Bytes   = 158
@@ -40,13 +42,17 @@ const (
 	maxSMBCredentialSchemaNameBytes   = 255
 	maxSMBCredentialSchemaTypeBytes   = 255
 	maxSMBCredentialSchemaDefault     = 1024
-	maxSMBCredentialConnectionIndexes = 1024
+	maxSMBCredentialDatabasePathBytes = 16 << 10
+	maxSMBCredentialDatabaseEntries   = 2
 	smbCredentialRollbackTimeout      = 5 * time.Second
 	smbCredentialControlTableName     = "o_smb_credential_key_control"
 	smbCredentialControlRevision      = 1
 )
 
-var errSMBCredentialCutover = errors.New("ReCasaOS SMB credential cutover failed")
+var (
+	errSMBCredentialCutover                   = errors.New("ReCasaOS SMB credential cutover failed")
+	errSMBCredentialTransactionOutcomeUnknown = errors.New("ReCasaOS SMB credential transaction outcome is unknown")
+)
 
 // sealedSMBCredentialRowPredicateSQL is only a storage-shape classifier.
 // authenticateSealedSMBCredentialRows remains authoritative for the canonical
@@ -111,12 +117,24 @@ type smbCredentialCutoverResult struct {
 type smbCredentialCutoverDependencies struct {
 	NewCredentialID func() (uuid.UUID, error)
 	Now             func() time.Time
+	Seal            func(*smbcredentials.Keyring, smbcredentials.Context, []byte) ([]byte, error)
+	Open            func(*smbcredentials.Keyring, smbcredentials.Context, []byte) ([]byte, error)
+	EnvelopeKeyID   func(*smbcredentials.Keyring, smbcredentials.Context, []byte) (string, error)
 }
 
 func defaultSMBCredentialCutoverDependencies() smbCredentialCutoverDependencies {
 	return smbCredentialCutoverDependencies{
 		NewCredentialID: uuid.NewRandom,
 		Now:             time.Now,
+		Seal: func(keyring *smbcredentials.Keyring, context smbcredentials.Context, password []byte) ([]byte, error) {
+			return keyring.Seal(context, password)
+		},
+		Open: func(keyring *smbcredentials.Keyring, context smbcredentials.Context, envelope []byte) ([]byte, error) {
+			return keyring.Open(context, envelope)
+		},
+		EnvelopeKeyID: func(keyring *smbcredentials.Keyring, context smbcredentials.Context, envelope []byte) (string, error) {
+			return keyring.EnvelopeKeyID(context, envelope)
+		},
 	}
 }
 
@@ -137,6 +155,8 @@ type smbCredentialResourceSnapshot struct {
 	MaxHostBytes        int64 `gorm:"column:max_host_bytes"`
 	MaxPortBytes        int64 `gorm:"column:max_port_bytes"`
 	MaxDirectoriesBytes int64 `gorm:"column:max_directories_bytes"`
+	MaxStatusBytes      int64 `gorm:"column:max_status_bytes"`
+	MaxMountPointBytes  int64 `gorm:"column:max_mount_point_bytes"`
 	MaxBootIDBytes      int64 `gorm:"column:max_boot_id_bytes"`
 	MaxMountIDsBytes    int64 `gorm:"column:max_mount_ids_bytes"`
 	MaxCredentialID     int64 `gorm:"column:max_credential_id_bytes"`
@@ -159,6 +179,13 @@ type smbCredentialSchemaResourceSnapshot struct {
 	MaxTypeBytes    int64 `gorm:"column:max_type_bytes"`
 	MaxDefaultBytes int64 `gorm:"column:max_default_bytes"`
 	MaxSQLBytes     int64 `gorm:"column:max_sql_bytes"`
+}
+
+type smbCredentialDatabaseListResourceSnapshot struct {
+	RowCount       int64 `gorm:"column:row_count"`
+	InvalidStorage int64 `gorm:"column:invalid_storage"`
+	MaxNameBytes   int64 `gorm:"column:max_name_bytes"`
+	MaxPathBytes   int64 `gorm:"column:max_path_bytes"`
 }
 
 type sqliteTableXColumn struct {
@@ -248,7 +275,9 @@ func cutoverSMBCredentialsWithDependencies(database *gorm.DB, keyring *smbcreden
 		activeKeyIDText = keyring.ActiveID()
 	}
 	activeKeyID, decodeErr := decodeSMBCredentialActiveKeyID(activeKeyIDText)
-	if database == nil || decodeErr != nil || dependencies.NewCredentialID == nil || dependencies.Now == nil {
+	if database == nil || decodeErr != nil ||
+		dependencies.NewCredentialID == nil || dependencies.Now == nil ||
+		dependencies.Seal == nil || dependencies.Open == nil || dependencies.EnvelopeKeyID == nil {
 		return result, errSMBCredentialCutover
 	}
 	defer clear(activeKeyID)
@@ -287,7 +316,7 @@ func cutoverSMBCredentialsWithDependencies(database *gorm.DB, keyring *smbcreden
 			result.Pending = true
 			result.Rows = rows
 		case counts.Total == counts.Sealed && validPendingSMBCredentialMarker(markers) && validSMBCredentialControl(controls, activeKeyID):
-			rows, authenticateErr := authenticateSealedSMBCredentialRows(transaction, keyring, activeKeyIDText)
+			rows, authenticateErr := authenticateSealedSMBCredentialRows(transaction, keyring, activeKeyIDText, dependencies)
 			if authenticateErr != nil {
 				return authenticateErr
 			}
@@ -311,11 +340,12 @@ func cutoverSMBCredentialsWithDependencies(database *gorm.DB, keyring *smbcreden
 func verifyNoSMBCredentialTempShadows(database *gorm.DB) error {
 	var count int64
 	if err := database.Raw(`SELECT count(*) FROM sqlite_temp_master
-				WHERE lower(name) IN (?, ?, ?)
+				WHERE lower(name) IN (?, ?, ?, ?)
 				OR (type = 'trigger' AND lower(tbl_name) IN (?, ?, ?))`,
 		"o_connections",
 		"o_security_migrations",
 		smbCredentialControlTableName,
+		smbCredentialIDIndexName,
 		"o_connections",
 		"o_security_migrations",
 		smbCredentialControlTableName,
@@ -339,6 +369,9 @@ func verifySMBCredentialCutoverSchema(database *gorm.DB) error {
 		return errSMBCredentialCutover
 	}
 	if err := preflightSMBCredentialSchemaResources(database); err != nil {
+		return err
+	}
+	if err := verifySMBCredentialConnectionDDL(database); err != nil {
 		return err
 	}
 	if err := verifySMBCredentialSchema(database); err != nil {
@@ -407,6 +440,30 @@ func verifySMBCredentialCutoverSchema(database *gorm.DB) error {
 	return nil
 }
 
+func verifySMBCredentialConnectionDDL(database *gorm.DB) error {
+	var storedSQL string
+	result := database.Raw(
+		"SELECT sql FROM main.sqlite_master WHERE type = ? AND name = ?",
+		"table",
+		"o_connections",
+	).Scan(&storedSQL)
+	if result.Error != nil || result.RowsAffected != 1 || storedSQL == "" {
+		return errSMBCredentialCutover
+	}
+
+	// The historical table is expand-only and therefore does not have one
+	// canonical byte-for-byte DDL string. Its exact columns, defaults, rowid,
+	// foreign keys, triggers, and index set are checked separately. CHECK and
+	// COLLATE are the remaining executable schema clauses that can run built-in
+	// or registered code while the credential UPDATE rebuilds a row. Reject them
+	// fail-closed instead of trying to interpret arbitrary historical SQL.
+	lowerSQL := strings.ToLower(storedSQL)
+	if strings.Contains(lowerSQL, "check") || strings.Contains(lowerSQL, "collate") {
+		return errSMBCredentialCutover
+	}
+	return nil
+}
+
 func verifyNoSMBCredentialForeignKeys(database *gorm.DB) error {
 	var count int64
 	if err := database.Raw(`SELECT count(*)
@@ -454,6 +511,11 @@ func withImmediateSMBCredentialTransaction(database *gorm.DB, operation func(*go
 			return cutoverStageError("configure durable connection")
 		}
 		if _, err := sqlConnection.ExecContext(operationContext, "BEGIN IMMEDIATE"); err != nil {
+			// Even though no cutover write has run, a driver or cancellation race
+			// may report an error after SQLite accepted BEGIN. Make a bounded best-
+			// effort rollback and always retire this physical connection so an
+			// orphan transaction or altered session cannot return to the pool.
+			rollbackAndDiscardSMBCredentialSQLConnection(sqlConnection)
 			return cutoverStageError("begin immediate")
 		}
 		transactionOpen := true
@@ -466,7 +528,7 @@ func withImmediateSMBCredentialTransaction(database *gorm.DB, operation func(*go
 			_, rollbackErr := sqlConnection.ExecContext(cleanupContext, "ROLLBACK")
 			cancelCleanup()
 			if rollbackErr != nil {
-				result = cutoverStageError("transaction outcome unknown")
+				result = unknownSMBCredentialTransactionOutcomeError()
 				invalidateConnection = true
 			}
 			if invalidateConnection {
@@ -478,11 +540,21 @@ func withImmediateSMBCredentialTransaction(database *gorm.DB, operation func(*go
 		}
 		if _, err := sqlConnection.ExecContext(operationContext, "COMMIT"); err != nil {
 			invalidateConnection = true
-			return cutoverStageError("commit outcome unknown")
+			return unknownSMBCredentialTransactionOutcomeError()
 		}
 		transactionOpen = false
 		return nil
 	})
+}
+
+func rollbackAndDiscardSMBCredentialSQLConnection(connection *sql.Conn) {
+	if connection == nil {
+		return
+	}
+	cleanupContext, cancelCleanup := context.WithTimeout(context.Background(), smbCredentialRollbackTimeout)
+	_, _ = connection.ExecContext(cleanupContext, "ROLLBACK")
+	cancelCleanup()
+	discardSMBCredentialSQLConnection(connection)
 }
 
 func discardSMBCredentialSQLConnection(connection *sql.Conn) {
@@ -545,6 +617,27 @@ func configureSMBCredentialCutoverConnection(connection *sql.Conn, operationCont
 }
 
 func verifySMBCredentialDatabaseAttachment(connection *sql.Conn, operationContext context.Context) error {
+	var resources smbCredentialDatabaseListResourceSnapshot
+	if err := connection.QueryRowContext(operationContext, `SELECT
+		count(*) AS row_count,
+		coalesce(sum(CASE WHEN typeof(name) = 'text' AND typeof(file) = 'text' THEN 0 ELSE 1 END), 0) AS invalid_storage,
+		coalesce(max(length(CAST(name AS BLOB))), 0) AS max_name_bytes,
+		coalesce(max(length(CAST(file AS BLOB))), 0) AS max_path_bytes
+		FROM pragma_database_list`).Scan(
+		&resources.RowCount,
+		&resources.InvalidStorage,
+		&resources.MaxNameBytes,
+		&resources.MaxPathBytes,
+	); err != nil {
+		return err
+	}
+	if resources.RowCount < 1 || resources.RowCount > maxSMBCredentialDatabaseEntries ||
+		resources.InvalidStorage != 0 ||
+		resources.MaxNameBytes < 0 || resources.MaxNameBytes > maxSMBCredentialSchemaNameBytes ||
+		resources.MaxPathBytes < 0 || resources.MaxPathBytes > maxSMBCredentialDatabasePathBytes {
+		return errSMBCredentialCutover
+	}
+
 	rows, err := connection.QueryContext(operationContext, "PRAGMA database_list")
 	if err != nil {
 		return err
@@ -667,19 +760,18 @@ func preflightSMBCredentialSchemaResources(database *gorm.DB) error {
 		}
 	}
 
-	var indexes smbCredentialSchemaResourceSnapshot
-	if err := database.Raw(`SELECT
-		count(*) AS row_count,
-		coalesce(sum(CASE WHEN typeof(name) = 'text' AND typeof(origin) = 'text' THEN 0 ELSE 1 END), 0) AS invalid_storage,
-		coalesce(max(length(CAST(name AS BLOB))), 0) AS max_name_bytes,
-		coalesce(max(length(CAST(origin AS BLOB))), 0) AS max_type_bytes
-		FROM pragma_index_list('o_connections', 'main')`).Scan(&indexes).Error; err != nil {
-		return err
-	}
-	if indexes.RowCount < 1 || indexes.RowCount > maxSMBCredentialConnectionIndexes || indexes.InvalidStorage != 0 ||
-		indexes.MaxNameBytes < 0 || indexes.MaxNameBytes > maxSMBCredentialSchemaNameBytes ||
-		indexes.MaxTypeBytes < 0 || indexes.MaxTypeBytes > maxSMBCredentialSchemaTypeBytes {
-		return errSMBCredentialCutover
+	// Every index on a table being mutated is executable schema. o_connections
+	// may have only the exact credential-ID index verified below; each pinned
+	// WITHOUT ROWID state table may have only its implicit primary-key index.
+	// This rejects expression/partial index resource amplifiers before any DML.
+	for _, tableName := range []string{
+		"o_connections",
+		"o_security_migrations",
+		smbCredentialControlTableName,
+	} {
+		if err := preflightSMBCredentialTableIndexes(database, tableName); err != nil {
+			return err
+		}
 	}
 
 	var indexColumns smbCredentialSchemaResourceSnapshot
@@ -692,6 +784,30 @@ func preflightSMBCredentialSchemaResources(database *gorm.DB) error {
 	}
 	if indexColumns.RowCount != 1 || indexColumns.InvalidStorage != 0 ||
 		indexColumns.MaxNameBytes < 0 || indexColumns.MaxNameBytes > maxSMBCredentialSchemaNameBytes {
+		return errSMBCredentialCutover
+	}
+	return nil
+}
+
+func preflightSMBCredentialTableIndexes(database *gorm.DB, tableName string) error {
+	var indexes smbCredentialSchemaResourceSnapshot
+	if err := database.Raw(`SELECT
+		count(*) AS row_count,
+		coalesce(sum(CASE WHEN
+			typeof(name) = 'text'
+			AND typeof(origin) = 'text'
+			AND typeof(seq) = 'integer'
+			AND typeof("unique") = 'integer'
+			AND typeof(partial) = 'integer'
+			THEN 0 ELSE 1 END), 0) AS invalid_storage,
+		coalesce(max(length(CAST(name AS BLOB))), 0) AS max_name_bytes,
+		coalesce(max(length(CAST(origin AS BLOB))), 0) AS max_type_bytes
+		FROM pragma_index_list(?, 'main')`, tableName).Scan(&indexes).Error; err != nil {
+		return err
+	}
+	if indexes.RowCount != 1 || indexes.InvalidStorage != 0 ||
+		indexes.MaxNameBytes < 0 || indexes.MaxNameBytes > maxSMBCredentialSchemaNameBytes ||
+		indexes.MaxTypeBytes < 0 || indexes.MaxTypeBytes > maxSMBCredentialSchemaTypeBytes {
 		return errSMBCredentialCutover
 	}
 	return nil
@@ -761,11 +877,15 @@ func preflightLegacySMBCredentialRows(database *gorm.DB, expectedRows int64) err
 		count(*) AS row_count,
 		coalesce(sum(CASE WHEN
 			typeof(id) = 'integer' AND id > 0
+			AND typeof(updated) = 'integer'
+			AND typeof(created) = 'integer'
 			AND typeof(username) = 'text'
 			AND typeof(password) = 'text'
 			AND typeof(host) = 'text'
 			AND typeof(port) = 'text'
+			AND typeof(status) = 'text'
 			AND typeof(directories) = 'text'
+			AND typeof(mount_point) = 'text'
 			AND typeof(boot_id) = 'text'
 			AND typeof(mount_ids) = 'text'
 			AND (credential_id IS NULL OR (typeof(credential_id) = 'text' AND credential_id = ''))
@@ -778,7 +898,9 @@ func preflightLegacySMBCredentialRows(database *gorm.DB, expectedRows int64) err
 			length(CAST(username AS BLOB)) +
 			length(CAST(host AS BLOB)) +
 			length(CAST(port AS BLOB)) +
+			length(CAST(status AS BLOB)) +
 			length(CAST(directories AS BLOB)) +
+			length(CAST(mount_point AS BLOB)) +
 			length(CAST(boot_id AS BLOB)) +
 			length(CAST(mount_ids AS BLOB))
 		), 0) AS metadata_bytes,
@@ -786,7 +908,9 @@ func preflightLegacySMBCredentialRows(database *gorm.DB, expectedRows int64) err
 		coalesce(max(length(CAST(password AS BLOB))), 0) AS max_password_bytes,
 		coalesce(max(length(CAST(host AS BLOB))), 0) AS max_host_bytes,
 		coalesce(max(length(CAST(port AS BLOB))), 0) AS max_port_bytes,
+		coalesce(max(length(CAST(status AS BLOB))), 0) AS max_status_bytes,
 		coalesce(max(length(CAST(directories AS BLOB))), 0) AS max_directories_bytes,
+		coalesce(max(length(CAST(mount_point AS BLOB))), 0) AS max_mount_point_bytes,
 		coalesce(max(length(CAST(boot_id AS BLOB))), 0) AS max_boot_id_bytes,
 		coalesce(max(length(CAST(mount_ids AS BLOB))), 0) AS max_mount_ids_bytes
 		FROM main.o_connections
@@ -802,7 +926,9 @@ func preflightLegacySMBCredentialRows(database *gorm.DB, expectedRows int64) err
 		snapshot.MaxPasswordBytes < 0 || snapshot.MaxPasswordBytes > maxSMBCredentialPasswordBytes ||
 		snapshot.MaxHostBytes < 0 || snapshot.MaxHostBytes > maxSMBCredentialHostBytes ||
 		snapshot.MaxPortBytes < 0 || snapshot.MaxPortBytes > maxSMBCredentialPortBytes ||
+		snapshot.MaxStatusBytes < 0 || snapshot.MaxStatusBytes > maxSMBCredentialStatusBytes ||
 		snapshot.MaxDirectoriesBytes < 0 || snapshot.MaxDirectoriesBytes > maxSMBCredentialDirectoriesBytes ||
+		snapshot.MaxMountPointBytes < 0 || snapshot.MaxMountPointBytes > maxSMBCredentialMountPointBytes ||
 		snapshot.MaxBootIDBytes < 0 || snapshot.MaxBootIDBytes > maxSMBCredentialBootIDBytes ||
 		snapshot.MaxMountIDsBytes < 0 || snapshot.MaxMountIDsBytes > maxSMBCredentialMountIDsBytes {
 		return errSMBCredentialCutover
@@ -814,12 +940,20 @@ func preflightSealedSMBCredentialRows(database *gorm.DB, expectedRows int64) err
 	var snapshot smbCredentialResourceSnapshot
 	statement := `SELECT
 		count(*) AS row_count,
-		coalesce(sum(CASE WHEN ` + sealedSMBCredentialRowPredicateSQL + ` THEN 0 ELSE 1 END), 0) AS invalid_storage,
+		coalesce(sum(CASE WHEN
+			` + sealedSMBCredentialRowPredicateSQL + `
+			AND typeof(updated) = 'integer'
+			AND typeof(created) = 'integer'
+			AND typeof(status) = 'text'
+			AND typeof(mount_point) = 'text'
+			THEN 0 ELSE 1 END), 0) AS invalid_storage,
 		coalesce(sum(
 			length(CAST(username AS BLOB)) +
 			length(CAST(host AS BLOB)) +
 			length(CAST(port AS BLOB)) +
+			length(CAST(status AS BLOB)) +
 			length(CAST(directories AS BLOB)) +
+			length(CAST(mount_point AS BLOB)) +
 			length(CAST(boot_id AS BLOB)) +
 			length(CAST(mount_ids AS BLOB)) +
 			length(CAST(credential_id AS BLOB)) +
@@ -829,7 +963,9 @@ func preflightSealedSMBCredentialRows(database *gorm.DB, expectedRows int64) err
 		coalesce(max(length(CAST(username AS BLOB))), 0) AS max_username_bytes,
 		coalesce(max(length(CAST(host AS BLOB))), 0) AS max_host_bytes,
 		coalesce(max(length(CAST(port AS BLOB))), 0) AS max_port_bytes,
+		coalesce(max(length(CAST(status AS BLOB))), 0) AS max_status_bytes,
 		coalesce(max(length(CAST(directories AS BLOB))), 0) AS max_directories_bytes,
+		coalesce(max(length(CAST(mount_point AS BLOB))), 0) AS max_mount_point_bytes,
 		coalesce(max(length(CAST(boot_id AS BLOB))), 0) AS max_boot_id_bytes,
 		coalesce(max(length(CAST(mount_ids AS BLOB))), 0) AS max_mount_ids_bytes,
 		coalesce(max(length(CAST(credential_id AS BLOB))), 0) AS max_credential_id_bytes,
@@ -847,7 +983,9 @@ func preflightSealedSMBCredentialRows(database *gorm.DB, expectedRows int64) err
 		snapshot.MaxUsernameBytes < 0 || snapshot.MaxUsernameBytes > maxSMBCredentialUsernameBytes ||
 		snapshot.MaxHostBytes < 0 || snapshot.MaxHostBytes > maxSMBCredentialHostBytes ||
 		snapshot.MaxPortBytes < 0 || snapshot.MaxPortBytes > maxSMBCredentialPortBytes ||
+		snapshot.MaxStatusBytes < 0 || snapshot.MaxStatusBytes > maxSMBCredentialStatusBytes ||
 		snapshot.MaxDirectoriesBytes < 0 || snapshot.MaxDirectoriesBytes > maxSMBCredentialDirectoriesBytes ||
+		snapshot.MaxMountPointBytes < 0 || snapshot.MaxMountPointBytes > maxSMBCredentialMountPointBytes ||
 		snapshot.MaxBootIDBytes < 0 || snapshot.MaxBootIDBytes > maxSMBCredentialBootIDBytes ||
 		snapshot.MaxMountIDsBytes < 0 || snapshot.MaxMountIDsBytes > maxSMBCredentialMountIDsBytes ||
 		snapshot.MaxCredentialID < 0 || snapshot.MaxCredentialID > 36 ||
@@ -981,7 +1119,7 @@ func migrateLegacySMBCredentialRows(database *gorm.DB, keyring *smbcredentials.K
 	}
 
 	for index := range rows {
-		if err := sealLegacySMBCredentialRow(database, keyring, &rows[index], dependencies.NewCredentialID); err != nil {
+		if err := sealLegacySMBCredentialRow(database, keyring, &rows[index], dependencies); err != nil {
 			return 0, err
 		}
 		rows[index].destroy()
@@ -990,7 +1128,7 @@ func migrateLegacySMBCredentialRows(database *gorm.DB, keyring *smbcredentials.K
 		return 0, cutoverStageError("legacy row count")
 	}
 
-	authenticatedRows, err := authenticateSealedSMBCredentialRows(database, keyring, activeKeyIDText)
+	authenticatedRows, err := authenticateSealedSMBCredentialRows(database, keyring, activeKeyIDText, dependencies)
 	if err != nil || authenticatedRows != len(rows) {
 		return 0, cutoverStageError("authenticate migrated rows")
 	}
@@ -1154,15 +1292,15 @@ func destroyLegacySMBCredentialRows(rows []legacySMBCredentialRow) {
 	}
 }
 
-func sealLegacySMBCredentialRow(database *gorm.DB, keyring *smbcredentials.Keyring, row *legacySMBCredentialRow, newCredentialID func() (uuid.UUID, error)) error {
-	if row == nil || newCredentialID == nil {
+func sealLegacySMBCredentialRow(database *gorm.DB, keyring *smbcredentials.Keyring, row *legacySMBCredentialRow, dependencies smbCredentialCutoverDependencies) error {
+	if row == nil || dependencies.NewCredentialID == nil || dependencies.Seal == nil || dependencies.Open == nil {
 		return cutoverStageError("nil legacy row")
 	}
 	normalizedPort := row.NormalizedPort
 	if normalizedPort != "445" {
 		return cutoverStageError("legacy runtime validation")
 	}
-	credentialUUID, err := newCredentialID()
+	credentialUUID, err := dependencies.NewCredentialID()
 	if err != nil {
 		return cutoverStageError("credential identity")
 	}
@@ -1173,12 +1311,12 @@ func sealLegacySMBCredentialRow(database *gorm.DB, keyring *smbcredentials.Keyri
 		Port:         normalizedPort,
 		Directories:  string(row.Directories),
 	}
-	envelope, err := keyring.Seal(context, row.Password)
+	envelope, err := dependencies.Seal(keyring, context, row.Password)
 	if err != nil {
 		return cutoverStageError("seal legacy row")
 	}
 	defer clear(envelope)
-	opened, err := keyring.Open(context, envelope)
+	opened, err := dependencies.Open(keyring, context, envelope)
 	if err != nil || !bytes.Equal(opened, row.Password) {
 		clear(opened)
 		return cutoverStageError("round-trip legacy row")
@@ -1227,7 +1365,10 @@ func sealLegacySMBCredentialRow(database *gorm.DB, keyring *smbcredentials.Keyri
 	return nil
 }
 
-func authenticateSealedSMBCredentialRows(database *gorm.DB, keyring *smbcredentials.Keyring, activeKeyID string) (int, error) {
+func authenticateSealedSMBCredentialRows(database *gorm.DB, keyring *smbcredentials.Keyring, activeKeyID string, dependencies smbCredentialCutoverDependencies) (int, error) {
+	if dependencies.Open == nil || dependencies.EnvelopeKeyID == nil {
+		return 0, cutoverStageError("sealed dependencies")
+	}
 	counts, err := classifySMBCredentialRows(database)
 	if err != nil || counts.Total != counts.Sealed {
 		return 0, cutoverStageError("preflight sealed classification")
@@ -1292,7 +1433,7 @@ func authenticateSealedSMBCredentialRows(database *gorm.DB, keyring *smbcredenti
 			Port:         row.Port,
 			Directories:  row.Directories,
 		}
-		plaintext, openErr := keyring.Open(context, row.PasswordEnvelope)
+		plaintext, openErr := dependencies.Open(keyring, context, row.PasswordEnvelope)
 		if openErr != nil {
 			clear(plaintext)
 			clear(row.PasswordEnvelope)
@@ -1312,7 +1453,7 @@ func authenticateSealedSMBCredentialRows(database *gorm.DB, keyring *smbcredenti
 			return 0, cutoverStageError("validate sealed runtime credential")
 		}
 		clear(plaintext)
-		envelopeKeyID, keyIDErr := keyring.EnvelopeKeyID(context, row.PasswordEnvelope)
+		envelopeKeyID, keyIDErr := dependencies.EnvelopeKeyID(keyring, context, row.PasswordEnvelope)
 		clear(row.PasswordEnvelope)
 		if keyIDErr != nil || envelopeKeyID != activeKeyID {
 			return 0, cutoverStageError("bind sealed row key")
@@ -1334,6 +1475,10 @@ func authenticateSealedSMBCredentialRows(database *gorm.DB, keyring *smbcredenti
 
 func cutoverStageError(stage string) error {
 	return fmt.Errorf("%w: %s", errSMBCredentialCutover, stage)
+}
+
+func unknownSMBCredentialTransactionOutcomeError() error {
+	return fmt.Errorf("%w: %w", errSMBCredentialCutover, errSMBCredentialTransactionOutcomeUnknown)
 }
 
 func normalizeSMBCredentialCutoverError(err error) error {
