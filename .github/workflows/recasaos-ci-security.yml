@@ -14,6 +14,8 @@ permissions:
 
 env:
   GOTOOLCHAIN: local
+  GOWORK: "off"
+  GOFLAGS: -mod=readonly
 
 concurrency:
   group: recasaos-ci-${{ github.workflow }}-${{ github.ref }}
@@ -47,6 +49,12 @@ jobs:
 
       - name: Exercise SMB2 module boundary fixtures
         run: .github/scripts/test-smb2-module-boundary.sh
+
+      - name: Verify reviewed Gorilla WebSocket module boundary
+        run: .github/scripts/check-gorilla-websocket-module-boundary.sh
+
+      - name: Exercise Gorilla WebSocket module boundary fixtures
+        run: .github/scripts/test-gorilla-websocket-module-boundary.sh
 
       - name: Enforce offline release and migration policy
         run: .github/scripts/check-release-policy.sh
@@ -147,6 +155,9 @@ jobs:
 
       - name: Recheck reviewed SMB2 module boundary after generation
         run: .github/scripts/check-smb2-module-boundary.sh
+
+      - name: Recheck reviewed Gorilla WebSocket module boundary after generation
+        run: .github/scripts/check-gorilla-websocket-module-boundary.sh
 
       - name: Enforce selected Go package dependency boundary
         run: .github/scripts/check-go-dependency-boundary.sh
@@ -525,6 +536,9 @@ jobs:
       - name: Verify reviewed SMB2 module boundary
         run: .github/scripts/check-smb2-module-boundary.sh
 
+      - name: Verify reviewed Gorilla WebSocket module boundary
+        run: .github/scripts/check-gorilla-websocket-module-boundary.sh
+
       - name: Preflight selected Go tool dependency boundary
         run: .github/scripts/check-go-dependency-boundary.sh --tools-only
 
@@ -539,6 +553,9 @@ jobs:
 
       - name: Recheck reviewed SMB2 module boundary after generation
         run: .github/scripts/check-smb2-module-boundary.sh
+
+      - name: Recheck reviewed Gorilla WebSocket module boundary after generation
+        run: .github/scripts/check-gorilla-websocket-module-boundary.sh
 
       - name: Run govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...

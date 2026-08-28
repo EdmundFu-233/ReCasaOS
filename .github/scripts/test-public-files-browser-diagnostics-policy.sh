@@ -46,11 +46,11 @@ expect_rejection() {
 "$checker" "$workflow"
 
 expect_rejection root-default-shell \
-  $'env:\n  GOTOOLCHAIN: local\n\nconcurrency:' \
-  $'env:\n  GOTOOLCHAIN: local\n\ndefaults:\n  run:\n    shell: '\''bash -c "exit 0" -- {0}'\''\n\nconcurrency:'
+  $'env:\n  GOTOOLCHAIN: local\n  GOWORK: "off"\n  GOFLAGS: -mod=readonly\n\nconcurrency:' \
+  $'env:\n  GOTOOLCHAIN: local\n  GOWORK: "off"\n  GOFLAGS: -mod=readonly\n\ndefaults:\n  run:\n    shell: '\''bash -c "exit 0" -- {0}'\''\n\nconcurrency:'
 expect_rejection root-environment-injection \
-  $'env:\n  GOTOOLCHAIN: local' \
-  $'env:\n  GOTOOLCHAIN: local\n  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"'
+  $'env:\n  GOTOOLCHAIN: local\n  GOWORK: "off"\n  GOFLAGS: -mod=readonly' \
+  $'env:\n  GOTOOLCHAIN: local\n  GOWORK: "off"\n  GOFLAGS: -mod=readonly\n  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"'
 expect_rejection policy-step-shell-bypass \
   $'      - name: Verify browser diagnostic retention policy\n        shell: bash' \
   $'      - name: Verify browser diagnostic retention policy\n        shell: '\''bash -c "exit 0" -- {0}'\'''
