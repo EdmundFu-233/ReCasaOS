@@ -18,12 +18,11 @@ import (
 func Get(url string, head map[string]string) (response string) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	req, err := http.NewRequest("GET", url, nil)
-
-	for k, v := range head {
-		req.Header.Add(k, v)
-	}
 	if err != nil {
 		return ""
+	}
+	for k, v := range head {
+		req.Header.Add(k, v)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -90,19 +89,19 @@ func PersonGet(url string) (response string) {
 // content:请求放回的内容
 func Post(url string, data []byte, contentType string, head map[string]string) (content string) {
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
+	if err != nil {
+		return ""
+	}
 	req.Header.Add("content-type", contentType)
 	for k, v := range head {
 		req.Header.Add(k, v)
 	}
-	if err != nil {
-		panic(err)
-	}
 
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, error := client.Do(req)
-	if error != nil {
-		fmt.Println(error)
-		return
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Println(err)
+		return ""
 	}
 	defer resp.Body.Close()
 
@@ -116,18 +115,18 @@ func Post(url string, data []byte, contentType string, head map[string]string) (
 // content:请求放回的内容
 func ZeroTierGet(url string, head map[string]string) (content string, code int) {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return "", 0
+	}
 	for k, v := range head {
 		req.Header.Add(k, v)
 	}
-	if err != nil {
-		panic(err)
-	}
 
 	client := &http.Client{Timeout: 20 * time.Second}
-	resp, error := client.Do(req)
+	resp, err := client.Do(req)
 
-	if error != nil {
-		panic(error)
+	if err != nil {
+		return "", 0
 	}
 	defer resp.Body.Close()
 	code = resp.StatusCode
