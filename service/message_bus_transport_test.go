@@ -160,3 +160,29 @@ func TestMessageBusGeneratedUnaryResponseLimit(t *testing.T) {
 		t.Fatalf("generated unary request error = %v, want response-size error", err)
 	}
 }
+
+func TestMessageBusGeneratedUnaryRequestPathsAreBounded(t *testing.T) {
+	registerRequest, err := message_bus.NewRegisterEventTypesRequest(
+		"http://message-bus.invalid/v2/message_bus",
+		message_bus.RegisterEventTypesJSONRequestBody{},
+	)
+	if err != nil {
+		t.Fatalf("NewRegisterEventTypesRequest returned error: %v", err)
+	}
+	if !isMessageBusUnaryRequest(registerRequest) {
+		t.Fatalf("generated Register path %q was not classified as unary", registerRequest.URL.Path)
+	}
+
+	publishRequest, err := message_bus.NewPublishEventRequest(
+		"http://message-bus.invalid/v2/message_bus",
+		"casaos",
+		"casaos:test",
+		message_bus.PublishEventJSONRequestBody{},
+	)
+	if err != nil {
+		t.Fatalf("NewPublishEventRequest returned error: %v", err)
+	}
+	if !isMessageBusUnaryRequest(publishRequest) {
+		t.Fatalf("generated Publish path %q was not classified as unary", publishRequest.URL.Path)
+	}
+}
