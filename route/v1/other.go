@@ -1,7 +1,9 @@
 package v1
 
 import (
+	"errors"
 	"fmt"
+	"net/http"
 
 	"github.com/IceWhaleTech/CasaOS/model"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/common_err"
@@ -9,16 +11,32 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
-func GetSearchResult(ctx echo.Context) error {
-	json := make(map[string]string)
-	ctx.Bind(&json)
-	url := json["url"]
+const maxSearchRequestBodySize int64 = 8 << 10
 
-	if url == "" {
+type searchRequest struct {
+	URL string `json:"url"`
+}
+
+func GetSearchResult(ctx echo.Context) error {
+	request := searchRequest{}
+	if err := bindBoundedFileJSON(ctx, &request, maxSearchRequestBodySize); err != nil {
+		status := http.StatusBadRequest
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		return ctx.JSON(status, model.Result{
+			Success: common_err.INVALID_PARAMS,
+			Message: common_err.GetMsg(common_err.INVALID_PARAMS),
+			Data:    "invalid search request",
+		})
+	}
+
+	if request.URL == "" {
 		return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS), Data: "key is empty"})
 	}
 	// data, err := service.MyService.Other().Search(key)
-	data, err := service.MyService.Other().AgentSearch(url)
+	data, err := service.MyService.Other().AgentSearch(request.URL)
 	if err != nil {
 		fmt.Println(err)
 		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
