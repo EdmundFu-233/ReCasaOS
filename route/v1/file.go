@@ -157,6 +157,26 @@ func respondManagedMutationFailure(ctx echo.Context, err error) error {
 }
 
 func respondV1UploadFailure(ctx echo.Context, err error) error {
+	if errors.Is(err, filesecurity.ErrUploadSpaceInsufficient) || errors.Is(err, filesecurity.ErrUploadSpaceUnavailable) {
+		statusCode := http.StatusInsufficientStorage
+		if errors.Is(err, filesecurity.ErrUploadSpaceUnavailable) {
+			statusCode = http.StatusServiceUnavailable
+		}
+		status := "FAILED"
+		if filesecurity.ManagedMutationChanged(err) {
+			status = "PARTIAL"
+		}
+		return ctx.JSON(statusCode, model.Result{
+			Success: common_err.SERVICE_ERROR,
+			Message: err.Error(),
+			Data: map[string]interface{}{
+				"status":             status,
+				"changed":            filesecurity.ManagedMutationChanged(err),
+				"durability_unknown": filesecurity.ManagedMutationDurabilityUnknown(err),
+				"error":              err.Error(),
+			},
+		})
+	}
 	if !filesecurity.ManagedMutationChanged(err) && errors.Is(err, errUploadTooLarge) {
 		return ctx.JSON(http.StatusRequestEntityTooLarge, model.Result{
 			Success: common_err.INVALID_PARAMS,
@@ -775,16 +795,21 @@ func PostFileUpload(ctx echo.Context) error {
 		return respondV1UploadFailure(ctx, changedV1UploadErrorIf(namespaceMayHaveChanged, "upload path changed after directory creation", err))
 	}
 
-	if err := writeUploadChunk(roots, paths.chunk, f); err != nil {
+	if err := writeUploadChunkWithSpace(roots, paths.chunk, f, fileHeader.Size); err != nil {
 		return respondV1UploadFailure(ctx, changedV1UploadErrorIf(namespaceMayHaveChanged, "upload directories may have changed before chunk publication failed", err))
 	}
 
-	complete, err := allV1ChunksPresent(roots, base, paths.tempRelative, totalChunks)
+	complete, assemblyBytes, err := allV1ChunksPresent(roots, base, paths.tempRelative, totalChunks)
 	if err != nil {
 		return respondV1UploadFailure(ctx, changedV1UploadError("upload chunk published before chunk-set validation failed", err))
 	}
 	if complete {
+		assemblySpaceRelease, spaceErr := filesecurity.ReserveUploadSpace(roots, filepath.Dir(paths.target), uint64(assemblyBytes))
+		if spaceErr != nil {
+			return respondV1UploadFailure(ctx, changedV1UploadError("upload chunks published before assembly space admission failed", spaceErr))
+		}
 		assemblyResult, assemblyErr := assembleV1Upload(roots, base, relative, paths.tempRelative, paths.assembly, paths.target, totalChunks)
+		assemblySpaceRelease()
 		if assemblyResult.TargetPublished {
 			uploadSession.completed = true
 			uploadSession.completedAt = time.Now()
@@ -1172,6 +1197,18 @@ func writeUploadChunk(roots *filesecurity.ManagedRoots, destination string, sour
 	return writeUploadChunkWithLimit(roots, destination, source, filesecurity.MaxUploadChunkSize)
 }
 
+func writeUploadChunkWithSpace(roots *filesecurity.ManagedRoots, destination string, source io.Reader, expectedSize int64) error {
+	if expectedSize < 0 || expectedSize > filesecurity.MaxUploadChunkSize {
+		return errUploadTooLarge
+	}
+	release, err := filesecurity.ReserveUploadSpace(roots, filepath.Dir(destination), uint64(expectedSize))
+	if err != nil {
+		return err
+	}
+	defer release()
+	return writeUploadChunkWithLimit(roots, destination, source, filesecurity.MaxUploadChunkSize)
+}
+
 func writeUploadChunkWithLimit(roots *filesecurity.ManagedRoots, destination string, source io.Reader, limit int64) error {
 	out, err := roots.CreateExclusive(destination, 0o600)
 	if err != nil {
@@ -1194,24 +1231,29 @@ func writeUploadChunkWithLimit(roots *filesecurity.ManagedRoots, destination str
 	return nil
 }
 
-func allV1ChunksPresent(roots *filesecurity.ManagedRoots, base, tempRelative string, totalChunks int64) (bool, error) {
+func allV1ChunksPresent(roots *filesecurity.ManagedRoots, base, tempRelative string, totalChunks int64) (bool, int64, error) {
+	var totalSize int64
 	for chunkNumber := int64(1); chunkNumber <= totalChunks; chunkNumber++ {
 		chunkLocation, err := roots.MatchChild(base, filepath.Join(tempRelative, strconv.FormatInt(chunkNumber, 10)))
 		if err != nil {
-			return false, err
+			return false, 0, err
 		}
 		info, err := roots.Stat(chunkLocation.Canonical)
 		if os.IsNotExist(err) {
-			return false, nil
+			return false, 0, nil
 		}
 		if err != nil {
-			return false, err
+			return false, 0, err
 		}
 		if !info.Mode().IsRegular() || info.Size() > filesecurity.MaxUploadChunkSize {
-			return false, fmt.Errorf("invalid upload chunk %d", chunkNumber)
+			return false, 0, fmt.Errorf("invalid upload chunk %d", chunkNumber)
 		}
+		if info.Size() < 0 || totalSize > filesecurity.MaxUploadTotalSize-info.Size() {
+			return false, 0, fmt.Errorf("assembled upload exceeds %d bytes", filesecurity.MaxUploadTotalSize)
+		}
+		totalSize += info.Size()
 	}
-	return true, nil
+	return true, totalSize, nil
 }
 
 func verifyCompletedV1Upload(session *v1UploadSession, roots v1CompletedUploadIdentityVerifier) error {
