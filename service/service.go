@@ -11,6 +11,11 @@
 package service
 
 import (
+	"context"
+	"net"
+	"net/http"
+	"time"
+
 	"github.com/IceWhaleTech/CasaOS-Common/external"
 	"github.com/IceWhaleTech/CasaOS/codegen/message_bus"
 	"github.com/IceWhaleTech/CasaOS/pkg/config"
@@ -20,9 +25,30 @@ import (
 
 var Cache *cache.Cache
 
+const messageBusRequestTimeout = 3 * time.Second
+
 var (
 	MyService Repository
+
+	messageBusDialer = &net.Dialer{
+		Timeout:   messageBusRequestTimeout,
+		KeepAlive: 30 * time.Second,
+	}
+	messageBusHTTPClient = &http.Client{Transport: newMessageBusTransport(messageBusDialer)}
 )
+
+// UnaryMessageBusClient deliberately excludes MessageBus streaming APIs. Those
+// need lifetime semantics that are different from bounded request/response work.
+type UnaryMessageBusClient interface {
+	PublishEventWithResponse(ctx context.Context, sourceID message_bus.SourceID, name message_bus.EventName, body message_bus.PublishEventJSONRequestBody, reqEditors ...message_bus.RequestEditorFn) (*message_bus.PublishEventResponse, error)
+	RegisterEventTypesWithResponse(ctx context.Context, body message_bus.RegisterEventTypesJSONRequestBody, reqEditors ...message_bus.RequestEditorFn) (*message_bus.RegisterEventTypesResponse, error)
+}
+
+func newMessageBusTransport(dialer *net.Dialer) *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = dialer.DialContext
+	return transport
+}
 
 type Repository interface {
 	Casa() CasaService
@@ -120,8 +146,45 @@ func (c *store) Health() HealthService {
 	return c.health
 }
 
+type boundedUnaryMessageBusClient struct {
+	delegate       UnaryMessageBusClient
+	requestTimeout time.Duration
+}
+
+var _ UnaryMessageBusClient = (*boundedUnaryMessageBusClient)(nil)
+
+func newBoundedUnaryMessageBusClient(delegate UnaryMessageBusClient, timeout time.Duration) *boundedUnaryMessageBusClient {
+	return &boundedUnaryMessageBusClient{
+		delegate:       delegate,
+		requestTimeout: timeout,
+	}
+}
+
+func (c *boundedUnaryMessageBusClient) PublishEventWithResponse(ctx context.Context, sourceID message_bus.SourceID, name message_bus.EventName, body message_bus.PublishEventJSONRequestBody, reqEditors ...message_bus.RequestEditorFn) (*message_bus.PublishEventResponse, error) {
+	requestContext, cancel := context.WithTimeout(ctx, c.requestTimeout)
+	defer cancel()
+	return c.delegate.PublishEventWithResponse(requestContext, sourceID, name, body, reqEditors...)
+}
+
+func (c *boundedUnaryMessageBusClient) RegisterEventTypesWithResponse(ctx context.Context, body message_bus.RegisterEventTypesJSONRequestBody, reqEditors ...message_bus.RequestEditorFn) (*message_bus.RegisterEventTypesResponse, error) {
+	requestContext, cancel := context.WithTimeout(ctx, c.requestTimeout)
+	defer cancel()
+	return c.delegate.RegisterEventTypesWithResponse(requestContext, body, reqEditors...)
+}
+
+// UnaryMessageBus returns the bounded request/response capability used by the
+// main service. The raw Repository accessor remains available for separately
+// designed streaming lifetimes.
+func UnaryMessageBus() UnaryMessageBusClient {
+	return unaryMessageBusFor(MyService)
+}
+
+func unaryMessageBusFor(repository Repository) UnaryMessageBusClient {
+	return newBoundedUnaryMessageBusClient(repository.MessageBus(), messageBusRequestTimeout)
+}
+
 func (c *store) MessageBus() *message_bus.ClientWithResponses {
-	client, _ := message_bus.NewClientWithResponses("", func(c *message_bus.Client) error {
+	client, _ := message_bus.NewClientWithResponses("", message_bus.WithHTTPClient(messageBusHTTPClient), func(c *message_bus.Client) error {
 		// error will never be returned, as we always want to return a client, even with wrong address,
 		// in order to avoid panic.
 		//
