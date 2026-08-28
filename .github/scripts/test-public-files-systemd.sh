@@ -1590,6 +1590,32 @@ storage_worker_count() {
   fi
 }
 
+# A multithreaded worker can become a zombie leader after SIGKILL while its
+# surviving D-state task remains in the service cgroup. pgrep cannot reliably
+# enumerate that leader once its command line has disappeared, so callers that
+# already captured the exact worker identities must reject only newly observed
+# worker PIDs instead of requiring a second direct-child count of four.
+hostile_storage_workers_have_no_unexpected_pids() {
+  local found
+  local known_pid
+  local pids
+  local worker_pid
+
+  pids="$(storage_worker_pids)" || return 1
+  while IFS= read -r worker_pid; do
+    [[ -n "$worker_pid" ]] || continue
+    [[ "$worker_pid" =~ ^[0-9]+$ && "$worker_pid" -gt 1 ]] || return 1
+    found=0
+    for known_pid in "${hostile_worker_pids[@]}"; do
+      if [[ "$worker_pid" == "$known_pid" ]]; then
+        found=1
+        break
+      fi
+    done
+    [[ "$found" == 1 ]] || return 1
+  done <<<"$pids"
+}
+
 slow_download_process_is_live() {
   local expected_start_time=$2
   local process_state
@@ -3960,8 +3986,8 @@ if [[ "$hostile_storage_test_enabled" == 1 ]]; then
     hostile_storage_clients_are_complete
   assert_hostile_storage_client_responses
   assert_hostile_storage_worker_boundaries kill-pending "$portal_pid"
-  [[ "$(storage_worker_count)" == 4 ]] ||
-    fail "hostile-storage timeout did not retain exactly four D-state workers"
+  hostile_storage_workers_have_no_unexpected_pids ||
+    fail "hostile-storage timeout exposed an unexpected worker identity"
 
   hostile_quarantine_headers="${workspace}/hostile-quarantine.headers"
   hostile_quarantine_body="${workspace}/hostile-quarantine.body"
@@ -4019,8 +4045,8 @@ if [[ "$hostile_storage_test_enabled" == 1 ]]; then
     "$hostile_quarantine_headers" "$hostile_quarantine_body"; then
     fail "quarantine response retained a bearer-shaped value"
   fi
-  [[ "$(storage_worker_count)" == 4 ]] ||
-    fail "quarantine admission started an additional storage worker"
+  hostile_storage_workers_have_no_unexpected_pids ||
+    fail "quarantine admission exposed an unexpected worker identity"
   assert_hostile_storage_worker_boundaries kill-pending "$portal_pid"
 
   hostile_tasks_current="$(
