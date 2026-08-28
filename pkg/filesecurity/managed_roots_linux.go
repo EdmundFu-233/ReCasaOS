@@ -25,6 +25,7 @@ const (
 	managedResolvePolicy                        = unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_SYMLINKS
 	managedRootDescriptorName                   = "<managed-root>"
 	managedOpenedPathDescriptorName             = "<managed-opened-path>"
+	managedDirectoryEntryDescriptorName         = "<managed-directory-entry>"
 	managedTemporaryDescriptorName              = "<managed-temporary>"
 	managedRemovalDirectoryDescriptorName       = "<managed-removal-directory>"
 	maxManagedTreeEntries                 int64 = 100_000
@@ -265,6 +266,48 @@ func (m *ManagedRoots) OpenPath(absolutePath string) (*os.File, error) {
 // path must use Match.
 func (m *ManagedRoots) OpenDirectory(absolutePath string) (*os.File, error) {
 	return m.open(absolutePath, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+}
+
+// StatDirectoryEntry binds one validated child name beneath an already-opened
+// managed directory before reading metadata. DirEntry.Info must not be used on
+// managed descriptors because os.File.ReadDir may resolve lazy metadata through
+// the descriptor's deliberately opaque diagnostic name.
+func (m *ManagedRoots) StatDirectoryEntry(directory *os.File, name string) (os.FileInfo, error) {
+	if m == nil || directory == nil {
+		return nil, ErrUnsafePath
+	}
+	opened, err := openManagedDirectoryEntryAt(int(directory.Fd()), name)
+	if err != nil {
+		return nil, err
+	}
+	info, statErr := opened.Stat()
+	closeErr := opened.Close()
+	if statErr != nil || closeErr != nil {
+		return nil, errors.Join(statErr, closeErr)
+	}
+	return info, nil
+}
+
+func openManagedDirectoryEntryAt(directoryFD int, name string) (*os.File, error) {
+	if directoryFD < 0 || ValidatePathComponent(name) != nil {
+		return nil, ErrUnsafePath
+	}
+	// O_PATH|O_NOFOLLOW binds a final symlink or special file as an object for
+	// fstat without opening or following it. The standard managed resolve policy
+	// rejects any unexpected traversal while still allowing mount-point entries.
+	fd, err := unix.Openat2(directoryFD, name, &unix.OpenHow{
+		Flags:   unix.O_PATH | unix.O_CLOEXEC | unix.O_NOFOLLOW,
+		Resolve: managedResolvePolicy,
+	})
+	if err != nil {
+		return nil, classifyManagedResolutionError(err)
+	}
+	opened := os.NewFile(uintptr(fd), managedDirectoryEntryDescriptorName)
+	if opened == nil {
+		unix.Close(fd)
+		return nil, errors.New("open managed directory entry")
+	}
+	return opened, nil
 }
 
 // ChmodDirectory changes only a directory that was resolved beneath a pinned

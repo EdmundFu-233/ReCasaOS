@@ -23,6 +23,7 @@ import (
 
 	"github.com/IceWhaleTech/CasaOS/model"
 	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
+	serviceModel "github.com/IceWhaleTech/CasaOS/service/model"
 	"github.com/moby/sys/mountinfo"
 )
 
@@ -638,4 +639,33 @@ func IsMounted(path string) bool {
 		}
 	}
 	return false
+}
+
+// DirectoryListingMountedPaths snapshots mount table and connection metadata
+// once for a listing. Callers use exact map lookups and never re-resolve or stat
+// each child path, which avoids entering a hostile mounted filesystem.
+func DirectoryListingMountedPaths() map[string]struct{} {
+	mounts, _ := mountinfo.GetMounts(nil)
+	var connections []serviceModel.ConnectionsDBModel
+	if MyService != nil {
+		if connectionService := MyService.Connections(); connectionService != nil {
+			connections, _ = connectionService.GetConnectionsList()
+		}
+	}
+	return directoryListingMountedPathSet(mounts, connections)
+}
+
+func directoryListingMountedPathSet(mounts []*mountinfo.Info, connections []serviceModel.ConnectionsDBModel) map[string]struct{} {
+	result := make(map[string]struct{}, len(mounts)+len(connections))
+	for _, mount := range mounts {
+		if mount != nil && mount.Mountpoint != "" {
+			result[mount.Mountpoint] = struct{}{}
+		}
+	}
+	for _, connection := range connections {
+		if connection.MountPoint != "" {
+			result[connection.MountPoint] = struct{}{}
+		}
+	}
+	return result
 }
