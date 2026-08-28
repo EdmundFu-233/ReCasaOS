@@ -19,6 +19,7 @@ import (
 func InitV1Router() http.Handler {
 	e := echo.New()
 
+	e.Use(rejectCredentialTransport())
 	e.Use(echo_middleware.Gzip())
 	e.Use(echo_middleware.Recover())
 	e.Use(safeRequestLogger())
@@ -47,7 +48,7 @@ func InitV1Router() http.Handler {
 
 			return claims, nil
 		},
-		TokenLookup: "header:Authorization,query:token",
+		TokenLookup: "header:Authorization",
 	}))
 	{
 
