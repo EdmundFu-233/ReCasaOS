@@ -30,6 +30,30 @@ func TestReadCasaOSLogTailReturnsRequestedCompleteLines(t *testing.T) {
 	}
 }
 
+func TestReadCasaOSLogTailUsesDefaultForNonPositiveLineLimit(t *testing.T) {
+	t.Parallel()
+
+	file, err := os.CreateTemp(t.TempDir(), "casaos-log-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if _, err := file.WriteString("line-1\nline-2\nline-3\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := file.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readCasaOSLogTail(file, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "line-1\nline-2\nline-3\n" {
+		t.Fatalf("default tail = %q, want %q", got, "line-1\nline-2\nline-3\n")
+	}
+}
+
 func TestReadCasaOSLogTailBoundsLargeFilesAndDiscardsPartialPrefix(t *testing.T) {
 	t.Parallel()
 
