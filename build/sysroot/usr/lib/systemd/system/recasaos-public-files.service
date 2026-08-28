@@ -1,6 +1,7 @@
 [Unit]
 Description=ReCasaOS isolated public-file portal
 ConditionPathIsDirectory=/srv/recasaos-public
+ConditionPathIsSymbolicLink=!/srv/recasaos-public
 ConditionFileNotEmpty=/etc/recasaos/public-file.verifier
 ConditionPathIsSymbolicLink=!/etc/recasaos/public-file.verifier
 # MemorySwapMax is effective only on the unified hierarchy. Refuse to start or
