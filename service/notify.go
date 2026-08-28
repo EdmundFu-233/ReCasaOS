@@ -62,7 +62,7 @@ func (i *notifyServer) SendNotify(name string, message map[string]interface{}) {
 		bt, _ := json.Marshal(v)
 		msg[k] = string(bt)
 	}
-	response, err := MyService.MessageBus().PublishEventWithResponse(context.Background(), common.SERVICENAME, name, msg)
+	response, err := UnaryMessageBus().PublishEventWithResponse(context.Background(), common.SERVICENAME, name, msg)
 	if err != nil {
 		logger.Error("failed to publish event to message bus", zap.Error(err))
 		return
@@ -177,7 +177,7 @@ func publishFileOperationNotifications(files []notify.File) bool {
 		logger.Error("failed to encode file operation notification", zap.Error(err))
 		return false
 	}
-	response, err := MyService.MessageBus().PublishEventWithResponse(context.Background(), common.SERVICENAME, "casaos:file:operate", map[string]string{"file_operate": string(payload)})
+	response, err := UnaryMessageBus().PublishEventWithResponse(context.Background(), common.SERVICENAME, "casaos:file:operate", map[string]string{"file_operate": string(payload)})
 	if err != nil {
 		logger.Error("failed to publish event to message bus", zap.Error(err))
 		return false
