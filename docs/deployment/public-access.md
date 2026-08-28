@@ -995,8 +995,9 @@ authentication fails.
 Choose one example:
 
 - `deploy/caddy/Caddyfile.example` requires stock Caddy 2.11.4 or newer;
-- `deploy/nginx/recasaos.conf.example` is intended for a current Nginx `http`
-  context.
+- `deploy/nginx/recasaos.conf.example` is intended for a patched Nginx `http`
+  context and uses the portable `listen ... ssl http2` syntax supported by the
+  Ubuntu 24.04 Nginx 1.24 package as well as newer releases.
 
 Before enabling either:
 
@@ -1020,6 +1021,16 @@ Before enabling either:
    are responses, so large files do not require a large request limit.
 8. Keep the edge proxy on a currently supported, fully patched release. The
    Caddy minimum is a security boundary, not permission to defer later patches.
+
+The Nginx example includes explicit default servers for the documented public
+addresses. An unknown plaintext `Host` receives `444`, and an unknown or
+missing TLS SNI is rejected during the handshake with
+`ssl_reject_handshake on`. A valid SNI paired with an unrelated HTTP `Host`
+also receives `444`; neither default server has a location or upstream.
+Keep these defaults when replacing the documentation addresses. They prevent
+direct-IP, unrelated-host, and no-SNI traffic from selecting the portal vhost;
+they do not replace certificate hostname validation or the external port and
+firewall checks below.
 
 Keep Caddy's `flush_interval` unset as the supplied example does. Caddy's
 default behavior partially buffers responses and allows a downstream client
