@@ -1,7 +1,9 @@
 package v1
 
 import (
+	"errors"
 	"fmt"
+	"net/http"
 
 	"github.com/IceWhaleTech/CasaOS/model"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/common_err"
@@ -9,11 +11,35 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
-func GetSearchResult(ctx echo.Context) error {
-	json := make(map[string]string)
-	ctx.Bind(&json)
-	url := json["url"]
+const maxSearchRequestBodySize int64 = 8 << 10
 
+func bindSearchRequest(ctx echo.Context) (map[string]string, error) {
+	request := ctx.Request()
+	request.Body = http.MaxBytesReader(ctx.Response().Writer, request.Body, maxSearchRequestBodySize)
+
+	values := make(map[string]string)
+	if err := ctx.Bind(&values); err != nil {
+		return nil, err
+	}
+	return values, nil
+}
+
+func GetSearchResult(ctx echo.Context) error {
+	values, err := bindSearchRequest(ctx)
+	if err != nil {
+		status := http.StatusBadRequest
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		return ctx.JSON(status, model.Result{
+			Success: common_err.INVALID_PARAMS,
+			Message: common_err.GetMsg(common_err.INVALID_PARAMS),
+			Data:    "invalid search request",
+		})
+	}
+
+	url := values["url"]
 	if url == "" {
 		return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS), Data: "key is empty"})
 	}
