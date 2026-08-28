@@ -36,13 +36,14 @@ var upgrader = websocket.Upgrader{
 }
 
 const (
-	sshHandshakeTimeout     = 10 * time.Second
-	sshTicketLifetime       = 30 * time.Second
-	sshTicketCookieName     = "recasaos_ssh_ticket"
-	maxPendingSSHTickets    = 64
-	sshWebSocketWriteWait   = 10 * time.Second
-	sshWebSocketMaxLifetime = 12 * time.Hour
-	sshOutputChunkSize      = 32 << 10
+	sshHandshakeTimeout        = 10 * time.Second
+	sshTicketLifetime          = 30 * time.Second
+	sshTicketCookieName        = "recasaos_ssh_ticket"
+	maxPendingSSHTickets       = 64
+	maxSSHLoginRequestBodySize = 16 << 10
+	sshWebSocketWriteWait      = 10 * time.Second
+	sshWebSocketMaxLifetime    = 12 * time.Hour
+	sshOutputChunkSize         = 32 << 10
 )
 
 var sshWebSocketSlots = make(chan struct{}, 16)
@@ -72,6 +73,11 @@ type sshTicketRegistry struct {
 var pendingSSHTickets = sshTicketRegistry{tickets: make(map[string]sshTicket)}
 
 func PostSshLogin(ctx echo.Context) error {
+	ctx.Request().Body = http.MaxBytesReader(
+		ctx.Response().Writer,
+		ctx.Request().Body,
+		maxSSHLoginRequestBodySize,
+	)
 	j := make(map[string]string)
 	if err := ctx.Bind(&j); err != nil {
 		return ctx.JSON(common_err.CLIENT_ERROR, modelCommon.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
