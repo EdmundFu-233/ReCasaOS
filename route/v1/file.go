@@ -79,7 +79,15 @@ const (
 	maxFileOperationRequestBodySize     int64 = 256 << 10
 	maxSmallFileJSONRequestBodySize     int64 = 64 << 10
 	maxFileDeleteItems                        = 16
+	// Path-only legacy UI callers expect a complete list and ignore pagination.
+	// The service bounds this compatibility mode at its raw scan limit; explicit
+	// pagination remains capped at ManagedDirectoryPageLimit.
+	defaultManagedDirectoryPageSize = service.ManagedDirectoryLegacyPageSize
+	managedDirectoryLimitMessage    = "directory listing exceeds the safe entry limit"
+	managedDirectoryBusyMessage     = "directory listing capacity is temporarily busy"
 )
+
+var errInvalidManagedDirectoryPagination = errors.New("invalid managed directory pagination")
 
 type filePathRequest struct {
 	Path string `json:"path"`
@@ -110,6 +118,58 @@ func bindBoundedFileJSON(ctx echo.Context, destination interface{}, maximum int6
 
 func validManagedRequestPath(path string) bool {
 	return path != "" && filepath.IsAbs(path) && strings.IndexByte(path, 0) < 0
+}
+
+func parseManagedDirectoryPagination(rawQuery string) (int, int, error) {
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return 0, 0, errInvalidManagedDirectoryPagination
+	}
+	_, hasIndex := values["index"]
+	_, hasSize := values["size"]
+	if hasIndex != hasSize {
+		return 0, 0, errInvalidManagedDirectoryPagination
+	}
+	if !hasIndex {
+		return 1, defaultManagedDirectoryPageSize, nil
+	}
+	index, err := parseManagedDirectoryPositiveInt(values, "index", 1)
+	if err != nil {
+		return 0, 0, err
+	}
+	size, err := parseManagedDirectoryPositiveInt(values, "size", defaultManagedDirectoryPageSize)
+	if err != nil || size > service.ManagedDirectoryPageLimit {
+		return 0, 0, errInvalidManagedDirectoryPagination
+	}
+	maxInt := int(^uint(0) >> 1)
+	if index-1 > maxInt/size {
+		return 0, 0, errInvalidManagedDirectoryPagination
+	}
+	return index, size, nil
+}
+
+func parseManagedDirectoryPositiveInt(values url.Values, name string, defaultValue int) (int, error) {
+	provided, ok := values[name]
+	if !ok {
+		return defaultValue, nil
+	}
+	if len(provided) != 1 || provided[0] == "" {
+		return 0, errInvalidManagedDirectoryPagination
+	}
+	for index := range provided[0] {
+		if provided[0][index] < '0' || provided[0][index] > '9' {
+			return 0, errInvalidManagedDirectoryPagination
+		}
+	}
+	parsed, err := strconv.Atoi(provided[0])
+	if err != nil || parsed <= 0 {
+		return 0, errInvalidManagedDirectoryPagination
+	}
+	return parsed, nil
+}
+
+func managedDirectoryNeedsMountedExtensions(path string) bool {
+	return path == "/mnt" || strings.HasPrefix(path, "/mnt/") || path == "/media" || strings.HasPrefix(path, "/media/")
 }
 
 func managedRoutePathsOverlap(first, second string) bool {
@@ -475,72 +535,82 @@ func archiveContentType(extension string) string {
 // @Router /file/dirpath [get]
 func DirPath(ctx echo.Context) error {
 	var req ListReq
-	path := ctx.QueryParam("path")
-	req.Path = path
-	req.Validate()
-	info, err := service.MyService.System().GetDirPath(req.Path)
+	index, size, err := parseManagedDirectoryPagination(ctx.Request().URL.RawQuery)
 	if err != nil {
-		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
+		return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
+	}
+	release, err := service.AcquireManagedDirectoryListing(ctx.Request().Context())
+	if err != nil {
+		return respondManagedDirectoryListingFailure(ctx, err)
+	}
+	defer release()
+	req.Path = ctx.QueryParam("path")
+	req.Index = index
+	req.Size = size
+	info, total, err := service.MyService.System().GetDirPathPage(ctx.Request().Context(), req.Path, req.Index, req.Size)
+	if err != nil {
+		return respondManagedDirectoryListingFailure(ctx, err)
+	}
+	if err := ctx.Request().Context().Err(); err != nil {
+		return err
 	}
 	shares := service.MyService.Shares().GetSharesList()
+	if err := ctx.Request().Context().Err(); err != nil {
+		return err
+	}
 	sharesMap := make(map[string]string)
 	for _, v := range shares {
 		sharesMap[v.Path] = fmt.Sprint(v.ID)
 	}
-	// if len(info) <= (req.Page-1)*req.Size {
-	// 	return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.CLIENT_ERROR, Message: common_err.GetMsg(common_err.INVALID_PARAMS), Data: "page out of range"})
-	// 	return
-	// }
-	forEnd := req.Index * req.Size
-	if forEnd > len(info) {
-		forEnd = len(info)
-	}
-	for i := (req.Index - 1) * req.Size; i < forEnd; i++ {
+	for i := range info {
 		if v, ok := sharesMap[info[i].Path]; ok {
-			ex := make(map[string]interface{})
-			shareEx := make(map[string]string)
-			shareEx["shared"] = "true"
-			shareEx["id"] = v
-			ex["share"] = shareEx
-			ex["mounted"] = false
-			info[i].Extensions = ex
-		}
-	}
-	if strings.HasPrefix(req.Path, "/mnt") || strings.HasPrefix(req.Path, "/media") {
-		for i := (req.Index - 1) * req.Size; i < forEnd; i++ {
 			ex := info[i].Extensions
 			if ex == nil {
 				ex = make(map[string]interface{})
 			}
-			mounted := service.IsMounted(info[i].Path)
+			shareEx := make(map[string]string)
+			shareEx["shared"] = "true"
+			shareEx["id"] = v
+			ex["share"] = shareEx
+			if _, exists := ex["mounted"]; !exists {
+				ex["mounted"] = false
+			}
+			info[i].Extensions = ex
+		}
+	}
+	if managedDirectoryNeedsMountedExtensions(req.Path) {
+		if err := ctx.Request().Context().Err(); err != nil {
+			return err
+		}
+		mountedPaths := service.DirectoryListingMountedPaths()
+		if err := ctx.Request().Context().Err(); err != nil {
+			return err
+		}
+		for i := range info {
+			ex := info[i].Extensions
+			if ex == nil {
+				ex = make(map[string]interface{})
+			}
+			_, mounted := mountedPaths[info[i].Path]
 			ex["mounted"] = mounted
 			info[i].Extensions = ex
 		}
 	}
-	// Hide the files or folders in operation
-	fileQueue := service.ActiveFileOperationTargets()
-
 	pathList := []ObjResp{}
-	for i := (req.Index - 1) * req.Size; i < forEnd; i++ {
-		if info[i].Name == ".temp" && info[i].IsDir {
-			continue
-		}
-		if _, ok := fileQueue[info[i].Path]; !ok {
-			t := ObjResp{}
-			t.IsDir = info[i].IsDir
-			t.Name = info[i].Name
-			t.Modified = info[i].Date
-			t.Date = info[i].Date
-			t.Size = info[i].Size
-			t.Path = info[i].Path
-			t.Extensions = info[i].Extensions
-			pathList = append(pathList, t)
-
-		}
+	for i := range info {
+		t := ObjResp{}
+		t.IsDir = info[i].IsDir
+		t.Name = info[i].Name
+		t.Modified = info[i].Date
+		t.Date = info[i].Date
+		t.Size = info[i].Size
+		t.Path = info[i].Path
+		t.Extensions = info[i].Extensions
+		pathList = append(pathList, t)
 	}
 	flist := FsListResp{
 		Content: pathList,
-		Total:   int64(len(info)),
+		Total:   total,
 		// Readme:   "",
 		// Write:    true,
 		// Provider: "local",
@@ -548,6 +618,28 @@ func DirPath(ctx echo.Context) error {
 		Size:  req.Size,
 	}
 	return ctx.JSON(common_err.SUCCESS, model.Result{Success: common_err.SUCCESS, Message: common_err.GetMsg(common_err.SUCCESS), Data: flist})
+}
+
+func respondManagedDirectoryListingFailure(ctx echo.Context, err error) error {
+	switch {
+	case errors.Is(err, service.ErrManagedDirectoryScanLimit):
+		return ctx.JSON(http.StatusUnprocessableEntity, model.Result{
+			Success: common_err.FILE_READ_ERROR,
+			Message: common_err.GetMsg(common_err.FILE_READ_ERROR),
+			Data:    managedDirectoryLimitMessage,
+		})
+	case errors.Is(err, service.ErrManagedDirectoryListingBusy):
+		ctx.Response().Header().Set("Retry-After", "1")
+		return ctx.JSON(http.StatusServiceUnavailable, model.Result{
+			Success: common_err.SERVICE_ERROR,
+			Message: common_err.GetMsg(common_err.SERVICE_ERROR),
+			Data:    managedDirectoryBusyMessage,
+		})
+	case errors.Is(err, service.ErrInvalidManagedDirectoryPage):
+		return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
+	default:
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
+	}
 }
 
 // @Summary rename file or dir
