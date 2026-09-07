@@ -108,7 +108,7 @@ func v2JWTConfig() echojwt.Config {
 
 			return claims, nil
 		},
-		TokenLookup: "header:Authorization",
+		TokenLookup: "header:Authorization:Bearer ",
 	}
 }
 

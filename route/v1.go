@@ -34,22 +34,7 @@ func InitV1Router() http.Handler {
 	v1Group := e.Group("/v1")
 	//	e.Any("/v1/test", v1.CheckNetwork)
 	v1Group.Use(privateNoStoreResponses())
-	v1Group.Use(echojwt.WithConfig(echojwt.Config{
-		Skipper: func(c echo.Context) bool {
-			return httpsecurity.LoopbackAuthBypassAllowed(c.Request())
-		},
-		ParseTokenFunc: func(c echo.Context, token string) (interface{}, error) {
-			claims, err := authsecurity.ValidateAccessToken(token, func() (*ecdsa.PublicKey, error) { return external.GetPublicKey(config.CommonInfo.RuntimePath) })
-			if err != nil {
-				return nil, echo.ErrUnauthorized
-			}
-
-			c.Request().Header.Set("user_id", strconv.Itoa(claims.ID))
-
-			return claims, nil
-		},
-		TokenLookup: "header:Authorization",
-	}))
+	v1Group.Use(echojwt.WithConfig(v1JWTConfig()))
 	{
 
 		v1SysGroup := v1Group.Group("/sys")
@@ -186,4 +171,21 @@ func InitV1Router() http.Handler {
 	}
 
 	return httpsecurity.WithSecurityHeaders(httpsecurity.WithCORS(e, httpsecurity.AllowedOriginsFromEnv()))
+}
+
+func v1JWTConfig() echojwt.Config {
+	return echojwt.Config{
+		Skipper: func(c echo.Context) bool {
+			return httpsecurity.LoopbackAuthBypassAllowed(c.Request())
+		},
+		ParseTokenFunc: func(c echo.Context, token string) (interface{}, error) {
+			claims, err := authsecurity.ValidateAccessToken(token, func() (*ecdsa.PublicKey, error) { return external.GetPublicKey(config.CommonInfo.RuntimePath) })
+			if err != nil {
+				return nil, echo.ErrUnauthorized
+			}
+			c.Request().Header.Set("user_id", strconv.Itoa(claims.ID))
+			return claims, nil
+		},
+		TokenLookup: "header:Authorization:Bearer ",
+	}
 }
