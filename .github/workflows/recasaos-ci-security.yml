@@ -164,6 +164,9 @@ jobs:
       - name: Generate API clients
         run: go generate ./...
 
+      - name: Verify API generation failure recovery
+        run: bash .github/scripts/test-api-generation.sh
+
       - name: Verify generated API clients are committed
         run: git diff --exit-code -- codegen/
 
