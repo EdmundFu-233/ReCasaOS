@@ -151,8 +151,8 @@ expect_rejection stale-go-mod go.mod \
   'toolchain go1.26.5' \
   'go.mod must pin exactly one toolchain'
 expect_rejection stale-language-version go.mod \
+  'go 1.26.0' \
   'go 1.25.0' \
-  'go 1.24.0' \
   'go.mod must pin exactly one language version'
 expect_rejection stale-workflow-version \
   .github/workflows/recasaos-ci-security.yml \

@@ -5,6 +5,18 @@ merge-evidence boundary. This runbook does not authorize a deployment, a host
 mount, or a persistent runner. Every privileged test runs on a disposable
 GitHub-hosted Ubuntu VM and inside the existing private mount-namespace guard.
 
+The Debian 11/systemd 247 container and QEMU guest are historical compatibility
+fixtures. Their APT sources use the official Debian and Debian-security
+snapshots at `20260828T000000Z`, avoiding packages disappearing from live
+bullseye mirrors. Only the snapshot sources disable Release `Valid-Until`
+expiry; the Debian archive keyring, Release signatures, and package hashes
+remain required. HTTP bootstrap supports the minimal image before it has CA
+certificates installed; authenticity still comes from those signatures. APT
+index failures remain fatal. This does not extend Debian 11's security support
+or qualify it as a currently supported public deployment platform. See the
+[Debian snapshot usage documentation](https://snapshot.debian.org/#usage) and
+[Debian 11 release information](https://www.debian.org/releases/bullseye/).
+
 ## Why a separate status is required
 
 The primary PR workflow intentionally skips the dedicated privileged mount job

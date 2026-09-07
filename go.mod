@@ -1,6 +1,6 @@
 module github.com/IceWhaleTech/CasaOS
 
-go 1.25.0
+go 1.26.0
 
 toolchain go1.26.6
 
@@ -18,7 +18,7 @@ require (
 	github.com/gomodule/redigo v1.8.9
 	github.com/google/uuid v1.6.0
 	github.com/googollee/go-socket.io v1.7.0
-	github.com/gorilla/websocket v1.5.0
+	github.com/gorilla/websocket v1.5.4-0.20240701034025-d67f41855da4
 	github.com/h2non/filetype v1.1.3
 	github.com/json-iterator/go v1.1.12
 	github.com/labstack/echo-jwt/v4 v4.4.0
@@ -38,7 +38,7 @@ require (
 	github.com/tidwall/gjson v1.17.0
 	go.uber.org/goleak v1.2.1
 	go.uber.org/zap v1.24.0
-	golang.org/x/crypto v0.55.0
+	golang.org/x/crypto v0.56.0
 	golang.org/x/image v0.45.0
 	golang.org/x/mod v0.40.0
 	golang.org/x/net v0.58.0
