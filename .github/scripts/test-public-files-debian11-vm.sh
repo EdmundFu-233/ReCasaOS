@@ -266,6 +266,16 @@ users:
       - $guest_public_key
 ssh_pwauth: false
 disable_root: true
+# Historical compatibility fixture only: retain Debian signature/hash checks
+# while allowing the reviewed snapshot Release metadata to expire.
+apt:
+  preserve_sources_list: false
+  sources_list: |
+    deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian/20260828T000000Z/ bullseye main
+    deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian-security/20260828T000000Z/ bullseye-security main
+  conf: |
+    APT::Update::Error-Mode "any";
+    Acquire::Retries "3";
 package_update: true
 package_upgrade: false
 packages:
