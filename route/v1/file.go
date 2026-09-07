@@ -804,7 +804,7 @@ func PostFileUpload(ctx echo.Context) error {
 		return respondV1UploadFailure(ctx, changedV1UploadError("upload chunk published before chunk-set validation failed", err))
 	}
 	if complete {
-		assemblySpaceRelease, spaceErr := filesecurity.ReserveUploadSpace(roots, filepath.Dir(paths.target), uint64(assemblyBytes))
+		assemblySpaceRelease, spaceErr := filesecurity.ReserveUploadSpace(roots, filepath.Dir(paths.assembly), uint64(assemblyBytes))
 		if spaceErr != nil {
 			return respondV1UploadFailure(ctx, changedV1UploadError("upload chunks published before assembly space admission failed", spaceErr))
 		}
