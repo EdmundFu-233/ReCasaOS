@@ -268,6 +268,9 @@ ssh_pwauth: false
 disable_root: true
 # Historical compatibility fixture only: retain Debian signature/hash checks
 # while allowing the reviewed snapshot Release metadata to expire.
+# The pinned image sets the legacy spelling to true. Cloud-init 20.4 rejects
+# conflicting old/new values, so override both spellings consistently.
+apt_preserve_sources_list: false
 apt:
   preserve_sources_list: false
   sources_list: |
