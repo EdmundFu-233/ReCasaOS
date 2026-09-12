@@ -167,8 +167,25 @@ jobs:
             "$image" \
             /bin/bash -ceu '
               export DEBIAN_FRONTEND=noninteractive
-              apt-get update >/dev/null
-              apt-get install --yes --no-install-recommends systemd >/dev/null
+              # This image qualifies historical systemd 247 compatibility.
+              # Live bullseye security pools can remove packages after LTS.
+              # Only snapshot expiry is waived; Debian signatures and package
+              # hashes remain mandatory, including during HTTP bootstrap.
+              apt_sources=/tmp/recasaos-debian11.sources.list
+              printf "%s\n" \
+                "deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian/20260828T000000Z/ bullseye main" \
+                "deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian-security/20260828T000000Z/ bullseye-security main" \
+                >"$apt_sources"
+              mkdir -p /tmp/recasaos-apt-lists/partial
+              apt_options=(
+                -o "Dir::Etc::sourcelist=$apt_sources"
+                -o Dir::Etc::sourceparts=-
+                -o Dir::State::lists=/tmp/recasaos-apt-lists
+                -o APT::Update::Error-Mode=any
+                -o Acquire::Retries=3
+              )
+              apt-get "${apt_options[@]}" update >/dev/null
+              apt-get "${apt_options[@]}" install --yes --no-install-recommends systemd >/dev/null
 
               set -- $(systemd-analyze --version)
               test "$1" = systemd
