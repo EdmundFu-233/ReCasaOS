@@ -236,25 +236,44 @@ func TestRequestLoggerBoundsLargeUnauthenticatedV1AndV2Requests(t *testing.T) {
 	)
 	largeUserAgent := strings.Repeat("u", 900<<10) + userAgentTail
 	tests := []struct {
-		name       string
-		handler    http.Handler
-		method     string
-		target     string
-		wantStatus map[int]bool
+		name           string
+		handler        http.Handler
+		method         string
+		target         string
+		wantStatus     int
+		wantErrorClass string
 	}{
 		{
-			name:       "v1",
-			handler:    InitV1Router(),
-			method:     http.MethodPost,
-			target:     "http://device.test/v1/file/recovery/inventory?token=" + querySecret,
-			wantStatus: map[int]bool{http.StatusBadRequest: true, http.StatusUnauthorized: true},
+			name:           "v1 query credential",
+			handler:        InitV1Router(),
+			method:         http.MethodPost,
+			target:         "http://device.test/v1/file/recovery/inventory?token=" + querySecret,
+			wantStatus:     http.StatusBadRequest,
+			wantErrorClass: "client_error",
 		},
 		{
-			name:       "v2",
-			handler:    InitV2Router(),
-			method:     http.MethodGet,
-			target:     "http://device.test" + V2APIPath + "/file/upload?token=" + querySecret,
-			wantStatus: map[int]bool{http.StatusUnauthorized: true},
+			name:           "v1 unauthenticated",
+			handler:        InitV1Router(),
+			method:         http.MethodPost,
+			target:         "http://device.test/v1/file/recovery/inventory",
+			wantStatus:     http.StatusUnauthorized,
+			wantErrorClass: "authentication_error",
+		},
+		{
+			name:           "v2 query credential",
+			handler:        InitV2Router(),
+			method:         http.MethodGet,
+			target:         "http://device.test" + V2APIPath + "/file/upload?token=" + querySecret,
+			wantStatus:     http.StatusBadRequest,
+			wantErrorClass: "client_error",
+		},
+		{
+			name:           "v2 unauthenticated",
+			handler:        InitV2Router(),
+			method:         http.MethodGet,
+			target:         "http://device.test" + V2APIPath + "/file/upload",
+			wantStatus:     http.StatusUnauthorized,
+			wantErrorClass: "authentication_error",
 		},
 	}
 
@@ -269,7 +288,7 @@ func TestRequestLoggerBoundsLargeUnauthenticatedV1AndV2Requests(t *testing.T) {
 		request.Header.Set("User-Agent", largeUserAgent)
 		response := httptest.NewRecorder()
 		test.handler.ServeHTTP(response, request)
-		if !test.wantStatus[response.Code] {
+		if response.Code != test.wantStatus {
 			t.Fatalf("%s status = %d, body = %s", test.name, response.Code, response.Body.String())
 		}
 	}
@@ -300,8 +319,8 @@ func TestRequestLoggerBoundsLargeUnauthenticatedV1AndV2Requests(t *testing.T) {
 		if err := json.Unmarshal([]byte(line), &entry); err != nil {
 			t.Fatalf("line %d is not valid JSON: %v: %s", index, err, line)
 		}
-		if entry["error_class"] != "authentication_error" {
-			t.Fatalf("line %d error_class = %#v", index, entry["error_class"])
+		if entry["error_class"] != tests[index].wantErrorClass {
+			t.Fatalf("line %d error_class = %#v, want %q", index, entry["error_class"], tests[index].wantErrorClass)
 		}
 	}
 }

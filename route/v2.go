@@ -71,10 +71,12 @@ func InitV2Router() http.Handler {
 
 	e := echo.New()
 
+	// The request logger is outermost so that rejected credential transport
+	// and unauthenticated traffic cannot suppress their own audit records by
+	// presenting a credential-shaped query parameter.
+	e.Use(safeRequestLogger())
 	e.Use(rejectCredentialTransport())
 	e.Use(echo_middleware.Gzip())
-
-	e.Use(safeRequestLogger())
 
 	e.Use(echojwt.WithConfig(v2JWTConfig()))
 	e.Use(privateNoStoreResponses())
