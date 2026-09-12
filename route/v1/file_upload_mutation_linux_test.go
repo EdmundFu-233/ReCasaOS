@@ -159,7 +159,7 @@ func TestV1UploadPrincipalNamespacesPreventMixedChunkAssembly(t *testing.T) {
 		t.Fatalf("first principal's chunk-two probe saw second principal's chunk: %v", err)
 	}
 	for _, paths := range []v1UploadPaths{firstChunkOne, secondChunkOne} {
-		complete, err := allV1ChunksPresent(roots, paths.base, paths.tempRelative, 2)
+		complete, _, err := allV1ChunksPresent(roots, paths.base, paths.tempRelative, 2)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -251,7 +251,7 @@ func TestV1UploadDoesNotConsumeOrDeleteLegacyUnscopedStaging(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	complete, err := allV1ChunksPresent(roots, paths.base, paths.tempRelative, 2)
+	complete, _, err := allV1ChunksPresent(roots, paths.base, paths.tempRelative, 2)
 	if err != nil {
 		session.lock.Unlock()
 		t.Fatal(err)
