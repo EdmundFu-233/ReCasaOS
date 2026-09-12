@@ -22,6 +22,7 @@ import (
 type FileInfo struct {
 	lock                 sync.Mutex
 	init                 bool
+	principalID          int
 	uploaded             []bool
 	chunkDigests         [][sha256.Size]byte
 	uploadedChunkNum     int64
@@ -101,9 +102,13 @@ const (
 
 func (s *FileUploadService) TestChunk(
 	c echo.Context,
+	principalID int,
 	identifier string,
 	chunkNumber int64,
 ) error {
+	if principalID < 1 {
+		return fmt.Errorf("authenticated upload principal is required")
+	}
 	s.cleanupExpiredUploads(time.Now())
 	if err := validateUploadIdentifier(identifier); err != nil {
 		return err
@@ -116,9 +121,15 @@ func (s *FileUploadService) TestChunk(
 	if err != nil {
 		return err
 	}
+	baseLocation, err := roots.Match(c.QueryParam("path"))
+	if err != nil {
+		return err
+	}
 	targetPath := targetLocation.Canonical
+	basePath := baseLocation.Canonical
+	targetRelative := filepath.Clean(c.QueryParam("relativePath"))
 
-	key := boundUploadIdentifier(identifier, targetPath)
+	key := boundUploadIdentifier(principalID, identifier, targetPath)
 	s.sessionsMu.Lock()
 	fileInfo, ok := s.uploadStatus[key]
 	s.sessionsMu.Unlock()
@@ -131,7 +142,8 @@ func (s *FileUploadService) TestChunk(
 
 	fileInfo.lock.Lock()
 	defer fileInfo.lock.Unlock()
-	if fileInfo.targetPath != targetPath || (!fileInfo.init && !fileInfo.completed) {
+	if !sameServiceUploadNamespace(fileInfo, principalID, roots, basePath, targetPath, targetRelative) ||
+		(!fileInfo.init && !fileInfo.completed) {
 		return fmt.Errorf("file not initialized")
 	}
 	fileInfo.lastActivity = time.Now()
@@ -159,6 +171,7 @@ func (s *FileUploadService) TestChunk(
 
 func (s *FileUploadService) UploadFile(
 	c echo.Context,
+	principalID int,
 	path string,
 	chunkNumber int64,
 	chunkSize int64,
@@ -171,6 +184,9 @@ func (s *FileUploadService) UploadFile(
 	bin *multipart.FileHeader,
 ) error {
 	_ = c
+	if principalID < 1 {
+		return fmt.Errorf("authenticated upload principal is required")
+	}
 	s.cleanupExpiredUploads(time.Now())
 	if err := filesecurity.ValidateChunk(totalChunks, chunkNumber); err != nil {
 		return err
@@ -202,31 +218,36 @@ func (s *FileUploadService) UploadFile(
 	if err != nil {
 		return err
 	}
+	baseLocation, err := roots.Match(path)
+	if err != nil {
+		return err
+	}
 	targetPath := targetLocation.Canonical
-	uploadHash := boundUploadIdentifier(identifier, targetPath)
-	tempRelative := filepath.Join(".temp", "v2-upload-"+uploadHash)
-	tempLocation, err := roots.MatchChild(path, tempRelative)
+	basePath := baseLocation.Canonical
+	key := boundUploadIdentifier(principalID, identifier, targetPath)
+	tempRelative := filepath.Join(".temp", "v2-upload-"+key)
+	tempLocation, err := roots.MatchChild(basePath, tempRelative)
 	if err != nil {
 		return err
 	}
 	tempDir := tempLocation.Canonical
-	chunkLocation, err := roots.MatchChild(path, filepath.Join(tempRelative, strconv.FormatInt(chunkNumber, 10)))
+	chunkLocation, err := roots.MatchChild(basePath, filepath.Join(tempRelative, strconv.FormatInt(chunkNumber, 10)))
 	if err != nil {
 		return err
 	}
 	chunkPath := chunkLocation.Canonical
-	assemblyLocation, err := roots.MatchChild(path, filepath.Join(tempRelative, ".complete"))
+	assemblyLocation, err := roots.MatchChild(basePath, filepath.Join(tempRelative, ".complete"))
 	if err != nil {
 		return err
 	}
 	assemblyPath := assemblyLocation.Canonical
 
-	key := boundUploadIdentifier(identifier, targetPath)
 	candidate := &FileInfo{
 		init:           true,
+		principalID:    principalID,
 		uploaded:       make([]bool, int(totalChunks)),
 		chunkDigests:   make([][sha256.Size]byte, int(totalChunks)),
-		base:           path,
+		base:           basePath,
 		targetPath:     targetPath,
 		targetRelative: filepath.Clean(relativePath),
 		tempRelative:   tempRelative,
@@ -245,7 +266,7 @@ func (s *FileUploadService) UploadFile(
 
 	fileInfo.lock.Lock()
 	if fileInfo.completed {
-		if fileInfo.targetPath != targetPath || fileInfo.totalChunks != totalChunks || fileInfo.totalSize != totalSize || fileInfo.chunkSize != chunkSize {
+		if !sameServiceUploadMetadata(fileInfo, candidate) {
 			fileInfo.lock.Unlock()
 			return fmt.Errorf("identifier is already bound to a completed upload with different metadata")
 		}
@@ -266,7 +287,7 @@ func (s *FileUploadService) UploadFile(
 		}
 		return errors.New("upload session cleanup is pending")
 	}
-	if fileInfo.targetPath != targetPath || fileInfo.totalChunks != totalChunks || fileInfo.totalSize != totalSize || fileInfo.chunkSize != chunkSize {
+	if !sameServiceUploadMetadata(fileInfo, candidate) {
 		fileInfo.lock.Unlock()
 		return fmt.Errorf("identifier is already bound to different upload metadata")
 	}
@@ -274,6 +295,21 @@ func (s *FileUploadService) UploadFile(
 		fileInfo.lock.Unlock()
 		return fmt.Errorf("invalid upload digest state")
 	}
+	// From this point onward use only the immutable location owned by the
+	// session. The request spelling has already been compared exactly after
+	// canonicalization; it must not choose a second staging namespace.
+	roots = fileInfo.roots
+	basePath = fileInfo.base
+	targetPath = fileInfo.targetPath
+	tempRelative = fileInfo.tempRelative
+	tempDir = fileInfo.tempDir
+	assemblyPath = fileInfo.assemblyPath
+	chunkLocation, err = roots.MatchChild(basePath, filepath.Join(tempRelative, strconv.FormatInt(chunkNumber, 10)))
+	if err != nil {
+		fileInfo.lock.Unlock()
+		return fmt.Errorf("resolve bound upload chunk: %w", err)
+	}
+	chunkPath = chunkLocation.Canonical
 	hadPublishedChunks := fileInfo.uploadedChunkNum > 0
 	if err := s.makeUploadDirectory(roots, filepath.Dir(targetPath), 0o750); err != nil {
 		fileInfo.init = false
@@ -285,7 +321,7 @@ func (s *FileUploadService) UploadFile(
 	// MkdirAll does not expose whether it created a prefix. Once it succeeds,
 	// any later failure is conservatively treated as changed.
 	namespaceMayHaveChanged := true
-	checkedTarget, err := roots.MatchChild(path, relativePath)
+	checkedTarget, err := roots.MatchChild(basePath, fileInfo.targetRelative)
 	if err != nil || checkedTarget.Canonical != targetPath {
 		if err == nil {
 			err = filesecurity.ErrUnsafePath
@@ -419,6 +455,30 @@ func (s *FileUploadService) makeUploadDirectory(roots *filesecurity.ManagedRoots
 		return errors.New("upload directory creation is unavailable")
 	}
 	return s.mkdirAll(roots, path, mode)
+}
+
+func sameServiceUploadNamespace(fileInfo *FileInfo, principalID int, roots *filesecurity.ManagedRoots, basePath, targetPath, targetRelative string) bool {
+	return fileInfo != nil && fileInfo.principalID == principalID && fileInfo.roots == roots &&
+		fileInfo.base == basePath && fileInfo.targetPath == targetPath &&
+		fileInfo.targetRelative == targetRelative
+}
+
+func sameServiceUploadMetadata(existing, candidate *FileInfo) bool {
+	return existing != nil && candidate != nil &&
+		sameServiceUploadNamespace(
+			existing,
+			candidate.principalID,
+			candidate.roots,
+			candidate.base,
+			candidate.targetPath,
+			candidate.targetRelative,
+		) &&
+		existing.tempRelative == candidate.tempRelative &&
+		existing.tempDir == candidate.tempDir &&
+		existing.assemblyPath == candidate.assemblyPath &&
+		existing.totalChunks == candidate.totalChunks &&
+		existing.totalSize == candidate.totalSize &&
+		existing.chunkSize == candidate.chunkSize
 }
 
 func changedServiceUploadError(operation string, err error) error {
@@ -677,8 +737,8 @@ func validateChunkShape(chunkNumber, chunkSize, currentChunkSize, totalChunks, t
 	return nil
 }
 
-func boundUploadIdentifier(identifier, targetPath string) string {
-	digest := sha256.Sum256([]byte(identifier + "\x00" + targetPath))
+func boundUploadIdentifier(principalID int, identifier, targetPath string) string {
+	digest := sha256.Sum256([]byte("jwt-user\x00" + strconv.Itoa(principalID) + "\x00" + identifier + "\x00" + targetPath))
 	return hex.EncodeToString(digest[:])
 }
 

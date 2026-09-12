@@ -6,6 +6,7 @@ import (
 	"mime"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -183,6 +184,96 @@ func TestParseSafeQueryIsStrictAndRejectsCredentials(t *testing.T) {
 	}
 }
 
+func TestStaticEntriesRejectEveryNonEmptyQuery(t *testing.T) {
+	const canary = "static-query-canary-do-not-reflect"
+	const errorBody = `{"error":"invalid query"}`
+
+	staticEntries := []struct {
+		name string
+		path string
+	}{
+		{name: "base path", path: BasePath},
+		{name: "base path slash", path: BasePath + "/"},
+		{name: "application script", path: BasePath + "/app.js"},
+		{name: "download worker", path: BasePath + "/download-worker.js"},
+		{name: "stylesheet", path: BasePath + "/style.css"},
+	}
+	queries := []struct {
+		name string
+		raw  string
+	}{
+		{name: "token", raw: "token=" + canary},
+		{name: "uppercase access token", raw: "ACCESS_TOKEN=" + canary},
+		{name: "authorization", raw: "authorization=" + canary},
+		{name: "unknown", raw: "unknown=" + canary},
+		{name: "malformed escape", raw: "%zz"},
+	}
+	securityHeaders := map[string]string{
+		"Cache-Control":                "no-store",
+		"Content-Security-Policy":      "default-src 'none'; script-src 'self'; worker-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+		"Cross-Origin-Opener-Policy":   "same-origin",
+		"Cross-Origin-Resource-Policy": "same-origin",
+		"Permissions-Policy":           "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+		"Referrer-Policy":              "no-referrer",
+		"X-Content-Type-Options":       "nosniff",
+		"X-Frame-Options":              "DENY",
+	}
+
+	portal := &Portal{}
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		t.Run(method, func(t *testing.T) {
+			for _, entry := range staticEntries {
+				t.Run(entry.name, func(t *testing.T) {
+					for _, query := range queries {
+						t.Run(query.name, func(t *testing.T) {
+							request := httptest.NewRequest(method, entry.path, nil)
+							request.URL.RawQuery = query.raw
+							response := httptest.NewRecorder()
+
+							portal.ServeHTTP(response, request)
+
+							if response.Code != http.StatusBadRequest {
+								t.Fatalf("status = %d, want 400", response.Code)
+							}
+							if got := response.Header().Get("Location"); got != "" {
+								t.Fatalf("Location = %q, want empty", got)
+							}
+							if got := response.Header().Get("Content-Type"); got != "application/json; charset=utf-8" {
+								t.Fatalf("Content-Type = %q, want generic JSON error", got)
+							}
+							if got := response.Header().Get("Content-Length"); got != strconv.Itoa(len(errorBody)) {
+								t.Fatalf("Content-Length = %q, want %d", got, len(errorBody))
+							}
+							for name, want := range securityHeaders {
+								if got := response.Header().Get(name); got != want {
+									t.Errorf("%s = %q, want %q", name, got, want)
+								}
+							}
+							for name, values := range response.Header() {
+								for _, value := range values {
+									if strings.Contains(value, canary) {
+										t.Errorf("%s reflected query canary in %q", name, value)
+									}
+								}
+							}
+							if strings.Contains(response.Body.String(), canary) {
+								t.Fatalf("response reflected query canary: %q", response.Body.String())
+							}
+							if method == http.MethodHead {
+								if response.Body.Len() != 0 {
+									t.Fatalf("HEAD body = %q, want empty", response.Body.String())
+								}
+							} else if got := response.Body.String(); got != errorBody {
+								t.Fatalf("body = %q, want %q", got, errorBody)
+							}
+						})
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestBearerAuthorizationRequiresOneExactHeaderToken(t *testing.T) {
 	token := testPublicBearer(31)
 	otherToken := testPublicBearer(99)
@@ -311,6 +402,7 @@ func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *test
 		"window.location.assign(",
 		"window.stop()",
 		"state.frame.src=",
+		"Download stream completed",
 	} {
 		if strings.Contains(script, forbidden) {
 			t.Errorf("app.js contains forbidden credential or buffering primitive %q", forbidden)
@@ -319,6 +411,12 @@ func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *test
 	for _, required := range []string{
 		"const protocolVersion=2",
 		"const fallbackByteLimit=32*1024*1024",
+		"const workerPreparationWaitMs=2*workerReplyTimeoutMs+1000",
+		"let authorizationSession=null",
+		"let workerGeneration=0",
+		"let workerPreparation=null",
+		"const workerGenerationWaiters=new Set()",
+		"let downloadIntent=null",
 		"response.body.getReader()",
 		"received>fallbackByteLimit",
 		"setTimeout(()=>revokeFallbackObjectURL(objectURL),60000)",
@@ -328,7 +426,16 @@ func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *test
 		"credentials:'omit'",
 		"referrerPolicy:'no-referrer'",
 		"Download handed to the browser",
-		"Download stream completed",
+		"workerPreparation.generation===workerGeneration",
+		"const record={generation:generation,promise:preparation}",
+		"if(workerPreparation===record)workerPreparation=null",
+		"workerGenerationWaiters.add(generationChanged)",
+		"workerGenerationWaiters.delete(generationChanged)",
+		"if(generation===workerGeneration)invalidateWorkerPreparation()",
+		"const intent=reserveDownloadIntent(path,entry,session)",
+		"sessionIsActive(intent.session)",
+		"api('api/file',path,intent.session,controller.signal)",
+		"sessionIsActive(pending.session)",
 		"recasaos-download-prepare",
 		"recasaos-download-cancel",
 		"state.navigationProof",
@@ -341,13 +448,109 @@ func TestPublicDownloadClientKeepsCredentialsEphemeralAndFallbackBounded(t *test
 		"form.submit()",
 		"handed:false",
 		"state.handed&&status.status==='completed'",
-		"boundedDownload(path,entry).catch(showError);",
+		"boundedDownload(path,entry,intent).catch(showError);",
 		"Token forgotten after page restore",
 		"const bearerPattern=/^rc1_[A-Za-z0-9_-]{43}$/",
 		"bearerPattern.test(candidate)",
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("app.js is missing %q", required)
+		}
+	}
+}
+
+func TestPublicDownloadPreparationIsTokenFreeSessionBoundAndDeadlineBounded(t *testing.T) {
+	portal := &Portal{}
+	recorder := httptest.NewRecorder()
+	portal.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, BasePath+"/app.js", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("app.js status = %d, want 200", recorder.Code)
+	}
+	script := recorder.Body.String()
+
+	prepareStart := strings.Index(script, "function prepareWorker(){")
+	prepareEnd := strings.Index(script, "async function waitForNativeStreaming(intent){")
+	if prepareStart < 0 || prepareEnd <= prepareStart {
+		t.Fatal("worker preparation lifecycle is unavailable")
+	}
+	preparation := script[prepareStart:prepareEnd]
+	for _, forbidden := range []string{"accessToken", "Authorization", "Bearer ", "token()"} {
+		if strings.Contains(preparation, forbidden) {
+			t.Errorf("worker preparation carries credential primitive %q", forbidden)
+		}
+	}
+
+	downloadStart := strings.Index(script, "async function download(path,entry,session){")
+	downloadEnd := strings.Index(script, "function denyPort(port)")
+	if downloadStart < 0 || downloadEnd <= downloadStart {
+		t.Fatal("download intent lifecycle is unavailable")
+	}
+	download := script[downloadStart:downloadEnd]
+	reserveIndex := strings.Index(download, "const intent=reserveDownloadIntent(path,entry,session)")
+	waitIndex := strings.Index(download, "await waitForNativeStreaming(intent)")
+	revalidateIndex := strings.Index(download, "downloadIntent!==intent||!sessionIsActive(intent.session)")
+	startIndex := strings.Index(download, "nativeReady&&canUseNativeStreaming())await startNativeDownload(path,entry,intent)")
+	if reserveIndex < 0 || waitIndex <= reserveIndex || revalidateIndex <= waitIndex || startIndex <= revalidateIndex {
+		t.Fatal("download does not reserve, wait, revalidate, and start in fail-closed order")
+	}
+
+	waitStart := strings.Index(script, "async function waitForNativeStreaming(intent){")
+	waitEnd := strings.Index(script, "async function load(path,session){")
+	if waitStart < 0 || waitEnd <= waitStart {
+		t.Fatal("worker wait lifecycle is unavailable")
+	}
+	wait := script[waitStart:waitEnd]
+	remainingIndex := strings.Index(wait, "const remaining=deadline-Date.now()")
+	prepareIndex := strings.Index(wait, "const preparation=prepareWorker()")
+	if remainingIndex < 0 || prepareIndex <= remainingIndex {
+		t.Fatal("worker wait can start a new preparation after its deadline")
+	}
+
+	boundedStart := strings.Index(script, "async function boundedDownload(path,entry,intent){")
+	boundedEnd := strings.Index(script, "function reserveDownloadIntent(path,entry,session){")
+	if boundedStart < 0 || boundedEnd <= boundedStart {
+		t.Fatal("bounded fallback lifecycle is unavailable")
+	}
+	bounded := script[boundedStart:boundedEnd]
+	readIndex := strings.Index(bounded, "const result=await reader.read()")
+	revokeIndex := strings.Index(bounded, "revokeFallbackObjectURL()")
+	if readIndex < 0 || revokeIndex < 0 {
+		t.Fatal("bounded fallback byte lifecycle is unavailable")
+	}
+	readSessionIndex := strings.Index(bounded[readIndex:], "if(!sessionIsActive(intent.session))")
+	if readSessionIndex >= 0 {
+		readSessionIndex += readIndex
+	}
+	finalSessionIndex := strings.LastIndex(bounded[:revokeIndex], "if(!sessionIsActive(intent.session))")
+	if readSessionIndex <= readIndex || finalSessionIndex <= readSessionIndex {
+		t.Fatal("bounded fallback can consume or hand off bytes after its authorization session becomes stale")
+	}
+
+	challengeStart := strings.Index(script, "function handleWorkerChallenge(event){")
+	challengeEnd := strings.Index(script, "function showError(error)")
+	if challengeStart < 0 || challengeEnd <= challengeStart {
+		t.Fatal("worker challenge lifecycle is unavailable")
+	}
+	challenge := script[challengeStart:challengeEnd]
+	sessionIndex := strings.Index(challenge, "sessionIsActive(pending.session)")
+	tokenIndex := strings.Index(challenge, "token:accessToken")
+	if sessionIndex < 0 || tokenIndex <= sessionIndex {
+		t.Fatal("worker challenge can send a token before validating its authorization session")
+	}
+
+	for _, required := range []string{
+		"const workerPreparationWaitMs=2*workerReplyTimeoutMs+1000",
+		"timer=setTimeout(()=>finish('timeout'),timeoutMs)",
+		"for(const wake of workerGenerationWaiters)wake()",
+		"if(generation===workerGeneration)invalidateWorkerPreparation()",
+		"navigator.serviceWorker.addEventListener('controllerchange',()=>{clearNativeState();invalidateWorkerPreparation()",
+		"function invalidateAuthorizationSession(){",
+		"accessToken='';authorizationSession=null;downloadIntent=null",
+		"clearBrowserListing()",
+		"if(sessionIsActive(session))download(child,entry,session)",
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("bounded preparation lifecycle is missing %q", required)
 		}
 	}
 }

@@ -185,6 +185,10 @@ func (p *Portal) Close() error {
 func (p *Portal) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w = &securityResponseWriter{ResponseWriter: w}
 	setSecurityHeaders(w.Header())
+	if r.URL.RawQuery != "" && isStaticEntryPath(r.URL.Path) {
+		writeError(w, r, http.StatusBadRequest, "invalid query")
+		return
+	}
 
 	switch r.URL.Path {
 	case BasePath:
@@ -209,6 +213,19 @@ func (p *Portal) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.serveFile(w, r)
 	default:
 		writeError(w, r, http.StatusNotFound, "not found")
+	}
+}
+
+func isStaticEntryPath(requestPath string) bool {
+	switch requestPath {
+	case BasePath,
+		BasePath + "/",
+		BasePath + "/app.js",
+		BasePath + "/download-worker.js",
+		BasePath + "/style.css":
+		return true
+	default:
+		return false
 	}
 }
 

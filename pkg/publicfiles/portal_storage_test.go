@@ -87,6 +87,57 @@ func TestPortalDoesNotUseModificationTimeAsRangeValidator(t *testing.T) {
 	}
 }
 
+func TestAPIPathsStillAcceptOnePathQueryParameter(t *testing.T) {
+	t.Parallel()
+
+	const fileContent = "report content"
+	backend := &scriptedStorageBackend{
+		listFn: func(_ context.Context, relativePath string, _ int) ([]Entry, error) {
+			if relativePath != "folder" {
+				t.Fatalf("list path = %q, want folder", relativePath)
+			}
+			return []Entry{}, nil
+		},
+		openFn: func(_ context.Context, relativePath string) (storageFile, fileInfo, error) {
+			if relativePath != "report.txt" {
+				t.Fatalf("file path = %q, want report.txt", relativePath)
+			}
+			return &memoryStorageFile{Reader: bytes.NewReader([]byte(fileContent))}, testStorageFileInfo{
+				name: "report.txt",
+				size: int64(len(fileContent)),
+			}, nil
+		},
+	}
+	bearer := testPublicBearer(73)
+	portal := testPortalWithStorage(backend, bearer)
+
+	tests := []struct {
+		name     string
+		endpoint string
+	}{
+		{name: "directory list", endpoint: BasePath + "/api/list?path=folder"},
+		{name: "file download", endpoint: BasePath + "/api/file?path=report.txt"},
+	}
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		for _, test := range tests {
+			t.Run(method+"/"+test.name, func(t *testing.T) {
+				request := httptest.NewRequest(method, "https://files.example.test"+test.endpoint, nil)
+				request.Header.Set("Authorization", "Bearer "+bearer)
+				response := httptest.NewRecorder()
+
+				portal.ServeHTTP(response, request)
+
+				if response.Code != http.StatusOK {
+					t.Fatalf("status = %d, want 200; body=%q", response.Code, response.Body.String())
+				}
+				if method == http.MethodHead && response.Body.Len() != 0 {
+					t.Fatalf("HEAD body = %q, want empty", response.Body.String())
+				}
+			})
+		}
+	}
+}
+
 func TestPortalMapsStorageWorkerPressureToServiceUnavailable(t *testing.T) {
 	t.Parallel()
 

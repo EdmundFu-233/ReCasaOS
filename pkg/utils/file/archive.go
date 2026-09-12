@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	archivepath "path"
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // ArchiveWriter is the minimal streaming interface used by the download
@@ -325,16 +327,56 @@ func lstatArchivePathWithoutSymlinks(root, current string) (os.FileInfo, error) 
 }
 
 func safeArchiveName(name string, directory bool) (string, error) {
-	if filepath.IsAbs(name) || filepath.VolumeName(name) != "" {
-		return "", fmt.Errorf("archive member name must be relative: %q", name)
+	portable := filepath.ToSlash(name)
+	if !utf8.ValidString(portable) || strings.ContainsRune(portable, '\\') || strings.IndexFunc(portable, func(character rune) bool {
+		return character < 0x20 || character == 0x7f
+	}) >= 0 {
+		return "", fmt.Errorf("archive member name is not portable: %q", name)
 	}
 
-	cleaned := archivepath.Clean(filepath.ToSlash(name))
-	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.HasPrefix(cleaned, "/") {
+	if directory && strings.HasSuffix(portable, "/") {
+		// A single trailing slash is the only spelling change accepted here.
+		// Archive producers may already mark a directory that way, while every
+		// other normalization could collapse two distinct source names.
+		portable = strings.TrimSuffix(portable, "/")
+	}
+	cleaned := archivepath.Clean(portable)
+	if cleaned != portable || cleaned == "." || !fs.ValidPath(cleaned) {
 		return "", fmt.Errorf("unsafe archive member name: %q", name)
 	}
-	if directory && !strings.HasSuffix(cleaned, "/") {
+	for _, component := range strings.Split(cleaned, "/") {
+		if strings.ContainsAny(component, `<>:"|?*`) ||
+			strings.HasSuffix(component, ".") ||
+			strings.HasSuffix(component, " ") ||
+			isWindowsReservedArchiveComponent(component) {
+			return "", fmt.Errorf("archive member name is not portable: %q", name)
+		}
+	}
+	if directory {
 		cleaned += "/"
 	}
 	return cleaned, nil
+}
+
+func isWindowsReservedArchiveComponent(component string) bool {
+	base := component
+	if dot := strings.IndexByte(base, '.'); dot >= 0 {
+		base = base[:dot]
+	}
+	base = strings.TrimRight(base, " ")
+	for _, reserved := range []string{"CON", "PRN", "AUX", "NUL"} {
+		if strings.EqualFold(base, reserved) {
+			return true
+		}
+	}
+	if len(base) < 4 ||
+		(!strings.EqualFold(base[:3], "COM") && !strings.EqualFold(base[:3], "LPT")) {
+		return false
+	}
+	switch base[3:] {
+	case "1", "2", "3", "4", "5", "6", "7", "8", "9", "¹", "²", "³":
+		return true
+	default:
+		return false
+	}
 }
