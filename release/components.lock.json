@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "publication_state": "hold",
+  "components": [
+    {
+      "name": "app-management",
+      "state": "unresolved",
+      "reason": "A reviewed ReCasaOS fork revision and release artifact have not been selected."
+    },
+    {
+      "name": "gateway",
+      "state": "unresolved",
+      "reason": "A reviewed ReCasaOS fork revision and release artifact have not been selected."
+    },
+    {
+      "name": "user-service",
+      "state": "unresolved",
+      "reason": "A reviewed ReCasaOS fork revision and release artifact have not been selected."
+    },
+    {
+      "name": "message-bus",
+      "state": "unresolved",
+      "reason": "Only the API input commit is pinned; the runtime release artifact is not locked."
+    },
+    {
+      "name": "administrative-ui",
+      "state": "unresolved",
+      "reason": "The current upstream main-branch hint is not a tracked gitlink or a verified artifact lock."
+    },
+    {
+      "name": "installer",
+      "state": "unresolved",
+      "reason": "The full-stack installer source revision and artifact set are external and not locked."
+    }
+  ]
+}
