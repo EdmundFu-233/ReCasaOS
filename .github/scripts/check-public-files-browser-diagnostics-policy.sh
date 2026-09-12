@@ -63,7 +63,11 @@ workflow = YAML.safe_load(
 reject("workflow root is not a mapping") unless workflow.is_a?(Hash)
 reject("workflow root defaults are forbidden") if workflow.key?("defaults")
 reject("workflow root environment changed") unless
-  workflow["env"] == {"GOTOOLCHAIN" => "local"}
+  workflow["env"] == {
+    "GOTOOLCHAIN" => "local",
+    "GOWORK" => "off",
+    "GOFLAGS" => "-mod=readonly",
+  }
 jobs = workflow["jobs"]
 reject("workflow jobs are missing") unless jobs.is_a?(Hash)
 test_job = jobs["test-and-vet"]
