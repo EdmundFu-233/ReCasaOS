@@ -3286,6 +3286,7 @@ printf '%s\n' \
   '[Unit]' \
   'ConditionPathIsDirectory=' \
   "ConditionPathIsDirectory=$share" \
+  "ConditionPathIsSymbolicLink=!$share" \
   'ConditionPathExists=/sys/fs/cgroup/cgroup.controllers' \
   'ConditionPathExists=/sys/fs/cgroup/system.slice/memory.max' \
   'ConditionPathExists=/sys/fs/cgroup/system.slice/memory.swap.max' \
@@ -3313,6 +3314,7 @@ printf '%s\n' \
   '[Unit]' \
   'ConditionPathIsDirectory=' \
   "ConditionPathIsDirectory=$share" \
+  "ConditionPathIsSymbolicLink=!$share" \
   'ConditionPathExists=/sys/fs/cgroup/cgroup.controllers' \
   'ConditionPathExists=/sys/fs/cgroup/system.slice/memory.max' \
   'ConditionPathExists=/sys/fs/cgroup/system.slice/memory.swap.max' \

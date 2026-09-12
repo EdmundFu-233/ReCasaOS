@@ -395,8 +395,11 @@ read-only mounts below `/run/recasaos-cgroup` inside the jail. Before loading
 the verifier, the process requires exact `/system.slice/recasaos-public-files.service`
 membership and cross-checks each open file's mount ID against `/proc/self/mountinfo`,
 its exact service-cgroup source, the cgroup2 filesystem, the read-only mount
-flag, and the reviewed value. `LoadCredential=` is available at the systemd
-baseline. The packaged unit intentionally uses
+flag, and the reviewed value. The bind source is also required to be a real
+directory: both the service and socket reject `/srv/recasaos-public` when it is
+a symbolic link, so a path replacement cannot silently turn an external target
+into the public root. `LoadCredential=` is available at the systemd baseline.
+The packaged unit intentionally uses
 `${CREDENTIALS_DIRECTORY}` in `ExecStart`; the shorter `%d`
 credential-directory specifier was added later and must not be substituted
 while systemd 247 remains supported. The staging checker accommodates

@@ -1,6 +1,7 @@
 [Unit]
 Description=ReCasaOS public-file portal socket
 ConditionPathIsDirectory=/srv/recasaos-public
+ConditionPathIsSymbolicLink=!/srv/recasaos-public
 ConditionFileNotEmpty=/etc/recasaos/public-file.verifier
 ConditionPathIsSymbolicLink=!/etc/recasaos/public-file.verifier
 ConditionPathExists=/sys/fs/cgroup/cgroup.controllers

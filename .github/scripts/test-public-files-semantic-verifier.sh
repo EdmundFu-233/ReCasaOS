@@ -75,6 +75,8 @@ printf '%s\n' \
   '[[ "$(grep -Fxc "ConditionPathExists=/sys/fs/cgroup/system.slice/memory.swap.max" "$service")" == 1 ]]' \
   '[[ "$(grep -Fxc "ConditionPathExists=/sys/fs/cgroup/system.slice/pids.max" "$service")" == 1 ]]' \
   '[[ "$(grep -Fxc "ConditionPathExists=/sys/fs/cgroup/cgroup.controllers" "$socket")" == 1 ]]' \
+  '[[ "$(grep -Fxc "ConditionPathIsSymbolicLink=!/srv/recasaos-public" "$service")" == 1 ]]' \
+  '[[ "$(grep -Fxc "ConditionPathIsSymbolicLink=!/srv/recasaos-public" "$socket")" == 1 ]]' \
   '[[ "$(grep -Fxc "ConditionPathExists=/sys/fs/cgroup/system.slice/memory.max" "$socket")" == 1 ]]' \
   '[[ "$(grep -Fxc "ConditionPathExists=/sys/fs/cgroup/system.slice/memory.swap.max" "$socket")" == 1 ]]' \
   '[[ "$(grep -Fxc "ConditionPathExists=/sys/fs/cgroup/system.slice/pids.max" "$socket")" == 1 ]]' \

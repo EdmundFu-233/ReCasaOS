@@ -176,6 +176,7 @@ require_exact_sectioned_active_lines "$service" \
   '[Unit]' \
   'Description=ReCasaOS isolated public-file portal' \
   'ConditionPathIsDirectory=/srv/recasaos-public' \
+  'ConditionPathIsSymbolicLink=!/srv/recasaos-public' \
   'ConditionFileNotEmpty=/etc/recasaos/public-file.verifier' \
   'ConditionPathIsSymbolicLink=!/etc/recasaos/public-file.verifier' \
   'ConditionPathExists=/sys/fs/cgroup/cgroup.controllers' \
@@ -250,6 +251,7 @@ require_exact_sectioned_active_lines "$socket" \
   '[Unit]' \
   'Description=ReCasaOS public-file portal socket' \
   'ConditionPathIsDirectory=/srv/recasaos-public' \
+  'ConditionPathIsSymbolicLink=!/srv/recasaos-public' \
   'ConditionFileNotEmpty=/etc/recasaos/public-file.verifier' \
   'ConditionPathIsSymbolicLink=!/etc/recasaos/public-file.verifier' \
   'ConditionPathExists=/sys/fs/cgroup/cgroup.controllers' \
