@@ -78,7 +78,21 @@ var rcloneHTTPClient = &http.Client{
 // not generally idempotent, so transport retries belong in the service state
 // machine where their effects can be reconciled explicitly.
 func callRclone(endpoint string, form url.Values) ([]byte, error) {
-	request, err := http.NewRequest(http.MethodPost, "http://localhost"+endpoint, strings.NewReader(form.Encode()))
+	return callRcloneContext(context.Background(), endpoint, form)
+}
+
+// callRcloneContext performs the same single RC request as callRclone while
+// allowing bounded reconciliation loops to impose a deadline shorter than the
+// client's general-purpose timeout. A context cancellation never causes a
+// replay of the request.
+func callRcloneContext(ctx context.Context, endpoint string, form url.Values) ([]byte, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("rclone RC %s: nil context", endpoint)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("rclone RC %s: %w", endpoint, err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost"+endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
 	}
@@ -104,8 +118,15 @@ func callRclone(endpoint string, form url.Values) ([]byte, error) {
 }
 
 func GetMountList() (MountList, error) {
+	return GetMountListContext(context.Background())
+}
+
+// GetMountListContext bounds the complete listmounts request, including socket
+// connection and response-body reads, by ctx. This prevents each sample in a
+// settle loop from independently consuming DefaultTimeout.
+func GetMountListContext(ctx context.Context) (MountList, error) {
 	var result MountList
-	body, err := callRclone("/mount/listmounts", url.Values{})
+	body, err := callRcloneContext(ctx, "/mount/listmounts", url.Values{})
 	if err != nil {
 		return result, err
 	}

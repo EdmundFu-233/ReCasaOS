@@ -1,17 +1,36 @@
 package httper
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return function(request)
+}
+
+type contextBlockingBody struct {
+	ctx     context.Context
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (body *contextBlockingBody) Read([]byte) (int, error) {
+	body.once.Do(func() { close(body.entered) })
+	<-body.ctx.Done()
+	return 0, body.ctx.Err()
+}
+
+func (*contextBlockingBody) Close() error {
+	return nil
 }
 
 func TestRcloneRemoteFromFilesystemSupportsSubdirectories(t *testing.T) {
@@ -67,6 +86,103 @@ func TestCallRcloneDoesNotRetryTransportErrors(t *testing.T) {
 	}
 }
 
+func TestGetMountListContextCancelsBlockedRequestWithoutReplay(t *testing.T) {
+	original := rcloneHTTPClient
+	t.Cleanup(func() { rcloneHTTPClient = original })
+	entered := make(chan struct{})
+	calls := 0
+	rcloneHTTPClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		close(entered)
+		<-request.Context().Done()
+		return nil, request.Context().Err()
+	})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := GetMountListContext(ctx)
+		result <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("listmounts request did not reach the transport")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("GetMountListContext() error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked listmounts request ignored context cancellation")
+	}
+	if calls != 1 {
+		t.Fatalf("listmounts POST calls = %d, want exactly one", calls)
+	}
+}
+
+func TestGetMountListContextRejectsAlreadyCancelledContext(t *testing.T) {
+	original := rcloneHTTPClient
+	t.Cleanup(func() { rcloneHTTPClient = original })
+	calls := 0
+	rcloneHTTPClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		return nil, errors.New("transport should not run")
+	})}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := GetMountListContext(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("GetMountListContext() error = %v, want context cancellation", err)
+	}
+	if calls != 0 {
+		t.Fatalf("already-cancelled request reached the transport: calls=%d", calls)
+	}
+}
+
+func TestGetMountListContextCancelsResponseBodyRead(t *testing.T) {
+	original := rcloneHTTPClient
+	t.Cleanup(func() { rcloneHTTPClient = original })
+	entered := make(chan struct{})
+	calls := 0
+	rcloneHTTPClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       &contextBlockingBody{ctx: request.Context(), entered: entered},
+			Header:     make(http.Header),
+		}, nil
+	})}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := GetMountListContext(ctx)
+		result <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("listmounts response body was not read")
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("GetMountListContext() body-read error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("listmounts response-body read exceeded its context deadline")
+	}
+	if calls != 1 {
+		t.Fatalf("listmounts POST calls = %d, want exactly one", calls)
+	}
+}
+
 func TestCallRcloneBoundsResponseAndDoesNotExposeErrorBody(t *testing.T) {
 	original := rcloneHTTPClient
 	t.Cleanup(func() { rcloneHTTPClient = original })
@@ -103,17 +219,16 @@ func TestCallRcloneDoesNotReplayRedirectedPost(t *testing.T) {
 	original := rcloneHTTPClient
 	t.Cleanup(func() { rcloneHTTPClient = original })
 	calls := 0
-	rcloneHTTPClient = &http.Client{
-		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-			calls++
-			return &http.Response{
-				StatusCode: http.StatusTemporaryRedirect,
-				Body:       io.NopCloser(strings.NewReader("redirect forbidden")),
-				Header:     http.Header{"Location": []string{"http://localhost/replayed"}},
-			}, nil
-		}),
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	}
+	testClient := *original
+	testClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{
+			StatusCode: http.StatusTemporaryRedirect,
+			Body:       io.NopCloser(strings.NewReader("redirect forbidden")),
+			Header:     http.Header{"Location": []string{"http://localhost/replayed"}},
+		}, nil
+	})
+	rcloneHTTPClient = &testClient
 
 	if _, err := callRclone("/config/delete", nil); err == nil {
 		t.Fatal("redirected mutating RC request was accepted")
