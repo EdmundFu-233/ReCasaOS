@@ -356,3 +356,58 @@ func TestV2CompletedUploadTombstonesAreBoundedWithoutEvictingActive(t *testing.T
 		t.Fatal("oldest clean completion tombstone was not evicted")
 	}
 }
+
+func TestV2UploadMetadataBindsEveryStagingIdentityField(t *testing.T) {
+	roots := &filesecurity.ManagedRoots{}
+	candidate := &FileInfo{
+		base:           "/managed/base",
+		targetPath:     "/managed/base/target.bin",
+		targetRelative: "target.bin",
+		tempRelative:   ".temp/v2-upload-key",
+		tempDir:        "/managed/base/.temp/v2-upload-key",
+		assemblyPath:   "/managed/base/.temp/v2-upload-key/.complete",
+		totalChunks:    2,
+		totalSize:      8,
+		chunkSize:      4,
+		roots:          roots,
+	}
+	if !sameServiceUploadMetadata(candidate, candidate) {
+		t.Fatal("identical upload metadata did not match")
+	}
+	cloneMetadata := func(value *FileInfo) *FileInfo {
+		return &FileInfo{
+			base:           value.base,
+			targetPath:     value.targetPath,
+			targetRelative: value.targetRelative,
+			tempRelative:   value.tempRelative,
+			tempDir:        value.tempDir,
+			assemblyPath:   value.assemblyPath,
+			totalChunks:    value.totalChunks,
+			totalSize:      value.totalSize,
+			chunkSize:      value.chunkSize,
+			roots:          value.roots,
+		}
+	}
+
+	tests := map[string]func(*FileInfo){
+		"roots":          func(value *FileInfo) { value.roots = nil },
+		"base":           func(value *FileInfo) { value.base += "-alias" },
+		"targetPath":     func(value *FileInfo) { value.targetPath += "-alias" },
+		"targetRelative": func(value *FileInfo) { value.targetRelative += "-alias" },
+		"tempRelative":   func(value *FileInfo) { value.tempRelative += "-alias" },
+		"tempDir":        func(value *FileInfo) { value.tempDir += "-alias" },
+		"assemblyPath":   func(value *FileInfo) { value.assemblyPath += "-alias" },
+		"totalChunks":    func(value *FileInfo) { value.totalChunks++ },
+		"totalSize":      func(value *FileInfo) { value.totalSize++ },
+		"chunkSize":      func(value *FileInfo) { value.chunkSize++ },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			changed := cloneMetadata(candidate)
+			mutate(changed)
+			if sameServiceUploadMetadata(candidate, changed) {
+				t.Fatal("changed upload metadata matched the existing session")
+			}
+		})
+	}
+}

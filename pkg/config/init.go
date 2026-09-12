@@ -80,6 +80,11 @@ func InitSetup(config string, sample string) {
 	mapTo("system", SystemConfigInfo)
 	mapTo("file", FileSettingInfo)
 	mapTo("common", CommonInfo)
+
+	// ConfigPath is runtime state, not a value controlled by the config file.
+	// Keep it bound to the file that InitSetup actually loaded so later writes
+	// cannot be redirected by stale or attacker-supplied INI content.
+	SystemConfigInfo.ConfigPath = ConfigFilePath
 }
 
 // 映射
