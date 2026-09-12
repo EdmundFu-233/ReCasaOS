@@ -244,16 +244,18 @@ func SpliceFiles(dir, path string, length int, startPoint int) error {
 
 	bufferedWriter := bufio.NewWriter(file)
 
-	// todo: here should have a goroutine to remove each partial file after it is read, to save disk space
-
 	for i := 0; i < length+startPoint-1; i++ {
-		data, err := ioutil.ReadFile(dir + "/" + strconv.Itoa(i+startPoint))
+		chunkPath := dir + "/" + strconv.Itoa(i+startPoint)
+		data, err := ioutil.ReadFile(chunkPath)
 		if err != nil {
 			return err
 		}
-		if _, err := bufferedWriter.Write(data); err != nil { // recommend to use https://github.com/iceber/iouring-go for faster write
+		if _, err := bufferedWriter.Write(data); err != nil {
 			return err
 		}
+		// Remove the partial chunk file after it has been read and written
+		// to free disk space during large file merges.
+		_ = os.Remove(chunkPath)
 	}
 
 	bufferedWriter.Flush()
