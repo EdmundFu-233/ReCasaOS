@@ -12,6 +12,10 @@
 #
 # This edge intentionally exposes ONLY /public-files. Every administrative,
 # setup, SSH, and v1/v2/v3 route returns 404 on the public hostname.
+# The explicit default servers below reject unknown HTTP Host values and TLS
+# SNI values before they can fall through to the portal virtual host. Keep
+# them bound to the same intended public addresses after replacing the
+# documentation values.
 
 log_format recasaos_no_query '$remote_addr - $remote_user [$time_local] '
                               '"$request_method $uri $server_protocol" $status $body_bytes_sent '
@@ -24,6 +28,29 @@ upstream recasaos_public_files {
     # The Gateway's /public-files route is an intentional 404 tombstone.
     server 127.0.0.1:39777;
     keepalive 16;
+}
+
+# Fail closed for an unrecognised plaintext Host. This is the default only for
+# the documented public addresses, not a wildcard listener for other hosts.
+server {
+    listen 203.0.113.10:80 default_server;
+    listen [2001:db8::10]:80 default_server;
+    server_name _;
+    access_log off;
+    error_log /dev/null;
+    return 444;
+}
+
+# Reject an unrecognised TLS SNI during the handshake. A client that sends no
+# SNI or an unrelated SNI must not receive the portal certificate or vhost.
+server {
+    listen 203.0.113.10:443 ssl default_server;
+    listen [2001:db8::10]:443 ssl default_server;
+    server_name _;
+    ssl_reject_handshake on;
+    access_log off;
+    error_log /dev/null;
+    return 444;
 }
 
 server {
@@ -42,9 +69,8 @@ server {
 }
 
 server {
-    listen 203.0.113.10:443 ssl;
-    listen [2001:db8::10]:443 ssl;
-    http2 on;
+    listen 203.0.113.10:443 ssl http2;
+    listen [2001:db8::10]:443 ssl http2;
     server_name recasaos.example.invalid;
 
     server_tokens off;
