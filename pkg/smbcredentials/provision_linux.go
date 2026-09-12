@@ -15,15 +15,35 @@ import (
 
 const sourceKeyringStagingName = "." + CredentialName + ".provisioning"
 
+const (
+	sourceDirectoryReadOpenFlags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC | unix.O_NOFOLLOW
+	sourceDirectoryPathOpenFlags = unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC | unix.O_NOFOLLOW
+	sourceObjectPathOpenFlags    = unix.O_PATH | unix.O_CLOEXEC | unix.O_NOFOLLOW
+)
+
 var errAnonymousSourcePublishUnavailable = errors.New(
 	"anonymous ReCasaOS SMB source publication is unavailable",
 )
 
+type sourcePathOps struct {
+	openat  func(int, string, int, uint32) (int, error)
+	fstat   func(int, *unix.Stat_t) error
+	fstatat func(int, string, *unix.Stat_t, int) error
+	close   func(int) error
+}
+
+func defaultSourcePathOps() sourcePathOps {
+	return sourcePathOps{
+		openat:  unix.Openat,
+		fstat:   unix.Fstat,
+		fstatat: unix.Fstatat,
+		close:   unix.Close,
+	}
+}
+
 type sourceProvisionOps struct {
+	sourcePathOps
 	random    io.Reader
-	openat    func(int, string, int, uint32) (int, error)
-	fstat     func(int, *unix.Stat_t) error
-	fstatat   func(int, string, *unix.Stat_t, int) error
 	write     func(int, []byte) (int, error)
 	pread     func(int, []byte, int64) (int, error)
 	fchown    func(int, int, int) error
@@ -32,24 +52,20 @@ type sourceProvisionOps struct {
 	linkat    func(int, string, int, string, int) error
 	renameat2 func(int, string, int, string, uint) error
 	unlinkat  func(int, string, int) error
-	close     func(int) error
 }
 
 func defaultSourceProvisionOps() sourceProvisionOps {
 	return sourceProvisionOps{
-		random:    rand.Reader,
-		openat:    unix.Openat,
-		fstat:     unix.Fstat,
-		fstatat:   unix.Fstatat,
-		write:     unix.Write,
-		pread:     unix.Pread,
-		fchown:    unix.Fchown,
-		fchmod:    unix.Fchmod,
-		fsync:     unix.Fsync,
-		linkat:    unix.Linkat,
-		renameat2: unix.Renameat2,
-		unlinkat:  unix.Unlinkat,
-		close:     unix.Close,
+		sourcePathOps: defaultSourcePathOps(),
+		random:        rand.Reader,
+		write:         unix.Write,
+		pread:         unix.Pread,
+		fchown:        unix.Fchown,
+		fchmod:        unix.Fchmod,
+		fsync:         unix.Fsync,
+		linkat:        unix.Linkat,
+		renameat2:     unix.Renameat2,
+		unlinkat:      unix.Unlinkat,
 	}
 }
 
@@ -82,7 +98,7 @@ func ProvisionSystemKeyringSource() (result ProvisionResult, err error) {
 	rootFD, openErr := ops.openat(
 		unix.AT_FDCWD,
 		"/",
-		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+		sourceDirectoryReadOpenFlags,
 		0,
 	)
 	if openErr != nil {
@@ -106,12 +122,18 @@ func provisionSystemKeyringSourceAt(
 	group uint32,
 	ops sourceProvisionOps,
 ) (result ProvisionResult, err error) {
-	path, openErr := openSourceProvisionPath(rootFD, owner, group, ops)
+	path, openErr := openSourceProvisionPath(
+		rootFD,
+		owner,
+		group,
+		sourceDirectoryReadOpenFlags,
+		ops.sourcePathOps,
+	)
 	if openErr != nil {
 		return ProvisionResult{}, openErr
 	}
 	defer func() {
-		if closeErr := path.close(ops); closeErr != nil {
+		if closeErr := path.close(ops.sourcePathOps); closeErr != nil {
 			if result.Created {
 				result.DurabilityUnknown = true
 			}
@@ -145,7 +167,8 @@ func openSourceProvisionPath(
 	rootFD int,
 	owner uint32,
 	group uint32,
-	ops sourceProvisionOps,
+	directoryOpenFlags int,
+	ops sourcePathOps,
 ) (*sourceProvisionPath, error) {
 	path := &sourceProvisionPath{
 		rootFD:      rootFD,
@@ -164,7 +187,7 @@ func openSourceProvisionPath(
 	etcFD, err := ops.openat(
 		rootFD,
 		"etc",
-		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+		directoryOpenFlags,
 		0,
 	)
 	if err != nil {
@@ -183,7 +206,7 @@ func openSourceProvisionPath(
 	directoryFD, err := ops.openat(
 		etcFD,
 		"recasaos",
-		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+		directoryOpenFlags,
 		0,
 	)
 	if err != nil {
@@ -206,7 +229,7 @@ func openSourceProvisionPath(
 	return path, nil
 }
 
-func (p *sourceProvisionPath) revalidate(ops sourceProvisionOps) error {
+func (p *sourceProvisionPath) revalidate(ops sourcePathOps) error {
 	var root, etc, directory unix.Stat_t
 	if err := ops.fstat(p.rootFD, &root); err != nil {
 		return sourceProvisionFailure("recheck source keyring root", err)
@@ -237,19 +260,19 @@ func (p *sourceProvisionPath) revalidate(ops sourceProvisionOps) error {
 	return nil
 }
 
-func (p *sourceProvisionPath) close(ops sourceProvisionOps) error {
+func (p *sourceProvisionPath) close(ops sourcePathOps) error {
 	var result error
 	if p.directoryFD >= 0 {
 		result = errors.Join(
 			result,
-			sourceCloseFailure("close source keyring directory", p.directoryFD, ops),
+			sourcePathCloseFailure("close source keyring directory", p.directoryFD, ops),
 		)
 		p.directoryFD = -1
 	}
 	if p.etcFD >= 0 {
 		result = errors.Join(
 			result,
-			sourceCloseFailure("close source keyring etc directory", p.etcFD, ops),
+			sourcePathCloseFailure("close source keyring etc directory", p.etcFD, ops),
 		)
 		p.etcFD = -1
 	}
@@ -293,7 +316,7 @@ func publishAnonymousSourceCandidate(
 	if err := prepareSourceCandidate(fd, 0, path.owner, path.group, data, ops); err != nil {
 		return ProvisionResult{}, err, false
 	}
-	if err := path.revalidate(ops); err != nil {
+	if err := path.revalidate(ops.sourcePathOps); err != nil {
 		return ProvisionResult{}, err, false
 	}
 	targetState, stateErr := inspectSourceName(path.directoryFD, CredentialName, fd, ops)
@@ -361,7 +384,7 @@ func publishAnonymousSourceCandidate(
 		if err := validateSourceCandidate(fd, 0, path.owner, path.group, data, ops); err != nil {
 			return ProvisionResult{}, err, false
 		}
-		if err := path.revalidate(ops); err != nil {
+		if err := path.revalidate(ops.sourcePathOps); err != nil {
 			return ProvisionResult{}, err, false
 		}
 		return ProvisionResult{}, errAnonymousSourcePublishUnavailable, true
@@ -385,7 +408,7 @@ func provisionNamedSource(
 	data []byte,
 	ops sourceProvisionOps,
 ) (result ProvisionResult, err error) {
-	if err := path.revalidate(ops); err != nil {
+	if err := path.revalidate(ops.sourcePathOps); err != nil {
 		return ProvisionResult{}, err
 	}
 	if namespaceResult, namespaceErr := requireEmptySourceNamespace(path.directoryFD, ops); namespaceErr != nil {
@@ -439,7 +462,7 @@ func publishNamedSourceCandidate(
 		return ProvisionResult{}, err
 	}
 	prepared = true
-	if err := path.revalidate(ops); err != nil {
+	if err := path.revalidate(ops.sourcePathOps); err != nil {
 		return ProvisionResult{}, err
 	}
 	stagingState, stagingErr := inspectSourceName(
@@ -654,7 +677,7 @@ func finalizePublishedSource(
 	if err := ops.fsync(path.directoryFD); err != nil {
 		syncErr = sourceProvisionFailure("sync published source keyring directory", err)
 	}
-	pathErr := path.revalidate(ops)
+	pathErr := path.revalidate(ops.sourcePathOps)
 	verifyAfter := validatePublishedSource(path, fd, data, ops)
 	err := errors.Join(verifyBefore, syncErr, pathErr, verifyAfter)
 	if err != nil {
@@ -802,7 +825,7 @@ func inspectSourceName(
 	return sourceNameOther, nil
 }
 
-func sourceNameExists(directoryFD int, name string, ops sourceProvisionOps) (bool, error) {
+func sourceNameExists(directoryFD int, name string, ops sourcePathOps) (bool, error) {
 	var stat unix.Stat_t
 	err := ops.fstatat(directoryFD, name, &stat, unix.AT_SYMLINK_NOFOLLOW)
 	if err == nil {
@@ -818,11 +841,11 @@ func requireEmptySourceNamespace(
 	directoryFD int,
 	ops sourceProvisionOps,
 ) (ProvisionResult, error) {
-	targetExists, targetErr := sourceNameExists(directoryFD, CredentialName, ops)
+	targetExists, targetErr := sourceNameExists(directoryFD, CredentialName, ops.sourcePathOps)
 	stagingExists, stagingErr := sourceNameExists(
 		directoryFD,
 		sourceKeyringStagingName,
-		ops,
+		ops.sourcePathOps,
 	)
 	if targetErr != nil || stagingErr != nil {
 		var existsErr error
@@ -890,6 +913,13 @@ func sourceLinkFailureDefinitive(err error) bool {
 }
 
 func sourceCloseFailure(operation string, fd int, ops sourceProvisionOps) error {
+	if err := ops.close(fd); err != nil {
+		return sourceProvisionFailure(operation, err)
+	}
+	return nil
+}
+
+func sourcePathCloseFailure(operation string, fd int, ops sourcePathOps) error {
 	if err := ops.close(fd); err != nil {
 		return sourceProvisionFailure(operation, err)
 	}

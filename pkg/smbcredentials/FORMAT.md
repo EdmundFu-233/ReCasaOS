@@ -136,6 +136,34 @@ migration, and runtime validation gates. A future cutover must provision
 durably, install and validate the unit boundary, restart into the new systemd
 credential, and only then begin an atomic database migration.
 
+`CheckSystemKeyringSourceStructure` is a separate, read-only structural
+snapshot of that same fixed source path. It requires the same root-owned ancestor and mode-`0700`
+namespace boundary, refuses to inspect while the fixed staging marker exists,
+first pins the target without opening its contents, then opens it read-only
+while requesting no-follow, nonblocking, and no-atime semantics. It binds both
+descriptors and the fixed name to the same regular single-link root-owned
+mode-`0400` inode, strictly parses only a bounded buffer, then immediately
+destroys the parsed state and clears the input bytes. It returns no keyring,
+key ID, bytes, or other key material and has no production call site.
+
+A successful source audit proves only that the current object was safely bound
+and structurally canonical during that call. It does not establish who created
+it, whether its original publication reached durable storage, whether the name
+will still refer to that inode after return, whether it matches any runtime or
+database state, whether it should be activated, or whether an occupied
+destination can be treated as idempotent provisioning success. Provisioning
+therefore continues to reject every occupied destination without opening or
+accepting it.
+
+The error-only audit API is also fail-closed. `ErrSourceKeyringMissing` is used
+only after the safe namespace, marker, and target absence are repeatedly
+confirmed; it does not authorize provisioning or retry.
+`ErrSourceCleanupRequired` means the staging marker exists or could not be
+inspected. `ErrUnsafeSourceKeyring` covers an unsafe or inconsistent boundary,
+target, or read, and malformed bytes also preserve `ErrInvalidKeyring` for
+`errors.Is`. Other I/O failures are indeterminate hard failures. Non-Linux
+builds return `ErrSourceAuditUnsupported`.
+
 ## Boundary
 
 These formats are intended to protect credentials in the current SQLite
