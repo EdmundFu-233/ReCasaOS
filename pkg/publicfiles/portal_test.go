@@ -6,6 +6,7 @@ import (
 	"mime"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -180,6 +181,96 @@ func TestParseSafeQueryIsStrictAndRejectsCredentials(t *testing.T) {
 		if err == nil && values.Get("path") != test.wantPath {
 			t.Errorf("parseSafeQuery(%q) path = %q, want %q", test.query, values.Get("path"), test.wantPath)
 		}
+	}
+}
+
+func TestStaticEntriesRejectEveryNonEmptyQuery(t *testing.T) {
+	const canary = "static-query-canary-do-not-reflect"
+	const errorBody = `{"error":"invalid query"}`
+
+	staticEntries := []struct {
+		name string
+		path string
+	}{
+		{name: "base path", path: BasePath},
+		{name: "base path slash", path: BasePath + "/"},
+		{name: "application script", path: BasePath + "/app.js"},
+		{name: "download worker", path: BasePath + "/download-worker.js"},
+		{name: "stylesheet", path: BasePath + "/style.css"},
+	}
+	queries := []struct {
+		name string
+		raw  string
+	}{
+		{name: "token", raw: "token=" + canary},
+		{name: "uppercase access token", raw: "ACCESS_TOKEN=" + canary},
+		{name: "authorization", raw: "authorization=" + canary},
+		{name: "unknown", raw: "unknown=" + canary},
+		{name: "malformed escape", raw: "%zz"},
+	}
+	securityHeaders := map[string]string{
+		"Cache-Control":                "no-store",
+		"Content-Security-Policy":      "default-src 'none'; script-src 'self'; worker-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+		"Cross-Origin-Opener-Policy":   "same-origin",
+		"Cross-Origin-Resource-Policy": "same-origin",
+		"Permissions-Policy":           "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+		"Referrer-Policy":              "no-referrer",
+		"X-Content-Type-Options":       "nosniff",
+		"X-Frame-Options":              "DENY",
+	}
+
+	portal := &Portal{}
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		t.Run(method, func(t *testing.T) {
+			for _, entry := range staticEntries {
+				t.Run(entry.name, func(t *testing.T) {
+					for _, query := range queries {
+						t.Run(query.name, func(t *testing.T) {
+							request := httptest.NewRequest(method, entry.path, nil)
+							request.URL.RawQuery = query.raw
+							response := httptest.NewRecorder()
+
+							portal.ServeHTTP(response, request)
+
+							if response.Code != http.StatusBadRequest {
+								t.Fatalf("status = %d, want 400", response.Code)
+							}
+							if got := response.Header().Get("Location"); got != "" {
+								t.Fatalf("Location = %q, want empty", got)
+							}
+							if got := response.Header().Get("Content-Type"); got != "application/json; charset=utf-8" {
+								t.Fatalf("Content-Type = %q, want generic JSON error", got)
+							}
+							if got := response.Header().Get("Content-Length"); got != strconv.Itoa(len(errorBody)) {
+								t.Fatalf("Content-Length = %q, want %d", got, len(errorBody))
+							}
+							for name, want := range securityHeaders {
+								if got := response.Header().Get(name); got != want {
+									t.Errorf("%s = %q, want %q", name, got, want)
+								}
+							}
+							for name, values := range response.Header() {
+								for _, value := range values {
+									if strings.Contains(value, canary) {
+										t.Errorf("%s reflected query canary in %q", name, value)
+									}
+								}
+							}
+							if strings.Contains(response.Body.String(), canary) {
+								t.Fatalf("response reflected query canary: %q", response.Body.String())
+							}
+							if method == http.MethodHead {
+								if response.Body.Len() != 0 {
+									t.Fatalf("HEAD body = %q, want empty", response.Body.String())
+								}
+							} else if got := response.Body.String(); got != errorBody {
+								t.Fatalf("body = %q, want %q", got, errorBody)
+							}
+						})
+					}
+				})
+			}
+		})
 	}
 }
 
