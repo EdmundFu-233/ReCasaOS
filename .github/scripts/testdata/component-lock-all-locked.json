@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "publication_state": "hold",
+  "components": [
+    {
+      "name": "app-management",
+      "state": "locked",
+      "source_repository": "https://example.invalid/recasaos/app-management",
+      "source_revision": "1111111111111111111111111111111111111111",
+      "artifact_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "license": "Apache-2.0",
+      "api_schema": "not-applicable",
+      "compatibility_status": "passed"
+    },
+    {
+      "name": "gateway",
+      "state": "locked",
+      "source_repository": "https://example.invalid/recasaos/gateway",
+      "source_revision": "2222222222222222222222222222222222222222",
+      "artifact_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "license": "Apache-2.0",
+      "api_schema": "not-applicable",
+      "compatibility_status": "passed"
+    },
+    {
+      "name": "user-service",
+      "state": "locked",
+      "source_repository": "https://example.invalid/recasaos/user-service",
+      "source_revision": "3333333333333333333333333333333333333333",
+      "artifact_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "license": "Apache-2.0",
+      "api_schema": "not-applicable",
+      "compatibility_status": "passed"
+    },
+    {
+      "name": "message-bus",
+      "state": "locked",
+      "source_repository": "https://example.invalid/recasaos/message-bus",
+      "source_revision": "4444444444444444444444444444444444444444",
+      "artifact_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+      "license": "Apache-2.0",
+      "api_schema": "not-applicable",
+      "compatibility_status": "passed"
+    },
+    {
+      "name": "administrative-ui",
+      "state": "locked",
+      "source_repository": "https://example.invalid/recasaos/administrative-ui",
+      "source_revision": "5555555555555555555555555555555555555555",
+      "artifact_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+      "license": "Apache-2.0",
+      "api_schema": "not-applicable",
+      "compatibility_status": "passed"
+    },
+    {
+      "name": "installer",
+      "state": "locked",
+      "source_repository": "https://example.invalid/recasaos/installer",
+      "source_revision": "6666666666666666666666666666666666666666",
+      "artifact_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+      "license": "Apache-2.0",
+      "api_schema": "not-applicable",
+      "compatibility_status": "passed"
+    }
+  ]
+}

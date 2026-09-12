@@ -283,6 +283,7 @@ package_update: true
 package_upgrade: false
 packages:
   - acl
+  - bindfs
   - ca-certificates
   - curl
   - dmsetup
@@ -290,7 +291,9 @@ packages:
   - file
   - iproute2
   - kmod
+  - nbd-client
   - procps
+  - qemu-utils
   - sudo
   - udev
   - util-linux
