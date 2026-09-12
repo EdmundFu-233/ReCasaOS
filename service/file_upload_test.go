@@ -116,6 +116,89 @@ func TestV2UploadRegistryPublishesSameKeyOnce(t *testing.T) {
 	}
 }
 
+func TestV2UploadSessionKeyAndRegistrySeparatePrincipals(t *testing.T) {
+	const identifier = "shared-client-identifier"
+	const targetPath = "/managed/shared-target.bin"
+	firstKey := boundUploadIdentifier(101, identifier, targetPath)
+	secondKey := boundUploadIdentifier(202, identifier, targetPath)
+	if firstKey == secondKey {
+		t.Fatal("different authenticated principals produced the same upload key")
+	}
+	if firstKey != boundUploadIdentifier(101, identifier, targetPath) {
+		t.Fatal("the same authenticated principal produced an unstable upload key")
+	}
+
+	service := NewFileUploadService()
+	service.removeTree = os.RemoveAll
+	base := t.TempDir()
+	type result struct {
+		key     string
+		session *FileInfo
+		created bool
+		err     error
+	}
+	results := make(chan result, 2)
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	for _, principalID := range []int{101, 202} {
+		principalID := principalID
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			key := boundUploadIdentifier(principalID, identifier, targetPath)
+			candidate := &FileInfo{
+				init:        true,
+				principalID: principalID,
+				tempDir:     filepath.Join(base, key),
+			}
+			session, created, err := service.getOrCreateUploadSession(key, candidate)
+			results <- result{key: key, session: session, created: created, err: err}
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+
+	seen := map[string]*FileInfo{}
+	for result := range results {
+		if result.err != nil || !result.created || result.session == nil {
+			t.Fatalf("principal session creation = %+v", result)
+		}
+		seen[result.key] = result.session
+	}
+	if len(seen) != 2 || len(service.uploadStatus) != 2 {
+		t.Fatalf("principal registry contains %d results and %d sessions, want 2 each", len(seen), len(service.uploadStatus))
+	}
+	if seen[firstKey] == seen[secondKey] {
+		t.Fatal("different authenticated principals shared one session object")
+	}
+}
+
+func TestV2UploadRejectsInvalidPrincipalBeforeCleanupOrResolution(t *testing.T) {
+	service := NewFileUploadService()
+	removeCalls := 0
+	rootCalls := 0
+	service.removeTree = func(string) error {
+		removeCalls++
+		return nil
+	}
+	service.managementRoots = func() (*filesecurity.ManagedRoots, error) {
+		rootCalls++
+		return nil, errors.New("must not resolve roots")
+	}
+
+	if err := service.UploadFile(nil, 0, "", 0, 0, 0, 0, 0, "", "", "", nil); err == nil || !strings.Contains(err.Error(), "principal") {
+		t.Fatalf("invalid principal upload error = %v", err)
+	}
+	if err := service.TestChunk(nil, 0, "", 0); err == nil || !strings.Contains(err.Error(), "principal") {
+		t.Fatalf("invalid principal chunk test error = %v", err)
+	}
+	if removeCalls != 0 || rootCalls != 0 {
+		t.Fatalf("invalid principal attempted cleanup=%d or root resolution=%d", removeCalls, rootCalls)
+	}
+}
+
 func TestV2UploadRegistryCapAndTerminalCleanup(t *testing.T) {
 	service := NewFileUploadService()
 	service.removeTree = os.RemoveAll
@@ -360,6 +443,7 @@ func TestV2CompletedUploadTombstonesAreBoundedWithoutEvictingActive(t *testing.T
 func TestV2UploadMetadataBindsEveryStagingIdentityField(t *testing.T) {
 	roots := &filesecurity.ManagedRoots{}
 	candidate := &FileInfo{
+		principalID:    1,
 		base:           "/managed/base",
 		targetPath:     "/managed/base/target.bin",
 		targetRelative: "target.bin",
@@ -376,6 +460,7 @@ func TestV2UploadMetadataBindsEveryStagingIdentityField(t *testing.T) {
 	}
 	cloneMetadata := func(value *FileInfo) *FileInfo {
 		return &FileInfo{
+			principalID:    value.principalID,
 			base:           value.base,
 			targetPath:     value.targetPath,
 			targetRelative: value.targetRelative,
@@ -390,6 +475,7 @@ func TestV2UploadMetadataBindsEveryStagingIdentityField(t *testing.T) {
 	}
 
 	tests := map[string]func(*FileInfo){
+		"principalID":    func(value *FileInfo) { value.principalID++ },
 		"roots":          func(value *FileInfo) { value.roots = nil },
 		"base":           func(value *FileInfo) { value.base += "-alias" },
 		"targetPath":     func(value *FileInfo) { value.targetPath += "-alias" },

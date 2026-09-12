@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -372,7 +373,7 @@ func TestV2UploadCapacityIsReservedBeforeTargetParentMutation(t *testing.T) {
 		}
 	}
 	targetParent := filepath.Join(root, "capacity-parent")
-	err = upload.UploadFile(nil, root, 1, 1, 1, 1, 1, "capacity", filepath.Join("capacity-parent", "target.bin"), "target.bin", &multipart.FileHeader{Size: 1})
+	err = upload.UploadFile(nil, 1, root, 1, 1, 1, 1, 1, "capacity", filepath.Join("capacity-parent", "target.bin"), "target.bin", &multipart.FileHeader{Size: 1})
 	if err == nil || !strings.Contains(err.Error(), "too many active") {
 		t.Fatalf("capacity error = %v", err)
 	}
@@ -400,7 +401,7 @@ func TestV2UploadParentAndStagingCreationFailuresAreTerminalAndConservative(t *t
 		upload.mkdirAll = func(*filesecurity.ManagedRoots, string, fs.FileMode) error {
 			return &filesecurity.ManagedMutationError{Operation: "sync created parent", Changed: true, DurabilityUnknown: true, Err: injected}
 		}
-		err := upload.UploadFile(nil, root, 1, 1, 1, 1, 1, "parent-partial", filepath.Join("partial", "target.bin"), "target.bin", &multipart.FileHeader{Size: 1})
+		err := upload.UploadFile(nil, 1, root, 1, 1, 1, 1, 1, "parent-partial", filepath.Join("partial", "target.bin"), "target.bin", &multipart.FileHeader{Size: 1})
 		if !errors.Is(err, injected) || !filesecurity.ManagedMutationChanged(err) || !filesecurity.ManagedMutationDurabilityUnknown(err) {
 			t.Fatalf("partial parent error = %v", err)
 		}
@@ -423,7 +424,7 @@ func TestV2UploadParentAndStagingCreationFailuresAreTerminalAndConservative(t *t
 			return managed.MkdirAll(path, mode)
 		}
 		parent := filepath.Join(root, "created")
-		err := upload.UploadFile(nil, root, 1, 1, 1, 1, 1, "staging-failure", filepath.Join("created", "target.bin"), "target.bin", &multipart.FileHeader{Size: 1})
+		err := upload.UploadFile(nil, 1, root, 1, 1, 1, 1, 1, "staging-failure", filepath.Join("created", "target.bin"), "target.bin", &multipart.FileHeader{Size: 1})
 		if !errors.Is(err, injected) || !filesecurity.ManagedMutationChanged(err) || filesecurity.ManagedMutationDurabilityUnknown(err) {
 			t.Fatalf("staging failure error = %v", err)
 		}
@@ -434,6 +435,145 @@ func TestV2UploadParentAndStagingCreationFailuresAreTerminalAndConservative(t *t
 			t.Fatalf("failed staging session was retained: %+v", upload.uploadStatus)
 		}
 	})
+}
+
+func TestV2UploadConcurrentPrincipalsNeverShareOrMixChunks(t *testing.T) {
+	root := t.TempDir()
+	roots, err := filesecurity.OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	upload := NewFileUploadService()
+	upload.managementRoots = func() (*filesecurity.ManagedRoots, error) { return roots, nil }
+	upload.removeTree = os.RemoveAll
+
+	const identifier = "shared-principal-identifier"
+	const relativePath = "principal-target.bin"
+	const fileName = "principal-target.bin"
+	const firstPrincipal = 101
+	const secondPrincipal = 202
+	targetPath := filepath.Join(root, relativePath)
+
+	if err := upload.UploadFile(
+		nil,
+		firstPrincipal,
+		root,
+		1,
+		1,
+		1,
+		2,
+		2,
+		identifier,
+		relativePath,
+		fileName,
+		multipartFileHeader(t, fileName, "a"),
+	); err != nil {
+		t.Fatalf("first principal chunk failed: %v", err)
+	}
+	firstKey := boundUploadIdentifier(firstPrincipal, identifier, targetPath)
+	firstSession := upload.uploadStatus[firstKey]
+	if firstSession == nil || firstSession.uploadedChunkNum != 1 {
+		t.Fatalf("first principal session = %+v", firstSession)
+	}
+
+	query := make(url.Values)
+	query.Set("path", root)
+	query.Set("relativePath", relativePath)
+	request := httptest.NewRequest("GET", "/v2/file/upload?"+query.Encode(), nil)
+	context := echo.New().NewContext(request, httptest.NewRecorder())
+	activityBeforeProbe := firstSession.lastActivity
+	if err := upload.TestChunk(context, secondPrincipal, identifier, 1); err == nil {
+		t.Fatal("second principal observed the first principal's uploaded chunk")
+	}
+	if !firstSession.lastActivity.Equal(activityBeforeProbe) {
+		t.Fatal("cross-principal probe refreshed the first principal's session TTL")
+	}
+
+	if err := upload.UploadFile(
+		nil,
+		secondPrincipal,
+		root,
+		1,
+		1,
+		1,
+		2,
+		2,
+		identifier,
+		relativePath,
+		fileName,
+		multipartFileHeader(t, fileName, "b"),
+	); err != nil {
+		t.Fatalf("second principal chunk failed: %v", err)
+	}
+	secondKey := boundUploadIdentifier(secondPrincipal, identifier, targetPath)
+	secondSession := upload.uploadStatus[secondKey]
+	if firstKey == secondKey || secondSession == nil || firstSession == secondSession {
+		t.Fatalf("principal sessions were not isolated: first=%p second=%p", firstSession, secondSession)
+	}
+	if firstSession.tempDir == secondSession.tempDir {
+		t.Fatalf("principal sessions share staging path %q", firstSession.tempDir)
+	}
+
+	type uploadResult struct {
+		principalID int
+		err         error
+	}
+	results := make(chan uploadResult, 2)
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	for _, candidate := range []struct {
+		principalID int
+		contents    string
+	}{
+		{principalID: firstPrincipal, contents: "A"},
+		{principalID: secondPrincipal, contents: "B"},
+	} {
+		candidate := candidate
+		chunk := multipartFileHeader(t, fileName, candidate.contents)
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			results <- uploadResult{
+				principalID: candidate.principalID,
+				err: upload.UploadFile(
+					nil,
+					candidate.principalID,
+					root,
+					2,
+					1,
+					1,
+					2,
+					2,
+					identifier,
+					relativePath,
+					fileName,
+					chunk,
+				),
+			}
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+
+	succeeded := 0
+	for result := range results {
+		if result.err == nil {
+			succeeded++
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("successful concurrent completions = %d, want exactly 1", succeeded)
+	}
+	contents, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "aA" && string(contents) != "bB" {
+		t.Fatalf("published target mixed principal chunks: %q", contents)
+	}
 }
 
 func TestV2UploadSessionRejectsSameTargetThroughDifferentBaseBeforeMutation(t *testing.T) {
@@ -453,6 +593,7 @@ func TestV2UploadSessionRejectsSameTargetThroughDifferentBaseBeforeMutation(t *t
 	firstChunk := multipartFileHeader(t, "target.bin", "a")
 	err = upload.UploadFile(
 		nil,
+		1,
 		root,
 		1,
 		1,
@@ -468,7 +609,7 @@ func TestV2UploadSessionRejectsSameTargetThroughDifferentBaseBeforeMutation(t *t
 		t.Fatalf("first upload chunk failed: %v", err)
 	}
 	target := filepath.Join(root, "nested", "target.bin")
-	key := boundUploadIdentifier("same-target-alias", target)
+	key := boundUploadIdentifier(1, "same-target-alias", target)
 	session := upload.uploadStatus[key]
 	if session == nil || session.uploadedChunkNum != 1 {
 		t.Fatalf("first upload session = %+v", session)
@@ -481,6 +622,7 @@ func TestV2UploadSessionRejectsSameTargetThroughDifferentBaseBeforeMutation(t *t
 	canonicalRetry := multipartFileHeader(t, "target.bin", "a")
 	err = upload.UploadFile(
 		nil,
+		1,
 		root+string(filepath.Separator),
 		1,
 		1,
@@ -505,6 +647,7 @@ func TestV2UploadSessionRejectsSameTargetThroughDifferentBaseBeforeMutation(t *t
 	aliasChunk := multipartFileHeader(t, "target.bin", "a")
 	err = upload.UploadFile(
 		nil,
+		1,
 		aliasBase,
 		1,
 		1,
@@ -538,7 +681,7 @@ func TestV2UploadSessionRejectsSameTargetThroughDifferentBaseBeforeMutation(t *t
 	request := httptest.NewRequest("GET", "/v2/file/upload?"+query.Encode(), nil)
 	context := echo.New().NewContext(request, httptest.NewRecorder())
 	activityBeforeProbe := session.lastActivity
-	if err := upload.TestChunk(context, "same-target-alias", 1); err == nil {
+	if err := upload.TestChunk(context, 1, "same-target-alias", 1); err == nil {
 		t.Fatal("same target alias reported the bound chunk as uploaded")
 	}
 	if !session.lastActivity.Equal(activityBeforeProbe) {
