@@ -34,7 +34,8 @@ var (
 		Timeout:   messageBusRequestTimeout,
 		KeepAlive: 30 * time.Second,
 	}
-	messageBusHTTPClient = &http.Client{Transport: newMessageBusTransport(messageBusDialer)}
+	messageBusHTTPTransport = newMessageBusTransport(messageBusDialer)
+	messageBusHTTPClient    = &http.Client{Transport: newMessageBusUnaryResponseLimitTransport(messageBusHTTPTransport, messageBusMaximumUnaryResponseBytes)}
 )
 
 // UnaryMessageBusClient deliberately excludes MessageBus streaming APIs. Those
