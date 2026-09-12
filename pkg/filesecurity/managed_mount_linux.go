@@ -27,6 +27,31 @@ func (m *ManagedRoots) MountID(opened *os.File) (uint64, error) {
 	return managedMountIDAt(int(opened.Fd()), "", unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
 }
 
+// AvailableBytes reports the unprivileged free-byte count for the exact
+// managed directory descriptor. It is an admission hint, not a durability
+// guarantee: the caller must still handle a later write failure.
+func (m *ManagedRoots) AvailableBytes(absolutePath string) (uint64, error) {
+	opened, err := m.OpenDirectory(absolutePath)
+	if err != nil {
+		return 0, err
+	}
+	defer opened.Close()
+
+	var filesystem unix.Statfs_t
+	if err := unix.Fstatfs(int(opened.Fd()), &filesystem); err != nil {
+		return 0, err
+	}
+	if filesystem.Bavail < 0 || filesystem.Bsize <= 0 {
+		return 0, errors.New("managed filesystem reported invalid available space")
+	}
+	blocks := uint64(filesystem.Bavail)
+	blockSize := uint64(filesystem.Bsize)
+	if blocks > ^uint64(0)/blockSize {
+		return 0, errors.New("managed filesystem available space overflow")
+	}
+	return blocks * blockSize, nil
+}
+
 // IsMountPoint reports whether absolutePath is a mount boundary below one of
 // the pinned management roots. Both the parent and target are inspected with
 // descriptor-relative statx calls, so a pathname swap cannot redirect the
