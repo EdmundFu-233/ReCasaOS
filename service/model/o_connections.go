@@ -10,6 +10,26 @@
  */
 package model
 
+// LegacySMBCredentialRowPredicateSQL is the single SQLite storage-class
+// contract shared by the expand-only startup gate and the legacy write
+// containment DAO. Empty credential identity fields may be NULL or TEXT, but
+// an empty envelope is legacy only when it is NULL or a zero-length BLOB.
+//
+// The credential cutover must replace every consumer of this predicate in the
+// same release that writes the first sealed row or migration marker.
+const LegacySMBCredentialRowPredicateSQL = `(
+	(credential_id IS NULL OR credential_id = '')
+	AND (credential_format IS NULL OR credential_format = '')
+	AND (
+		password_envelope IS NULL
+		OR (
+			typeof(password_envelope) = 'blob'
+			AND length(CAST(password_envelope AS BLOB)) = 0
+		)
+	)
+	AND row_revision = 0
+)`
+
 type ConnectionsDBModel struct {
 	ID               uint   `gorm:"column:id;primary_key" json:"id"`
 	Updated          int64  `gorm:"autoUpdateTime"`
