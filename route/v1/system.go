@@ -2,6 +2,7 @@ package v1
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -22,6 +23,14 @@ import (
 	"github.com/IceWhaleTech/CasaOS/service"
 	"github.com/labstack/echo/v4"
 	"github.com/tidwall/gjson"
+)
+
+const maxAvailablePortAttempts = 16
+
+var (
+	errInvalidPortProtocol         = errors.New("port protocol must be tcp or udp")
+	errInvalidPortValue            = errors.New("port must be a canonical decimal value between 1 and 65535")
+	errAvailablePortProbeExhausted = errors.New("available port probing exhausted")
 )
 
 // @Summary check version
@@ -337,14 +346,46 @@ func PutSystemState(ctx echo.Context) error {
 // @Router /app/getport [get]
 func GetPort(ctx echo.Context) error {
 	t := utils.DefaultQuery(ctx, "type", "tcp")
-	var p int
-	ok := true
-	for ok {
-		p, _ = port.GetAvailablePort(t)
-		ok = !port.IsPortAvailable(p, t)
+	if err := validatePortProtocol(t); err != nil {
+		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
+	}
+	p, err := findAvailablePort(t, maxAvailablePortAttempts, port.GetAvailablePort, port.IsPortAvailable)
+	if err != nil {
+		return ctx.JSON(http.StatusServiceUnavailable, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR)})
 	}
 	// @tiger 这里最好封装成 {'port': ...} 的形式，来体现出参的上下文
 	return ctx.JSON(common_err.SUCCESS, &model.Result{Success: common_err.SUCCESS, Message: common_err.GetMsg(common_err.SUCCESS), Data: p})
+}
+
+func findAvailablePort(protocol string, attempts int, getAvailablePort func(string) (int, error), isPortAvailable func(int, string) bool) (int, error) {
+	if validatePortProtocol(protocol) != nil || attempts < 1 || getAvailablePort == nil || isPortAvailable == nil {
+		return 0, errInvalidPortProtocol
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
+		candidate, err := getAvailablePort(protocol)
+		if err != nil {
+			return 0, err
+		}
+		if candidate >= 1 && candidate <= 65535 && isPortAvailable(candidate, protocol) {
+			return candidate, nil
+		}
+	}
+	return 0, errAvailablePortProbeExhausted
+}
+
+func validatePortProtocol(protocol string) error {
+	if protocol != "tcp" && protocol != "udp" {
+		return errInvalidPortProtocol
+	}
+	return nil
+}
+
+func parseCanonicalPort(value string) (int, error) {
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 1 || parsed > 65535 || strconv.Itoa(parsed) != value {
+		return 0, errInvalidPortValue
+	}
+	return parsed, nil
 }
 
 // @Summary 检查端口是否可用
@@ -357,8 +398,14 @@ func GetPort(ctx echo.Context) error {
 // @Success 200 {string} string "ok"
 // @Router /app/check/{port} [get]
 func PortCheck(ctx echo.Context) error {
-	p, _ := strconv.Atoi(ctx.Param("port"))
 	t := utils.DefaultQuery(ctx, "type", "tcp")
+	if err := validatePortProtocol(t); err != nil {
+		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
+	}
+	p, err := parseCanonicalPort(ctx.Param("port"))
+	if err != nil {
+		return ctx.JSON(http.StatusBadRequest, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
+	}
 	return ctx.JSON(common_err.SUCCESS, &model.Result{Success: common_err.SUCCESS, Message: common_err.GetMsg(common_err.SUCCESS), Data: port.IsPortAvailable(p, t)})
 }
 

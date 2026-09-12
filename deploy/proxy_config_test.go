@@ -122,8 +122,8 @@ func TestPublicPortalRuntimeLogsDoNotRecordFullRequestURI(t *testing.T) {
 		serverCount++
 		searchFrom = blockStart + len(serverBlock)
 	}
-	if serverCount != 2 {
-		t.Fatalf("expected two Nginx public server blocks, found %d", serverCount)
+	if serverCount != 4 {
+		t.Fatalf("expected two default and two portal Nginx server blocks, found %d", serverCount)
 	}
 
 	for _, line := range strings.Split(nginxConfig, "\n") {
@@ -158,6 +158,93 @@ func TestPublicPortalHTTPRedirectDropsRequestURI(t *testing.T) {
 		}
 		if !strings.Contains(config, test.required) {
 			t.Errorf("%s HTTP redirect is not pinned to the HTTPS portal root", test.path)
+		}
+	}
+}
+
+func TestNginxConfigRejectsUnknownHostAndSNI(t *testing.T) {
+	config := uncommentedConfiguration(
+		repositoryFile(t, "deploy/nginx/recasaos.conf.example"),
+	)
+	if strings.Count(config, "listen 203.0.113.10:80 default_server;") != 1 ||
+		strings.Count(config, "listen [2001:db8::10]:80 default_server;") != 1 {
+		t.Error("Nginx must define one IPv4 and one IPv6 default HTTP server")
+	}
+	if strings.Count(config, "listen 203.0.113.10:443 ssl default_server;") != 1 ||
+		strings.Count(config, "listen [2001:db8::10]:443 ssl default_server;") != 1 {
+		t.Error("Nginx must define one IPv4 and one IPv6 default TLS server")
+	}
+
+	const serverMarker = "server {"
+	serverCount := 0
+	foundHTTPDefault := false
+	foundTLSDefault := false
+	for searchFrom := 0; ; {
+		relativeStart := strings.Index(config[searchFrom:], serverMarker)
+		if relativeStart < 0 {
+			break
+		}
+		blockStart := searchFrom + relativeStart + len("server ")
+		block := normalizedText(braceBlockAt(t, config, blockStart))
+		serverCount++
+		if strings.Contains(block, "listen 203.0.113.10:80 default_server;") {
+			foundHTTPDefault = true
+			for _, required := range []string{
+				"listen [2001:db8::10]:80 default_server;",
+				"server_name _;",
+				"access_log off;",
+				"error_log /dev/null;",
+				"return 444;",
+			} {
+				if !strings.Contains(block, required) {
+					t.Errorf("Nginx default HTTP server is missing %q", required)
+				}
+			}
+			if strings.Contains(block, "proxy_pass") || strings.Contains(block, "location ") {
+				t.Error("Nginx default HTTP server must not proxy or define locations")
+			}
+		}
+		if strings.Contains(block, "listen 203.0.113.10:443 ssl default_server;") {
+			foundTLSDefault = true
+			for _, required := range []string{
+				"listen [2001:db8::10]:443 ssl default_server;",
+				"server_name _;",
+				"ssl_reject_handshake on;",
+				"access_log off;",
+				"error_log /dev/null;",
+				"return 444;",
+			} {
+				if !strings.Contains(block, required) {
+					t.Errorf("Nginx default TLS server is missing %q", required)
+				}
+			}
+			if strings.Contains(block, "proxy_pass") || strings.Contains(block, "location ") {
+				t.Error("Nginx default TLS server must not proxy or define locations")
+			}
+		}
+		searchFrom = blockStart + len(block)
+	}
+	if serverCount != 4 {
+		t.Errorf("expected two default and two portal Nginx servers, found %d", serverCount)
+	}
+	if !foundHTTPDefault || !foundTLSDefault {
+		t.Error("Nginx default HTTP and TLS servers must be represented as complete blocks")
+	}
+}
+
+func TestNginxConfigUsesPortableHTTP2ListenSyntax(t *testing.T) {
+	config := uncommentedConfiguration(
+		repositoryFile(t, "deploy/nginx/recasaos.conf.example"),
+	)
+	if strings.Contains(config, "http2 on;") {
+		t.Error("Nginx example must not require the newer standalone http2 directive")
+	}
+	for _, required := range []string{
+		"listen 203.0.113.10:443 ssl http2;",
+		"listen [2001:db8::10]:443 ssl http2;",
+	} {
+		if strings.Count(config, required) != 1 {
+			t.Errorf("Nginx example must contain exactly one %q", required)
 		}
 	}
 }

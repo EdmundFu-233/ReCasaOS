@@ -132,6 +132,7 @@ jobs:
             .github/scripts/sample-cgroup-memory.py \
             .github/scripts/test-cgroup-memory-sampler.sh \
             .github/scripts/test-debian11-systemd-vm-policy.sh \
+            .github/scripts/test-hostile-worker-exe-lifecycle.py \
             .github/scripts/test-public-files-debian11-vm.sh \
             .github/scripts/test-public-files-systemd.sh \
             .github/scripts/test-trusted-privileged-workflow.sh

@@ -44,6 +44,10 @@ func (m *ManagedRoots) OpenDirectory(string) (*os.File, error) {
 	return nil, ErrManagedRootsUnsupported
 }
 
+func (m *ManagedRoots) StatDirectoryEntry(*os.File, string) (os.FileInfo, error) {
+	return nil, ErrManagedRootsUnsupported
+}
+
 func (m *ManagedRoots) ChmodDirectory(string, fs.FileMode) error {
 	return ErrManagedRootsUnsupported
 }

@@ -1,0 +1,440 @@
+From 11d8e38d2d9cea2693b97e2ef787efd67612ea22 Mon Sep 17 00:00:00 2001
+From: EdmundFu-233 <thotsky@protonmail.com>
+Date: Mon, 7 Sep 2026 10:05:25 -0400
+Subject: [PATCH] fix(upload): retry space-denied assembly on staged filesystem
+
+---
+ docs/THREAT_MODEL.md                    |   2 +-
+ route/v1/file.go                        |   2 +-
+ service/file_upload.go                  |  83 +++++---
+ service/file_upload_space_linux_test.go | 261 ++++++++++++++++++++++++
+ 4 files changed, 312 insertions(+), 36 deletions(-)
+ create mode 100644 service/file_upload_space_linux_test.go
+
+diff --git a/docs/THREAT_MODEL.md b/docs/THREAT_MODEL.md
+index 94c8c21..fc93575 100644
+--- a/docs/THREAT_MODEL.md
++++ b/docs/THREAT_MODEL.md
+@@ -89,7 +89,7 @@ this repository, but recovery plans must account for them.
+ | Legacy Samba migration or config race | Only byte-exact upstream CasaOS main configuration plus an exact multiset of raw database-derived legacy stanzas is eligible for automatic migration. Eligible rows are transactionally renamed and made private; Unicode, injection-shaped, duplicate, noncanonical, or otherwise unsafe rows remain as database evidence but are omitted from the active candidate. Dedicated byte-preserving backups are mode `0600` and the old `.bak` is untouched. Config publication uses inode/digest/permission compare-and-swap; detected unknown files are quarantined and block future publication. Empty post-unmount directories are deliberately retained because pathname cleanup after releasing mount ownership is unsafe. | Review quarantined DB rows and `.recasaos-quarantine-*` files manually; never re-enable the old guest/root fragment. A non-cooperating root or same-service-UID process racing after the final CAS identity check is within the trusted-host boundary. Migration backups intentionally remain for audit and can cause repeated migration reconciliation until an administrator resolves retained unsafe rows. Test exact, reordered, mixed-safe/unsafe, restart/commit failure, crash-resume, backup, and concurrent-replacement cases. |
+ | SQLite pathname replacement or secret logging | Database setup walks every ancestor with no-follow descriptors. Ancestors must be root/service-owned; group/other-writable ancestors are rejected unless sticky rename protection applies and the child is root/service-owned. The final directory is service-owned `0700`; the database, WAL, SHM, and journal are service-owned single-link regular files forced to `0600`. The canonical pathname must still identify the pinned directory before and after initialization. SQL warning logs use parameterized queries. | Do not relocate the DB beneath an untrusted writable hierarchy. SQLite canonicalizes `/proc/self/fd` paths, so the implementation deliberately does not claim descriptor-bound auxiliary filenames. Root and the service UID remain trusted after initialization. Use encrypted storage/backups when confidentiality at rest is required; test non-sticky writable ancestors, rename/replacement identity checks, symlink/hardlink artifacts, WAL metadata, permissive umask, and log redaction. |
+ | WebSocket hijacking or exhaustion | Root file/SSH sockets validate Origin, cap messages/connections, use bounded queues and deadlines, and overwrite client sender identity. SSH passwords are accepted only from a verified POST-issued one-use ticket or the first socket frame, and the local SSH host key must match protected system key material. The legacy UI still emits ignored credentials and JWTs in its WebSocket URL, so browser/Gateway logging remains a release blocker until that UI is patched. External-component sockets remain separate risks. | Keep all WebSockets off the public file hostname; patch and pin the UI so credentials and long-lived JWTs never enter URLs; use short-lived one-use socket tickets; test host-key mismatch, expiry/replay/revocation, normal session exit, slow output, and saturation across the locked stack. |
+-| Upload/download denial of service | Root multipart handlers cap chunks at 256 MiB, files at 64 GiB/256 chunks, and active v1/v2 sessions at 16 per registry. Completed replay tombstones are bounded at 128, expiry cleanup is retryable, indexes are checked before allocation, and final publication binds the assembled file's full stat identity plus SHA-256. Assembly streams and upload paths resolve through pinned roots. The candidate also checks `f_bavail` through the pinned target-parent descriptor, reserves each admitted chunk/final assembly under a process-wide lock, and preserves 512 MiB of unprivileged free headroom. Durable per-principal quotas, restart persistence, and hostile local-parent rename races remain concerns. | Keep privileged upload APIs on VPN; add durable per-user/disk quotas and crash-safe reservations; keep upload parents unavailable to untrusted local writers; monitor private temporary uploads; test 413/429/507, interruption, concurrency, replay, archive budgets, and disk exhaustion. |
++| Upload/download denial of service | Root multipart handlers cap chunks at 256 MiB, files at 64 GiB/256 chunks, and active v1/v2 sessions at 16 per registry. Completed replay tombstones are bounded at 128, expiry cleanup is retryable, indexes are checked before allocation, and final publication binds the assembled file's full stat identity plus SHA-256. Assembly streams and upload paths resolve through pinned roots. The candidate also checks `f_bavail` through a descriptor for the actual staging write parent beneath the pinned roots, reserves each admitted chunk/final assembly under a process-wide lock, and preserves 512 MiB of unprivileged free headroom. The eventual target can be on a different nested mount and is not the capacity source for staging writes. After v2 assembly admission fails, chunk probes request a retry and a verified duplicate chunk retries publication without rewriting the chunk; success requires a published target. Durable per-principal quotas, restart persistence, and hostile local-parent rename races remain concerns. | Keep privileged upload APIs on VPN; add durable per-user/disk quotas and crash-safe reservations; keep upload parents unavailable to untrusted local writers; monitor private temporary uploads; test 413/429/507, interruption, concurrency, replay, archive budgets, and disk exhaustion. |
+ | SSRF and third-party credential theft | Root proxy/search fetches are bound to separate capabilities and exact service endpoint allowlists, including host, path, and query shape. They require canonical HTTPS on port 443, re-check DNS and redirects under the same capability, disable ambient proxies, share a bounded transport, and cap response headers and bodies. Cloud, OAuth, DDNS, ZeroTier, update checks, and external components still cross trust boundaries. | Keep the capability allowlists narrow and pair them with an egress policy; use scoped credentials and encrypted secret storage; regression-test lookalike hosts, unexpected paths/queries, userinfo, IPv4/IPv6 special ranges, DNS rebinding, cross-capability redirects, and credential logging. |
+ | Local component compromise | Shared runtime files, public keys, message bus, Gateway management, and privileged OS operations create lateral movement paths. | Separate Unix users and writable paths; authenticate local IPC; minimize capabilities/sudo; protect runtime files; audit service-unit hardening. |
+ | Supply-chain drift | The Message Bus OpenAPI input, generator, Go toolchain, and Actions are pinned, and dangerous inherited workflows plus remote-shell updates are disabled. A structured CI package-graph gate rejects the unmaintained `golang.org/x/crypto/openpgp` subtree across Linux tests in both CGO modes, race-enabled tests, privileged browser/systemd tags, supported release targets, the checker, and selected Go tools without blocking the separately required `golang.org/x/crypto/ssh` package. Tool graphs are checked before generators execute and the full selected graph is checked again afterward. UI/installer/runtime components are not yet locked as one release. | Follow `RECASAOS_COMPONENTS.md`; pin every release component/action to reviewed immutable revisions; generate before test; scan dependencies; verify checksums, SBOM, signatures, and provenance. The package gate prevents a known forbidden import family from becoming selected in the enumerated graphs; it is not a general vulnerability scanner, does not cover unselected platform/tag combinations, and does not prove that allowed dependencies are safe. |
+diff --git a/route/v1/file.go b/route/v1/file.go
+index aa5ef08..9a517f1 100644
+--- a/route/v1/file.go
++++ b/route/v1/file.go
+@@ -804,7 +804,7 @@ func PostFileUpload(ctx echo.Context) error {
+ 		return respondV1UploadFailure(ctx, changedV1UploadError("upload chunk published before chunk-set validation failed", err))
+ 	}
+ 	if complete {
+-		assemblySpaceRelease, spaceErr := filesecurity.ReserveUploadSpace(roots, filepath.Dir(paths.target), uint64(assemblyBytes))
++		assemblySpaceRelease, spaceErr := filesecurity.ReserveUploadSpace(roots, filepath.Dir(paths.assembly), uint64(assemblyBytes))
+ 		if spaceErr != nil {
+ 			return respondV1UploadFailure(ctx, changedV1UploadError("upload chunks published before assembly space admission failed", spaceErr))
+ 		}
+diff --git a/service/file_upload.go b/service/file_upload.go
+index 856729a..79d507e 100644
+--- a/service/file_upload.go
++++ b/service/file_upload.go
+@@ -77,6 +77,7 @@ type FileUploadService struct {
+ 	removeTree      func(string) error
+ 	managementRoots func() (*filesecurity.ManagedRoots, error)
+ 	mkdirAll        func(*filesecurity.ManagedRoots, string, fs.FileMode) error
++	reserveSpace    func(*filesecurity.ManagedRoots, string, uint64) (func(), error)
+ }
+ 
+ func NewFileUploadService() *FileUploadService {
+@@ -84,6 +85,7 @@ func NewFileUploadService() *FileUploadService {
+ 		uploadStatus:    make(map[string]*FileInfo),
+ 		removeTree:      filesecurity.RemoveManagementTree,
+ 		managementRoots: filesecurity.ManagementFileRoots,
++		reserveSpace:    filesecurity.ReserveUploadSpace,
+ 		mkdirAll: func(roots *filesecurity.ManagedRoots, path string, mode fs.FileMode) error {
+ 			return roots.MkdirAll(path, mode)
+ 		},
+@@ -142,6 +144,12 @@ func (s *FileUploadService) TestChunk(
+ 		}
+ 		return fileInfo.completionErr
+ 	}
++	if fileInfo.uploadedChunkNum == fileInfo.totalChunks {
++		// A previous assembly admission may have failed after the last chunk
++		// was committed. Ask the resumable client to POST again so it retries
++		// publication instead of skipping every chunk of an absent target.
++		return errors.New("upload assembly is pending")
++	}
+ 	if !fileInfo.uploaded[chunkNumber-1] {
+ 		return fmt.Errorf("file not found")
+ 	}
+@@ -296,56 +304,63 @@ func (s *FileUploadService) UploadFile(
+ 	fileInfo.stagingClean = false
+ 	fileInfo.lastActivity = time.Now()
+ 	chunkIndex := int(chunkNumber - 1)
++	reconciled := false
+ 	if fileInfo.uploaded[chunkIndex] {
+-		reconciled, err := reconcileRecordedServiceChunk(fileInfo, chunkIndex, roots, chunkPath, currentChunkSize)
++		reconciled, err = reconcileRecordedServiceChunk(fileInfo, chunkIndex, roots, chunkPath, currentChunkSize)
+ 		if err != nil {
+ 			fileInfo.lock.Unlock()
+ 			return changedServiceUploadErrorIf(namespaceMayHaveChanged || hadPublishedChunks, "upload namespace changed before recorded chunk reconciliation failed", err)
+ 		}
+-		if reconciled {
+-			fileInfo.lock.Unlock()
+-			return nil
+-		}
+ 	}
+ 
+-	source, err := bin.Open()
+-	if err != nil {
+-		fileInfo.lock.Unlock()
+-		return changedServiceUploadErrorIf(namespaceMayHaveChanged || hadPublishedChunks, "upload namespace changed before multipart chunk open failed", err)
+-	}
+-	chunkSpaceRelease, spaceErr := filesecurity.ReserveUploadSpace(roots, filepath.Dir(targetPath), uint64(currentChunkSize))
+-	if spaceErr != nil {
+-		_ = source.Close()
+-		fileInfo.lock.Unlock()
+-		return spaceErr
+-	}
+-	writeResult, writeErr := func() (serviceChunkWriteResult, error) {
+-		defer chunkSpaceRelease()
+-		return writeValidatedServiceChunk(roots, chunkPath, source, currentChunkSize)
+-	}()
+-	if writeErr != nil && !writeResult.Published {
+-		fileInfo.lock.Unlock()
+-		return changedServiceUploadErrorIf(namespaceMayHaveChanged || hadPublishedChunks, "upload namespace changed before chunk publication failed", writeErr)
+-	}
+-	if !writeResult.Published {
+-		fileInfo.lock.Unlock()
+-		return changedServiceUploadErrorIf(namespaceMayHaveChanged || hadPublishedChunks, "upload namespace changed before chunk publication was confirmed", errors.New("validated upload chunk was not published"))
+-	}
++	var writeErr error
++	if !reconciled {
++		source, err := bin.Open()
++		if err != nil {
++			fileInfo.lock.Unlock()
++			return changedServiceUploadErrorIf(namespaceMayHaveChanged || hadPublishedChunks, "upload namespace changed before multipart chunk open failed", err)
++		}
++		// Chunks and assembly are written under .temp, which can be on a
++		// different filesystem from a nested target mount. Admit the actual
++		// write's parent, not the eventual publication destination.
++		chunkSpaceRelease, spaceErr := s.reserveSpace(roots, filepath.Dir(chunkPath), uint64(currentChunkSize))
++		if spaceErr != nil {
++			closeErr := source.Close()
++			fileInfo.lock.Unlock()
++			return changedServiceUploadErrorIf(namespaceMayHaveChanged || hadPublishedChunks, "upload directories may have changed before chunk space admission failed", errors.Join(spaceErr, closeErr))
++		}
++		var writeResult serviceChunkWriteResult
++		writeResult, writeErr = func() (serviceChunkWriteResult, error) {
++			defer chunkSpaceRelease()
++			return writeValidatedServiceChunk(roots, chunkPath, source, currentChunkSize)
++		}()
++		if writeErr != nil && !writeResult.Published {
++			fileInfo.lock.Unlock()
++			return changedServiceUploadErrorIf(namespaceMayHaveChanged || hadPublishedChunks, "upload namespace changed before chunk publication failed", writeErr)
++		}
++		if !writeResult.Published {
++			fileInfo.lock.Unlock()
++			return changedServiceUploadErrorIf(namespaceMayHaveChanged || hadPublishedChunks, "upload namespace changed before chunk publication was confirmed", errors.New("validated upload chunk was not published"))
++		}
+ 
+-	if !fileInfo.uploaded[chunkIndex] {
+-		fileInfo.uploadedChunkNum++
+-		fileInfo.uploaded[chunkIndex] = true
++		if !fileInfo.uploaded[chunkIndex] {
++			fileInfo.uploadedChunkNum++
++			fileInfo.uploaded[chunkIndex] = true
++		}
++		fileInfo.chunkDigests[chunkIndex] = writeResult.Digest
+ 	}
+-	fileInfo.chunkDigests[chunkIndex] = writeResult.Digest
+ 	if fileInfo.uploadedChunkNum != totalChunks {
+ 		fileInfo.lock.Unlock()
+ 		return writeErr
+ 	}
+ 
+-	assemblySpaceRelease, spaceErr := filesecurity.ReserveUploadSpace(roots, filepath.Dir(targetPath), uint64(fileInfo.totalSize))
++	// A verified duplicate chunk can still be the retry that completes an
++	// earlier space-denied assembly. Do not rewrite it or report success until
++	// the pending target is actually published.
++	assemblySpaceRelease, spaceErr := s.reserveSpace(roots, filepath.Dir(fileInfo.assemblyPath), uint64(fileInfo.totalSize))
+ 	if spaceErr != nil {
+ 		fileInfo.lock.Unlock()
+-		return changedServiceUploadError("upload chunks published before assembly space admission failed", spaceErr)
++		return changedServiceUploadError("upload chunks published before assembly space admission failed", errors.Join(writeErr, spaceErr))
+ 	}
+ 	assemblyResult, assemblyErr := func() (serviceAssemblyResult, error) {
+ 		defer assemblySpaceRelease()
+diff --git a/service/file_upload_space_linux_test.go b/service/file_upload_space_linux_test.go
+new file mode 100644
+index 0000000..859bed9
+--- /dev/null
++++ b/service/file_upload_space_linux_test.go
+@@ -0,0 +1,261 @@
++//go:build linux
++
++package service
++
++import (
++	"bytes"
++	"errors"
++	"io"
++	"io/fs"
++	"mime/multipart"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"path/filepath"
++	"strconv"
++	"testing"
++
++	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
++	"github.com/labstack/echo/v4"
++)
++
++func newSpaceTestUpload(t *testing.T) (*FileUploadService, string) {
++	t.Helper()
++	root := t.TempDir()
++	roots, err := filesecurity.OpenManagementFileRoots([]string{root})
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = roots.Close() })
++	upload := NewFileUploadService()
++	upload.managementRoots = func() (*filesecurity.ManagedRoots, error) { return roots, nil }
++	upload.removeTree = os.RemoveAll
++	return upload, root
++}
++
++func spaceTestChunk(t *testing.T, content string) *multipart.FileHeader {
++	t.Helper()
++	var body bytes.Buffer
++	writer := multipart.NewWriter(&body)
++	part, err := writer.CreateFormFile("file", "target.bin")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := io.WriteString(part, content); err != nil {
++		t.Fatal(err)
++	}
++	if err := writer.Close(); err != nil {
++		t.Fatal(err)
++	}
++	form, err := multipart.NewReader(&body, writer.Boundary()).ReadForm(1024)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = form.RemoveAll() })
++	return form.File["file"][0]
++}
++
++func checkSpaceTestChunk(upload *FileUploadService, root string, number int64) error {
++	query := url.Values{"path": {root}, "relativePath": {"nested/target.bin"}}
++	request := httptest.NewRequest(http.MethodGet, "/?"+query.Encode(), nil)
++	context := echo.New().NewContext(request, httptest.NewRecorder())
++	return upload.TestChunk(context, "space-test", number)
++}
++
++func sendSpaceTestChunk(t *testing.T, upload *FileUploadService, root string, number int64) error {
++	t.Helper()
++	content := "data"
++	if number == 2 {
++		content = "tail"
++	}
++	return upload.UploadFile(nil, root, number, 4, 4, 2, 8, "space-test", "nested/target.bin", "target.bin", spaceTestChunk(t, content))
++}
++
++func TestV2UploadSpaceChecksStagingBeforeChunkWrite(t *testing.T) {
++	upload, root := newSpaceTestUpload(t)
++	target := filepath.Join(root, "nested", "target.bin")
++	staging := filepath.Join(root, ".temp", "v2-upload-"+boundUploadIdentifier("space-test", target))
++	admission := filesecurity.NewUploadSpaceAdmission(func(_ *filesecurity.ManagedRoots, parent string) (uint64, error) {
++		if parent == staging {
++			return filesecurity.DefaultUploadReservedFreeBytes, nil
++		}
++		// The target can be a nested mount with ample space while the
++		// filesystem receiving the staging write is full.
++		return filesecurity.DefaultUploadReservedFreeBytes + 1024, nil
++	})
++	upload.reserveSpace = func(roots *filesecurity.ManagedRoots, parent string, size uint64) (func(), error) {
++		return admission.Reserve(roots, parent, size, filesecurity.DefaultUploadReservedFreeBytes)
++	}
++	err := sendSpaceTestChunk(t, upload, root, 1)
++	if !errors.Is(err, filesecurity.ErrUploadSpaceInsufficient) || !filesecurity.ManagedMutationChanged(err) {
++		t.Fatalf("staging admission error = %v, want insufficient space with created-directory state", err)
++	}
++	entries, err := os.ReadDir(staging)
++	if err != nil || len(entries) != 0 {
++		t.Fatalf("denied upload wrote staging content: %v, %v", entries, err)
++	}
++}
++
++func TestV2UploadSpaceChecksStagingBeforeAssembly(t *testing.T) {
++	upload, root := newSpaceTestUpload(t)
++	target := filepath.Join(root, "nested", "target.bin")
++	staging := filepath.Join(root, ".temp", "v2-upload-"+boundUploadIdentifier("space-test", target))
++	upload.reserveSpace = func(_ *filesecurity.ManagedRoots, parent string, size uint64) (func(), error) {
++		if size == 8 && parent == staging {
++			return nil, filesecurity.ErrUploadSpaceInsufficient
++		}
++		return func() {}, nil
++	}
++	if err := sendSpaceTestChunk(t, upload, root, 1); err != nil {
++		t.Fatal(err)
++	}
++	if err := sendSpaceTestChunk(t, upload, root, 2); !errors.Is(err, filesecurity.ErrUploadSpaceInsufficient) {
++		t.Fatalf("assembly admission error = %v, want insufficient staging space", err)
++	}
++	if _, err := os.Stat(filepath.Join(staging, ".complete")); !errors.Is(err, fs.ErrNotExist) {
++		t.Fatalf("denied assembly created output: %v", err)
++	}
++	if _, err := os.Stat(target); !errors.Is(err, fs.ErrNotExist) {
++		t.Fatalf("denied assembly published target: %v", err)
++	}
++}
++
++func TestV2UploadSpaceRetryPublishesPendingAssembly(t *testing.T) {
++	for _, denied := range []error{filesecurity.ErrUploadSpaceInsufficient, filesecurity.ErrUploadSpaceUnavailable} {
++		for _, retryChunk := range []int64{1, 2} {
++			t.Run(denied.Error()+"/chunk-"+strconv.FormatInt(retryChunk, 10), func(t *testing.T) {
++				upload, root := newSpaceTestUpload(t)
++				allowAssembly := false
++				active, chunkReservations, assemblyAttempts := 0, 0, 0
++				upload.reserveSpace = func(_ *filesecurity.ManagedRoots, _ string, size uint64) (func(), error) {
++					if size == 8 {
++						assemblyAttempts++
++						if !allowAssembly {
++							return nil, denied
++						}
++					} else {
++						chunkReservations++
++					}
++					active++
++					return func() { active-- }, nil
++				}
++				if err := sendSpaceTestChunk(t, upload, root, 1); err != nil {
++					t.Fatal(err)
++				}
++				if err := checkSpaceTestChunk(upload, root, 1); err != nil {
++					t.Fatalf("incomplete upload lost its existing chunk: %v", err)
++				}
++				if err := sendSpaceTestChunk(t, upload, root, 1); err != nil || chunkReservations != 1 || assemblyAttempts != 0 {
++					t.Fatalf("incomplete chunk replay rewrote data or assembled early: %v", err)
++				}
++				if err := sendSpaceTestChunk(t, upload, root, 2); !errors.Is(err, denied) || !filesecurity.ManagedMutationChanged(err) {
++					t.Fatalf("first assembly failure = %v", err)
++				}
++				if err := checkSpaceTestChunk(upload, root, retryChunk); err == nil {
++					t.Error("chunk probe lets the client skip an unpublished complete upload")
++				}
++				if err := sendSpaceTestChunk(t, upload, root, retryChunk); !errors.Is(err, denied) {
++					t.Fatalf("retry falsely reported success while assembly was denied: %v", err)
++				}
++				target := filepath.Join(root, "nested", "target.bin")
++				if _, err := os.Stat(target); !errors.Is(err, fs.ErrNotExist) {
++					t.Fatalf("unadmitted target exists: %v", err)
++				}
++				allowAssembly = true
++				if err := sendSpaceTestChunk(t, upload, root, retryChunk); err != nil {
++					t.Fatalf("recovered assembly failed: %v", err)
++				}
++				content, err := os.ReadFile(target)
++				if err != nil || string(content) != "datatail" {
++					t.Fatalf("published content = %q, %v", content, err)
++				}
++				session := upload.uploadStatus[boundUploadIdentifier("space-test", target)]
++				if session == nil || !session.completed || !session.stagingClean {
++					t.Fatal("recovery did not retain a clean completed tombstone")
++				}
++				if _, err := os.Stat(session.tempDir); !errors.Is(err, fs.ErrNotExist) {
++					t.Fatalf("completed upload retained staging files: %v", err)
++				}
++				if err := checkSpaceTestChunk(upload, root, retryChunk); err != nil {
++					t.Fatalf("completed probe failed: %v", err)
++				}
++				if err := sendSpaceTestChunk(t, upload, root, retryChunk); err != nil {
++					t.Fatalf("completed replay failed: %v", err)
++				}
++				if active != 0 || chunkReservations != 2 || assemblyAttempts != 3 {
++					t.Fatalf("reservation lifecycle: active=%d chunks=%d assemblies=%d", active, chunkReservations, assemblyAttempts)
++				}
++			})
++		}
++	}
++}
++
++func TestV2UploadSpaceReservationsReleaseOnWriteAndAssemblyErrors(t *testing.T) {
++	for _, phase := range []string{"chunk", "assembly"} {
++		t.Run(phase, func(t *testing.T) {
++			upload, root := newSpaceTestUpload(t)
++			active := 0
++			upload.reserveSpace = func(*filesecurity.ManagedRoots, string, uint64) (func(), error) {
++				active++
++				return func() { active-- }, nil
++			}
++			var err error
++			if phase == "chunk" {
++				chunk := spaceTestChunk(t, "oversized")
++				chunk.Size = 4
++				err = upload.UploadFile(nil, root, 1, 4, 4, 2, 8, "space-test", "nested/target.bin", "target.bin", chunk)
++			} else {
++				if err := sendSpaceTestChunk(t, upload, root, 1); err != nil {
++					t.Fatal(err)
++				}
++				target := filepath.Join(root, "nested", "target.bin")
++				session := upload.uploadStatus[boundUploadIdentifier("space-test", target)]
++				injected := errors.New("injected assembly publication failure")
++				session.assemblyBeforeCommit = func() error { return injected }
++				err = sendSpaceTestChunk(t, upload, root, 2)
++				if !errors.Is(err, injected) {
++					t.Fatalf("assembly error = %v, want injected failure", err)
++				}
++			}
++			if err == nil || !filesecurity.ManagedMutationChanged(err) || active != 0 {
++				t.Fatalf("failed %s write: err=%v, active reservations=%d", phase, err, active)
++			}
++			if _, err := os.Stat(filepath.Join(root, "nested", "target.bin")); !errors.Is(err, fs.ErrNotExist) {
++				t.Fatalf("failed write published target: %v", err)
++			}
++		})
++	}
++}
++
++func TestV2UploadSpaceRetryRejectsChangedRecordedChunk(t *testing.T) {
++	upload, root := newSpaceTestUpload(t)
++	assemblyAttempts := 0
++	upload.reserveSpace = func(_ *filesecurity.ManagedRoots, _ string, size uint64) (func(), error) {
++		if size == 8 {
++			assemblyAttempts++
++			return nil, filesecurity.ErrUploadSpaceInsufficient
++		}
++		return func() {}, nil
++	}
++	if err := sendSpaceTestChunk(t, upload, root, 1); err != nil {
++		t.Fatal(err)
++	}
++	if err := sendSpaceTestChunk(t, upload, root, 2); !errors.Is(err, filesecurity.ErrUploadSpaceInsufficient) {
++		t.Fatalf("assembly error = %v", err)
++	}
++	target := filepath.Join(root, "nested", "target.bin")
++	session := upload.uploadStatus[boundUploadIdentifier("space-test", target)]
++	if err := os.WriteFile(filepath.Join(session.tempDir, "2"), []byte("evil"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	if err := sendSpaceTestChunk(t, upload, root, 2); !errors.Is(err, filesecurity.ErrUnsafePath) {
++		t.Fatalf("changed recorded chunk was accepted: %v", err)
++	}
++	if assemblyAttempts != 1 {
++		t.Fatalf("changed chunk reached assembly admission %d times", assemblyAttempts)
++	}
++	if _, err := os.Stat(target); !errors.Is(err, fs.ErrNotExist) {
++		t.Fatalf("changed chunk published target: %v", err)
++	}
++}
+-- 
+2.55.0
+

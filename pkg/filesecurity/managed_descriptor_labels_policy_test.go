@@ -22,6 +22,7 @@ func TestManagedProductionDescriptorsUseApprovedOpaqueNames(t *testing.T) {
 	rules := map[string]managedDescriptorPolicyRule{
 		"managedRootDescriptorName":                         {value: "<managed-root>", uses: 1},
 		"managedOpenedPathDescriptorName":                   {value: "<managed-opened-path>", uses: 1},
+		"managedDirectoryEntryDescriptorName":               {value: "<managed-directory-entry>", uses: 1},
 		"managedTemporaryDescriptorName":                    {value: "<managed-temporary>", uses: 1},
 		"managedRemovalDirectoryDescriptorName":             {value: "<managed-removal-directory>", uses: 1},
 		"managedTransferDestinationFileDescriptorName":      {value: "<managed-transfer-destination-file>", uses: 1},

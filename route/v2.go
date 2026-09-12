@@ -71,9 +71,12 @@ func InitV2Router() http.Handler {
 
 	e := echo.New()
 
-	e.Use(echo_middleware.Gzip())
-
+	// The request logger is outermost so that rejected credential transport
+	// and unauthenticated traffic cannot suppress their own audit records by
+	// presenting a credential-shaped query parameter.
 	e.Use(safeRequestLogger())
+	e.Use(rejectCredentialTransport())
+	e.Use(echo_middleware.Gzip())
 
 	e.Use(echojwt.WithConfig(v2JWTConfig()))
 	e.Use(privateNoStoreResponses())
@@ -107,7 +110,7 @@ func v2JWTConfig() echojwt.Config {
 
 			return claims, nil
 		},
-		TokenLookup: "header:Authorization,query:token",
+		TokenLookup: "header:Authorization:Bearer ",
 	}
 }
 
@@ -219,12 +222,15 @@ func InitFile() http.Handler {
 		w.Header().Set("Content-Disposition", "attachment; filename*=utf-8''"+url.PathEscape(fileName))
 		http.ServeContent(w, r, fileName, info.ModTime(), opened)
 	})
-	return httpsecurity.WithSecurityHeaders(handler)
+	return httpsecurity.WithSecurityHeaders(rejectCredentialTransportHTTP(handler))
 }
 
 func accessTokenFromRequest(r *http.Request) (string, bool) {
 	const maxTokenLength = 16 << 10
 
+	if r == nil || hasCredentialQueryParameter(r) {
+		return "", false
+	}
 	authorization := r.Header.Values(echo.HeaderAuthorization)
 	if len(authorization) > 0 {
 		if len(authorization) != 1 {
@@ -238,19 +244,13 @@ func accessTokenFromRequest(r *http.Request) (string, bool) {
 		return token, true
 	}
 
-	// Query tokens are retained temporarily for compatibility with the current
-	// CasaOS UI. Request logging intentionally omits query strings.
-	queryTokens := r.URL.Query()["token"]
-	if len(queryTokens) != 1 || queryTokens[0] == "" || len(queryTokens[0]) > maxTokenLength || strings.ContainsAny(queryTokens[0], " \t\r\n") {
-		return "", false
-	}
-	return queryTokens[0], true
+	return "", false
 }
 
 func InitDir() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token := r.URL.Query().Get("token")
-		if len(token) == 0 {
+		token, ok := accessTokenFromRequest(r)
+		if !ok {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			w.Write([]byte(`{"message": "token not found"}`))
