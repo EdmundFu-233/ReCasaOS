@@ -82,8 +82,11 @@ func PostSshLogin(ctx echo.Context) error {
 	if err := validateSSHParameters(userName, password, port); err != nil {
 		return ctx.JSON(common_err.CLIENT_ERROR, modelCommon.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS), Data: "Username or password or port is empty"})
 	}
-	client, err := sshsecurity.DialLocal(userName, password, port)
+	client, err := sshsecurity.DialLocalContext(ctx.Request().Context(), userName, password, port)
 	if err != nil {
+		if errors.Is(err, sshsecurity.ErrLocalSSHBusy) {
+			return ctx.JSON(http.StatusTooManyRequests, modelCommon.Result{Success: http.StatusTooManyRequests, Message: "too many concurrent SSH login attempts"})
+		}
 		logger.Error("connect ssh error", zap.Any("error", err))
 		return ctx.JSON(common_err.CLIENT_ERROR, modelCommon.Result{Success: common_err.CLIENT_ERROR, Message: common_err.GetMsg(common_err.CLIENT_ERROR), Data: "Please check if the username and port are correct, and make sure that ssh server is installed."})
 	}
@@ -143,8 +146,12 @@ func WsSsh(ctx echo.Context) error {
 	cols := boundedTerminalDimension(handshake.Cols, 200)
 	rows := boundedTerminalDimension(handshake.Rows, 32)
 
-	client, err := sshsecurity.DialLocal(handshake.Username, handshake.Password, handshake.Port)
+	client, err := sshsecurity.DialLocalContext(ctx.Request().Context(), handshake.Username, handshake.Password, handshake.Port)
 	if err != nil {
+		if errors.Is(err, sshsecurity.ErrLocalSSHBusy) {
+			writeSSHClose(wsConn, websocket.CloseTryAgainLater, "SSH service is busy")
+			return nil
+		}
 		logger.Error("connect ssh websocket error", zap.Error(err))
 		writeSSHClose(wsConn, websocket.ClosePolicyViolation, "SSH authentication failed")
 		return nil
