@@ -22,7 +22,7 @@ primary_workflow="${2:-$repo_root/.github/workflows/recasaos-ci-security.yml}"
 # digest update in this independently frozen checker.
 command -v python3 >/dev/null 2>&1 ||
   die "Python is unavailable for trusted workflow hashing"
-expected_workflow_sha256=d652eaf9120772d7714f2a4440e20663921ebe6833a5c5f9888f5faa703ab080
+expected_workflow_sha256=54846e6270b8b922c7a3107fb8403d25da1fb4045e42806c896d41600553e169
 actual_workflow_sha256="$(
   python3 - "$workflow" <<'PYTHON'
 import hashlib
@@ -363,13 +363,17 @@ for trusted_path in \
   .github/scripts/test-hostile-worker-exe-lifecycle.py \
   .github/scripts/test-public-files-debian11-vm.sh \
   .github/scripts/test-public-files-systemd.sh \
-  .github/scripts/test-trusted-privileged-workflow.sh
+  .github/scripts/test-smb-credential-admission-checker.sh \
+  .github/scripts/test-smb-credential-startup-dispatch.sh \
+  .github/scripts/test-smb-credential-systemd-admission.sh \
+  .github/scripts/test-trusted-privileged-workflow.sh \
+  deploy/systemd/check-smb-credential-admission.sh
 do
-  # The last entry is the trust root itself and intentionally has no
-  # line continuation; every other entry must appear as the exact list line
-  # so that a renamed or suffixed path cannot satisfy the freeze by prefix.
+  # The final entry intentionally has no line continuation; every other entry
+  # must appear as the exact list line so that a renamed or suffixed path
+  # cannot satisfy the freeze by prefix.
   if [[ "$trusted_path" == \
-    .github/scripts/test-trusted-privileged-workflow.sh ]]; then
+    deploy/systemd/check-smb-credential-admission.sh ]]; then
     trusted_path_line="            $trusted_path"
   else
     trusted_path_line="            $trusted_path \\"

@@ -25,6 +25,7 @@ import (
 	"github.com/IceWhaleTech/CasaOS/pkg/config"
 	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
 	"github.com/IceWhaleTech/CasaOS/pkg/samba"
+	"github.com/IceWhaleTech/CasaOS/pkg/smbcredentials"
 	"github.com/IceWhaleTech/CasaOS/pkg/sqlite"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/file"
 	"github.com/IceWhaleTech/CasaOS/route"
@@ -62,14 +63,10 @@ var (
 	sambaProbeFlag = flag.Bool("internal-samba-probe", false, "internal use only")
 )
 
-func init() {
-	if isInternalSambaProbeInvocation() {
-		return
-	}
-	flag.Parse()
-	if *versionFlag {
-		fmt.Println("v" + common.VERSION)
-		return
+func initializeApplication() {
+	credentialValidated, err := admitStartupSMBCredential(smbcredentials.LoadSystemdKeyring)
+	if err != nil {
+		panic(fmt.Errorf("admit ReCasaOS SMB systemd credential: %w", err))
 	}
 
 	println("git commit:", commit)
@@ -81,7 +78,6 @@ func init() {
 	if len(*dbFlag) == 0 {
 		*dbFlag = config.AppInfo.DBPath + "/db"
 	}
-
 	sqliteDB = sqlite.GetDb(*dbFlag)
 	// gredis.GetRedisConn(config.RedisInfo),
 
@@ -90,6 +86,9 @@ func init() {
 	service.Cache = cache.Init()
 
 	service.GetCPUThermalZone()
+	if credentialValidated {
+		logger.Info("Validated optional ReCasaOS SMB runtime credential payload; sealed storage remains disabled")
+	}
 
 	//service.MyService.System().GenreateSystemEntry()
 	///
@@ -112,9 +111,12 @@ func main() {
 	if isInternalSambaProbeInvocation() {
 		os.Exit(samba.RunInternalProbe())
 	}
+	flag.Parse()
 	if *versionFlag {
+		fmt.Println("v" + common.VERSION)
 		return
 	}
+	initializeApplication()
 	managementRoots, err := filesecurity.OpenManagementFileRootsFromEnvironment()
 	if err != nil {
 		panic(fmt.Errorf("initialize management file roots: %w", err))
@@ -245,15 +247,10 @@ func main() {
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    1 << 20,
 	}
-
 	logger.Info("CasaOS main service is listening...", zap.Any("address", listener.Addr().String()))
 	// defer service.MyService.Storage().UnmountAllStorage()
 	err = s.Serve(listener) // not using http.serve() to fix G114: Use of net/http serve function that has no support for setting timeouts (see https://github.com/securego/gosec)
 	if err != nil && err != http.ErrServerClosed {
 		panic(err)
 	}
-}
-
-func isInternalSambaProbeInvocation() bool {
-	return len(os.Args) == 2 && os.Args[1] == samba.InternalProbeArgument
 }
