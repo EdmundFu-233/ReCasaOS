@@ -205,9 +205,14 @@ non-destructive operator workflow. It does not provide or authorize cleanup.
 
 ## Development
 
-ReCasaOS currently requires Linux for the complete build and test suite. The Go
-toolchain and generator versions are locked in `go.mod`; the remote Message Bus
-OpenAPI input is locked to an immutable commit.
+ReCasaOS supports the service runtime only on a conventional Linux appliance;
+Android is not a supported target. Native Darwin builds are a contributor
+validation target, not a supported runtime. The root binary on unsupported
+platforms exits immediately instead of starting a partially functional service.
+The Go toolchain and generator versions are locked in `go.mod`; the remote
+Message Bus OpenAPI input is locked to an immutable commit.
+
+Run the complete build and test suite on Linux:
 
 ```sh
 go generate ./...
@@ -216,16 +221,26 @@ go vet ./...
 govulncheck ./...
 ```
 
-On a non-Linux development host, compile the complete Linux package graph with:
+On Darwin, compile all native packages and tests without executing the
+Linux-oriented test suite, then run native vet:
+
+```sh
+go test -exec=true ./...
+go vet ./...
+```
+
+The macOS GitHub Actions job repeats these checks and verifies that the root
+binary rejects unsupported runtime use with a clear, nonzero exit. To validate
+the complete Linux package graph from any non-Linux development host, use:
 
 ```sh
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test -exec=true ./...
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go vet ./...
 ```
 
-`-exec=true` verifies cross-platform compilation but does not execute the Linux
-test binaries. GitHub Actions executes the full suite on Ubuntu with the patched
-Go version recorded in the workflow.
+`-exec=true` verifies compilation but does not execute the test binaries.
+GitHub Actions executes the full suite on Ubuntu with the patched Go version
+recorded in the workflow.
 
 ## Contributing and security
 

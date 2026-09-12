@@ -1,6 +1,8 @@
 .PHONY: build build-ui build-backend build-public-files help
 
 PUBLIC_FILES_BINARY := build/sysroot/usr/lib/recasaos-public-files/rootfs/usr/bin/recasaos-public-files
+ROOT_BINARY ?= casa
+UPX ?= upx
 
 build: build-backend
 
@@ -10,7 +12,8 @@ build-ui:
 	@exit 1
 
 build-backend:
-	export CGO_ENABLED=1;export CGO_LDFLAGS=-static;go build -o ./casa main.go;upx --lzma --best casa
+	CGO_ENABLED=1 CGO_LDFLAGS=-static go build -o "$(ROOT_BINARY)" .
+	$(UPX) --lzma --best "$(ROOT_BINARY)"
 
 build-public-files:
 	mkdir -p $(dir $(PUBLIC_FILES_BINARY))
