@@ -666,7 +666,7 @@ func (s *systemService) GetCasaOSLogs(lineNumber int) string {
 		return err.Error()
 	}
 	defer file.Close()
-	content, err := io.ReadAll(file)
+	content, err := readCasaOSLogTail(file, lineNumber)
 	if err != nil {
 		return err.Error()
 	}

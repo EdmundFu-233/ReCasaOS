@@ -10,6 +10,7 @@ fail() {
 script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 repository="$(cd -- "$script_directory/../.." && pwd -P)"
 checker="$script_directory/check-debian11-systemd-vm-policy.sh"
+hostile_worker_lifecycle_test="$script_directory/test-hostile-worker-exe-lifecycle.py"
 workflow="$repository/.github/workflows/recasaos-ci-security.yml"
 vm_script="$repository/.github/scripts/test-public-files-debian11-vm.sh"
 systemd_script="$repository/.github/scripts/test-public-files-systemd.sh"
@@ -17,10 +18,14 @@ sampler="$repository/.github/scripts/sample-cgroup-memory.py"
 
 [[ -x "$checker" ]] || fail "policy checker is not executable"
 command -v perl >/dev/null 2>&1 || fail "perl is unavailable"
+command -v python3 >/dev/null 2>&1 || fail "Python is unavailable"
+[[ -f "$hostile_worker_lifecycle_test" ]] ||
+  fail "hostile-worker executable lifecycle test is unavailable"
 workspace="$(mktemp -d "${TMPDIR:-/tmp}/recasaos-debian-vm-policy.XXXXXX")"
 trap 'rm -rf -- "$workspace"' EXIT
 
 "$checker" "$workflow" "$vm_script" "$systemd_script" "$sampler"
+python3 "$hostile_worker_lifecycle_test" "$systemd_script"
 
 replace_once() {
   local file=$1
@@ -136,9 +141,9 @@ expect_rejection hostile-storage-expanded-formation-window systemd \
 expect_rejection hostile-storage-deadline-after-clients systemd \
   $'  hostile_blocked_deadline=$((SECONDS + 8))\n  for _ in {1..4}; do\n    start_hostile_storage_client\n  done' \
   $'  ignored_deadline=$((SECONDS + 8))\n  for _ in {1..4}; do\n    start_hostile_storage_client\n  done\n  hostile_blocked_deadline=$((SECONDS + 8))'
-expect_rejection hostile-storage-leader-only-d-state systemd \
-  'task_root = Path("/proc") / str(pid) / "task"' \
-  'task_root = Path("/proc") / str(pid)'
+expect_rejection hostile-storage-unbound-cgroup-task systemd \
+  '        if thread_status.get(b"Tgid") != str(pid).encode("ascii"):' \
+  '        if False:'
 expect_rejection hostile-storage-three-d-state-workers systemd \
   'storage_workers_are_in_d_state 4' \
   'storage_workers_are_in_d_state 3'
@@ -148,6 +153,54 @@ expect_rejection hostile-storage-split-formation-deadline systemd \
 expect_rejection hostile-storage-blocked-allows-pending-kill systemd \
   'if phase == "blocked" and kill_is_pending:' \
   'if phase == "blocked" and false:'
+expect_rejection hostile-storage-empty-worker-set systemd \
+  'seen = set()' \
+  $'worker_pairs = ()\nseen = set()'
+expect_rejection hostile-storage-skipped-worker-inspection systemd \
+  '    state, parent, start_before = read_identity(pid)' \
+  $'    continue\n    state, parent, start_before = read_identity(pid)'
+expect_rejection hostile-storage-inspection-early-return systemd \
+  $'assert_hostile_storage_worker_boundaries() {\n  local expected_parent=$2' \
+  $'assert_hostile_storage_worker_boundaries() {\n  return 0\n  local expected_parent=$2'
+expect_rejection hostile-storage-inspection-override systemd \
+  'hostile_storage_clients_are_live() {' \
+  $'assert_hostile_storage_worker_boundaries() { :; }\n\nhostile_storage_clients_are_live() {'
+expect_rejection hostile-storage-missing-exe-in-blocked-phase systemd \
+  '        phase == "kill-pending"' \
+  '        phase in {"blocked", "kill-pending"}'
+expect_rejection hostile-storage-missing-exe-non-zombie systemd \
+  '        and state == b"Z"' \
+  '        and state in {b"D", b"Z"}'
+expect_rejection hostile-storage-missing-exe-unpinned-parent systemd \
+  '        and parent == expected_parent' \
+  '        and parent >= 1'
+expect_rejection hostile-storage-missing-exe-unpinned-start systemd \
+  '        and start == expected_start' \
+  '        and start.isdigit()'
+expect_rejection hostile-storage-missing-exe-leader-task systemd \
+  '        and d_tid != pid' \
+  '        and d_tid == pid'
+expect_rejection hostile-storage-missing-exe-catch-all systemd \
+  '    except FileNotFoundError as error:' \
+  '    except OSError as error:'
+expect_rejection hostile-storage-missing-exe-no-survivor-image systemd \
+  '        worker_executable = os.stat(proc_root / str(d_tid) / "exe")' \
+  '        worker_executable = reviewed_binary'
+expect_rejection hostile-storage-missing-exe-leader-status systemd \
+  '        status_pid = d_tid' \
+  '        status_pid = pid'
+expect_rejection hostile-storage-missing-exe-unpinned-tgid systemd \
+  '    if status.get(b"Tgid") != str(pid).encode("ascii"):' \
+  '    if False:'
+expect_rejection hostile-storage-missing-exe-unpinned-status-pid systemd \
+  '    if status.get(b"Pid") != str(status_pid).encode("ascii"):' \
+  '    if False:'
+expect_rejection hostile-storage-missing-exe-no-final-zombie-check systemd \
+  '    if leader_executable_missing and state_after != b"Z":' \
+  '    if False:'
+expect_rejection hostile-storage-missing-final-cgroup-membership systemd \
+  '    if d_tid not in read_cgroup_tids():' \
+  '    if False:'
 expect_rejection hostile-storage-incomplete-inspection systemd \
   'or len(worker_pairs) != 4' \
   'or len(worker_pairs) != 1'
