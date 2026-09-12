@@ -1,16 +1,19 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	net2 "net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/IceWhaleTech/CasaOS-Common/utils/command"
@@ -51,6 +54,7 @@ type SystemService interface {
 	GetMemInfo() map[string]interface{}
 	GetCpuInfo() []cpu.InfoStat
 	GetDirPath(path string) ([]model.Path, error)
+	GetDirPathPage(ctx context.Context, path string, index, size int) ([]model.Path, int64, error)
 	GetDirPathOne(path string) (m model.Path)
 	GetNetState(name string) string
 	GetDiskInfo() *disk.UsageStat
@@ -69,6 +73,71 @@ type SystemService interface {
 	GenreateSystemEntry()
 }
 type systemService struct{}
+
+const (
+	// ManagedDirectoryPageLimit bounds entries retained for one explicitly
+	// paginated response. The scanner still walks the directory to produce an
+	// exact total of valid visible entries.
+	ManagedDirectoryPageLimit = 512
+	// ManagedDirectoryLegacyPageSize preserves the response metadata expected by
+	// path-only CasaOS-UI callers. That mode is internally retained at the lower
+	// raw scan limit and fails atomically rather than truncating above the limit.
+	ManagedDirectoryLegacyPageSize = 100_000
+	// ManagedDirectoryRawScanLimit is the maximum number of raw directory entries
+	// accepted for one listing. A single additional entry may be read only as a
+	// sentinel to distinguish an exactly-full directory from an over-budget one.
+	ManagedDirectoryRawScanLimit  = 10_000
+	managedDirectoryReadBatchSize = 256
+	managedDirectoryListingLimit  = 4
+	legacyDirectoryFilterInternal = false
+	pagedDirectoryFilterInternal  = true
+)
+
+var (
+	ErrInvalidManagedDirectoryPage = errors.New("invalid managed directory page")
+	ErrManagedDirectoryScanLimit   = errors.New("managed directory listing exceeds raw scan limit")
+	ErrManagedDirectoryListingBusy = errors.New("managed directory listing capacity is busy")
+	managedDirectoryListings       = newManagedDirectoryListingGate(managedDirectoryListingLimit)
+)
+
+type managedDirectoryListingGate struct {
+	slots chan struct{}
+}
+
+func newManagedDirectoryListingGate(capacity int) *managedDirectoryListingGate {
+	return &managedDirectoryListingGate{slots: make(chan struct{}, capacity)}
+}
+
+func (g *managedDirectoryListingGate) acquire(ctx context.Context) (func(), error) {
+	if ctx == nil {
+		return nil, context.Canceled
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case g.slots <- struct{}{}:
+		var once sync.Once
+		release := func() {
+			once.Do(func() { <-g.slots })
+		}
+		if err := ctx.Err(); err != nil {
+			release()
+			return nil, err
+		}
+		return release, nil
+	default:
+		return nil, ErrManagedDirectoryListingBusy
+	}
+}
+
+// AcquireManagedDirectoryListing reserves one bounded end-to-end listing slot.
+// HTTP callers hold the returned lease through response serialization; the
+// release function is idempotent. Admission and context checks bound aggregate
+// work but cannot interrupt a filesystem syscall already blocked in the kernel.
+func AcquireManagedDirectoryListing(ctx context.Context) (func(), error) {
+	return managedDirectoryListings.acquire(ctx)
+}
 
 func (c *systemService) GetDeviceInfo() model.DeviceInfo {
 	m := model.DeviceInfo{}
@@ -311,8 +380,70 @@ func (c *systemService) GetDirPathOne(path string) (m model.Path) {
 }
 
 func (c *systemService) GetDirPath(path string) ([]model.Path, error) {
+	release, err := AcquireManagedDirectoryListing(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	dirs, _, err := c.getDirPathPage(context.Background(), path, 0, ManagedDirectoryRawScanLimit, false, legacyDirectoryFilterInternal)
+	return dirs, err
+}
+
+type managedDirectoryPagePlan struct {
+	offset       int64
+	retainedSize int
+	legacy       bool
+}
+
+func planManagedDirectoryPage(index, size int) (managedDirectoryPagePlan, error) {
+	retainedSize := size
+	legacyListing := index == 1 && size == ManagedDirectoryLegacyPageSize
+	if legacyListing {
+		retainedSize = ManagedDirectoryRawScanLimit
+	}
+	if index < 1 || retainedSize < 1 || (!legacyListing && size > ManagedDirectoryPageLimit) || index-1 > (int(^uint(0)>>1))/retainedSize {
+		return managedDirectoryPagePlan{}, ErrInvalidManagedDirectoryPage
+	}
+	return managedDirectoryPagePlan{
+		offset:       int64((index - 1) * retainedSize),
+		retainedSize: retainedSize,
+		legacy:       legacyListing,
+	}, nil
+}
+
+// GetDirPathPage expects network callers to hold an admission lease across the
+// complete response lifecycle. It does not acquire internally, avoiding a
+// double slot while the route serializes a potentially large legacy response.
+func (c *systemService) GetDirPathPage(ctx context.Context, path string, index, size int) ([]model.Path, int64, error) {
+	plan, err := planManagedDirectoryPage(index, size)
+	if err != nil {
+		return nil, 0, err
+	}
+	return c.getDirPathPage(ctx, path, plan.offset, plan.retainedSize, true, pagedDirectoryFilterInternal)
+}
+
+func (c *systemService) getDirPathPage(ctx context.Context, path string, offset int64, size int, hideActiveTargets, filterInternalEntries bool) ([]model.Path, int64, error) {
+	if ctx == nil {
+		return nil, 0, context.Canceled
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
 	if path == "" {
-		return []model.Path{{Name: "DATA", Path: "/DATA/", IsDir: true, Date: time.Now()}}, nil
+		entry := model.Path{Name: "DATA", Path: "/DATA/", IsDir: true, Date: time.Now()}
+		if offset == 0 && size > 0 {
+			return []model.Path{entry}, 1, nil
+		}
+		return []model.Path{}, 1, nil
+	}
+	hiddenTargets := map[string]string(nil)
+	if hideActiveTargets {
+		// One immutable queue snapshot defines visibility for the entire scan, so
+		// a concurrent operation transition cannot make total and content disagree.
+		hiddenTargets = ActiveFileOperationTargets()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
 	}
 	if path == "/DATA" {
 		sysType := runtime.GOOS
@@ -327,42 +458,115 @@ func (c *systemService) GetDirPath(path string) ([]model.Path, error) {
 
 	roots, err := filesecurity.ManagementFileRoots()
 	if err != nil {
-		return []model.Path{}, err
+		return nil, 0, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
 	}
 	location, err := roots.Match(path)
 	if err != nil {
-		return []model.Path{}, err
+		return nil, 0, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
 	}
 	directory, err := roots.OpenDirectory(location.Canonical)
 	if err != nil {
-		return []model.Path{}, err
+		return nil, 0, err
 	}
-	ls, err := directory.ReadDir(-1)
-	closeErr := directory.Close()
-	if err != nil {
-		logger.Error("when read dir", zap.Error(err))
-		return []model.Path{}, err
+	return readManagedDirectoryPage(ctx, directory, location.Canonical, offset, size, hiddenTargets, filterInternalEntries, func(name string) (fs.FileInfo, error) {
+		return roots.StatDirectoryEntry(directory, name)
+	})
+}
+
+// readManagedDirectoryPage scans using positive bounded reads, retains only the
+// requested valid-entry window, and still counts every valid entry exactly.
+// Symlinks and non-regular special files are always filtered. Paged callers also
+// filter the internal .temp directory and one snapshot of active operation
+// targets before total and pagination; the legacy wrapper keeps its base .temp
+// behavior for non-HTTP compatibility.
+func readManagedDirectoryPage(ctx context.Context, directory fs.ReadDirFile, directoryPath string, offset int64, size int, hiddenTargets map[string]string, filterInternalEntries bool, statEntry func(string) (fs.FileInfo, error)) (page []model.Path, total int64, resultErr error) {
+	if ctx == nil || directory == nil || offset < 0 || size < 1 || statEntry == nil {
+		return nil, 0, ErrInvalidManagedDirectoryPage
 	}
-	if closeErr != nil {
-		return []model.Path{}, closeErr
-	}
-	dirs := []model.Path{}
-	for _, l := range ls {
-		if l.Type()&os.ModeSymlink != 0 {
-			continue
+	defer func() {
+		closeErr := directory.Close()
+		if resultErr != nil || closeErr != nil {
+			page = nil
+			total = 0
+			resultErr = errors.Join(resultErr, closeErr)
 		}
-		filePath := filepath.Join(location.Canonical, l.Name())
-		tempFile, err := l.Info()
-		if err != nil {
-			logger.Error("when read dir", zap.Error(err))
-			return []model.Path{}, err
+	}()
+
+	page = make([]model.Path, 0, size)
+	rawScanned := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
 		}
-		if !tempFile.IsDir() && !tempFile.Mode().IsRegular() {
-			continue
+		readSize := managedDirectoryReadBatchSize
+		remaining := ManagedDirectoryRawScanLimit - rawScanned
+		if remaining < readSize {
+			// Allow one sentinel entry to prove that the accepted raw-entry
+			// limit was exceeded without inspecting or returning that entry.
+			readSize = remaining + 1
 		}
-		dirs = append(dirs, model.Path{Name: l.Name(), Path: filePath, IsDir: tempFile.IsDir(), Date: tempFile.ModTime(), Size: tempFile.Size()})
+		entries, readErr := directory.ReadDir(readSize)
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+		if len(entries) > remaining {
+			return nil, 0, ErrManagedDirectoryScanLimit
+		}
+		if len(entries) == 0 && readErr == nil {
+			return nil, 0, io.ErrNoProgress
+		}
+
+		for _, entry := range entries {
+			rawScanned++
+			if err := ctx.Err(); err != nil {
+				return nil, 0, err
+			}
+			info, infoErr := statEntry(entry.Name())
+			if infoErr != nil {
+				if errors.Is(infoErr, fs.ErrNotExist) {
+					// A concurrently removed entry is absent from this snapshot.
+					continue
+				}
+				return nil, 0, fmt.Errorf("stat managed directory entry: %w", infoErr)
+			}
+			if !info.IsDir() && !info.Mode().IsRegular() {
+				continue
+			}
+			filePath := filepath.Join(directoryPath, entry.Name())
+			if filterInternalEntries && entry.Name() == ".temp" && info.IsDir() {
+				continue
+			}
+			if _, hidden := hiddenTargets[filePath]; hidden {
+				continue
+			}
+
+			position := total
+			total++
+			if position < offset || int64(len(page)) >= int64(size) {
+				continue
+			}
+			page = append(page, model.Path{
+				Name:  entry.Name(),
+				Path:  filePath,
+				IsDir: info.IsDir(),
+				Date:  info.ModTime(),
+				Size:  info.Size(),
+			})
+		}
+
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return page, total, nil
+			}
+			return nil, 0, fmt.Errorf("read managed directory: %w", readErr)
+		}
 	}
-	return dirs, nil
 }
 
 func (c *systemService) GetCpuInfo() []cpu.InfoStat {
