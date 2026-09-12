@@ -20,6 +20,10 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
+// spaceTestPrincipal mirrors the authenticated upload principal that the
+// v2 handlers now require before any staging or filesystem work.
+const spaceTestPrincipal = 7
+
 func newSpaceTestUpload(t *testing.T) (*FileUploadService, string) {
 	t.Helper()
 	root := t.TempDir()
@@ -60,7 +64,7 @@ func checkSpaceTestChunk(upload *FileUploadService, root string, number int64) e
 	query := url.Values{"path": {root}, "relativePath": {"nested/target.bin"}}
 	request := httptest.NewRequest(http.MethodGet, "/?"+query.Encode(), nil)
 	context := echo.New().NewContext(request, httptest.NewRecorder())
-	return upload.TestChunk(context, "space-test", number)
+	return upload.TestChunk(context, spaceTestPrincipal, "space-test", number)
 }
 
 func sendSpaceTestChunk(t *testing.T, upload *FileUploadService, root string, number int64) error {
@@ -69,13 +73,13 @@ func sendSpaceTestChunk(t *testing.T, upload *FileUploadService, root string, nu
 	if number == 2 {
 		content = "tail"
 	}
-	return upload.UploadFile(nil, root, number, 4, 4, 2, 8, "space-test", "nested/target.bin", "target.bin", spaceTestChunk(t, content))
+	return upload.UploadFile(nil, spaceTestPrincipal, root, number, 4, 4, 2, 8, "space-test", "nested/target.bin", "target.bin", spaceTestChunk(t, content))
 }
 
 func TestV2UploadSpaceChecksStagingBeforeChunkWrite(t *testing.T) {
 	upload, root := newSpaceTestUpload(t)
 	target := filepath.Join(root, "nested", "target.bin")
-	staging := filepath.Join(root, ".temp", "v2-upload-"+boundUploadIdentifier("space-test", target))
+	staging := filepath.Join(root, ".temp", "v2-upload-"+boundUploadIdentifier(spaceTestPrincipal, "space-test", target))
 	admission := filesecurity.NewUploadSpaceAdmission(func(_ *filesecurity.ManagedRoots, parent string) (uint64, error) {
 		if parent == staging {
 			return filesecurity.DefaultUploadReservedFreeBytes, nil
@@ -100,7 +104,7 @@ func TestV2UploadSpaceChecksStagingBeforeChunkWrite(t *testing.T) {
 func TestV2UploadSpaceChecksStagingBeforeAssembly(t *testing.T) {
 	upload, root := newSpaceTestUpload(t)
 	target := filepath.Join(root, "nested", "target.bin")
-	staging := filepath.Join(root, ".temp", "v2-upload-"+boundUploadIdentifier("space-test", target))
+	staging := filepath.Join(root, ".temp", "v2-upload-"+boundUploadIdentifier(spaceTestPrincipal, "space-test", target))
 	upload.reserveSpace = func(_ *filesecurity.ManagedRoots, parent string, size uint64) (func(), error) {
 		if size == 8 && parent == staging {
 			return nil, filesecurity.ErrUploadSpaceInsufficient
@@ -170,7 +174,7 @@ func TestV2UploadSpaceRetryPublishesPendingAssembly(t *testing.T) {
 				if err != nil || string(content) != "datatail" {
 					t.Fatalf("published content = %q, %v", content, err)
 				}
-				session := upload.uploadStatus[boundUploadIdentifier("space-test", target)]
+				session := upload.uploadStatus[boundUploadIdentifier(spaceTestPrincipal, "space-test", target)]
 				if session == nil || !session.completed || !session.stagingClean {
 					t.Fatal("recovery did not retain a clean completed tombstone")
 				}
@@ -204,13 +208,13 @@ func TestV2UploadSpaceReservationsReleaseOnWriteAndAssemblyErrors(t *testing.T) 
 			if phase == "chunk" {
 				chunk := spaceTestChunk(t, "oversized")
 				chunk.Size = 4
-				err = upload.UploadFile(nil, root, 1, 4, 4, 2, 8, "space-test", "nested/target.bin", "target.bin", chunk)
+				err = upload.UploadFile(nil, spaceTestPrincipal, root, 1, 4, 4, 2, 8, "space-test", "nested/target.bin", "target.bin", chunk)
 			} else {
 				if err := sendSpaceTestChunk(t, upload, root, 1); err != nil {
 					t.Fatal(err)
 				}
 				target := filepath.Join(root, "nested", "target.bin")
-				session := upload.uploadStatus[boundUploadIdentifier("space-test", target)]
+				session := upload.uploadStatus[boundUploadIdentifier(spaceTestPrincipal, "space-test", target)]
 				injected := errors.New("injected assembly publication failure")
 				session.assemblyBeforeCommit = func() error { return injected }
 				err = sendSpaceTestChunk(t, upload, root, 2)
@@ -245,7 +249,7 @@ func TestV2UploadSpaceRetryRejectsChangedRecordedChunk(t *testing.T) {
 		t.Fatalf("assembly error = %v", err)
 	}
 	target := filepath.Join(root, "nested", "target.bin")
-	session := upload.uploadStatus[boundUploadIdentifier("space-test", target)]
+	session := upload.uploadStatus[boundUploadIdentifier(spaceTestPrincipal, "space-test", target)]
 	if err := os.WriteFile(filepath.Join(session.tempDir, "2"), []byte("evil"), 0o600); err != nil {
 		t.Fatal(err)
 	}
