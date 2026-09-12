@@ -185,7 +185,7 @@ func main() {
 
 	// register at message bus
 	for i := 0; i < 10; i++ {
-		response, err := service.MyService.MessageBus().RegisterEventTypesWithResponse(context.Background(), common.EventTypes)
+		response, err := service.UnaryMessageBus().RegisterEventTypesWithResponse(context.Background(), common.EventTypes)
 		if err != nil {
 			logger.Error("error when trying to register one or more event types - some event type will not be discoverable", zap.Error(err))
 			time.Sleep(time.Second)
