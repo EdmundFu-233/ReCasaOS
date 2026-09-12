@@ -70,9 +70,12 @@ func GetDb(dbPath string) *gorm.DB {
 		panic(fmt.Sprintf("SQLite directory identity check failed: %v", err))
 	}
 
-	err = db.AutoMigrate(&model2.AppNotify{}, model2.SharesDBModel{}, model2.ConnectionsDBModel{}, model2.PeerDriveDBModel{})
+	err = db.AutoMigrate(&model2.AppNotify{}, model2.SharesDBModel{}, model2.PeerDriveDBModel{})
 	if err != nil {
 		panic(fmt.Sprintf("SQLite schema migration failed: %v", err))
+	}
+	if err := expandSMBCredentialSchema(db); err != nil {
+		panic(fmt.Sprintf("SQLite SMB credential schema expansion failed: %v", err))
 	}
 
 	for _, statement := range []string{

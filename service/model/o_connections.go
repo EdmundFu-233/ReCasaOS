@@ -11,18 +11,22 @@
 package model
 
 type ConnectionsDBModel struct {
-	ID          uint   `gorm:"column:id;primary_key" json:"id"`
-	Updated     int64  `gorm:"autoUpdateTime"`
-	Created     int64  `gorm:"autoCreateTime"`
-	Username    string `json:"username"`
-	Password    string `json:"password"`
-	Host        string `json:"host"`
-	Port        string `json:"port"`
-	Status      string `json:"status"`
-	Directories string `json:"directories"` // string array
-	MountPoint  string `json:"mount_point"` //parent directory of mount point
-	BootID      string `json:"-"`
-	MountIDs    string `json:"-"` // JSON map of share name to Linux mount ID
+	ID               uint   `gorm:"column:id;primary_key" json:"id"`
+	Updated          int64  `gorm:"autoUpdateTime"`
+	Created          int64  `gorm:"autoCreateTime"`
+	Username         string `json:"username"`
+	Password         string `json:"password"`
+	CredentialID     string `gorm:"column:credential_id;type:text" json:"-"`
+	CredentialFormat string `gorm:"column:credential_format;type:text" json:"-"`
+	PasswordEnvelope []byte `gorm:"column:password_envelope;type:blob" json:"-"`
+	RowRevision      uint64 `gorm:"column:row_revision;not null;default:0" json:"-"`
+	Host             string `json:"host"`
+	Port             string `json:"port"`
+	Status           string `json:"status"`
+	Directories      string `json:"directories"` // string array
+	MountPoint       string `json:"mount_point"` //parent directory of mount point
+	BootID           string `json:"-"`
+	MountIDs         string `json:"-"` // JSON map of share name to Linux mount ID
 }
 
 func (p *ConnectionsDBModel) TableName() string {
