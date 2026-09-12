@@ -77,6 +77,7 @@ type FileUploadService struct {
 	removeTree      func(string) error
 	managementRoots func() (*filesecurity.ManagedRoots, error)
 	mkdirAll        func(*filesecurity.ManagedRoots, string, fs.FileMode) error
+	reserveSpace    func(*filesecurity.ManagedRoots, string, uint64) (func(), error)
 }
 
 func NewFileUploadService() *FileUploadService {
@@ -84,6 +85,7 @@ func NewFileUploadService() *FileUploadService {
 		uploadStatus:    make(map[string]*FileInfo),
 		removeTree:      filesecurity.RemoveManagementTree,
 		managementRoots: filesecurity.ManagementFileRoots,
+		reserveSpace:    filesecurity.ReserveUploadSpace,
 		mkdirAll: func(roots *filesecurity.ManagedRoots, path string, mode fs.FileMode) error {
 			return roots.MkdirAll(path, mode)
 		},
@@ -141,6 +143,12 @@ func (s *FileUploadService) TestChunk(
 			return err
 		}
 		return fileInfo.completionErr
+	}
+	if fileInfo.uploadedChunkNum == fileInfo.totalChunks {
+		// A previous assembly admission may have failed after the last chunk
+		// was committed. Ask the resumable client to POST again so it retries
+		// publication instead of skipping every chunk of an absent target.
+		return errors.New("upload assembly is pending")
 	}
 	if !fileInfo.uploaded[chunkNumber-1] {
 		return fmt.Errorf("file not found")
@@ -296,44 +304,68 @@ func (s *FileUploadService) UploadFile(
 	fileInfo.stagingClean = false
 	fileInfo.lastActivity = time.Now()
 	chunkIndex := int(chunkNumber - 1)
+	reconciled := false
 	if fileInfo.uploaded[chunkIndex] {
-		reconciled, err := reconcileRecordedServiceChunk(fileInfo, chunkIndex, roots, chunkPath, currentChunkSize)
+		reconciled, err = reconcileRecordedServiceChunk(fileInfo, chunkIndex, roots, chunkPath, currentChunkSize)
 		if err != nil {
 			fileInfo.lock.Unlock()
 			return changedServiceUploadErrorIf(namespaceMayHaveChanged || hadPublishedChunks, "upload namespace changed before recorded chunk reconciliation failed", err)
 		}
-		if reconciled {
+	}
+
+	var writeErr error
+	if !reconciled {
+		source, err := bin.Open()
+		if err != nil {
 			fileInfo.lock.Unlock()
-			return nil
+			return changedServiceUploadErrorIf(namespaceMayHaveChanged || hadPublishedChunks, "upload namespace changed before multipart chunk open failed", err)
 		}
-	}
+		// Chunks and assembly are written under .temp, which can be on a
+		// different filesystem from a nested target mount. Admit the actual
+		// write's parent, not the eventual publication destination.
+		chunkSpaceRelease, spaceErr := s.reserveSpace(roots, filepath.Dir(chunkPath), uint64(currentChunkSize))
+		if spaceErr != nil {
+			closeErr := source.Close()
+			fileInfo.lock.Unlock()
+			return changedServiceUploadErrorIf(namespaceMayHaveChanged || hadPublishedChunks, "upload directories may have changed before chunk space admission failed", errors.Join(spaceErr, closeErr))
+		}
+		var writeResult serviceChunkWriteResult
+		writeResult, writeErr = func() (serviceChunkWriteResult, error) {
+			defer chunkSpaceRelease()
+			return writeValidatedServiceChunk(roots, chunkPath, source, currentChunkSize)
+		}()
+		if writeErr != nil && !writeResult.Published {
+			fileInfo.lock.Unlock()
+			return changedServiceUploadErrorIf(namespaceMayHaveChanged || hadPublishedChunks, "upload namespace changed before chunk publication failed", writeErr)
+		}
+		if !writeResult.Published {
+			fileInfo.lock.Unlock()
+			return changedServiceUploadErrorIf(namespaceMayHaveChanged || hadPublishedChunks, "upload namespace changed before chunk publication was confirmed", errors.New("validated upload chunk was not published"))
+		}
 
-	source, err := bin.Open()
-	if err != nil {
-		fileInfo.lock.Unlock()
-		return changedServiceUploadErrorIf(namespaceMayHaveChanged || hadPublishedChunks, "upload namespace changed before multipart chunk open failed", err)
+		if !fileInfo.uploaded[chunkIndex] {
+			fileInfo.uploadedChunkNum++
+			fileInfo.uploaded[chunkIndex] = true
+		}
+		fileInfo.chunkDigests[chunkIndex] = writeResult.Digest
 	}
-	writeResult, writeErr := writeValidatedServiceChunk(roots, chunkPath, source, currentChunkSize)
-	if writeErr != nil && !writeResult.Published {
-		fileInfo.lock.Unlock()
-		return changedServiceUploadErrorIf(namespaceMayHaveChanged || hadPublishedChunks, "upload namespace changed before chunk publication failed", writeErr)
-	}
-	if !writeResult.Published {
-		fileInfo.lock.Unlock()
-		return changedServiceUploadErrorIf(namespaceMayHaveChanged || hadPublishedChunks, "upload namespace changed before chunk publication was confirmed", errors.New("validated upload chunk was not published"))
-	}
-
-	if !fileInfo.uploaded[chunkIndex] {
-		fileInfo.uploadedChunkNum++
-		fileInfo.uploaded[chunkIndex] = true
-	}
-	fileInfo.chunkDigests[chunkIndex] = writeResult.Digest
 	if fileInfo.uploadedChunkNum != totalChunks {
 		fileInfo.lock.Unlock()
 		return writeErr
 	}
 
-	assemblyResult, assemblyErr := assembleServiceUpload(fileInfo)
+	// A verified duplicate chunk can still be the retry that completes an
+	// earlier space-denied assembly. Do not rewrite it or report success until
+	// the pending target is actually published.
+	assemblySpaceRelease, spaceErr := s.reserveSpace(roots, filepath.Dir(fileInfo.assemblyPath), uint64(fileInfo.totalSize))
+	if spaceErr != nil {
+		fileInfo.lock.Unlock()
+		return changedServiceUploadError("upload chunks published before assembly space admission failed", errors.Join(writeErr, spaceErr))
+	}
+	assemblyResult, assemblyErr := func() (serviceAssemblyResult, error) {
+		defer assemblySpaceRelease()
+		return assembleServiceUpload(fileInfo)
+	}()
 	if assemblyResult.TargetPublished {
 		fileInfo.completed = true
 		fileInfo.completedAt = time.Now()

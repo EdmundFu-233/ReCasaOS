@@ -49,6 +49,23 @@ func TestManagedRootsMountInspectionAndEmptyDirectoryRemoval(t *testing.T) {
 	}
 }
 
+func TestManagedRootsAvailableBytesUsesPinnedDirectory(t *testing.T) {
+	root := t.TempDir()
+	roots, err := OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+
+	available, err := roots.AvailableBytes(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if available == 0 {
+		t.Fatal("managed filesystem reported no available bytes for a temporary directory")
+	}
+}
+
 func TestManagedRootsRemoveEmptyDirectoryRefusesFilesAndNonEmptyDirectories(t *testing.T) {
 	root := t.TempDir()
 	roots, err := OpenManagementFileRoots([]string{root})

@@ -33,3 +33,16 @@ func TestRespondUploadMutationFailureReportsPublishedPartialState(t *testing.T) 
 		}
 	}
 }
+
+func TestRespondUploadMutationFailureUsesStorageStatus(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/v2/file/upload", nil)
+	response := httptest.NewRecorder()
+	context := echo.New().NewContext(request, response)
+
+	if err := respondUploadMutationFailure(context, filesecurity.ErrUploadSpaceInsufficient); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != http.StatusInsufficientStorage {
+		t.Fatalf("status = %d, want %d; body = %s", response.Code, http.StatusInsufficientStorage, response.Body.String())
+	}
+}

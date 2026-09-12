@@ -97,11 +97,17 @@ func (c *CasaOS) PostUploadFile(ctx echo.Context) error {
 }
 
 func respondUploadMutationFailure(ctx echo.Context, err error) error {
+	statusCode := http.StatusInternalServerError
+	if errors.Is(err, filesecurity.ErrUploadSpaceInsufficient) {
+		statusCode = http.StatusInsufficientStorage
+	} else if errors.Is(err, filesecurity.ErrUploadSpaceUnavailable) {
+		statusCode = http.StatusServiceUnavailable
+	}
 	status := "FAILED"
 	if filesecurity.ManagedMutationChanged(err) {
 		status = "PARTIAL"
 	}
-	return ctx.JSON(http.StatusInternalServerError, map[string]interface{}{
+	return ctx.JSON(statusCode, map[string]interface{}{
 		"status":             status,
 		"changed":            filesecurity.ManagedMutationChanged(err),
 		"durability_unknown": filesecurity.ManagedMutationDurabilityUnknown(err),
