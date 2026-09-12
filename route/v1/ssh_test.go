@@ -3,9 +3,11 @@ package v1
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	commonjwt "github.com/IceWhaleTech/CasaOS-Common/utils/jwt"
+	"github.com/IceWhaleTech/CasaOS/pkg/utils/common_err"
 	"github.com/labstack/echo/v4"
 )
 
@@ -32,6 +34,21 @@ func TestValidateSSHParameters(t *testing.T) {
 				t.Fatalf("error = %v, wantError %v", err, test.wantError)
 			}
 		})
+	}
+}
+
+func TestPostSSHLoginRejectsOversizedBodyBeforeSSHAttempt(t *testing.T) {
+	body := `{"username":"admin","password":"` + strings.Repeat("x", maxSSHLoginRequestBodySize) + `","port":"22"}`
+	request := httptest.NewRequest(http.MethodPost, "/v1/sys/ssh-login", strings.NewReader(body))
+	request.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	response := httptest.NewRecorder()
+	context := echo.New().NewContext(request, response)
+
+	if err := PostSshLogin(context); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != common_err.CLIENT_ERROR {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
 }
 
