@@ -1,0 +1,33 @@
+{
+  "rc": "v0.5.0-rc.2+msgbus",
+  "date": "2026-09-15",
+  "build_flags": "CGO_ENABLED=0, -trimpath, -tags netgo osusergo, -ldflags \"-X main.commit=<sha> -X main.date=2026-09-15 -s -w\"; Go 1.27.1 darwin cross-compile to linux. RC local builds, reproducibly byte-identical on rebuild; canonical musl+upx pending.",
+  "binaries": [
+    {
+      "component": "message-bus",
+      "source_revision": "ba87168fcfa4ac5ff7a114f66a139eb5fe427646",
+      "file": "msgbus-linux-arm64",
+      "sha256": "28c1c8349cfa85129e95f083213acb1297ef96ad5ddded5b51acae6d51541e55",
+      "vm_smoke": "executes on linux/arm64 (-v prints v0.4.4)"
+    },
+    {
+      "component": "message-bus",
+      "source_revision": "ba87168fcfa4ac5ff7a114f66a139eb5fe427646",
+      "file": "msgbus-linux-amd64",
+      "sha256": "eb99a6a75cb1d04f06df8270e02aa3563f5eab049dd66818a289e7c7cf5a9e9c"
+    }
+  ],
+  "sbom": [
+    {
+      "component": "message-bus",
+      "file": "sbom-msgbus-rc4.json",
+      "sha256": "649eaa10cfd5edac523425f1b47a07008d3205d2f3029b18133ca9dd72b1702d",
+      "modules": 145,
+      "method": "go list -m -json all (module inventory, not a full SPDX SBOM)"
+    }
+  ],
+  "compatibility": {
+    "check": "fork HEAD equals the root-pinned MessageBus API input commit ba87168 (API and runtime are the same revision by construction); fork unit suites (ysk/route/service) green; root regenerated-client tests green in CI",
+    "result": "passed"
+  }
+}
