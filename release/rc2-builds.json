@@ -1,0 +1,33 @@
+{
+  "rc": "v0.5.0-rc.2+gateway",
+  "date": "2026-09-15",
+  "build_flags": "CGO_ENABLED=0, -trimpath, -tags netgo osusergo, -ldflags \"-X main.commit=<sha> -X main.date=2026-09-15 -s -w\"; Go 1.27.1 darwin cross-compile to linux. RC local builds, reproducibly byte-identical on rebuild; canonical musl+upx pending.",
+  "binaries": [
+    {
+      "component": "gateway",
+      "source_revision": "ed8d0efa2b54fe83cbe632288ea625029a14374f",
+      "file": "gateway-linux-arm64",
+      "sha256": "0246da7e90de375bea4fb808f2ea148f29378f4a5dd228c3212f48f9d6c65f23",
+      "vm_smoke": "executes on linux/arm64 (-v prints v0.4.8)"
+    },
+    {
+      "component": "gateway",
+      "source_revision": "ed8d0efa2b54fe83cbe632288ea625029a14374f",
+      "file": "gateway-linux-amd64",
+      "sha256": "a35647fd8cedf67f561a3953459a8619c857e0238907164a1f128b9bad1a0a0a"
+    }
+  ],
+  "sbom": [
+    {
+      "component": "gateway",
+      "file": "sbom-gateway-rc2.json",
+      "sha256": "c570109fe1aaf123cf2f3f39c6293dd64191f0655ab746cb0b74eb7a1b841e9f",
+      "modules": 141,
+      "method": "go list -m -json all (module inventory, not a full SPDX SBOM)"
+    }
+  ],
+  "compatibility": {
+    "check": "CasaOS-Common model/gateway.go (Route, ChangePortRequest) byte-identical between v0.4.8-alpha9 (gateway) and v0.4.11-alpha4 (root): registration contract stable. Live proxy behavior covered by gateway route suite (spoof stripping, trusted chain, segment boundary) green on linux/arm64 VM.",
+    "result": "passed"
+  }
+}

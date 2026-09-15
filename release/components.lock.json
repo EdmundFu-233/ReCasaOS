@@ -9,8 +9,13 @@
     },
     {
       "name": "gateway",
-      "state": "unresolved",
-      "reason": "ReCasaOS fork pinned at 606a84523802dde7269f10660c867d089e7ed660 (EdmundFu-233/ReCasaOS-Gateway main). Trusted-proxy and route-lease work, release artifact, and compatibility evidence are pending; see ReCasaOS#6."
+      "state": "locked",
+      "source_repository": "https://github.com/EdmundFu-233/ReCasaOS-Gateway",
+      "source_revision": "ed8d0efa2b54fe83cbe632288ea625029a14374f",
+      "artifact_sha256": "0246da7e90de375bea4fb808f2ea148f29378f4a5dd228c3212f48f9d6c65f23",
+      "license": "Apache-2.0",
+      "api_schema": "gateway-openapi-v1",
+      "compatibility_status": "passed"
     },
     {
       "name": "user-service",
