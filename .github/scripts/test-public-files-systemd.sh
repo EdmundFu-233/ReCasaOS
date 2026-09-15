@@ -5116,8 +5116,8 @@ if [[ "$hostile_storage_test_enabled" == 1 ]]; then
     hostile_storage_clients_are_complete
   assert_hostile_storage_client_responses
   assert_hostile_storage_worker_boundaries kill-pending "$portal_pid"
-  [[ "$(storage_worker_count)" == 4 ]] ||
-    fail "FUSE hostile-storage timeout did not retain exactly four D-state workers"
+  hostile_storage_workers_have_no_unexpected_pids ||
+    fail "FUSE hostile-storage timeout exposed an unexpected worker identity"
   hostile_storage_fuse_has_waiting_request ||
     fail "FUSE kernel waiting evidence disappeared after bounded timeouts"
 
@@ -5179,8 +5179,8 @@ if [[ "$hostile_storage_test_enabled" == 1 ]]; then
     "$hostile_fuse_quarantine_headers" "$hostile_fuse_quarantine_body"; then
     fail "FUSE quarantine response retained a bearer-shaped value"
   fi
-  [[ "$(storage_worker_count)" == 4 ]] ||
-    fail "FUSE quarantine admission started an additional storage worker"
+  hostile_storage_workers_have_no_unexpected_pids ||
+    fail "FUSE quarantine admission exposed an unexpected worker identity"
   assert_hostile_storage_worker_boundaries kill-pending "$portal_pid"
   wait_until "static portal during FUSE storage quarantine" page_is_ready
 

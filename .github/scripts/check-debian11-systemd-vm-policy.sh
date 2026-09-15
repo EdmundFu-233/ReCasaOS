@@ -370,7 +370,7 @@ source = Path(sys.argv[1]).read_text(encoding="utf-8")
 # complete source prevents shell-level early returns or later function
 # redefinitions from bypassing checks that only inspect the embedded Python.
 expected_systemd_script_sha256 = (
-    "7a237aaad92e91f9c170eacf88d7ec6bbaab03fa96ef8f4c43e3301bb2e2a957"
+    "2c88f329c6d05d3f741daa8e8af56339944ca3de185f144c899df20d210111ab"
 )
 actual_systemd_script_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
 if actual_systemd_script_sha256 != expected_systemd_script_sha256:
@@ -821,7 +821,7 @@ require_order(
         "assert_hostile_storage_worker_boundaries blocked \"$portal_pid\"",
         'wait_until_before "four bounded FUSE hostile-storage timeouts"',
         "assert_hostile_storage_worker_boundaries kill-pending \"$portal_pid\"\n"
-        "  [[ \"$(storage_worker_count)\" == 4 ]]",
+        "  hostile_storage_workers_have_no_unexpected_pids ||",
         'wait_until "static portal during FUSE storage quarantine" page_is_ready',
         "assert_hostile_storage_worker_boundaries kill-pending 1",
         'fail "FUSE kernel waiting evidence disappeared during pending restart"',
