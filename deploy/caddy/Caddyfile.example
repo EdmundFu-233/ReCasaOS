@@ -39,9 +39,24 @@ https://recasaos.example.invalid {
 	encode zstd gzip
 
 	# Native browser streaming uses one bounded same-origin POST containing only
-	# a short-lived navigation proof. Reject oversized bodies before proxying.
-	request_body {
-		max_size 1MB
+	# a short-lived navigation proof (hundreds of bytes, framed by browsers
+	# with a declared Content-Length). Enforce the 1 MB ceiling before
+	# proxying. A POST/PUT/PATCH without a declared Content-Length (including
+	# chunked bodies, whose size cannot be pre-checked) is rejected with 411,
+	# and any declared Content-Length at or above 1000000 bytes (Caddy MB
+	# units) is rejected with 413. request_body max_size is deliberately not
+	# used: the portal answers 204/405 without reading the body, so an
+	# over-limit body surfaces as a proxy error instead of 413.
+	@body_length_required {
+		method POST PUT PATCH
+		not header_regexp Content-Length .+
+	}
+	handle @body_length_required {
+		respond 411
+	}
+	@body_too_large header_regexp Content-Length ^[0-9]{7,}$
+	handle @body_too_large {
+		respond 413
 	}
 
 	header {
