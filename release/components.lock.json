@@ -5,17 +5,17 @@
     {
       "name": "app-management",
       "state": "unresolved",
-      "reason": "A reviewed ReCasaOS fork revision and release artifact have not been selected."
+      "reason": "ReCasaOS fork pinned at debfa317f0f996b91b43210e8d57799461388704 (EdmundFu-233/ReCasaOS-AppManagement main). Release artifact, compatibility evidence, and SBOM are pending; see ReCasaOS#9."
     },
     {
       "name": "gateway",
       "state": "unresolved",
-      "reason": "A reviewed ReCasaOS fork revision and release artifact have not been selected."
+      "reason": "ReCasaOS fork pinned at 606a84523802dde7269f10660c867d089e7ed660 (EdmundFu-233/ReCasaOS-Gateway main). Trusted-proxy and route-lease work, release artifact, and compatibility evidence are pending; see ReCasaOS#6."
     },
     {
       "name": "user-service",
       "state": "unresolved",
-      "reason": "A reviewed ReCasaOS fork revision and release artifact have not been selected."
+      "reason": "ReCasaOS fork pinned at c07c76677c671a354273e54b446a4c2891acc04a (EdmundFu-233/ReCasaOS-UserService main); main CI is green including the trusted exact-SHA attestor startup fix. Release artifact build, cross-component compatibility evidence, and GitHub App wiring are pending; see ReCasaOS#5."
     },
     {
       "name": "message-bus",
@@ -25,7 +25,7 @@
     {
       "name": "administrative-ui",
       "state": "unresolved",
-      "reason": "The current upstream main-branch hint is not a tracked gitlink or a verified artifact lock."
+      "reason": "ReCasaOS fork pinned at af29f2a5d0056790b8c81db1d93217bb94cc1aea (EdmundFu-233/ReCasaOS-UI main). Ticket-based SSH rework, release artifact, and compatibility evidence are pending; see ReCasaOS#8."
     },
     {
       "name": "installer",
