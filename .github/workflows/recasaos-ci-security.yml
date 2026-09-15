@@ -149,6 +149,12 @@ jobs:
       - name: Verify public-file systemd packaging boundary
         run: deploy/systemd/check-public-files-units.sh .
 
+      - name: Verify staged SMB credential admission boundary
+        run: deploy/systemd/check-smb-credential-admission.sh .
+
+      - name: Exercise SMB credential admission checker negative cases
+        run: .github/scripts/test-smb-credential-admission-checker.sh
+
       - name: Verify Debian 11 systemd 247 unit compatibility
         timeout-minutes: 5
         shell: bash
@@ -202,6 +208,7 @@ jobs:
                 /repo/build/sysroot/usr/lib/systemd/system/recasaos-public-files.service \
                 /repo/build/sysroot/usr/lib/systemd/system/recasaos-public-files.socket \
                 /bin/true
+              /repo/deploy/systemd/check-smb-credential-admission.sh /repo
             '
 
       - name: Exercise public-file unit checker negative cases
@@ -239,6 +246,9 @@ jobs:
 
       - name: Verify generation preserved module locks
         run: git diff --exit-code -- go.mod go.sum
+
+      - name: Exercise SMB credential startup dispatch
+        run: .github/scripts/test-smb-credential-startup-dispatch.sh
 
       - name: Recheck reviewed SMB2 module boundary after generation
         run: .github/scripts/check-smb2-module-boundary.sh
@@ -298,7 +308,7 @@ jobs:
               -run '^TestPrepareSecureDatabaseDirectoryRejectsForeignOwnedChildInStickyAncestor$'
 
       - name: Run security-sensitive race tests
-        run: go test -race ./cmd/recasaos-public-files ./pkg/authsecurity ./pkg/filesecurity ./pkg/httpsecurity ./pkg/netsecurity ./pkg/publicfiles ./pkg/samba ./pkg/sqlite ./pkg/utils/file ./pkg/utils/httper ./route/v1 ./service
+        run: go test -race ./cmd/recasaos-public-files ./pkg/authsecurity ./pkg/filesecurity ./pkg/httpsecurity ./pkg/netsecurity ./pkg/publicfiles ./pkg/samba ./pkg/smbcredentials ./pkg/sqlite ./pkg/utils/file ./pkg/utils/httper ./route/v1 ./service
 
       - name: Run vet
         run: go vet ./...
