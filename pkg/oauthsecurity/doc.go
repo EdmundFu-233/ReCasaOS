@@ -18,5 +18,10 @@
 //   - provider client secrets come only from the process environment or a
 //     root-owned 0600 credential file, never from source or URLs;
 //   - the exchange client posts to exactly the configured token URL over
-//     HTTPS, never follows redirects, never proxies, and bounds the response.
+//     HTTPS, never follows redirects, never proxies, and bounds the response;
+//   - refresh tokens rest only as versioned XChaCha20-Poly1305 envelopes
+//     bound to provider, principal, and sealing key ID, with rotation that
+//     leaves exactly one valid form and revocation checked before decrypt;
+//   - provider failures surface only as curated redacted sentinels; raw
+//     provider strings never reach callers or logs.
 package oauthsecurity
