@@ -204,6 +204,111 @@ target, or read, and malformed bytes also preserve `ErrInvalidKeyring` for
 `errors.Is`. Other I/O failures are indeterminate hard failures. Non-Linux
 builds return `ErrSourceAuditUnsupported`.
 
+## Transactional pending cutover boundary
+
+The package-private SQLite staging core has no production call site. It does
+not run from `main`, `GetDb`, a service, route, unit, installer, or migration
+CLI. Its only successful durable result is `sealed + pending`; it never writes
+the `complete` marker and therefore never authorizes service construction,
+mount restore, API traffic, READY notification, or credential activation.
+
+The core accepts only one file-backed SQLite `main` database with no attached
+schema, in `DELETE` or `WAL` journal mode. On one pinned `database/sql`
+connection it sets and reads back `trusted_schema=OFF`,
+`writable_schema=OFF`, `ignore_check_constraints=OFF`, `foreign_keys=ON`,
+`recursive_triggers=OFF`, `synchronous=FULL`, and `secure_delete=ON`, then uses
+`BEGIN IMMEDIATE`. A SQL-only aggregate first bounds the database-list row
+count, storage classes, schema-alias bytes, and file-path bytes before the
+authoritative `PRAGMA database_list` scan. Before materializing credential
+fields it rejects case-insensitive temporary schema shadows, including the
+credential-identity index name; main or temporary triggers directly
+attached to the connection, marker, or key-control tables; any foreign key
+whose child or parent is one of those tables; hidden/generated or unknown
+connection columns; conflicting security schema; mixed/partial rows; unknown
+markers; and resource bounds. Every mutated table has exactly its pinned index
+set: the canonical credential-identity index for `o_connections`, and only the
+implicit primary-key index for each exact `WITHOUT ROWID` state table. Extra
+indexes are executable SQLite schema and are rejected before DML. Historical
+`o_connections` DDL may differ in quoting and `AUTOINCREMENT`, but `CHECK` and
+`COLLATE` clauses are rejected in addition to the exact column/default/rowid,
+trigger, foreign-key, and index checks. This prevents compact expression-index,
+constraint, or collation definitions from amplifying a bounded write into an
+unbounded index key or callback. Unrelated triggers and unrelated foreign-key
+graphs remain allowed because the cutover cannot make them fire or cascade.
+
+Before reading schema SQL, PRAGMA metadata, marker text, or control-key bytes
+into Go memory, SQL-only aggregate preflights bound the relevant object count,
+DDL size, identifier/type/default size, connection-index count, singleton row
+count, storage classes, and field lengths. The later exact-schema and
+exact-state checks remain authoritative; these earlier bounds prevent a
+tampered database from forcing unbounded values through those scans.
+
+The preflight permits at most 4,096 rows and 4 MiB of total plaintext password
+data. It also bounds every password to 1,024 bytes, username and host to 255
+bytes, status to 255 bytes, directories and mount point to 16 KiB, envelope-v1
+blobs to their exact 158..1,182-byte range, and all other metadata both per
+field and in aggregate. `updated`, `created`, `status`, and `mount_point` receive
+strict storage checks even though the cutover does not change their values:
+SQLite rebuilds and journals the complete physical record for each credential
+update, so carried columns are part of the same resource boundary.
+After the bounded read but before any credential-row, marker-row, or control-row
+write, the core applies the same username/password/host/port, directory, and
+mount-ownership semantics consumed by the runtime. A SQL `NULL` port is invalid
+storage; only an empty TEXT legacy port is normalized to `445`.
+
+The same transaction creates this exact singleton control table and binds even
+an empty database to the 32-byte active key ID:
+
+```sql
+CREATE TABLE o_smb_credential_key_control (
+    singleton INTEGER NOT NULL PRIMARY KEY CHECK (
+        typeof(singleton) = 'integer' AND singleton = 1
+    ),
+    active_key_id BLOB NOT NULL CHECK (
+        typeof(active_key_id) = 'blob' AND length(active_key_id) = 32
+    ),
+    revision INTEGER NOT NULL CHECK (
+        typeof(revision) = 'integer' AND revision >= 1
+    )
+) WITHOUT ROWID
+```
+
+For every strict legacy row, the transaction generates a canonical UUIDv4,
+normalizes only an empty legacy port to `445`, seals the bounded password,
+immediately opens and compares the generated envelope, and performs an
+exact-row compare-and-set update. The plaintext column becomes SQL `NULL`, the
+envelope is stored as a BLOB, and `row_revision` becomes `1`. A complete
+authoritative scan must then authenticate every envelope and prove that its
+authenticated wrapping-key ID equals the singleton control value before the
+pending marker can commit. Before `COMMIT`, an operation error uses a separate,
+bounded cleanup context to roll the marker, control table, and every row back
+together. A rollback failure discards the physical connection and reports an
+unknown transaction outcome through a distinct machine-readable error sentinel
+that also preserves the generic cutover error. A `COMMIT` error is also
+outcome-unknown: the
+connection is discarded and a caller must close, durably reopen, and classify
+the database before deciding what happened. It must never generate new UUIDs
+or envelopes as a blind retry. A failed `BEGIN IMMEDIATE` performs a bounded
+best-effort rollback and always retires its physical connection before returning
+the ordinary retry-safe admission error. A pending retry makes no durable state change
+and requires the same active key plus another authoritative full scan, although
+it still takes the immediate writer lock for one stable classification.
+
+This transaction does not prove that the systemd runtime payload matches the
+durable `/etc/recasaos` source. Before any future production caller can begin,
+a separate descriptor-safe, error-only comparison gate must prove equality of
+the runtime and source keyrings without returning key bytes or IDs. The caller
+must then close and durably reopen the pending database, authenticate it,
+checkpoint and scrub the current SQLite database/WAL/journal artifacts,
+reauthenticate, and have a sealed-only runtime DAO before a separate
+coordinator may write `complete`.
+
+`secure_delete=ON` and a committed `password=NULL` are not physical-erasure
+claims. Until the later scrub succeeds, old plaintext can remain in the main
+file, freelist, rollback journal, WAL, backups, copy-on-write snapshots, storage
+history, process memory, or kernel buffers. A `pending` database is recovery
+state and must never reach normal startup.
+
 ## Boundary
 
 These formats are intended to protect credentials in the current SQLite
