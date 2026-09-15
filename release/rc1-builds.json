@@ -1,0 +1,54 @@
+{
+  "rc": "v0.5.0-rc.1",
+  "date": "2026-09-15",
+  "build_flags": "CGO_ENABLED=0, -trimpath, -tags netgo osusergo, -ldflags \"-X main.commit=<sha> -X main.date=2026-09-15 -s -w\"; Go 1.26.6 darwin cross-compile to linux. NOTE: canonical release uses musl-static + upx via CI; these RC artifacts are CGO-free local builds, reproducibly byte-identical on rebuild.",
+  "binaries": [
+    {
+      "component": "root",
+      "source_revision": "d85b68c",
+      "file": "casaos-linux-arm64",
+      "sha256": "0b2b30ca4e1dc3e1c6ae950996aa01128c3a573b5deb0bc4a27f7f74801b49c2",
+      "vm_smoke": "executes on linux/arm64 (prints usage)"
+    },
+    {
+      "component": "root",
+      "source_revision": "d85b68c",
+      "file": "casaos-linux-amd64",
+      "sha256": "865bc2d204845a6666f92922857f397fc0b3ef1737d1022b4c2376ddcef3ecbd"
+    },
+    {
+      "component": "user-service",
+      "source_revision": "c07c76677c671a354273e54b446a4c2891acc04a",
+      "file": "userservice-linux-arm64",
+      "sha256": "04eda0ec2049c3ba08c0d76dd484fbad0f3f06cc7af6afaef169d706cb15c6f7",
+      "vm_smoke": "executes on linux/arm64 (-v prints v0.4.8)"
+    },
+    {
+      "component": "user-service",
+      "source_revision": "c07c76677c671a354273e54b446a4c2891acc04a",
+      "file": "userservice-linux-amd64",
+      "sha256": "ee2fa54231d5252e3ea71bd55396ca0ee8a4f416ae250fa802b3037033a9af81"
+    }
+  ],
+  "sbom": [
+    {
+      "component": "root",
+      "file": "sbom-root-rc1.json",
+      "sha256": "1988db491b1c0a520155e58b193e5054370abd2cc2ae4fde134db224cb6e1aa9",
+      "modules": 215,
+      "method": "go list -m -json all (module inventory, not a full SPDX SBOM)"
+    },
+    {
+      "component": "user-service",
+      "file": "sbom-userservice-rc1.json",
+      "sha256": "8773945368f472b4ce3ef88d060927b980377eee820117d6bc699868d10a85a1",
+      "modules": 214,
+      "method": "go list -m -json all (module inventory, not a full SPDX SBOM)"
+    }
+  ],
+  "compatibility": {
+    "check": "fork-minted access token (CasaOS-Common v0.4.8-alpha12 GetAccessToken, real GenerateKeyPair) accepted by root pkg/authsecurity.ValidateAccessToken (CasaOS-Common v0.4.11-alpha4); claims username=compat-user id=42 issuer=casaos intact; refresh-as-access rejected; tampered token rejected",
+    "static": "CasaOS-Common utils/jwt/jwt.go (Claims + mint path) byte-identical between v0.4.8-alpha12 and v0.4.11-alpha4; helper differs only in gin-vs-echo middleware plumbing",
+    "result": "passed"
+  }
+}
