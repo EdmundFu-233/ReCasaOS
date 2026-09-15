@@ -1,0 +1,33 @@
+{
+  "rc": "v0.5.0-rc.2+appmgmt",
+  "date": "2026-09-15",
+  "build_flags": "CGO_ENABLED=0, -trimpath, -tags netgo osusergo, -ldflags \"-X main.commit=<sha> -X main.date=2026-09-15 -s -w\"; Go 1.27.1 darwin cross-compile to linux. RC local builds, reproducibly byte-identical on rebuild; canonical musl+upx pending.",
+  "binaries": [
+    {
+      "component": "app-management",
+      "source_revision": "8ffe129ea8b67bc29d794c833ec88add9096dd1e",
+      "file": "appmgmt-linux-arm64",
+      "sha256": "e693b2790fdadb2235d4cdfdbf7ea4d4a8a2020beee6a0530a0c7c7aef1e847f",
+      "vm_smoke": "executes on linux/arm64 (-v prints v0.4.16)"
+    },
+    {
+      "component": "app-management",
+      "source_revision": "8ffe129ea8b67bc29d794c833ec88add9096dd1e",
+      "file": "appmgmt-linux-amd64",
+      "sha256": "4affa16f0ce68ef24d9bed6b9f6d3ce67250a6871d4bc40db3242d8fccbdf82b"
+    }
+  ],
+  "sbom": [
+    {
+      "component": "app-management",
+      "file": "sbom-appmgmt-rc3.json",
+      "sha256": "e33551a9dd168c4ef54b8b93fb31604b6706cc6e64c44b2a1c73b8f31218bfea",
+      "modules": 608,
+      "method": "go list -m -json all (module inventory, not a full SPDX SBOM)"
+    }
+  ],
+  "compatibility": {
+    "check": "app-management openapi v2 contract byte-identical (PR touches no api/model files); service suite green incl. codegen regeneration; named-volume semantics covered by new unit tests green on linux/arm64 VM; pre-existing daemon-dependent failures unchanged",
+    "result": "passed"
+  }
+}

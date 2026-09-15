@@ -4,8 +4,13 @@
   "components": [
     {
       "name": "app-management",
-      "state": "unresolved",
-      "reason": "ReCasaOS fork pinned at debfa317f0f996b91b43210e8d57799461388704 (EdmundFu-233/ReCasaOS-AppManagement main). Release artifact, compatibility evidence, and SBOM are pending; see ReCasaOS#9."
+      "state": "locked",
+      "source_repository": "https://github.com/EdmundFu-233/ReCasaOS-AppManagement",
+      "source_revision": "8ffe129ea8b67bc29d794c833ec88add9096dd1e",
+      "artifact_sha256": "e693b2790fdadb2235d4cdfdbf7ea4d4a8a2020beee6a0530a0c7c7aef1e847f",
+      "license": "Apache-2.0",
+      "api_schema": "appmanagement-openapi-v2",
+      "compatibility_status": "passed"
     },
     {
       "name": "gateway",
@@ -40,7 +45,7 @@
     {
       "name": "administrative-ui",
       "state": "unresolved",
-      "reason": "ReCasaOS fork pinned at af29f2a5d0056790b8c81db1d93217bb94cc1aea (EdmundFu-233/ReCasaOS-UI main). Ticket-based SSH rework, release artifact, and compatibility evidence are pending; see ReCasaOS#8."
+      "reason": "ReCasaOS fork pinned at c7a84091c524af7a86ee1750e1d75c08cf7141d1 (EdmundFu-233/ReCasaOS-UI main) with ticket-SSH hardening (PR #2). Release artifact, browser-test evidence, and compatibility evidence are pending; see ReCasaOS#8."
     },
     {
       "name": "installer",
