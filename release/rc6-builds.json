@@ -1,0 +1,32 @@
+{
+  "rc": "v0.5.0-rc.3+reviews",
+  "date": "2026-09-16",
+  "build_flags": "CGO_ENABLED=0, -trimpath, -tags netgo osusergo, -ldflags \"-X main.commit=<sha> -X main.date=2026-09-16 -s -w\"; darwin cross-compile to linux. RC local builds; canonical musl+upx pending.",
+  "binaries": [
+    {
+      "component": "gateway",
+      "source_revision": "d4ac7e7d60f59dc70e0d6e2761e6193eb2109be6",
+      "file": "gateway2-linux-arm64",
+      "sha256": "cfb9619676a422006ca41c0c4d49283e03e3dc469188cdfcdcfcb198a7f2d103",
+      "vm_smoke": "executes on linux/arm64 (-v prints v0.4.8)",
+      "note": "includes independent-review fixes (route-table mutex, ticker lifecycle, bounded legacy lease, CDN header sanitization)"
+    },
+    {
+      "component": "app-management",
+      "source_revision": "7220742a404508fd6bc497f279d915c4e1b45dd9",
+      "file": "appmgmt2-linux-arm64",
+      "sha256": "f5bef01300612ba15304f32db25e948f3cd7ff0e2c49a48de9bcaa539685fbfc",
+      "vm_smoke": "executes on linux/arm64 (-v prints v0.4.16)",
+      "note": "includes independent-review fixes (valid OCI fixture digests with assertions, TLS operator note)"
+    }
+  ],
+  "artifacts": [
+    {
+      "component": "administrative-ui",
+      "source_revision": "51c5c739a229d797194a281a0818461ee48325ee",
+      "file": "ReCasaOS-UI source archive (git archive of the pinned commit)",
+      "sha256": "05600803b6ea01859f07f01fc36d49fdb8dc2e600f66d34d7258effa955f074f",
+      "note": "includes independent-review fixes (fenced residual caps, honest password comment)"
+    }
+  ]
+}

@@ -6,8 +6,8 @@
       "name": "app-management",
       "state": "locked",
       "source_repository": "https://github.com/EdmundFu-233/ReCasaOS-AppManagement",
-      "source_revision": "8ffe129ea8b67bc29d794c833ec88add9096dd1e",
-      "artifact_sha256": "e693b2790fdadb2235d4cdfdbf7ea4d4a8a2020beee6a0530a0c7c7aef1e847f",
+      "source_revision": "7220742a404508fd6bc497f279d915c4e1b45dd9",
+      "artifact_sha256": "f5bef01300612ba15304f32db25e948f3cd7ff0e2c49a48de9bcaa539685fbfc",
       "license": "Apache-2.0",
       "api_schema": "appmanagement-openapi-v2",
       "compatibility_status": "passed"
@@ -16,8 +16,8 @@
       "name": "gateway",
       "state": "locked",
       "source_repository": "https://github.com/EdmundFu-233/ReCasaOS-Gateway",
-      "source_revision": "ed8d0efa2b54fe83cbe632288ea625029a14374f",
-      "artifact_sha256": "0246da7e90de375bea4fb808f2ea148f29378f4a5dd228c3212f48f9d6c65f23",
+      "source_revision": "d4ac7e7d60f59dc70e0d6e2761e6193eb2109be6",
+      "artifact_sha256": "cfb9619676a422006ca41c0c4d49283e03e3dc469188cdfcdcfcb198a7f2d103",
       "license": "Apache-2.0",
       "api_schema": "gateway-openapi-v1",
       "compatibility_status": "passed"
@@ -46,8 +46,8 @@
       "name": "administrative-ui",
       "state": "locked",
       "source_repository": "https://github.com/EdmundFu-233/ReCasaOS-UI",
-      "source_revision": "7c4a617dc2ad64623fd173e1cc08c27bde41a596",
-      "artifact_sha256": "c055e5d1aee127977b85e2f37d1537f8f778c27377fe28f3ce3c522f3c2a0738",
+      "source_revision": "51c5c739a229d797194a281a0818461ee48325ee",
+      "artifact_sha256": "05600803b6ea01859f07f01fc36d49fdb8dc2e600f66d34d7258effa955f074f",
       "license": "no-license-file-upstream-all-rights-reserved",
       "api_schema": "ui-static-against-root-openapi-v2",
       "compatibility_status": "passed"
