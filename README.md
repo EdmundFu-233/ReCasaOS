@@ -13,17 +13,54 @@ preserving compatibility where that does not weaken the security boundary.
 
 ## Current status
 
-**Development foundation — not yet an installable full-stack release.** This
-repository owns the CasaOS root backend, while Gateway, UserService, UI, App
-Management, Message Bus, installer, and packaging remain separate components.
-A green root build is not proof that an arbitrary mix of those components is
-safe or compatible.
+**v0.5.0 is released** at
+[EdmundFu-233/ReCasaOS v0.5.0](https://github.com/EdmundFu-233/ReCasaOS/releases/tag/v0.5.0).
+All six required components are locked in
+[`release/components.lock.json`](release/components.lock.json) with immutable
+source revisions, artifact digests, licenses, API/schema versions, and passed
+compatibility evidence:
 
-Do not use `get.casaos.io` install or update scripts to install ReCasaOS. Those
-scripts are controlled by the upstream CasaOS project and do not install the
-fixes in this fork. ReCasaOS will publish an installer only after every runtime
-component is pinned, clean-install and upgrade/rollback tests pass, and release
-artifacts have checksums and provenance.
+| Component | Source |
+| --- | --- |
+| Root service | this repository |
+| UserService | `EdmundFu-233/ReCasaOS-UserService` |
+| Gateway | `EdmundFu-233/ReCasaOS-Gateway` |
+| Administrative UI | `EdmundFu-233/ReCasaOS-UI` |
+| AppManagement | `EdmundFu-233/ReCasaOS-AppManagement` |
+| Message Bus | `EdmundFu-233/ReCasaOS-MessageBus` |
+| Installer | `EdmundFu-233/ReCasaOS-Installer` |
+
+The GitHub release carries musl-static Linux binaries (amd64, arm64, arm-7,
+riscv64) plus the migration tool, a `checksums.txt` GPG-signed with the
+ReCasaOS release key (fingerprint `65A1BD27 2E10 6BF7 983B 3D13 D3F5 9DC3
+10EE 3539`; public key in [`release/recasaos-release.pub`](release/recasaos-release.pub)),
+and a SLSA provenance attestation bound to the release tag and workflow.
+Verify before installing:
+
+```sh
+gpg --import release/recasaos-release.pub
+gpg --verify checksums.txt.asc checksums.txt
+sha256sum -c checksums.txt
+gh attestation verify checksums.txt --repo EdmundFu-233/ReCasaOS
+```
+
+Install only through the offline installer, which verifies every artifact
+SHA-256 against its bundle manifest before writing anything and never uses
+the network:
+
+```sh
+./install.sh --bundle <dir> [--prefix /]
+```
+
+Do not use `get.casaos.io` install or update scripts. Those scripts are
+controlled by the upstream CasaOS project and do not install the fixes in
+this fork.
+
+The full administrative dashboard is still **not ready for unrestricted
+Internet exposure**. Keep it on a private management network or mesh VPN,
+even at v0.5.0: post-release hardening continues on `main` (tracked in
+[Issues](https://github.com/EdmundFu-233/ReCasaOS/issues)), and an
+independent penetration test has not been performed.
 
 The first hardening milestone includes:
 
