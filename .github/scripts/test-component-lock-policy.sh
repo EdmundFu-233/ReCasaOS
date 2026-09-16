@@ -69,7 +69,7 @@ expect_reject() {
 manifest="$repo_root/release/components.lock.json"
 locked_fixture="$script_dir/testdata/component-lock-one-locked.json"
 all_locked_fixture="$script_dir/testdata/component-lock-all-locked.json"
-expect_accept current-unresolved-hold "$manifest"
+expect_accept current-fully-locked-hold "$manifest"
 expect_accept one-structural-lock-hold "$locked_fixture"
 expect_accept all-structural-locks-hold "$all_locked_fixture"
 
@@ -195,7 +195,7 @@ expect_reject alternate-case-component-name-key "$mutated"
 grep -Fq 'unknown key "Name"' "$work_dir/stderr" ||
   fail "alternate-case component name key was not rejected by the exact JSON schema"
 
-sed 's/"state": "unresolved"/"State": "unresolved"/' \
+sed 's/"state": "locked"/"State": "locked"/' \
   "$manifest" >"$mutated"
 expect_reject alternate-case-component-state-key "$mutated"
 grep -Fq 'unknown key "State"' "$work_dir/stderr" ||
