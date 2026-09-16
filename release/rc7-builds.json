@@ -1,0 +1,18 @@
+{
+  "rc": "v0.5.0+post-release",
+  "date": "2026-09-16",
+  "binaries": [
+    {
+      "component": "user-service",
+      "source_revision": "ed9d8cd75f62b490362b78b760ae96efcdd6f179",
+      "file": "userservice3-linux-arm64",
+      "sha256": "ee874d90d1017f1cfb1108dbb2f0aaaba64afde7fb1ba101377b50b975bd97d2",
+      "vm_smoke": "executes on linux/arm64 (-v prints v0.4.8)",
+      "note": "post-release hardening: wildcard credentialed CORS replaced with exact operator allowlist (EdmundFu-233/ReCasaOS-UserService#13); byte-identical on rebuild"
+    }
+  ],
+  "compatibility": {
+    "check": "no API/OpenAPI change: CORS is transport policy and configuration only; full UserService suite green including new CORS tests (default silent, exact echo with credentials, wildcard/malformed rejected, invalid config fails startup naming the key)",
+    "result": "passed"
+  }
+}
