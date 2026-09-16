@@ -75,8 +75,12 @@ func TestBackupNeverOverwrites(t *testing.T) {
 		t.Fatalf("second ring: %v", err)
 	}
 	defer second.Destroy()
-	if _, err := backupKeyringAt(root.rootFD, root.owner, root.group, second, ops); !errors.Is(err, ErrBackupExists) {
+	result, err := backupKeyringAt(root.rootFD, root.owner, root.group, second, ops)
+	if !errors.Is(err, ErrBackupExists) {
 		t.Fatalf("second backup: got %v, want ErrBackupExists", err)
+	}
+	if result.CleanupRequired {
+		t.Fatalf("refused overwrite cleaned its staging: no HOLD expected, got %+v", result)
 	}
 	if _, err := os.Lstat(filepath.Join(root.directory, backupStagingName)); !os.IsNotExist(err) {
 		t.Fatalf("staging must be cleaned after refusal")

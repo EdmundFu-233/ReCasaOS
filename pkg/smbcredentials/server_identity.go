@@ -90,11 +90,13 @@ func (pin ServerIdentity) Verify(host string, port int, addresses []string) erro
 	if normalizedHost != pin.host || port != int(pin.port) {
 		return ErrServerIdentityChanged
 	}
-	normalizedAddresses, err := normalizeServerAddresses(addresses)
+	presented, err := parseServerAddressList(addresses)
 	if err != nil {
 		return err
 	}
-	if !equalAddressSets(normalizedAddresses, pin.addresses) {
+	// Compare as sets: "10.0.0.1" and "::ffff:10.0.0.1" normalize to the
+	// same address, and that aliasing must not read as a server change.
+	if !equalAddressSets(dedupeAddresses(presented), pin.addresses) {
 		return ErrServerAddressChanged
 	}
 	return nil
@@ -195,6 +197,13 @@ func normalizeServerHost(host string) (string, error) {
 	if parsed := net.ParseIP(trimmed); parsed != nil {
 		return parsed.String(), nil
 	}
+	if looksLikeNumericAddress(trimmed) {
+		// Hex, octal, and packed-decimal forms (0x7f.0.0.1, 0177.0.0.1,
+		// 2130706433) mean different addresses to different resolvers
+		// while net.ParseIP rejects them. Pinning such a name would bind
+		// a different identity than the connection uses, so refuse it.
+		return "", ErrInvalidServerIdentity
+	}
 	labels := strings.Split(trimmed, ".")
 	for _, label := range labels {
 		if len(label) < 1 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
@@ -211,6 +220,66 @@ func normalizeServerHost(host string) (string, error) {
 		}
 	}
 	return trimmed, nil
+}
+
+func looksLikeNumericAddress(host string) bool {
+	for _, label := range strings.Split(host, ".") {
+		if !isAmbiguousNumericLabel(label) {
+			return false
+		}
+	}
+	return true
+}
+
+// isAmbiguousNumericLabel reports labels that inet_aton-class parsers read
+// as numbers: decimal, 0x-hex, and leading-zero octal. Plain hex words
+// without a 0x prefix (such as "dead") are real hostnames to those parsers
+// and stay allowed.
+func isAmbiguousNumericLabel(label string) bool {
+	if label == "" {
+		return false
+	}
+	if len(label) > 2 && (strings.HasPrefix(label, "0x") || strings.HasPrefix(label, "0X")) {
+		for i := 2; i < len(label); i++ {
+			character := label[i]
+			if (character < '0' || character > '9') &&
+				(character < 'a' || character > 'f') &&
+				(character < 'A' || character > 'F') {
+				return false
+			}
+		}
+		return true
+	}
+	if len(label) > 1 && label[0] == '0' {
+		for i := 1; i < len(label); i++ {
+			if label[i] < '0' || label[i] > '7' {
+				return false
+			}
+		}
+		return true
+	}
+	for i := 0; i < len(label); i++ {
+		if label[i] < '0' || label[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func parseServerAddressList(addresses []string) ([]string, error) {
+	if len(addresses) < 1 || len(addresses) > maxServerAddresses {
+		return nil, ErrInvalidServerIdentity
+	}
+	parsed := make([]string, 0, len(addresses))
+	for _, raw := range addresses {
+		address := net.ParseIP(strings.TrimSpace(raw))
+		if address == nil {
+			return nil, ErrInvalidServerIdentity
+		}
+		parsed = append(parsed, address.String())
+	}
+	sort.Strings(parsed)
+	return parsed, nil
 }
 
 func normalizeServerAddresses(addresses []string) ([]string, error) {
@@ -233,6 +302,20 @@ func normalizeServerAddresses(addresses []string) ([]string, error) {
 	}
 	sort.Strings(normalized)
 	return normalized, nil
+}
+
+func dedupeAddresses(addresses []string) []string {
+	seen := make(map[string]struct{}, len(addresses))
+	out := make([]string, 0, len(addresses))
+	for _, address := range addresses {
+		if _, duplicate := seen[address]; duplicate {
+			continue
+		}
+		seen[address] = struct{}{}
+		out = append(out, address)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func equalAddressSets(first, second []string) bool {

@@ -2,6 +2,7 @@ package oauthsecurity
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"sync"
@@ -167,16 +168,16 @@ func TestTokenRevoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seal: %v", err)
 	}
-	if err := ring.Revoke(envelope); err != nil {
+	if err := ring.Revoke("google", 7, envelope); err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
 	if _, err := ring.Open("google", 7, envelope); !errors.Is(err, ErrRevokedToken) {
 		t.Fatalf("got %v, want ErrRevokedToken", err)
 	}
-	if err := ring.Revoke(envelope); err != nil {
+	if err := ring.Revoke("google", 7, envelope); err != nil {
 		t.Fatalf("double revoke must be idempotent: %v", err)
 	}
-	if err := ring.Revoke([]byte("garbage")); !errors.Is(err, ErrInvalidTokenEnvelope) {
+	if err := ring.Revoke("google", 7, []byte("garbage")); !errors.Is(err, ErrInvalidTokenEnvelope) {
 		t.Fatalf("revoke garbage: got %v", err)
 	}
 }
@@ -302,7 +303,7 @@ func TestLoadTokenKeyFromEnvironment(t *testing.T) {
 		}
 		return "", false
 	}
-	material, id, err := loadTokenKey(lookup, nil, &counterReader{})
+	material, id, err := loadTokenKey(lookup, nil)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -332,8 +333,130 @@ func TestLoadTokenKeyRejects(t *testing.T) {
 			value, ok := env[key]
 			return value, ok
 		}
-		if _, _, err := loadTokenKey(lookup, readCredentialFile, &counterReader{}); !errors.Is(err, ErrInvalidConfiguration) {
+		if _, _, err := loadTokenKey(lookup, readCredentialFile); !errors.Is(err, ErrInvalidConfiguration) {
 			t.Fatalf("%s: got %v, want ErrInvalidConfiguration", name, err)
 		}
 	}
+}
+
+func TestTokenRevokeRequiresLiveEnvelope(t *testing.T) {
+	ring := testTokenRing(t)
+	envelope, err := ring.seal("google", 7, []byte("tok"), &counterReader{})
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	// A well-formed forgery that never decrypted must not consume a slot.
+	forged := bytes.Clone(envelope)
+	forged[len(forged)-1] ^= 0xff
+	forged[len(forged)-2] ^= 0xff
+	for range 16 {
+		if err := ring.Revoke("google", 7, forged); err == nil {
+			t.Fatalf("forged envelope must never revoke")
+		}
+	}
+	// The genuine envelope still revokes afterwards: no exhaustion.
+	if err := ring.Revoke("google", 7, envelope); err != nil {
+		t.Fatalf("genuine revoke after forgeries: %v", err)
+	}
+}
+
+func TestTokenKeyIDSurvivesReload(t *testing.T) {
+	lookup := func(key string) (string, bool) {
+		if key == tokenKeyEnvVariable {
+			return "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", true
+		}
+		return "", false
+	}
+	first, firstID, err := loadTokenKey(lookup, nil)
+	if err != nil {
+		t.Fatalf("first load: %v", err)
+	}
+	defer clear(first[:])
+	second, secondID, err := loadTokenKey(lookup, nil)
+	if err != nil {
+		t.Fatalf("second load: %v", err)
+	}
+	defer clear(second[:])
+	if firstID != secondID {
+		t.Fatalf("same key must reload the same ID")
+	}
+	// Full restart story: ring1 seals under its active key; the operator
+	// persists that key material; a fresh ring reimports the reloaded key
+	// and opens the pre-restart envelope.
+	ring1, err := newTokenKeyring(&counterReader{})
+	if err != nil {
+		t.Fatalf("ring1: %v", err)
+	}
+	idA := ring1.state.active
+	matA := ring1.state.keys[idA]
+	envelope, err := ring1.seal("google", 7, []byte("tok"), &counterReader{next: 200})
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	operatorHex := hex.EncodeToString(matA[:])
+	clear(matA[:])
+	reloaded, reloadedID, err := loadTokenKey(func(key string) (string, bool) {
+		if key == tokenKeyEnvVariable {
+			return operatorHex, true
+		}
+		return "", false
+	}, nil)
+	if err != nil {
+		t.Fatalf("reload persisted key: %v", err)
+	}
+	defer clear(reloaded[:])
+	if reloadedID != idA {
+		t.Fatalf("reloaded ID must match the sealing key ID")
+	}
+	ring2, err := newTokenKeyring(&counterReader{next: 100})
+	if err != nil {
+		t.Fatalf("ring2: %v", err)
+	}
+	if err := ring2.AddRetainedKey(reloadedID, reloaded); err != nil {
+		t.Fatalf("reimport: %v", err)
+	}
+	clear(reloaded[:])
+	opened, err := ring2.Open("google", 7, envelope)
+	if err != nil {
+		t.Fatalf("pre-restart envelope must open after reload: %v", err)
+	}
+	clear(opened)
+}
+
+func TestTokenConcurrentHammer(t *testing.T) {
+	ring := testTokenRing(t)
+	envelope, err := ring.Seal("google", 7, []byte("tok"))
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	var wg sync.WaitGroup
+	for i := range 16 {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			principal := n + 1
+			sealed, err := ring.Seal("google", principal, []byte("tok"))
+			if err != nil {
+				t.Errorf("seal: %v", err)
+				return
+			}
+			opened, err := ring.Open("google", principal, sealed)
+			if err != nil {
+				t.Errorf("open: %v", err)
+				return
+			}
+			clear(opened)
+			_, _ = ring.RotateToken("google", principal, sealed)
+			_ = ring.Revoke("google", principal, sealed)
+		}(i)
+	}
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = ring.RotateKey()
+			_, _ = ring.Open("google", 7, envelope)
+		}()
+	}
+	wg.Wait()
 }

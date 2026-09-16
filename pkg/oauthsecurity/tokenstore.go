@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
@@ -44,12 +45,15 @@ var (
 
 // TokenKeyring holds host-protected key-encryption keys for sealed refresh
 // tokens. Keys enter only from the process environment or a root-owned 0600
-// credential file; the keyring never logs key material.
+// credential file; the keyring never logs key material. Every method is safe
+// for concurrent use: seal/open race rotation and revocation instead of
+// crashing on the underlying maps.
 type TokenKeyring struct {
 	state *tokenKeyringState
 }
 
 type tokenKeyringState struct {
+	mu      sync.RWMutex
 	keys    map[[tokenKeyIDSize]byte][tokenKeySize]byte
 	active  [tokenKeyIDSize]byte
 	order   [][tokenKeyIDSize]byte
@@ -84,31 +88,46 @@ func (k *TokenKeyring) rotateKey(random io.Reader) ([tokenKeyIDSize]byte, error)
 	if k == nil || k.state == nil || random == nil {
 		return [tokenKeyIDSize]byte{}, ErrInvalidTokenEnvelope
 	}
-	var id [tokenKeyIDSize]byte
-	var material [tokenKeySize]byte
-	if _, err := io.ReadFull(random, id[:]); err != nil {
-		return [tokenKeyIDSize]byte{}, ErrInvalidTokenEnvelope
-	}
-	if _, err := io.ReadFull(random, material[:]); err != nil {
-		clear(id[:])
-		return [tokenKeyIDSize]byte{}, ErrInvalidTokenEnvelope
-	}
-	k.state.keys[id] = material
-	clear(material[:])
-	k.state.order = append(k.state.order, id)
-	k.state.active = id
-	for len(k.state.order) > maxTokenKeys {
-		victim := k.state.order[0]
-		k.state.order = k.state.order[1:]
-		if victim != k.state.active {
-			delete(k.state.keys, victim)
+	k.state.mu.Lock()
+	defer k.state.mu.Unlock()
+	for attempts := 0; attempts < 4; attempts++ {
+		var material [tokenKeySize]byte
+		if _, err := io.ReadFull(random, material[:]); err != nil {
+			return [tokenKeyIDSize]byte{}, ErrInvalidTokenEnvelope
 		}
+		// The identifier derives from the material itself (like the SMB
+		// keyring), so a reloaded key reproduces its identifier and old
+		// envelopes keep opening across restarts. Random per-load
+		// identifiers would orphan every sealed token on restart.
+		id := deriveTokenKeyID(material)
+		var zeroKey [tokenKeySize]byte
+		if material == zeroKey {
+			continue
+		}
+		if _, exists := k.state.keys[id]; exists {
+			clear(material[:])
+			continue
+		}
+		k.state.keys[id] = material
+		clear(material[:])
+		k.state.order = append(k.state.order, id)
+		k.state.active = id
+		for len(k.state.order) > maxTokenKeys {
+			victim := k.state.order[0]
+			k.state.order = k.state.order[1:]
+			if victim != k.state.active {
+				delete(k.state.keys, victim)
+			}
+		}
+		return id, nil
 	}
-	return id, nil
+	return [tokenKeyIDSize]byte{}, ErrInvalidTokenEnvelope
 }
 
 // AddRetainedKey imports one previously generated key so envelopes sealed
 // before a restart or rotation still open. Duplicate imports are rejected.
+// The caller must clear material after a successful import; the keyring
+// copies it.
 func (k *TokenKeyring) AddRetainedKey(id [tokenKeyIDSize]byte, material [tokenKeySize]byte) error {
 	if k == nil || k.state == nil {
 		return ErrInvalidTokenEnvelope
@@ -118,6 +137,8 @@ func (k *TokenKeyring) AddRetainedKey(id [tokenKeyIDSize]byte, material [tokenKe
 	if id == zeroID || material == zeroKey {
 		return ErrInvalidTokenEnvelope
 	}
+	k.state.mu.Lock()
+	defer k.state.mu.Unlock()
 	if _, duplicate := k.state.keys[id]; duplicate {
 		return ErrInvalidTokenEnvelope
 	}
@@ -131,8 +152,9 @@ func (k *TokenKeyring) AddRetainedKey(id [tokenKeyIDSize]byte, material [tokenKe
 
 // Seal encrypts one refresh token. The envelope binds the provider,
 // principal, and sealing key ID as associated data so a sealed token cannot
-// move across providers, users, or keys. Callers must clear the refresh
-// slice after Seal returns.
+// move across providers, users, or keys. The provider and principal must
+// come from the authenticated session, never from caller-supplied token
+// content. Callers must clear the refresh slice after Seal returns.
 func (k *TokenKeyring) Seal(provider string, principalID int, refresh []byte) ([]byte, error) {
 	return k.seal(provider, principalID, refresh, rand.Reader)
 }
@@ -156,6 +178,8 @@ func (k *TokenKeyring) seal(provider string, principalID int, refresh []byte, ra
 	}
 	defer clear(nonce[:])
 
+	k.state.mu.RLock()
+	defer k.state.mu.RUnlock()
 	key, ok := k.state.keys[k.state.active]
 	if !ok {
 		return nil, ErrUnknownTokenKey
@@ -189,6 +213,12 @@ func (k *TokenKeyring) Open(provider string, principalID int, envelope []byte) (
 	if k == nil || k.state == nil {
 		return nil, ErrInvalidTokenEnvelope
 	}
+	k.state.mu.RLock()
+	defer k.state.mu.RUnlock()
+	return k.openLocked(provider, principalID, envelope)
+}
+
+func (k *TokenKeyring) openLocked(provider string, principalID int, envelope []byte) ([]byte, error) {
 	if !ValidProviderName(provider) || principalID < 1 || principalID > maxPrincipalID {
 		return nil, ErrInvalidTokenEnvelope
 	}
@@ -222,13 +252,20 @@ func (k *TokenKeyring) Open(provider string, principalID int, envelope []byte) (
 	return refresh, nil
 }
 
-// Revoke records one sealed envelope as revoked. The envelope must parse and
-// its plaintext is never touched; revocation needs no key access.
-func (k *TokenKeyring) Revoke(envelope []byte) error {
+// Revoke records one sealed envelope as revoked. The envelope must decrypt
+// under the given bindings first: revocation without key access would let
+// anyone forge unparseable-but-well-formed envelopes and exhaust the bounded
+// revocation set. Revoking an already-revoked envelope succeeds silently.
+func (k *TokenKeyring) Revoke(provider string, principalID int, envelope []byte) error {
 	if k == nil || k.state == nil {
 		return ErrInvalidTokenEnvelope
 	}
-	if _, err := parseTokenEnvelope(envelope); err != nil {
+	k.state.mu.Lock()
+	defer k.state.mu.Unlock()
+	if _, err := k.openLocked(provider, principalID, envelope); err != nil {
+		if errors.Is(err, ErrRevokedToken) {
+			return nil
+		}
 		return err
 	}
 	if len(k.state.revoked) >= maxRevocations {
@@ -241,25 +278,69 @@ func (k *TokenKeyring) Revoke(envelope []byte) error {
 
 // RotateToken re-seals one live envelope under the active key and revokes the
 // old envelope, so a rotated refresh token has exactly one valid sealed form.
+// The whole rotation holds the write lock: concurrent rotations of the same
+// envelope serialize instead of minting two live forms.
 func (k *TokenKeyring) RotateToken(provider string, principalID int, envelope []byte) ([]byte, error) {
 	return k.rotateToken(provider, principalID, envelope, rand.Reader)
 }
 
 func (k *TokenKeyring) rotateToken(provider string, principalID int, envelope []byte, random io.Reader) ([]byte, error) {
-	refresh, err := k.Open(provider, principalID, envelope)
+	if k == nil || k.state == nil || random == nil {
+		return nil, ErrInvalidTokenEnvelope
+	}
+	k.state.mu.Lock()
+	defer k.state.mu.Unlock()
+	refresh, err := k.openLocked(provider, principalID, envelope)
 	if err != nil {
 		return nil, err
 	}
 	defer clear(refresh)
-	resealed, err := k.seal(provider, principalID, refresh, random)
+	resealed, err := k.sealLocked(provider, principalID, refresh, random)
 	if err != nil {
 		return nil, err
 	}
-	if err := k.Revoke(envelope); err != nil {
+	if len(k.state.revoked) >= maxRevocations {
 		clear(resealed)
+		return nil, ErrInvalidTokenEnvelope
+	}
+	digest := sha256.Sum256(envelope)
+	k.state.revoked[digest] = struct{}{}
+	return resealed, nil
+}
+
+// sealLocked seals while the caller holds the state lock.
+func (k *TokenKeyring) sealLocked(provider string, principalID int, refresh []byte, random io.Reader) ([]byte, error) {
+	snapshot := bytes.Clone(refresh)
+	defer clear(snapshot)
+
+	var nonce [chacha20poly1305.NonceSizeX]byte
+	if _, err := io.ReadFull(random, nonce[:]); err != nil {
+		return nil, ErrInvalidTokenEnvelope
+	}
+	defer clear(nonce[:])
+
+	key, ok := k.state.keys[k.state.active]
+	if !ok {
+		return nil, ErrUnknownTokenKey
+	}
+	aead, err := chacha20poly1305.NewX(key[:])
+	clear(key[:])
+	if err != nil {
+		return nil, ErrInvalidTokenEnvelope
+	}
+	aad, err := tokenAAD(provider, principalID, k.state.active)
+	if err != nil {
 		return nil, err
 	}
-	return resealed, nil
+	defer clear(aad)
+
+	envelope := make([]byte, 0, 8+1+tokenKeyIDSize+chacha20poly1305.NonceSizeX+len(snapshot)+chacha20poly1305.Overhead)
+	envelope = append(envelope, tokenEnvelopeMagic[:]...)
+	envelope = append(envelope, tokenEnvelopeVersion)
+	envelope = append(envelope, k.state.active[:]...)
+	envelope = append(envelope, nonce[:]...)
+	envelope = aead.Seal(envelope, nonce[:], snapshot, aad)
+	return envelope, nil
 }
 
 type parsedTokenEnvelope struct {
@@ -305,16 +386,28 @@ func tokenAAD(provider string, principalID int, keyID [tokenKeyIDSize]byte) ([]b
 	return aad, nil
 }
 
+// deriveTokenKeyID binds the key identifier to the key material itself, so a
+// restarted process reloads the same identifier for the same key and
+// previously sealed envelopes keep opening. Random per-load identifiers
+// would orphan every sealed token on restart.
+func deriveTokenKeyID(material [tokenKeySize]byte) [tokenKeyIDSize]byte {
+	digest := sha256.Sum256(material[:])
+	var id [tokenKeyIDSize]byte
+	copy(id[:], digest[:tokenKeyIDSize])
+	clear(digest[:])
+	return id
+}
+
 // LoadTokenKey loads the 32-byte token sealing key from exactly one source:
 // RECASAOS_OAUTH_TOKEN_KEY (64 hex characters) or
 // RECASAOS_OAUTH_TOKEN_KEY_FILE (a root-owned 0600 file with the same
 // content). The returned material must be cleared by the caller after the
 // keyring takes ownership.
 func LoadTokenKey() ([tokenKeySize]byte, [tokenKeyIDSize]byte, error) {
-	return loadTokenKey(os.LookupEnv, readCredentialFile, rand.Reader)
+	return loadTokenKey(os.LookupEnv, readCredentialFile)
 }
 
-func loadTokenKey(lookup func(string) (string, bool), readCredential func(string) ([]byte, error), random io.Reader) ([tokenKeySize]byte, [tokenKeyIDSize]byte, error) {
+func loadTokenKey(lookup func(string) (string, bool), readCredential func(string) ([]byte, error)) ([tokenKeySize]byte, [tokenKeyIDSize]byte, error) {
 	var material [tokenKeySize]byte
 	var id [tokenKeyIDSize]byte
 	inline, inlinePresent := lookup(tokenKeyEnvVariable)
@@ -348,13 +441,5 @@ func loadTokenKey(lookup func(string) (string, bool), readCredential func(string
 		clear(material[:])
 		return material, id, ErrInvalidConfiguration
 	}
-	if random == nil {
-		clear(material[:])
-		return material, id, ErrInvalidConfiguration
-	}
-	if _, err := io.ReadFull(random, id[:]); err != nil {
-		clear(material[:])
-		return material, id, ErrInvalidConfiguration
-	}
-	return material, id, nil
+	return material, deriveTokenKeyID(material), nil
 }
