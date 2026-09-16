@@ -54,8 +54,13 @@
     },
     {
       "name": "installer",
-      "state": "unresolved",
-      "reason": "The full-stack installer source revision and artifact set are external and not locked."
+      "state": "locked",
+      "source_repository": "https://github.com/EdmundFu-233/ReCasaOS-Installer",
+      "source_revision": "3bdb56a97a792bdab9ce11ab9d997d8ac9bda9b8",
+      "artifact_sha256": "6b17eb8e7c9ee6980325d16e12606d333a6f274c45c3f4be1fee11e81764b232",
+      "license": "Apache-2.0",
+      "api_schema": "installer-manifest-v1",
+      "compatibility_status": "passed"
     }
   ]
 }
