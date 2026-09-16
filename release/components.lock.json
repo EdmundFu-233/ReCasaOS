@@ -46,8 +46,8 @@
       "name": "administrative-ui",
       "state": "locked",
       "source_repository": "https://github.com/EdmundFu-233/ReCasaOS-UI",
-      "source_revision": "51c5c739a229d797194a281a0818461ee48325ee",
-      "artifact_sha256": "05600803b6ea01859f07f01fc36d49fdb8dc2e600f66d34d7258effa955f074f",
+      "source_revision": "0d6cf15eae7c94aa097b8940f947b149ce844ed7",
+      "artifact_sha256": "b77b1edabbf68a225307bdc03bd65d66100bcd8fffeebf50e8ab4d2a36a65629",
       "license": "no-license-file-upstream-all-rights-reserved",
       "api_schema": "ui-static-against-root-openapi-v2",
       "compatibility_status": "passed"
