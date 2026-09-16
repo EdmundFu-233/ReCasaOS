@@ -34,8 +34,13 @@
     },
     {
       "name": "message-bus",
-      "state": "unresolved",
-      "reason": "Only the API input commit is pinned; the runtime release artifact is not locked."
+      "state": "locked",
+      "source_repository": "https://github.com/EdmundFu-233/ReCasaOS-MessageBus",
+      "source_revision": "ba87168fcfa4ac5ff7a114f66a139eb5fe427646",
+      "artifact_sha256": "28c1c8349cfa85129e95f083213acb1297ef96ad5ddded5b51acae6d51541e55",
+      "license": "Apache-2.0",
+      "api_schema": "messagebus-openapi-v2",
+      "compatibility_status": "passed"
     },
     {
       "name": "administrative-ui",

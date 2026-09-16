@@ -1,0 +1,1354 @@
+{
+	"Path": "github.com/IceWhaleTech/CasaOS-MessageBus",
+	"Main": true,
+	"Dir": "/Users/edmundfu/Desktop/Project/ReCasaOS-MessageBus",
+	"GoMod": "/Users/edmundfu/Desktop/Project/ReCasaOS-MessageBus/go.mod",
+	"GoVersion": "1.20"
+}
+{
+	"Path": "github.com/CorrectRoadH/go-socket.io",
+	"Version": "v1.8.0-rc.5",
+	"Time": "2024-12-19T08:20:44Z",
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/!correct!road!h/go-socket.io@v1.8.0-rc.5",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/!correct!road!h/go-socket.io/@v/v1.8.0-rc.5.mod",
+	"GoVersion": "1.16",
+	"Sum": "h1:cjlXtmuOug5168+XRM+7iJxbd9lLkL9AgzemF7ZqoPI=",
+	"GoModSum": "h1:DgupkgFQg7/js8Tr1uLYICJRGlHmKWIV6hWWTH2V2fc="
+}
+{
+	"Path": "github.com/IceWhaleTech/CasaOS-Common",
+	"Version": "v0.4.4-alpha2",
+	"Time": "2023-04-22T04:38:20Z",
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/!ice!whale!tech/!casa!o!s-!common@v0.4.4-alpha2",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/!ice!whale!tech/!casa!o!s-!common/@v/v0.4.4-alpha2.mod",
+	"GoVersion": "1.20",
+	"Sum": "h1:EIuQbVpuU2QZVui+ApYCEt27qGCUaQhgHCdOeHmgAwc=",
+	"GoModSum": "h1:iv6fJJs7IKv1tSrsbyA3Fq9xfeKNoaxhqA6IQUBeg9Q="
+}
+{
+	"Path": "github.com/RaveNoX/go-jsoncommentstrip",
+	"Version": "v1.0.0",
+	"Time": "2019-03-30T15:43:36Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/!rave!no!x/go-jsoncommentstrip/@v/v1.0.0.mod",
+	"GoVersion": "1.12",
+	"GoModSum": "h1:78ihd09MekBnJnxpICcwzCMzGrKSKYe4AqU6PDYYpjk="
+}
+{
+	"Path": "github.com/andybalholm/brotli",
+	"Version": "v1.0.5",
+	"Time": "2022-09-24T02:39:05Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/andybalholm/brotli@v1.0.5",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/andybalholm/brotli/@v/v1.0.5.mod",
+	"GoVersion": "1.12",
+	"Sum": "h1:8uQZIdzKmjc/iuPu7O2ioW48L81FgatrcpfFmiq/cCs=",
+	"GoModSum": "h1:fO7iG3H7G2nSZ7m0zPUDn85XEX2GTukHGRSepvi9Eig="
+}
+{
+	"Path": "github.com/apapsch/go-jsonmerge/v2",
+	"Version": "v2.0.0",
+	"Time": "2021-11-19T17:29:21Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/apapsch/go-jsonmerge/v2@v2.0.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/apapsch/go-jsonmerge/v2/@v/v2.0.0.mod",
+	"GoVersion": "1.12",
+	"Sum": "h1:axGnT1gRIfimI7gJifB699GoE/oq+F2MU7Dml6nw9rQ=",
+	"GoModSum": "h1:lvDnEdqiQrp0O42VQGgmlKpxL1AP2+08jFMw88y4klk="
+}
+{
+	"Path": "github.com/benbjohnson/clock",
+	"Version": "v1.1.0",
+	"Time": "2020-11-24T13:07:21Z",
+	"Indirect": true,
+	"Sum": "h1:Q92kusRqC1XV2MjkWETPvjJVqKetz1OzxZB7mHJLju8="
+}
+{
+	"Path": "github.com/bmatcuk/doublestar",
+	"Version": "v1.1.1",
+	"Time": "2018-08-11T13:50:57Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/bmatcuk/doublestar/@v/v1.1.1.mod",
+	"GoModSum": "h1:UD6OnuiIn0yFxxA2le/rnRU1G4RaI4UvFv1sNto9p6w="
+}
+{
+	"Path": "github.com/bytedance/sonic",
+	"Version": "v1.8.7",
+	"Time": "2023-04-03T09:25:57Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/bytedance/sonic/@v/v1.8.7.mod",
+	"GoVersion": "1.15",
+	"Sum": "h1:d3sry5vGgVq/OpgozRUNP6xBsSo0mtNdwliApw+SAMQ=",
+	"GoModSum": "h1:i736AoUSYt75HyZLoJW9ERYxcy6eaN6h4BZXU064P/U="
+}
+{
+	"Path": "github.com/chenzhuoyu/base64x",
+	"Version": "v0.0.0-20221115062448-fe3a3abad311",
+	"Time": "2022-11-15T06:24:48Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/chenzhuoyu/base64x/@v/v0.0.0-20221115062448-fe3a3abad311.mod",
+	"GoVersion": "1.15",
+	"Sum": "h1:qSGYFH7+jGhDF8vLC+iwCD4WpbV1EBDSzWkJODFLams=",
+	"GoModSum": "h1:b583jCggY9gE99b6G5LEC39OIiVsWj+R97kbl5odCEk="
+}
+{
+	"Path": "github.com/coreos/go-systemd",
+	"Version": "v0.0.0-20191104093116-d3cd4ed1dbcf",
+	"Time": "2019-11-04T09:31:16Z",
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/coreos/go-systemd@v0.0.0-20191104093116-d3cd4ed1dbcf",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/coreos/go-systemd/@v/v0.0.0-20191104093116-d3cd4ed1dbcf.mod",
+	"Sum": "h1:iW4rZ826su+pqaw19uhpSCzhj44qo35pNgKFGqzDKkU=",
+	"GoModSum": "h1:F5haX7vjVVG0kc13fIWeqUViNPyEJxv/OmvnBo0Yme4="
+}
+{
+	"Path": "github.com/coreos/go-systemd/v22",
+	"Version": "v22.5.0",
+	"Time": "2022-11-07T13:52:27Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/coreos/go-systemd/v22@v22.5.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/coreos/go-systemd/v22/@v/v22.5.0.mod",
+	"GoVersion": "1.12",
+	"Sum": "h1:RrqgGjYQKalulkV8NGVIfkXQf6YYmOyiJKk8iXXhfZs=",
+	"GoModSum": "h1:Y58oyj3AT4RCenI/lSvhwexgC+NSVTIJ3seZv2GcEnc="
+}
+{
+	"Path": "github.com/creack/pty",
+	"Version": "v1.1.9",
+	"Time": "2019-09-25T15:36:33Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/creack/pty/@v/v1.1.9.mod",
+	"GoVersion": "1.13",
+	"GoModSum": "h1:oKZEueFk5CKHvIhNR5MUki03XCEU+Q6VDXinZuGJ33E="
+}
+{
+	"Path": "github.com/davecgh/go-spew",
+	"Version": "v1.1.1",
+	"Time": "2018-02-21T23:26:28Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/davecgh/go-spew@v1.1.1",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/davecgh/go-spew/@v/v1.1.1.mod",
+	"Sum": "h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=",
+	"GoModSum": "h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38="
+}
+{
+	"Path": "github.com/decred/dcrd/dcrec/secp256k1/v4",
+	"Version": "v4.0.1",
+	"Time": "2021-11-03T11:56:47Z",
+	"Indirect": true
+}
+{
+	"Path": "github.com/deepmap/oapi-codegen",
+	"Version": "v1.12.4",
+	"Time": "2022-12-01T13:56:59Z",
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/deepmap/oapi-codegen@v1.12.4",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/deepmap/oapi-codegen/@v/v1.12.4.mod",
+	"GoVersion": "1.18",
+	"Sum": "h1:pPmn6qI9MuOtCz82WY2Xaw46EQjgvxednXXrP7g5Q2s=",
+	"GoModSum": "h1:3lgHGMu6myQ2vqbbTXH2H1o4eXFTGnFiDaOaKKl5yas="
+}
+{
+	"Path": "github.com/dsnet/compress",
+	"Version": "v0.0.2-0.20210315054119-f66993602bf5",
+	"Time": "2021-03-15T05:41:19Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/dsnet/compress@v0.0.2-0.20210315054119-f66993602bf5",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/dsnet/compress/@v/v0.0.2-0.20210315054119-f66993602bf5.mod",
+	"GoVersion": "1.9",
+	"Sum": "h1:iFaUwBSo5Svw6L7HYpRu/0lE3e0BaElwnNO1qkNQxBY=",
+	"GoModSum": "h1:qssHWj60/X5sZFNxpG4HBPDHVqxNm4DfnCKgrbZOT+s="
+}
+{
+	"Path": "github.com/dsnet/golib",
+	"Version": "v0.0.0-20171103203638-1ea166775780",
+	"Time": "2017-11-03T20:36:38Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/dsnet/golib/@v/v0.0.0-20171103203638-1ea166775780.mod",
+	"GoModSum": "h1:Lj+Z9rebOhdfkVLjJ8T6VcRQv3SXugXy999NBtR9aFY="
+}
+{
+	"Path": "github.com/dustin/go-humanize",
+	"Version": "v1.0.1",
+	"Time": "2023-01-10T06:44:38Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/dustin/go-humanize@v1.0.1",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/dustin/go-humanize/@v/v1.0.1.mod",
+	"GoVersion": "1.16",
+	"Sum": "h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=",
+	"GoModSum": "h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+mFykh5fBlto="
+}
+{
+	"Path": "github.com/getkin/kin-openapi",
+	"Version": "v0.115.0",
+	"Time": "2023-02-27T10:49:09Z",
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/getkin/kin-openapi@v0.115.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/getkin/kin-openapi/@v/v0.115.0.mod",
+	"GoVersion": "1.16",
+	"Sum": "h1:c8WHRLVY3G8m9jQTy0/DnIuljgRwTCB5twZytQS4JyU=",
+	"GoModSum": "h1:l5e9PaFUo9fyLJCPGQeXI2ML8c3P8BHOEV2VaAVf/pc="
+}
+{
+	"Path": "github.com/gin-contrib/sse",
+	"Version": "v0.1.0",
+	"Time": "2019-06-02T15:02:53Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/gin-contrib/sse@v0.1.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/gin-contrib/sse/@v/v0.1.0.mod",
+	"GoVersion": "1.12",
+	"Sum": "h1:Y/yl/+YNO8GZSjAhjMsSuLt29uWRFHdHYUb5lYOV9qE=",
+	"GoModSum": "h1:RHrZQHXnP2xjPF+u1gW/2HnVO7nvIa9PG3Gm+fLHvGI="
+}
+{
+	"Path": "github.com/gin-gonic/gin",
+	"Version": "v1.9.0",
+	"Time": "2023-02-21T09:20:32Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/gin-gonic/gin@v1.9.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/gin-gonic/gin/@v/v1.9.0.mod",
+	"GoVersion": "1.18",
+	"Sum": "h1:OjyFBKICoexlu99ctXNR2gg+c5pKrKMuyjgARg9qeY8=",
+	"GoModSum": "h1:W1Me9+hsUSyj3CePGrd1/QrKJMSJ1Tu/0hFEH89961k="
+}
+{
+	"Path": "github.com/glebarez/go-sqlite",
+	"Version": "v1.21.0",
+	"Time": "2023-03-06T05:20:28Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/glebarez/go-sqlite@v1.21.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/glebarez/go-sqlite/@v/v1.21.0.mod",
+	"GoVersion": "1.17",
+	"Sum": "h1:b8MHPtBagkSD2gntImZPsG3o3QEXgMDxguW/GLUonHQ=",
+	"GoModSum": "h1:GodsA6yGSa3eKbvpr7dS+JaqazzVfMcjIXvx6KHhW/c="
+}
+{
+	"Path": "github.com/glebarez/sqlite",
+	"Version": "v1.7.0",
+	"Time": "2023-02-08T14:22:24Z",
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/glebarez/sqlite@v1.7.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/glebarez/sqlite/@v/v1.7.0.mod",
+	"GoVersion": "1.18",
+	"Sum": "h1:A7Xj/KN2Lvie4Z4rrgQHY8MsbebX3NyWsL3n2i82MVI=",
+	"GoModSum": "h1:PkeevrRlF/1BhQBCnzcMWzgrIk7IOop+qS2jUYLfHhk="
+}
+{
+	"Path": "github.com/go-chi/chi/v5",
+	"Version": "v5.0.7",
+	"Time": "2021-11-18T21:56:43Z",
+	"Indirect": true
+}
+{
+	"Path": "github.com/go-openapi/jsonpointer",
+	"Version": "v0.19.6",
+	"Time": "2023-01-02T19:46:53Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/go-openapi/jsonpointer@v0.19.6",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/go-openapi/jsonpointer/@v/v0.19.6.mod",
+	"GoVersion": "1.13",
+	"Sum": "h1:eCs3fxoIi3Wh6vtgmLTOjdhSpiqphQ+DaPn38N2ZdrE=",
+	"GoModSum": "h1:osyAmYz/mB/C3I+WsTTSgw1ONzaLJoLCyoi6/zppojs="
+}
+{
+	"Path": "github.com/go-openapi/swag",
+	"Version": "v0.22.3",
+	"Time": "2022-08-18T03:19:56Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/go-openapi/swag@v0.22.3",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/go-openapi/swag/@v/v0.22.3.mod",
+	"GoVersion": "1.18",
+	"Sum": "h1:yMBqmnQ0gyZvEb/+KzuWZOXgllrXT4SADYbvDaXHv/g=",
+	"GoModSum": "h1:UzaqsxGiab7freDnrUUra0MwWfN/q7tE4j+VcZ0yl14="
+}
+{
+	"Path": "github.com/go-playground/assert/v2",
+	"Version": "v2.2.0",
+	"Time": "2022-09-06T03:32:22Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/go-playground/assert/v2@v2.2.0",
+	"Sum": "h1:JvknZsQTYeFEAhQwI4qEt9cyV5ONwRHC+lYKSsYSR8s="
+}
+{
+	"Path": "github.com/go-playground/locales",
+	"Version": "v0.14.1",
+	"Time": "2023-01-05T16:04:36Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/go-playground/locales@v0.14.1",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/go-playground/locales/@v/v0.14.1.mod",
+	"GoVersion": "1.17",
+	"Sum": "h1:EWaQ/wswjilfKLTECiXz7Rh+3BjFhfDFKv/oXslEjJA=",
+	"GoModSum": "h1:hxrqLVvrK65+Rwrd5Fc6F2O76J/NuW9t0sjnWqG1slY="
+}
+{
+	"Path": "github.com/go-playground/universal-translator",
+	"Version": "v0.18.1",
+	"Time": "2023-01-30T04:27:26Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/go-playground/universal-translator@v0.18.1",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/go-playground/universal-translator/@v/v0.18.1.mod",
+	"GoVersion": "1.18",
+	"Sum": "h1:Bcnm0ZwsGyWbCzImXv+pAJnYK9S473LQFuzCbDbfSFY=",
+	"GoModSum": "h1:xekY+UJKNuX9WP91TpwSH2VMlDf28Uj24BCp08ZFTUY="
+}
+{
+	"Path": "github.com/go-playground/validator/v10",
+	"Version": "v10.12.0",
+	"Time": "2023-03-20T00:23:43Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/go-playground/validator/v10@v10.12.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/go-playground/validator/v10/@v/v10.12.0.mod",
+	"GoVersion": "1.18",
+	"Sum": "h1:E4gtWgxWxp8YSxExrQFv5BpCahla0PVF2oTTEYaWQGI=",
+	"GoModSum": "h1:hCAPuzYvKdP33pxWa+2+6AIKXEKqjIUyqsNCtbsSJrA="
+}
+{
+	"Path": "github.com/go-test/deep",
+	"Version": "v1.0.8",
+	"Time": "2021-10-13T16:56:29Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/go-test/deep/@v/v1.0.8.mod",
+	"GoVersion": "1.16",
+	"Sum": "h1:TDsG77qcSprGbC6vTN8OuXp5g+J+b5Pcguhf7Zt61VM=",
+	"GoModSum": "h1:5C2ZWiW0ErCdrYzpqxLbTX7MG14M9iiw8DgHncVwcsE="
+}
+{
+	"Path": "github.com/gobwas/httphead",
+	"Version": "v0.1.0",
+	"Time": "2020-12-08T10:25:04Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/gobwas/httphead@v0.1.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/gobwas/httphead/@v/v0.1.0.mod",
+	"GoVersion": "1.15",
+	"Sum": "h1:exrUm0f4YX0L7EBwZHuCF4GDp8aJfVeBrlLQrs6NqWU=",
+	"GoModSum": "h1:O/RXo79gxV8G+RqlR/otEwx4Q36zl9rqC5u12GKvMCM="
+}
+{
+	"Path": "github.com/gobwas/pool",
+	"Version": "v0.2.1",
+	"Time": "2019-04-10T18:43:06Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/gobwas/pool@v0.2.1",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/gobwas/pool/@v/v0.2.1.mod",
+	"Sum": "h1:xfeeEhW7pwmX8nuLVlqbzVc7udMDrwetjEv+TZIz1og=",
+	"GoModSum": "h1:q8bcK0KcYlCgd9e7WYLm9LpyS+YeLd8JVDW6WezmKEw="
+}
+{
+	"Path": "github.com/gobwas/ws",
+	"Version": "v1.1.0",
+	"Time": "2021-07-11T11:15:42Z",
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/gobwas/ws@v1.1.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/gobwas/ws/@v/v1.1.0.mod",
+	"GoVersion": "1.15",
+	"Sum": "h1:7RFti/xnNkMJnrK7D1yQ/iCIB5OrrY/54/H930kIbHA=",
+	"GoModSum": "h1:nzvNcVha5eUziGrbxFCo6qFIojQHjJV5cLYIbezhfL0="
+}
+{
+	"Path": "github.com/goccy/go-json",
+	"Version": "v0.10.2",
+	"Time": "2023-03-19T20:01:20Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/goccy/go-json@v0.10.2",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/goccy/go-json/@v/v0.10.2.mod",
+	"GoVersion": "1.12",
+	"Sum": "h1:CrxCmQqYDkv1z7lO7Wbh2HN93uovUHgrECaO5ZrCXAU=",
+	"GoModSum": "h1:6MelG93GURQebXPDq3khkgXZkazVtN9CRI+MGFi0w8I="
+}
+{
+	"Path": "github.com/godbus/dbus/v5",
+	"Version": "v5.1.0",
+	"Time": "2022-02-27T11:53:47Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/godbus/dbus/v5@v5.1.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/godbus/dbus/v5/@v/v5.1.0.mod",
+	"GoVersion": "1.12",
+	"Sum": "h1:4KLkAxT3aOY8Li4FRJe/KvhoNFFxo0m6fNuFUO8QJUk=",
+	"GoModSum": "h1:xhWf0FNVPg57R7Z0UbKHbJfkEywrmjJnf7w5xrFpKfA="
+}
+{
+	"Path": "github.com/gofrs/uuid",
+	"Version": "v4.4.0+incompatible",
+	"Time": "2023-01-26T08:04:47Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/gofrs/uuid@v4.4.0+incompatible",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/gofrs/uuid/@v/v4.4.0+incompatible.mod",
+	"Sum": "h1:3qXRTX8/NbyulANqlc0lchS1gqAVxRgsuW1YrTJupqA=",
+	"GoModSum": "h1:b2aQJv3Z4Fp6yNu3cdSllBxTCLRxnplIgP/c0N/04lM="
+}
+{
+	"Path": "github.com/golang-jwt/jwt",
+	"Version": "v3.2.2+incompatible",
+	"Time": "2021-07-30T20:54:04Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/golang-jwt/jwt@v3.2.2+incompatible",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/golang-jwt/jwt/@v/v3.2.2+incompatible.mod",
+	"Sum": "h1:IfV12K8xAKAnZqdXVzCZ+TOjboZ2keLg81eXfW3O+oY=",
+	"GoModSum": "h1:8pz2t5EyA70fFQQSrl6XZXzqecmYZeUEB8OUGHkxJ+I="
+}
+{
+	"Path": "github.com/golang-jwt/jwt/v4",
+	"Version": "v4.5.0",
+	"Time": "2022-12-09T17:04:03Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/golang-jwt/jwt/v4@v4.5.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/golang-jwt/jwt/v4/@v/v4.5.0.mod",
+	"GoVersion": "1.16",
+	"Sum": "h1:7cYmW1XlMY7h7ii7UhUyChSgS5wUJEnm9uZVTGqOWzg=",
+	"GoModSum": "h1:m21LjoU+eqJr34lmDMbreY2eSTRJ1cv77w39/MY0Ch0="
+}
+{
+	"Path": "github.com/golang/protobuf",
+	"Version": "v1.5.0",
+	"Time": "2021-03-18T00:15:31Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/golang/protobuf/@v/v1.5.0.mod",
+	"GoVersion": "1.9",
+	"GoModSum": "h1:FsONVRAS9T7sI+LIUmWTfcYkHO4aIWwzhcaSAoJOfIk="
+}
+{
+	"Path": "github.com/golang/snappy",
+	"Version": "v0.0.4",
+	"Time": "2021-06-08T04:05:37Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/golang/snappy@v0.0.4",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/golang/snappy/@v/v0.0.4.mod",
+	"Sum": "h1:yAGX7huGHXlcLOEtBnF4w7FQwA26wojNCwOYAEhLjQM=",
+	"GoModSum": "h1:/XxbfmMg8lxefKM7IXC3fBNl/7bRcc72aCRzEWrmP2Q="
+}
+{
+	"Path": "github.com/golangci/lint-1",
+	"Version": "v0.0.0-20181222135242-d2cdd8c08219",
+	"Time": "2018-12-22T13:52:42Z",
+	"Indirect": true
+}
+{
+	"Path": "github.com/gomodule/redigo",
+	"Version": "v2.0.0+incompatible",
+	"Time": "2018-03-14T22:34:43Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/gomodule/redigo@v2.0.0+incompatible",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/gomodule/redigo/@v/v2.0.0+incompatible.mod",
+	"Sum": "h1:K/R+8tc58AaqLkqG2Ol3Qk+DR/TlNuhuh457pBFPtt0=",
+	"GoModSum": "h1:B4C85qUVwatsJoIUNIfCRsp7qO0iAmpGFZ4EELWSbC4="
+}
+{
+	"Path": "github.com/google/go-cmp",
+	"Version": "v0.5.9",
+	"Time": "2022-09-02T22:41:56Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/google/go-cmp@v0.5.9",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/google/go-cmp/@v/v0.5.9.mod",
+	"GoVersion": "1.13",
+	"Sum": "h1:O2Tfq5qg4qc4AmwVlvv0oLiVAGB7enBSJ2x2DqQFi38=",
+	"GoModSum": "h1:17dUlkBOakJ0+DkrSSNjCkIjxS6bF9zb3elmeNGIjoY="
+}
+{
+	"Path": "github.com/google/gofuzz",
+	"Version": "v1.0.0",
+	"Time": "2019-04-08T17:44:45Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/google/gofuzz/@v/v1.0.0.mod",
+	"GoVersion": "1.12",
+	"GoModSum": "h1:dBl0BpW6vV/+mYPU4Po3pmUjxk6FQPldtuIdl/M65Eg="
+}
+{
+	"Path": "github.com/google/pprof",
+	"Version": "v0.0.0-20221118152302-e6195bd50e26",
+	"Time": "2022-11-18T15:23:02Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/google/pprof@v0.0.0-20221118152302-e6195bd50e26",
+	"Sum": "h1:Xim43kblpZXfIBQsbuBVKCudVG457BR2GZFIz3uw3hQ="
+}
+{
+	"Path": "github.com/google/uuid",
+	"Version": "v1.3.0",
+	"Time": "2021-07-12T22:33:52Z",
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/google/uuid@v1.3.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/google/uuid/@v/v1.3.0.mod",
+	"Sum": "h1:t6JiXgmwXMjEs8VusXIJk2BXHsn+wx8BZdTaoZ5fu7I=",
+	"GoModSum": "h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo="
+}
+{
+	"Path": "github.com/gorilla/mux",
+	"Version": "v1.8.0",
+	"Time": "2020-07-11T20:05:21Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/gorilla/mux@v1.8.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/gorilla/mux/@v/v1.8.0.mod",
+	"GoVersion": "1.12",
+	"Sum": "h1:i40aqfkR1h2SlN9hojwV5ZA91wcXFOvkdNIeFDP5koI=",
+	"GoModSum": "h1:DVbg23sWSpFRCP0SfiEN6jmj59UnW/n46BH5rLB71So="
+}
+{
+	"Path": "github.com/gorilla/websocket",
+	"Version": "v1.5.0",
+	"Time": "2022-01-04T01:59:52Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/gorilla/websocket@v1.5.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/gorilla/websocket/@v/v1.5.0.mod",
+	"GoVersion": "1.12",
+	"Sum": "h1:PPwGk2jz7EePpoHN/+ClbZu8SPxiqlu12wZP/3sWmnc=",
+	"GoModSum": "h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE="
+}
+{
+	"Path": "github.com/invopop/yaml",
+	"Version": "v0.2.0",
+	"Time": "2022-06-07T22:07:29Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/invopop/yaml@v0.2.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/invopop/yaml/@v/v0.2.0.mod",
+	"GoVersion": "1.14",
+	"Sum": "h1:7zky/qH+O0DwAyoobXUqvVBwgBFRxKoQ/3FjcVpjTMY=",
+	"GoModSum": "h1:2XuRLgs/ouIrW3XNzuNj7J3Nvu/Dig5MXvbCEdiBN3Q="
+}
+{
+	"Path": "github.com/jinzhu/inflection",
+	"Version": "v1.0.0",
+	"Time": "2019-06-03T04:28:36Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/jinzhu/inflection@v1.0.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/jinzhu/inflection/@v/v1.0.0.mod",
+	"Sum": "h1:K317FqzuhWc8YvSVlFMCCUb36O/S9MCKRDI7QkRKD/E=",
+	"GoModSum": "h1:h+uFLlag+Qp1Va5pdKtLDYj+kHp5pxUVkryuEj+Srlc="
+}
+{
+	"Path": "github.com/jinzhu/now",
+	"Version": "v1.1.5",
+	"Time": "2022-03-17T06:16:25Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/jinzhu/now@v1.1.5",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/jinzhu/now/@v/v1.1.5.mod",
+	"GoVersion": "1.12",
+	"Sum": "h1:/o9tlHleP7gOFmsnYNz3RGnqzefHA47wQpKrrdTIwXQ=",
+	"GoModSum": "h1:d3SSVoowX0Lcu0IBviAWJpolVfI5UJVZZ7cO71lE/z8="
+}
+{
+	"Path": "github.com/josharian/intern",
+	"Version": "v1.0.0",
+	"Time": "2019-12-14T22:12:22Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/josharian/intern@v1.0.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/josharian/intern/@v/v1.0.0.mod",
+	"GoVersion": "1.5",
+	"Sum": "h1:vlS4z54oSdjm0bgjRigI+G1HpF+tI+9rE5LLzOg8HmY=",
+	"GoModSum": "h1:5DoeVV0s6jJacbCEi61lwdGj/aVlrQvzHFFd8Hwg//Y="
+}
+{
+	"Path": "github.com/json-iterator/go",
+	"Version": "v1.1.12",
+	"Time": "2021-09-11T02:17:26Z",
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/json-iterator/go@v1.1.12",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/json-iterator/go/@v/v1.1.12.mod",
+	"GoVersion": "1.12",
+	"Sum": "h1:PV8peI4a0ysnczrg+LtxykD8LfKY9ML6u2jnxaEnrnM=",
+	"GoModSum": "h1:e30LSqwooZae/UwlEbR2852Gd8hjQvJoHmT4TnhNGBo="
+}
+{
+	"Path": "github.com/juju/gnuflag",
+	"Version": "v0.0.0-20171113085948-2ce1bb71843d",
+	"Time": "2017-11-13T08:59:48Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/juju/gnuflag/@v/v0.0.0-20171113085948-2ce1bb71843d.mod",
+	"GoModSum": "h1:2PavIy+JPciBPrBUjwbNvtwB6RQlve+hkpll6QSNmOE="
+}
+{
+	"Path": "github.com/kballard/go-shellquote",
+	"Version": "v0.0.0-20180428030007-95032a82bc51",
+	"Time": "2018-04-28T03:00:07Z",
+	"Indirect": true
+}
+{
+	"Path": "github.com/klauspost/compress",
+	"Version": "v1.16.5",
+	"Time": "2023-04-13T08:02:38Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/klauspost/compress@v1.16.5",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/klauspost/compress/@v/v1.16.5.mod",
+	"GoVersion": "1.18",
+	"Sum": "h1:IFV2oUNUzZaz+XyusxpLzpzS8Pt5rh0Z16For/djlyI=",
+	"GoModSum": "h1:ntbaceVETuRiXiv4DpjP66DpAtAGkEQskQzEyD//IeE="
+}
+{
+	"Path": "github.com/klauspost/cpuid",
+	"Version": "v1.2.0",
+	"Time": "2018-04-05T13:32:22Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/klauspost/cpuid/@v/v1.2.0.mod",
+	"GoModSum": "h1:Pj4uuM528wm8OyEC2QMXAi2YiTZ96dNQPGgoMS4s3ek="
+}
+{
+	"Path": "github.com/klauspost/cpuid/v2",
+	"Version": "v2.2.4",
+	"Time": "2023-02-20T14:56:06Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/klauspost/cpuid/v2/@v/v2.2.4.mod",
+	"GoVersion": "1.15",
+	"Sum": "h1:acbojRNwl3o09bUq+yDCtZFc1aiwaAAxtcn8YkZXnvk=",
+	"GoModSum": "h1:RVVoqg1df56z8g3pUjL/3lE5UfnlrJX8tyFgg4nqhuY="
+}
+{
+	"Path": "github.com/klauspost/pgzip",
+	"Version": "v1.2.5",
+	"Time": "2020-09-02T09:48:45Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/klauspost/pgzip@v1.2.5",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/klauspost/pgzip/@v/v1.2.5.mod",
+	"Sum": "h1:qnWYvvKqedOF2ulHpMG72XQol4ILEJ8k2wwRl/Km8oE=",
+	"GoModSum": "h1:Ch1tH69qFZu15pkjo5kYi6mth2Zzwzt50oCQKQE9RUs="
+}
+{
+	"Path": "github.com/kr/pretty",
+	"Version": "v0.3.0",
+	"Time": "2020-11-24T22:22:38Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/kr/pretty/@v/v0.3.0.mod",
+	"GoVersion": "1.12",
+	"Sum": "h1:WgNl7dwNpEZ6jJ9k1snq4pZsg7DOEN8hP9Xw0Tsjwk0=",
+	"GoModSum": "h1:640gp4NfQd8pI5XOwp5fnNeVWj67G7CFk/SaSQn7NBk="
+}
+{
+	"Path": "github.com/kr/pty",
+	"Version": "v1.1.1",
+	"Time": "2018-01-13T18:08:13Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/kr/pty/@v/v1.1.1.mod",
+	"GoModSum": "h1:pFQYn66WHrOpPYNljwOMqo10TkYh1fy3cYio2l3bCsQ="
+}
+{
+	"Path": "github.com/kr/text",
+	"Version": "v0.2.0",
+	"Time": "2020-02-14T20:31:06Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/kr/text@v0.2.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/kr/text/@v/v0.2.0.mod",
+	"Sum": "h1:5Nx0Ya0ZqY2ygV366QzturHI13Jq95ApcVaJBhpS+AY=",
+	"GoModSum": "h1:eLer722TekiGuMkidMxC/pM04lWEeraHUUmBw8l2grE="
+}
+{
+	"Path": "github.com/labstack/echo/v4",
+	"Version": "v4.10.2",
+	"Time": "2023-02-21T23:11:41Z",
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/labstack/echo/v4@v4.10.2",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/labstack/echo/v4/@v/v4.10.2.mod",
+	"GoVersion": "1.17",
+	"Sum": "h1:n1jAhnq/elIFTHr1EYpiYtyKgx4RW9ccVgkqByZaN2M=",
+	"GoModSum": "h1:OEyqf2//K1DFdE57vw2DRgWY0M7s65IVQO2FzvI4J5k="
+}
+{
+	"Path": "github.com/labstack/gommon",
+	"Version": "v0.4.0",
+	"Time": "2022-06-14T19:47:25Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/labstack/gommon@v0.4.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/labstack/gommon/@v/v0.4.0.mod",
+	"GoVersion": "1.12",
+	"Sum": "h1:y7cvthEAEbU0yHOf4axH8ZG2NH8knB9iNSoTO8dyIk8=",
+	"GoModSum": "h1:uW6kP17uPlLJsD3ijUYn3/M5bAxtlZhMI6m3MFxTMTM="
+}
+{
+	"Path": "github.com/leodido/go-urn",
+	"Version": "v1.2.3",
+	"Time": "2023-04-05T10:26:23Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/leodido/go-urn@v1.2.3",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/leodido/go-urn/@v/v1.2.3.mod",
+	"GoVersion": "1.16",
+	"Sum": "h1:6BE2vPT0lqoz3fmOesHZiaiFh7889ssCo2GMvLCfiuA=",
+	"GoModSum": "h1:7ZrI8mTSeBSHl/UaRyKQW1qZeMgak41ANeCNaVckg+4="
+}
+{
+	"Path": "github.com/lestrrat-go/backoff/v2",
+	"Version": "v2.0.8",
+	"Time": "2021-02-28T05:19:12Z",
+	"Indirect": true
+}
+{
+	"Path": "github.com/lestrrat-go/blackmagic",
+	"Version": "v1.0.0",
+	"Time": "2021-04-02T00:53:41Z",
+	"Indirect": true
+}
+{
+	"Path": "github.com/lestrrat-go/httpcc",
+	"Version": "v1.0.1",
+	"Time": "2022-03-29T04:21:01Z",
+	"Indirect": true
+}
+{
+	"Path": "github.com/lestrrat-go/iter",
+	"Version": "v1.0.1",
+	"Time": "2021-03-28T07:41:06Z",
+	"Indirect": true
+}
+{
+	"Path": "github.com/lestrrat-go/jwx",
+	"Version": "v1.2.25",
+	"Time": "2022-05-23T12:48:33Z",
+	"Indirect": true
+}
+{
+	"Path": "github.com/lestrrat-go/option",
+	"Version": "v1.0.0",
+	"Time": "2021-01-25T22:59:02Z",
+	"Indirect": true
+}
+{
+	"Path": "github.com/mailru/easyjson",
+	"Version": "v0.7.7",
+	"Time": "2021-02-06T19:00:08Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/mailru/easyjson@v0.7.7",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/mailru/easyjson/@v/v0.7.7.mod",
+	"GoVersion": "1.12",
+	"Sum": "h1:UGYAvKxe3sBsEDzO8ZeWOSlIQfWFlxbzLZe7hwFURr0=",
+	"GoModSum": "h1:xzfreul335JAWq5oZzymOObrkdz5UnU4kGfJJLY9Nlc="
+}
+{
+	"Path": "github.com/matryer/moq",
+	"Version": "v0.2.7",
+	"Time": "2022-03-31T09:09:31Z",
+	"Indirect": true
+}
+{
+	"Path": "github.com/mattn/go-colorable",
+	"Version": "v0.1.13",
+	"Time": "2022-08-15T05:53:26Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/mattn/go-colorable@v0.1.13",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/mattn/go-colorable/@v/v0.1.13.mod",
+	"GoVersion": "1.15",
+	"Sum": "h1:fFA4WZxdEF4tXPZVKMLwD8oUnCTTo08duU7wxecdEvA=",
+	"GoModSum": "h1:7S9/ev0klgBDR4GtXTXX8a3vIGJpMovkB8vQcUbaXHg="
+}
+{
+	"Path": "github.com/mattn/go-isatty",
+	"Version": "v0.0.18",
+	"Time": "2023-03-22T12:37:56Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/mattn/go-isatty@v0.0.18",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/mattn/go-isatty/@v/v0.0.18.mod",
+	"GoVersion": "1.15",
+	"Sum": "h1:DOKFKCQ7FNG2L1rbrmstDN4QVRdS89Nkh85u68Uwp98=",
+	"GoModSum": "h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y="
+}
+{
+	"Path": "github.com/mattn/go-sqlite3",
+	"Version": "v1.14.16",
+	"Time": "2022-10-26T13:03:24Z",
+	"Indirect": true
+}
+{
+	"Path": "github.com/mholt/archiver/v3",
+	"Version": "v3.5.1",
+	"Time": "2021-10-30T17:12:43Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/mholt/archiver/v3@v3.5.1",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/mholt/archiver/v3/@v/v3.5.1.mod",
+	"GoVersion": "1.13",
+	"Sum": "h1:rDjOBX9JSF5BvoJGvjqK479aL70qh9DIpZCl+k7Clwo=",
+	"GoModSum": "h1:e3dqJ7H78uzsRSEACH1joayhuSyhnonssnDhppzS1L4="
+}
+{
+	"Path": "github.com/modern-go/concurrent",
+	"Version": "v0.0.0-20180306012644-bacd9c7ef1dd",
+	"Time": "2018-03-06T01:26:44Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/modern-go/concurrent@v0.0.0-20180306012644-bacd9c7ef1dd",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/modern-go/concurrent/@v/v0.0.0-20180306012644-bacd9c7ef1dd.mod",
+	"Sum": "h1:TRLaZ9cD/w8PVh93nsPXa1VrQ6jlwL5oN8l14QlcNfg=",
+	"GoModSum": "h1:6dJC0mAP4ikYIbvyc7fijjWJddQyLn8Ig3JB5CqoB9Q="
+}
+{
+	"Path": "github.com/modern-go/reflect2",
+	"Version": "v1.0.2",
+	"Time": "2021-09-11T02:10:30Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/modern-go/reflect2@v1.0.2",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/modern-go/reflect2/@v/v1.0.2.mod",
+	"GoVersion": "1.12",
+	"Sum": "h1:xBagoLtFs94CBntxluKeaWgTMpvLxC4ur3nMaC9Gz0M=",
+	"GoModSum": "h1:yWuevngMOJpCy52FWWMvUC8ws7m/LJsjYzDa0/r8luk="
+}
+{
+	"Path": "github.com/mohae/deepcopy",
+	"Version": "v0.0.0-20170929034955-c48cc78d4826",
+	"Time": "2017-09-29T03:49:55Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/mohae/deepcopy@v0.0.0-20170929034955-c48cc78d4826",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/mohae/deepcopy/@v/v0.0.0-20170929034955-c48cc78d4826.mod",
+	"Sum": "h1:RWengNIwukTxcDr9M+97sNutRR1RKhG96O6jWumTTnw=",
+	"GoModSum": "h1:TaXosZuwdSHYgviHp1DAtfrULt5eUgsSMsZf+YrPgl8="
+}
+{
+	"Path": "github.com/nwaples/rardecode",
+	"Version": "v1.1.3",
+	"Time": "2022-03-06T03:25:31Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/nwaples/rardecode@v1.1.3",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/nwaples/rardecode/@v/v1.1.3.mod",
+	"Sum": "h1:cWCaZwfM5H7nAD6PyEdcVnczzV8i/JtotnyW/dD9lEc=",
+	"GoModSum": "h1:5DzqNKiOdpKKBH87u8VlvAnPZMXcGRhxWkRpHbbfGS0="
+}
+{
+	"Path": "github.com/pelletier/go-toml/v2",
+	"Version": "v2.0.7",
+	"Time": "2023-02-28T16:34:24Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/pelletier/go-toml/v2@v2.0.7",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/pelletier/go-toml/v2/@v/v2.0.7.mod",
+	"GoVersion": "1.16",
+	"Sum": "h1:muncTPStnKRos5dpVKULv2FVd4bMOhNePj9CjgDb8Us=",
+	"GoModSum": "h1:eumQOmlWiOPt5WriQQqoM5y18pDHwha2N+QD+EUNTek="
+}
+{
+	"Path": "github.com/perimeterx/marshmallow",
+	"Version": "v1.1.4",
+	"Time": "2022-11-10T09:36:41Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/perimeterx/marshmallow@v1.1.4",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/perimeterx/marshmallow/@v/v1.1.4.mod",
+	"GoVersion": "1.17",
+	"Sum": "h1:pZLDH9RjlLGGorbXhcaQLhfuV0pFMNfPO55FuFkxqLw=",
+	"GoModSum": "h1:dsXbUu8CRzfYP5a87xpp0xq9S3u0Vchtcl8we9tYaXw="
+}
+{
+	"Path": "github.com/pierrec/lz4/v4",
+	"Version": "v4.1.17",
+	"Time": "2022-09-27T07:11:15Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/pierrec/lz4/v4@v4.1.17",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/pierrec/lz4/v4/@v/v4.1.17.mod",
+	"GoVersion": "1.14",
+	"Sum": "h1:kV4Ip+/hUBC+8T6+2EgburRtkE9ef4nbY3f4dFhGjMc=",
+	"GoModSum": "h1:gZWDp/Ze/IJXGXf23ltt2EXimqmTUXEy0GFuRQyBid4="
+}
+{
+	"Path": "github.com/pkg/diff",
+	"Version": "v0.0.0-20210226163009-20ebb0f2a09e",
+	"Time": "2021-02-26T16:30:09Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/pkg/diff/@v/v0.0.0-20210226163009-20ebb0f2a09e.mod",
+	"GoVersion": "1.15",
+	"GoModSum": "h1:pJLUxLENpZxwdsKMEsNbx1VGcRFpLqf3715MtcvvzbA="
+}
+{
+	"Path": "github.com/pkg/errors",
+	"Version": "v0.9.1",
+	"Time": "2020-01-14T19:47:44Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/pkg/errors@v0.9.1",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/pkg/errors/@v/v0.9.1.mod",
+	"Sum": "h1:FEBLx1zS214owpjy7qsBeixbURkuhQAwrK5UwLGTwt4=",
+	"GoModSum": "h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0="
+}
+{
+	"Path": "github.com/pmezard/go-difflib",
+	"Version": "v1.0.0",
+	"Time": "2016-01-10T10:55:54Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/pmezard/go-difflib@v1.0.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/pmezard/go-difflib/@v/v1.0.0.mod",
+	"Sum": "h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=",
+	"GoModSum": "h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4="
+}
+{
+	"Path": "github.com/remyoudompheng/bigfft",
+	"Version": "v0.0.0-20230129092748-24d4a6f8daec",
+	"Time": "2023-01-29T09:27:48Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/remyoudompheng/bigfft@v0.0.0-20230129092748-24d4a6f8daec",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/remyoudompheng/bigfft/@v/v0.0.0-20230129092748-24d4a6f8daec.mod",
+	"GoVersion": "1.12",
+	"Sum": "h1:W09IVJc94icq4NjY3clb7Lk8O1qJ8BdBEF8z0ibU0rE=",
+	"GoModSum": "h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo="
+}
+{
+	"Path": "github.com/rogpeppe/go-internal",
+	"Version": "v1.9.0",
+	"Time": "2022-08-22T10:17:05Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/rogpeppe/go-internal/@v/v1.9.0.mod",
+	"GoVersion": "1.17",
+	"Sum": "h1:73kH8U+JUqXU8lRuOHeVHaa/SZPifC7BkcraZVejAe8=",
+	"GoModSum": "h1:WtVeX8xhTBvf0smdhujwtBcq4Qrzq/fJaraNFVN+nFs="
+}
+{
+	"Path": "github.com/samber/lo",
+	"Version": "v1.46.0",
+	"Time": "2024-07-15T17:40:18Z",
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/samber/lo@v1.46.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/samber/lo/@v/v1.46.0.mod",
+	"GoVersion": "1.18",
+	"Sum": "h1:w8G+oaCPgz1PoCJztqymCFaKwXt+5cCXn51uPxExFfQ=",
+	"GoModSum": "h1:RmDH9Ct32Qy3gduHQuKJ3gW1fMHAnE/fAzQuf6He5cU="
+}
+{
+	"Path": "github.com/sirupsen/logrus",
+	"Version": "v1.9.0",
+	"Time": "2022-07-19T07:08:54Z",
+	"Indirect": true
+}
+{
+	"Path": "github.com/sourcegraph/conc",
+	"Version": "v0.3.0",
+	"Time": "2023-02-25T04:04:07Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/sourcegraph/conc@v0.3.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/sourcegraph/conc/@v/v0.3.0.mod",
+	"GoVersion": "1.19",
+	"Sum": "h1:OQTbbt6P72L20UqAkXXuLOj79LfEanQ+YQFNpLA9ySo=",
+	"GoModSum": "h1:Sdozi7LEKbFPqYX2/J+iBAM6HpqSLTASQIKqDmF7Mt0="
+}
+{
+	"Path": "github.com/spkg/bom",
+	"Version": "v0.0.0-20160624110644-59b7046e48ad",
+	"Time": "2016-06-24T11:06:44Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/spkg/bom/@v/v0.0.0-20160624110644-59b7046e48ad.mod",
+	"GoModSum": "h1:qLr4V1qq6nMqFKkMo8ZTx3f+BZEkzsRUY10Xsm2mwU0="
+}
+{
+	"Path": "github.com/stretchr/objx",
+	"Version": "v0.5.0",
+	"Time": "2022-09-18T03:09:40Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/stretchr/objx/@v/v0.5.0.mod",
+	"GoVersion": "1.12",
+	"GoModSum": "h1:Yh+to48EsGEfYuaHDzXPcE3xhTkx73EhmCGUpEOglKo="
+}
+{
+	"Path": "github.com/stretchr/testify",
+	"Version": "v1.8.4",
+	"Time": "2023-05-30T09:38:40Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/stretchr/testify@v1.8.4",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/stretchr/testify/@v/v1.8.4.mod",
+	"GoVersion": "1.20",
+	"Sum": "h1:CcVxjf3Q8PM0mHUKJCdn+eZZtm5yQwehR5yeSVQQcUk=",
+	"GoModSum": "h1:sz/lmYIOXD/1dqDmKjjqLyZ2RngseejIcXlSw2iwfAo="
+}
+{
+	"Path": "github.com/twitchyliquid64/golang-asm",
+	"Version": "v0.15.1",
+	"Time": "2021-01-12T00:43:21Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/twitchyliquid64/golang-asm@v0.15.1",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/twitchyliquid64/golang-asm/@v/v0.15.1.mod",
+	"GoVersion": "1.13",
+	"Sum": "h1:SU5vSMR7hnwNxj24w34ZyCi/FmDZTkS4MhqMhdFk5YI=",
+	"GoModSum": "h1:a1lVb/DtPvCB8fslRZhAngC2+aY1QWCk3Cedj/Gdt08="
+}
+{
+	"Path": "github.com/ugorji/go",
+	"Version": "v1.2.7",
+	"Time": "2022-02-26T19:38:31Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/ugorji/go/@v/v1.2.7.mod",
+	"GoVersion": "1.11",
+	"GoModSum": "h1:nF9osbDWLy6bDVv/Rtoh6QgnvNDpmCalQV5urGCCS6M="
+}
+{
+	"Path": "github.com/ugorji/go/codec",
+	"Version": "v1.2.11",
+	"Time": "2023-03-08T16:23:33Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/ugorji/go/codec@v1.2.11",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/ugorji/go/codec/@v/v1.2.11.mod",
+	"GoVersion": "1.11",
+	"Sum": "h1:BMaWp1Bb6fHwEtbplGBGJ498wD+LKlNSl25MjdZY4dU=",
+	"GoModSum": "h1:UNopzCgEMSXjBc6AOMqYvWC1ktqTAfzJZUZgYf6w6lg="
+}
+{
+	"Path": "github.com/ulikunitz/xz",
+	"Version": "v0.5.11",
+	"Time": "2022-12-12T20:10:11Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/ulikunitz/xz@v0.5.11",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/ulikunitz/xz/@v/v0.5.11.mod",
+	"GoVersion": "1.12",
+	"Sum": "h1:kpFauv27b6ynzBNT/Xy+1k+fK4WswhN/6PN5WhFAGw8=",
+	"GoModSum": "h1:nbz6k7qbPmH4IRqmfOplQw/tblSgqTqBwxkY0oWt/14="
+}
+{
+	"Path": "github.com/valyala/bytebufferpool",
+	"Version": "v1.0.0",
+	"Time": "2016-08-17T18:16:52Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/valyala/bytebufferpool@v1.0.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/valyala/bytebufferpool/@v/v1.0.0.mod",
+	"Sum": "h1:GqA5TC/0021Y/b9FG4Oi9Mr3q7XYx6KllzawFIhcdPw=",
+	"GoModSum": "h1:6bBcMArwyJ5K/AmCkWv1jt77kVWyCJ6HpOuEn7z0Csc="
+}
+{
+	"Path": "github.com/valyala/fasttemplate",
+	"Version": "v1.2.2",
+	"Time": "2022-10-18T07:24:49Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/valyala/fasttemplate@v1.2.2",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/valyala/fasttemplate/@v/v1.2.2.mod",
+	"GoVersion": "1.12",
+	"Sum": "h1:lxLXG0uE3Qnshl9QyaK6XJxMXlQZELvChBOCmQD0Loo=",
+	"GoModSum": "h1:KHLXt3tVN2HBp8eijSv/kGJopbvo7S+qRAEEKiv+SiQ="
+}
+{
+	"Path": "github.com/xi2/xz",
+	"Version": "v0.0.0-20171230120015-48954b6210f8",
+	"Time": "2017-12-30T12:00:15Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/github.com/xi2/xz@v0.0.0-20171230120015-48954b6210f8",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/xi2/xz/@v/v0.0.0-20171230120015-48954b6210f8.mod",
+	"Sum": "h1:nIPpBwaJSVYIxUFsDv3M8ofmx9yWTog9BfvIu0q41lo=",
+	"GoModSum": "h1:HUYIGzjTL3rfEspMxjDjgmT5uz5wzYJKVo23qUhYTos="
+}
+{
+	"Path": "github.com/yuin/goldmark",
+	"Version": "v1.4.13",
+	"Time": "2022-07-09T07:22:17Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/github.com/yuin/goldmark/@v/v1.4.13.mod",
+	"GoVersion": "1.18",
+	"GoModSum": "h1:6yULJ656Px+3vBD8DxQVa3kxgyrAnzto9xy5taEt/CY="
+}
+{
+	"Path": "go.uber.org/atomic",
+	"Version": "v1.10.0",
+	"Time": "2022-08-11T23:31:55Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/go.uber.org/atomic@v1.10.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/go.uber.org/atomic/@v/v1.10.0.mod",
+	"GoVersion": "1.18",
+	"Sum": "h1:9qC72Qh0+3MqyJbAn8YU5xVq1frD8bn3JtD2oXtafVQ=",
+	"GoModSum": "h1:LUxbIzbOniOlMKjJjyPfpl4v+PKK2cNJn91OQbhoJI0="
+}
+{
+	"Path": "go.uber.org/goleak",
+	"Version": "v1.2.1",
+	"Time": "2023-02-13T19:01:45Z",
+	"Dir": "/Users/edmundfu/go/pkg/mod/go.uber.org/goleak@v1.2.1",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/go.uber.org/goleak/@v/v1.2.1.mod",
+	"GoVersion": "1.18",
+	"Sum": "h1:NBol2c7O1ZokfZ0LEU9K6Whx/KnwvepVetCUhtKja4A=",
+	"GoModSum": "h1:qlT2yGI9QafXHhZZLxlSuNsMw3FFLxBr+tBRlmO1xH4="
+}
+{
+	"Path": "go.uber.org/multierr",
+	"Version": "v1.11.0",
+	"Time": "2023-03-29T23:00:37Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/go.uber.org/multierr@v1.11.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/go.uber.org/multierr/@v/v1.11.0.mod",
+	"GoVersion": "1.19",
+	"Sum": "h1:blXXJkSxSSfBVBlC76pxqeO+LN3aDfLQo+309xJstO0=",
+	"GoModSum": "h1:20+QtiLqy0Nd6FdQB9TLXag12DsQkrbs3htMFfDN80Y="
+}
+{
+	"Path": "go.uber.org/zap",
+	"Version": "v1.24.0",
+	"Time": "2022-11-30T18:27:43Z",
+	"Dir": "/Users/edmundfu/go/pkg/mod/go.uber.org/zap@v1.24.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/go.uber.org/zap/@v/v1.24.0.mod",
+	"GoVersion": "1.19",
+	"Sum": "h1:FiJd5l1UOLj0wCgbSE0rwwXHzEdAZS6hiiSnxJN/D60=",
+	"GoModSum": "h1:2kMP+WWQ8aoFoedH3T2sq6iJ2yDWpHbP0f6MQbS9Gkg="
+}
+{
+	"Path": "golang.org/x/arch",
+	"Version": "v0.3.0",
+	"Time": "2023-02-08T14:50:55Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/golang.org/x/arch/@v/v0.3.0.mod",
+	"GoVersion": "1.17",
+	"Sum": "h1:02VY4/ZcO/gBOH6PUaoiptASxtXU10jazRCP865E97k=",
+	"GoModSum": "h1:5om86z9Hs0C8fWVUuoMHwpExlXzs5Tkyp9hOrfG7pp8="
+}
+{
+	"Path": "golang.org/x/crypto",
+	"Version": "v0.8.0",
+	"Time": "2023-04-06T17:52:09Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/golang.org/x/crypto@v0.8.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/golang.org/x/crypto/@v/v0.8.0.mod",
+	"GoVersion": "1.17",
+	"Sum": "h1:pd9TJtTueMTVQXzk8E2XESSMQDj/U7OUu0PqJqPXQjQ=",
+	"GoModSum": "h1:mRqEX+O9/h5TFCrQhkgjo2yKi0yYA+9ecGkdQoHrywE="
+}
+{
+	"Path": "golang.org/x/exp",
+	"Version": "v0.0.0-20230713183714-613f0c0eb8a1",
+	"Time": "2023-07-13T18:37:14Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/golang.org/x/exp@v0.0.0-20230713183714-613f0c0eb8a1",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/golang.org/x/exp/@v/v0.0.0-20230713183714-613f0c0eb8a1.mod",
+	"GoVersion": "1.20",
+	"Sum": "h1:MGwJjxBy0HJshjDNfLsYO8xppfqWlA5ZT9OhtUUhTNw=",
+	"GoModSum": "h1:FXUEEKJgO7OQYeo8N01OfiKP8RXMtf6e8aTskBGqWdc="
+}
+{
+	"Path": "golang.org/x/mod",
+	"Version": "v0.17.0",
+	"Time": "2024-03-15T15:59:16Z",
+	"Indirect": true
+}
+{
+	"Path": "golang.org/x/net",
+	"Version": "v0.9.0",
+	"Time": "2023-04-06T15:40:04Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/golang.org/x/net@v0.9.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/golang.org/x/net/@v/v0.9.0.mod",
+	"GoVersion": "1.17",
+	"Sum": "h1:aWJ/m6xSmxWBx+V0XRHTlrYrPG56jKsLdTFmsSsCzOM=",
+	"GoModSum": "h1:d48xBJpPfHeWQsugry2m+kC02ZBRGRgulfHnEXEuWns="
+}
+{
+	"Path": "golang.org/x/sync",
+	"Version": "v0.7.0",
+	"Time": "2024-03-04T17:26:02Z",
+	"Indirect": true
+}
+{
+	"Path": "golang.org/x/sys",
+	"Version": "v0.7.0",
+	"Time": "2023-04-04T14:21:21Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/golang.org/x/sys@v0.7.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/golang.org/x/sys/@v/v0.7.0.mod",
+	"GoVersion": "1.17",
+	"Sum": "h1:3jlCCIQZPdOYu1h8BkNvLz8Kgwtae2cagcG/VamtZRU=",
+	"GoModSum": "h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg="
+}
+{
+	"Path": "golang.org/x/term",
+	"Version": "v0.7.0",
+	"Time": "2023-04-04T18:21:21Z",
+	"Indirect": true
+}
+{
+	"Path": "golang.org/x/text",
+	"Version": "v0.16.0",
+	"Time": "2024-05-14T20:26:09Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/golang.org/x/text@v0.16.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/golang.org/x/text/@v/v0.16.0.mod",
+	"GoVersion": "1.18",
+	"Sum": "h1:a94ExnEXNtEwYLGJSIUxnWoxoRz/ZcCsV63ROupILh4=",
+	"GoModSum": "h1:GhwF1Be+LQoKShO3cGOHzqOgRrGaYc9AvblQOmPVHnI="
+}
+{
+	"Path": "golang.org/x/time",
+	"Version": "v0.3.0",
+	"Time": "2022-11-16T15:19:46Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/golang.org/x/time@v0.3.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/golang.org/x/time/@v/v0.3.0.mod",
+	"Sum": "h1:rg5rLMjNzMS1RkNLzCG38eapWhnYLFYXDXj2gOlr8j4=",
+	"GoModSum": "h1:tRJNPiyCQ0inRvYxbN9jk5I+vvW/OXSQhTDSoE431IQ="
+}
+{
+	"Path": "golang.org/x/tools",
+	"Version": "v0.21.1-0.20240508182429-e35e4ccd0d2d",
+	"Time": "2024-05-08T18:24:29Z",
+	"Indirect": true
+}
+{
+	"Path": "golang.org/x/xerrors",
+	"Version": "v0.0.0-20220411194840-2f41105eb62f",
+	"Time": "2022-04-11T19:48:40Z",
+	"Indirect": true
+}
+{
+	"Path": "google.golang.org/protobuf",
+	"Version": "v1.30.0",
+	"Time": "2023-03-16T08:32:54Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/google.golang.org/protobuf@v1.30.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/google.golang.org/protobuf/@v/v1.30.0.mod",
+	"GoVersion": "1.11",
+	"Sum": "h1:kPPoIgf3TsEvrm0PFe15JQ+570QVxYzEvvHqChK+cng=",
+	"GoModSum": "h1:HV8QOd/L58Z+nl8r43ehVNZIU/HEI6OcFqwMG9pJV4I="
+}
+{
+	"Path": "gopkg.in/check.v1",
+	"Version": "v1.0.0-20201130134442-10cb98267c6c",
+	"Time": "2020-11-30T13:44:42Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/gopkg.in/check.v1@v1.0.0-20201130134442-10cb98267c6c",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/gopkg.in/check.v1/@v/v1.0.0-20201130134442-10cb98267c6c.mod",
+	"GoVersion": "1.11",
+	"Sum": "h1:Hei/4ADfdWqJk1ZMxUNpqntNwaWcugrBjAiHlqqRiVk=",
+	"GoModSum": "h1:JHkPIbrfpd72SG/EVd6muEfDQjcINNoR0C8j2r3qZ4Q="
+}
+{
+	"Path": "gopkg.in/errgo.v2",
+	"Version": "v2.1.0",
+	"Time": "2018-08-23T07:15:05Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/gopkg.in/errgo.v2/@v/v2.1.0.mod",
+	"GoModSum": "h1:hNsd1EY+bozCKY1Ytp96fpM3vjJbqLJn88ws8XvfDNI="
+}
+{
+	"Path": "gopkg.in/ini.v1",
+	"Version": "v1.67.0",
+	"Time": "2022-08-08T11:35:30Z",
+	"Dir": "/Users/edmundfu/go/pkg/mod/gopkg.in/ini.v1@v1.67.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/gopkg.in/ini.v1/@v/v1.67.0.mod",
+	"Sum": "h1:Dgnx+6+nfE+IfzjUEISNeydPJh9AXNNsWbGP9KzCsOA=",
+	"GoModSum": "h1:pNLf8WUiyNEtQjuu5G5vTm06TEv9tsIgeAvK8hOrP4k="
+}
+{
+	"Path": "gopkg.in/natefinch/lumberjack.v2",
+	"Version": "v2.2.1",
+	"Time": "2023-02-06T19:38:14Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/gopkg.in/natefinch/lumberjack.v2@v2.2.1",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/gopkg.in/natefinch/lumberjack.v2/@v/v2.2.1.mod",
+	"GoVersion": "1.13",
+	"Sum": "h1:bBRl1b0OH9s/DuPhuXpNl+VtCaJXFZ5/uEFST95x9zc=",
+	"GoModSum": "h1:YD8tP3GAjkrDg1eZH7EGmyESg/lsYskCTPBJVb9jqSc="
+}
+{
+	"Path": "gopkg.in/yaml.v2",
+	"Version": "v2.4.0",
+	"Time": "2020-11-17T15:46:20Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/gopkg.in/yaml.v2/@v/v2.4.0.mod",
+	"GoVersion": "1.15",
+	"GoModSum": "h1:RDklbk79AGWmwhnvt/jBztapEOGDOx6ZbXqjP6csGnQ="
+}
+{
+	"Path": "gopkg.in/yaml.v3",
+	"Version": "v3.0.1",
+	"Time": "2022-05-27T08:35:30Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/gopkg.in/yaml.v3@v3.0.1",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/gopkg.in/yaml.v3/@v/v3.0.1.mod",
+	"Sum": "h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=",
+	"GoModSum": "h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM="
+}
+{
+	"Path": "gorm.io/gorm",
+	"Version": "v1.24.6",
+	"Time": "2023-03-02T09:22:51Z",
+	"Dir": "/Users/edmundfu/go/pkg/mod/gorm.io/gorm@v1.24.6",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/gorm.io/gorm/@v/v1.24.6.mod",
+	"GoVersion": "1.16",
+	"Sum": "h1:wy98aq9oFEetsc4CAbKD2SoBCdMzsbSIvSUUFJuHi5s=",
+	"GoModSum": "h1:L4uxeKpfBml98NYqVqwAdmV1a2nBtAec/cf3fpucW/k="
+}
+{
+	"Path": "gotest.tools",
+	"Version": "v2.2.0+incompatible",
+	"Time": "2018-11-11T18:29:05Z",
+	"Dir": "/Users/edmundfu/go/pkg/mod/gotest.tools@v2.2.0+incompatible",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/gotest.tools/@v/v2.2.0+incompatible.mod",
+	"Sum": "h1:VsBPFP1AI068pPrMxtb/S8Zkgf9xEmTLJjfM+P5UIEo=",
+	"GoModSum": "h1:DsYFclhRJ6vuDpmuTbkuFWG+y2sxOXAzmJt81HFBacw="
+}
+{
+	"Path": "gotest.tools/v3",
+	"Version": "v3.4.0",
+	"Time": "2022-10-06T01:25:29Z",
+	"Indirect": true
+}
+{
+	"Path": "lukechampine.com/uint128",
+	"Version": "v1.2.0",
+	"Time": "2022-01-14T21:58:55Z",
+	"Indirect": true
+}
+{
+	"Path": "modernc.org/cc/v3",
+	"Version": "v3.40.0",
+	"Time": "2022-09-23T11:05:40Z",
+	"Indirect": true
+}
+{
+	"Path": "modernc.org/ccgo/v3",
+	"Version": "v3.16.13",
+	"Time": "2022-11-01T11:51:12Z",
+	"Indirect": true
+}
+{
+	"Path": "modernc.org/httpfs",
+	"Version": "v1.0.6",
+	"Time": "2021-02-24T15:52:46Z",
+	"Indirect": true
+}
+{
+	"Path": "modernc.org/libc",
+	"Version": "v1.22.3",
+	"Time": "2023-02-22T19:27:45Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/modernc.org/libc@v1.22.3",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/modernc.org/libc/@v/v1.22.3.mod",
+	"GoVersion": "1.18",
+	"Sum": "h1:D/g6O5ftAfavceqlLOFwaZuA5KYafKwmr30A6iSqoyY=",
+	"GoModSum": "h1:MQrloYP209xa2zHome2a8HLiLm6k0UT8CoHpV74tOFw="
+}
+{
+	"Path": "modernc.org/mathutil",
+	"Version": "v1.5.0",
+	"Time": "2022-08-22T14:27:38Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/modernc.org/mathutil@v1.5.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/modernc.org/mathutil/@v/v1.5.0.mod",
+	"GoVersion": "1.13",
+	"Sum": "h1:rV0Ko/6SfM+8G+yKiyI830l3Wuz1zRutdslNoQ0kfiQ=",
+	"GoModSum": "h1:mZW8CKdRPY1v87qxC/wUdX5O1qDzXMP5TH3wjfpga6E="
+}
+{
+	"Path": "modernc.org/memory",
+	"Version": "v1.5.0",
+	"Time": "2022-12-04T10:36:34Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/modernc.org/memory@v1.5.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/modernc.org/memory/@v/v1.5.0.mod",
+	"GoVersion": "1.18",
+	"Sum": "h1:N+/8c5rE6EqugZwHii4IFsaJ7MUhoWX07J5tC/iI5Ds=",
+	"GoModSum": "h1:PkUhL0Mugw21sHPeskwZW4D6VscE/GQJOnIpCnW6pSU="
+}
+{
+	"Path": "modernc.org/opt",
+	"Version": "v0.1.3",
+	"Time": "2022-03-30T09:23:55Z",
+	"Indirect": true
+}
+{
+	"Path": "modernc.org/sqlite",
+	"Version": "v1.21.0",
+	"Time": "2023-02-23T13:46:00Z",
+	"Indirect": true,
+	"Dir": "/Users/edmundfu/go/pkg/mod/modernc.org/sqlite@v1.21.0",
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/modernc.org/sqlite/@v/v1.21.0.mod",
+	"GoVersion": "1.18",
+	"Sum": "h1:4aP4MdUf15i3R3M2mx6Q90WHKz3nZLoz96zlB6tNdow=",
+	"GoModSum": "h1:XwQ0wZPIh1iKb5mkvCJ3szzbhk+tykC8ZWqTRTgYRwI="
+}
+{
+	"Path": "modernc.org/strutil",
+	"Version": "v1.1.3",
+	"Time": "2022-08-25T14:17:15Z",
+	"Indirect": true
+}
+{
+	"Path": "modernc.org/tcl",
+	"Version": "v1.15.1",
+	"Time": "2022-10-24T09:20:55Z",
+	"Indirect": true
+}
+{
+	"Path": "modernc.org/token",
+	"Version": "v1.0.1",
+	"Time": "2018-11-09T15:17:25Z",
+	"Indirect": true
+}
+{
+	"Path": "modernc.org/z",
+	"Version": "v1.7.0",
+	"Time": "2022-09-16T18:18:06Z",
+	"Indirect": true
+}
+{
+	"Path": "rsc.io/pdf",
+	"Version": "v0.1.1",
+	"Time": "2018-04-11T19:01:10Z",
+	"Indirect": true,
+	"GoMod": "/Users/edmundfu/go/pkg/mod/cache/download/rsc.io/pdf/@v/v0.1.1.mod",
+	"GoModSum": "h1:n8OzWcQ6Sp37PL01nO98y4iUCRdTGarVfzxY20ICaU4="
+}
