@@ -44,8 +44,13 @@
     },
     {
       "name": "administrative-ui",
-      "state": "unresolved",
-      "reason": "ReCasaOS fork pinned at c7a84091c524af7a86ee1750e1d75c08cf7141d1 (EdmundFu-233/ReCasaOS-UI main) with ticket-SSH hardening (PR #2). Release artifact, browser-test evidence, and compatibility evidence are pending; see ReCasaOS#8."
+      "state": "locked",
+      "source_repository": "https://github.com/EdmundFu-233/ReCasaOS-UI",
+      "source_revision": "7c4a617dc2ad64623fd173e1cc08c27bde41a596",
+      "artifact_sha256": "c055e5d1aee127977b85e2f37d1537f8f778c27377fe28f3ce3c522f3c2a0738",
+      "license": "no-license-file-upstream-all-rights-reserved",
+      "api_schema": "ui-static-against-root-openapi-v2",
+      "compatibility_status": "passed"
     },
     {
       "name": "installer",
