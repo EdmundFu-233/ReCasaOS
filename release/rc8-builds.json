@@ -1,0 +1,13 @@
+{
+  "rc": "v0.5.0+post-release",
+  "date": "2026-09-16",
+  "artifacts": [
+    {
+      "component": "administrative-ui",
+      "source_revision": "0d6cf15eae7c94aa097b8940f947b149ce844ed7",
+      "file": "ReCasaOS-UI source archive (git archive of the pinned commit)",
+      "sha256": "b77b1edabbf68a225307bdc03bd65d66100bcd8fffeebf50e8ab4d2a36a65629",
+      "note": "supply-chain fix: @icewhale OpenAPI dependencies pinned to exact versions (0.4.13-2adb795, 0.4.10-alpha2); lockfile regenerated; production build green; credential-URL gate 3/3 green"
+    }
+  ]
+}
