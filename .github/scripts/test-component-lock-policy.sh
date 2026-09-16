@@ -69,9 +69,17 @@ expect_reject() {
 manifest="$repo_root/release/components.lock.json"
 locked_fixture="$script_dir/testdata/component-lock-one-locked.json"
 all_locked_fixture="$script_dir/testdata/component-lock-all-locked.json"
-expect_accept current-fully-locked-hold "$manifest"
-expect_accept one-structural-lock-hold "$locked_fixture"
-expect_accept all-structural-locks-hold "$all_locked_fixture"
+# Fixtures predate publication: lift them to the release state once and use
+# the lifted copies everywhere below.
+locked_release="$work_dir/locked-release.json"
+all_locked_release="$work_dir/all-locked-release.json"
+sed 's/"publication_state": "hold"/"publication_state": "release"/' \
+  "$locked_fixture" >"$locked_release"
+sed 's/"publication_state": "hold"/"publication_state": "release"/' \
+  "$all_locked_fixture" >"$all_locked_release"
+expect_accept current-fully-locked-release "$manifest"
+expect_accept one-structural-lock-release "$locked_release"
+expect_accept all-structural-locks-release "$all_locked_release"
 
 mutated="$work_dir/mutated.json"
 
@@ -99,64 +107,69 @@ sed \
 expect_reject noncanonical-component-order "$mutated"
 
 sed 's/"source_revision": "1111111111111111111111111111111111111111"/"source_revision": "main"/' \
-  "$locked_fixture" >"$mutated"
+  "$locked_release" >"$mutated"
 expect_reject moving-source-reference "$mutated"
 
 sed 's/"source_revision": "1111111111111111111111111111111111111111"/"source_revision": "abc123"/' \
-  "$locked_fixture" >"$mutated"
+  "$locked_release" >"$mutated"
 expect_reject malformed-source-revision "$mutated"
 
 sed 's/"artifact_sha256": "2222222222222222222222222222222222222222222222222222222222222222"/"artifact_sha256": "1234"/' \
-  "$locked_fixture" >"$mutated"
+  "$locked_release" >"$mutated"
 expect_reject malformed-artifact-digest "$mutated"
 
 sed 's|"source_repository": "https:|"source_repository": "http:|' \
-  "$locked_fixture" >"$mutated"
+  "$locked_release" >"$mutated"
 expect_reject non-https-source-repository "$mutated"
 
 sed 's/"license": "Apache-2.0"/"license": null/' \
-  "$locked_fixture" >"$mutated"
+  "$locked_release" >"$mutated"
 expect_reject missing-license "$mutated"
 
 sed 's/"api_schema": "not-applicable"/"api_schema": null/' \
-  "$locked_fixture" >"$mutated"
+  "$locked_release" >"$mutated"
 expect_reject missing-api-schema "$mutated"
 
 sed 's/"compatibility_status": "passed"/"compatibility_status": null/' \
-  "$locked_fixture" >"$mutated"
+  "$locked_release" >"$mutated"
 expect_reject missing-compatibility-status "$mutated"
 
 sed \
   's/"state": "locked",/"state": "unresolved", "reason": "fixture retains forbidden lock material",/' \
-  "$locked_fixture" >"$mutated"
+  "$locked_release" >"$mutated"
 expect_reject unresolved-component-with-pin "$mutated"
 
-sed 's/  disable: true/  disable: false/' \
-  "$repo_root/.goreleaser.yaml" >"$work_dir/enabled-primary.yaml"
-expect_reject unresolved-with-primary-release-enabled \
-  "$manifest" "$work_dir/enabled-primary.yaml" "$debug_config"
+sed 's/  disable: false/  disable: true/' \
+  "$repo_root/.goreleaser.yaml" >"$work_dir/disabled-primary.yaml"
+expect_reject locked-with-primary-release-disabled \
+  "$manifest" "$work_dir/disabled-primary.yaml" "$debug_config"
 
-sed 's/  disable: true/  disable: false/' \
-  "$repo_root/.goreleaser.debug.yaml" >"$work_dir/enabled-debug.yaml"
-expect_reject unresolved-with-debug-release-enabled \
-  "$manifest" "$primary_config" "$work_dir/enabled-debug.yaml"
+sed 's/  disable: false/  disable: true/' \
+  "$repo_root/.goreleaser.debug.yaml" >"$work_dir/disabled-debug.yaml"
+expect_reject locked-with-debug-release-disabled \
+  "$manifest" "$primary_config" "$work_dir/disabled-debug.yaml"
 
-expect_reject all-locked-with-release-enabled \
-  "$all_locked_fixture" "$work_dir/enabled-primary.yaml" "$debug_config"
+expect_accept all-locked-with-release-enabled \
+  "$all_locked_release" "$primary_config" "$debug_config"
+sed \
+  's/"state": "locked",/"state": "unresolved", "reason": "regression must re-arm the hold",/' \
+  "$all_locked_release" >"$mutated"
+expect_reject unresolved-regression-rearms-hold \
+  "$mutated"
 
 sed 's/"schema_version": 1/"schema_version": 2/' \
   "$manifest" >"$mutated"
 expect_reject unknown-schema-version "$mutated"
 
-sed '/"publication_state": "hold",/d' \
+sed '/"publication_state": "release",/d' \
   "$manifest" >"$mutated"
 expect_reject missing-publication-state "$mutated"
 
-sed 's/"publication_state": "hold"/"publication_state": "ready"/' \
+sed 's/"publication_state": "release"/"publication_state": "ready"/' \
   "$manifest" >"$mutated"
 expect_reject ready-publication-state "$mutated"
 
-sed 's/"publication_state": "hold"/"publication_state": "paused"/' \
+sed 's/"publication_state": "release"/"publication_state": "paused"/' \
   "$manifest" >"$mutated"
 expect_reject unknown-publication-state "$mutated"
 
@@ -183,7 +196,7 @@ expect_reject alternate-case-schema-version-key "$mutated"
 grep -Fq 'unknown key "Schema_Version"' "$work_dir/stderr" ||
   fail "alternate-case schema key was not rejected by the exact JSON schema"
 
-sed 's/"publication_state": "hold"/"Publication_State": "hold"/' \
+sed 's/"publication_state": "release"/"Publication_State": "release"/' \
   "$manifest" >"$mutated"
 expect_reject alternate-case-publication-state-key "$mutated"
 grep -Fq 'unknown key "Publication_State"' "$work_dir/stderr" ||
@@ -209,7 +222,7 @@ grep -Fq 'unknown key "Schema_Version"' "$work_dir/stderr" ||
 
 sed \
   's/"name": "app-management"/"name": "not-app-management", "Name": "app-management"/' \
-  "$locked_fixture" >"$mutated"
+  "$locked_release" >"$mutated"
 expect_reject mixed-case-component-name-semantic-duplicate "$mutated"
 grep -Fq 'unknown key "Name"' "$work_dir/stderr" ||
   fail "mixed-case component duplicate was not rejected by the exact JSON schema"
@@ -285,33 +298,33 @@ grep -Fq 'release contains a forbidden YAML merge key' "$work_dir/stderr" ||
 
 printf '%s\n' \
   'release:' \
-  '  "\u0064isable": false' \
+  '  "\u0064isable": true' \
   '  footer: "x' \
-  '  disable: true' \
+  '  disable: false' \
   '  "' \
   >"$work_dir/escaped-key-with-quoted-pseudo-field.yaml"
 expect_reject escaped-disable-key-with-quoted-pseudo-disable \
   "$manifest" "$work_dir/escaped-key-with-quoted-pseudo-field.yaml" "$debug_config"
-grep -Fq 'release.disable must be an explicit YAML boolean true' "$work_dir/stderr" ||
+grep -Fq 'release.disable must be an explicit YAML boolean false' "$work_dir/stderr" ||
   fail "escaped disable key was not interpreted with YAML string semantics"
 
 printf '%s\n' \
-  'release: { disable: false }' \
+  'release: { disable: true }' \
   'footer: "x' \
-  '  disable: true' \
+  '  disable: false' \
   '  "' \
   >"$work_dir/flow-release-with-quoted-pseudo-field.yaml"
-expect_reject flow-release-false-with-quoted-pseudo-disable \
+expect_reject flow-release-true-with-quoted-pseudo-disable \
   "$manifest" "$work_dir/flow-release-with-quoted-pseudo-field.yaml" "$debug_config"
-grep -Fq 'release.disable must be an explicit YAML boolean true' "$work_dir/stderr" ||
-  fail "flow release false value was not interpreted with YAML mapping semantics"
+grep -Fq 'release.disable must be an explicit YAML boolean false' "$work_dir/stderr" ||
+  fail "flow release true value was not interpreted with YAML mapping semantics"
 
 printf '%s\n' \
   'release: { disable: "true" }' \
   >"$work_dir/string-disable.yaml"
-expect_reject string-true-is-not-boolean-true \
+expect_reject string-true-is-not-boolean-false \
   "$manifest" "$work_dir/string-disable.yaml" "$debug_config"
-grep -Fq 'release.disable must be an explicit YAML boolean true' "$work_dir/stderr" ||
+grep -Fq 'release.disable must be an explicit YAML boolean false' "$work_dir/stderr" ||
   fail "string true was not rejected by the strict YAML boolean policy"
 
 printf '%s\n' \

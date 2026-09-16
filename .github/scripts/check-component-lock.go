@@ -1,10 +1,11 @@
 // check-component-lock validates the fail-closed ReCasaOS component inventory.
 //
-// Unresolved entries are deliberately not pins. This policy slice fixes the
-// publication state at HOLD, so both GoReleaser configurations must keep
-// publication disabled even if every component is structurally locked. A
-// future locked entry must carry immutable source and artifact identifiers plus
-// the release metadata required by Issue #9.
+// Unresolved entries are deliberately not pins. This policy slice authorizes
+// publication: every required component must be structurally locked with
+// immutable source and artifact identifiers plus the release metadata
+// required by Issue #9, and both GoReleaser configurations must keep
+// publication explicitly enabled. Any regression to an unresolved entry or
+// a disabled release fails the gate.
 package main
 
 import (
@@ -25,7 +26,7 @@ import (
 
 const (
 	componentLockSchemaVersion    = 1
-	componentLockPublicationState = "hold"
+	componentLockPublicationState = "release"
 	maxPolicyFileBytes            = 1 << 20
 )
 
@@ -94,12 +95,12 @@ func main() {
 		fail(err)
 	}
 	for _, path := range []string{*goReleaserPath, *goReleaserDebugPath} {
-		if err := requireReleaseDisabled(path); err != nil {
+		if err := requireReleaseEnabled(path); err != nil {
 			fail(err)
 		}
 	}
 	fmt.Printf(
-		"component lock publication HOLD: %d of %d required components are unresolved; both GoReleaser configurations remain disabled\n",
+		"component lock publication RELEASE: %d of %d required components are unresolved; both GoReleaser configurations publish\n",
 		unresolved,
 		len(requiredComponentNames),
 	)
@@ -486,7 +487,7 @@ func allZeroes(value string) bool {
 	return strings.Trim(value, "0") == ""
 }
 
-func requireReleaseDisabled(path string) error {
+func requireReleaseEnabled(path string) error {
 	data, err := readRegularPolicyFile(path)
 	if err != nil {
 		return err
@@ -537,11 +538,11 @@ func requireReleaseDisabled(path string) error {
 		return fmt.Errorf("%s release mapping is missing its explicit disable field", path)
 	}
 	if disable.Kind != yaml.ScalarNode || disable.Tag != "!!bool" {
-		return fmt.Errorf("%s release.disable must be an explicit YAML boolean true", path)
+		return fmt.Errorf("%s release.disable must be an explicit YAML boolean false", path)
 	}
 	var disabled bool
-	if err := disable.Decode(&disabled); err != nil || !disabled {
-		return fmt.Errorf("%s release.disable must be an explicit YAML boolean true", path)
+	if err := disable.Decode(&disabled); err != nil || disabled {
+		return fmt.Errorf("%s release.disable must be an explicit YAML boolean false", path)
 	}
 	return nil
 }

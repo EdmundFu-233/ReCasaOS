@@ -275,6 +275,18 @@ archives:
       - build/sysroot/etc/**/*
 checksum:
   name_template: "checksums.txt"
+signs:
+  - cmd: gpg
+    signature: "${artifact}.asc"
+    args:
+      - "--batch"
+      - "--local-user"
+      - "{{ .Env.RECASAOS_RELEASE_KEYID }}"
+      - "--output"
+      - "${signature}"
+      - "--detach-sign"
+      - "${artifact}"
+    artifacts: checksum
 snapshot:
   version_template: "{{ incpatch .Version }}"
 changelog:
@@ -284,8 +296,10 @@ changelog:
       - "^docs:"
       - "^test:"
 release:
-  # Binary releases remain disabled until the component BOM and installer are pinned.
-  disable: true
+  # Publication was enabled by a reviewed release-policy change after the
+  # component BOM, installer, SBOMs, signatures, and compatibility evidence
+  # landed. Regressions re-arm the hold: see RECASAOS_COMPONENTS.md.
+  disable: false
   github:
     owner: EdmundFu-233
     name: ReCasaOS
