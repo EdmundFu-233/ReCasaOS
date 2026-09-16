@@ -1,0 +1,22 @@
+{
+  "rc": "v0.5.0-rc.2+ui",
+  "date": "2026-09-16",
+  "binaries": [],
+  "artifacts": [
+    {
+      "component": "administrative-ui",
+      "source_revision": "7c4a617dc2ad64623fd173e1cc08c27bde41a596",
+      "file": "reCasaOS-UI source archive (git archive of the pinned commit)",
+      "sha256": "c055e5d1aee127977b85e2f37d1537f8f778c27377fe28f3ce3c522f3c2a0738",
+      "note": "Source archive is byte-reproducible; the webpack www output is not (build hashes observed: ef5f4189 then differing on rebuild). Production build succeeds after removing the unpublished dead dependency @icewhale/icewhale-files-openapi."
+    }
+  ],
+  "compatibility": {
+    "check": "sys SSH terminal opens wsssh with a bare URL on the POST-minted HttpOnly cookie ticket, matching root WsSsh/PostSshLogin (root ssh_test suite green in CI); file-drop WS drops its ignored query token; regression gate terminal-credential-url.spec.js 3/3 green; production build succeeds; fenced residuals documented (container ?token= on non-root backend; avatar/wallpaper ?token= on legacy 410 APIs awaiting UserService#4)",
+    "result": "passed"
+  },
+  "risks": [
+    "UI has no LICENSE file and upstream reports license:null (all rights reserved by default): licensing must be clarified before formal publication.",
+    "Remaining @icewhale/* deps float on latest tags: mutable supply chain, pin before formal publication."
+  ]
+}
