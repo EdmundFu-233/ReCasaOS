@@ -68,14 +68,16 @@ be hand-edited.
    reason and no revision or digest. A locked entry must contain its
    repository, immutable commit, artifact SHA-256, API/schema version, license,
    and passed compatibility status. This policy slice fixes
-   `publication_state` at `hold` and always requires both GoReleaser
-   configurations to keep publication disabled, even if every component later
-   becomes structurally locked. The gate parses each GoReleaser file as exactly
-   one YAML document, requires one explicit boolean `release.disable: true`,
-   and rejects BOMs plus release aliases, anchors, and merge keys. Changing
-   the publication state requires a separate reviewed release-policy change
-   after the full-stack SBOM,
-   signatures, provenance, installer, and compatibility evidence exist. This
+   `publication_state` at `release`: every required component is structurally
+   locked, and both GoReleaser configurations keep publication explicitly
+   enabled. The gate parses each GoReleaser file as exactly
+   one YAML document, requires one explicit boolean `release.disable: false`,
+   and rejects BOMs plus release aliases, anchors, and merge keys. The
+   publication state was changed from `hold` by a reviewed release-policy
+   change after the full-stack SBOM,
+   signatures, provenance, installer, and compatibility evidence landed. A
+   regression in any of those re-arms the gate: the state must return to
+   `hold` until the evidence is whole again. This
    inventory is therefore a fail-closed release gate, not a readiness claim.
 
 ## Compatibility and update rules

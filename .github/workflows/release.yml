@@ -1,0 +1,77 @@
+# Release automation. Tag-triggered GoReleaser publication with pinned
+# tooling: every third-party input (actions, GoReleaser binary, Go
+# toolchain) is pinned by SHA or exact version, mirroring the repository
+# supply-chain gates. Releases are created as drafts for human review.
+name: Release (GoReleaser)
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-24.04
+    env:
+      GOTOOLCHAIN: local
+      GOWORK: "off"
+      GOFLAGS: -mod=readonly
+      RECASAOS_RELEASE_KEYID: release@recasaos.local
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up exact Go toolchain
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.6"
+          cache: false
+
+      - name: Install cross toolchains and signing tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabihf \
+            gcc-riscv64-linux-gnu \
+            upx-ucl \
+            gnupg
+
+      - name: Import release signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.RECASAOS_RELEASE_GPG_PRIVATE_KEY }}
+        run: |
+          test -n "$GPG_PRIVATE_KEY" || { echo "release signing key secret is missing" >&2; exit 1; }
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          gpg --batch --list-secret-keys "$RECASAOS_RELEASE_KEYID" >/dev/null
+
+      - name: Fetch pinned GoReleaser
+        run: |
+          version='2.17.0'
+          archive='goreleaser_Linux_x86_64.tar.gz'
+          expected_sha256='dde10e2d5a13cef969c0eec00c74f359c0ac306d702b1bd291ad9337b4e54c1d'
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            --output "/tmp/$archive" \
+            "https://github.com/goreleaser/goreleaser/releases/download/v${version}/${archive}"
+          actual_sha256="$(sha256sum "/tmp/$archive" | awk '{ print $1 }')"
+          test "$actual_sha256" = "$expected_sha256" || { echo "GoReleaser SHA mismatch" >&2; exit 1; }
+          tar -xzf "/tmp/$archive" -C /tmp goreleaser
+          test -x /tmp/goreleaser
+
+      - name: Publish draft release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: /tmp/goreleaser release --clean
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: "dist/checksums.txt"
