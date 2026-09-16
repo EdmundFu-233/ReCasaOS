@@ -154,3 +154,27 @@ func TestIdentityErrorsCarryNoValues(t *testing.T) {
 		t.Fatalf("verification error leaks identity: %v", err)
 	}
 }
+
+func TestPinRejectsAmbiguousNumericHosts(t *testing.T) {
+	for _, host := range []string{"0x7f.0.0.1", "0177.0.0.1", "2130706433", "12345", "0XAB.0.0.1"} {
+		if _, err := PinServerIdentity(host, 445, []string{"10.0.0.1"}); !errors.Is(err, ErrInvalidServerIdentity) {
+			t.Fatalf("%q must be rejected as ambiguous numeric", host)
+		}
+	}
+	// Plain hex words and real names stay allowed; true IP literals pin.
+	for _, host := range []string{"dead.beef", "file123", "10.0.0.1", "2001:db8::1"} {
+		if _, err := PinServerIdentity(host, 445, []string{"10.0.0.1"}); err != nil {
+			t.Fatalf("%q must pin: %v", host, err)
+		}
+	}
+}
+
+func TestVerifyTreatsAliasesAsSameSet(t *testing.T) {
+	pin, err := PinServerIdentity("file.example", 445, []string{"10.0.0.1"})
+	if err != nil {
+		t.Fatalf("pin: %v", err)
+	}
+	if err := pin.Verify("file.example", 445, []string{"10.0.0.1", "::ffff:10.0.0.1"}); err != nil {
+		t.Fatalf("aliased presentation must verify: %v", err)
+	}
+}

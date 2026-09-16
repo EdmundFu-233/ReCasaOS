@@ -100,35 +100,35 @@ func backupKeyringAt(
 
 	data, marshalErr := keyring.Marshal()
 	if marshalErr != nil {
-		_, cleanupErr := cleanupBackupStaging(path, fd, ops)
-		return BackupResult{CleanupRequired: true}, errors.Join(marshalErr, cleanupErr)
+		stillDirty, cleanupErr := cleanupBackupStaging(path, fd, ops)
+		return BackupResult{CleanupRequired: stillDirty}, errors.Join(marshalErr, cleanupErr)
 	}
 	defer clear(data)
 	if err := prepareSourceCandidate(fd, 1, path.owner, path.group, data, ops); err != nil {
-		_, cleanupErr := cleanupBackupStaging(path, fd, ops)
-		return BackupResult{CleanupRequired: true}, errors.Join(err, cleanupErr)
+		stillDirty, cleanupErr := cleanupBackupStaging(path, fd, ops)
+		return BackupResult{CleanupRequired: stillDirty}, errors.Join(err, cleanupErr)
 	}
 	if err := path.revalidate(ops.sourcePathOps); err != nil {
-		_, cleanupErr := cleanupBackupStaging(path, fd, ops)
-		return BackupResult{CleanupRequired: true}, errors.Join(err, cleanupErr)
+		stillDirty, cleanupErr := cleanupBackupStaging(path, fd, ops)
+		return BackupResult{CleanupRequired: stillDirty}, errors.Join(err, cleanupErr)
 	}
 	stagingState, stagingErr := inspectSourceName(path.directoryFD, backupStagingName, fd, ops)
 	if stagingErr != nil || stagingState != sourceNameCandidate {
-		_, cleanupErr := cleanupBackupStaging(path, fd, ops)
-		return BackupResult{CleanupRequired: true}, errors.Join(ErrSourceCleanupRequired, stagingErr, cleanupErr)
+		stillDirty, cleanupErr := cleanupBackupStaging(path, fd, ops)
+		return BackupResult{CleanupRequired: stillDirty}, errors.Join(ErrSourceCleanupRequired, stagingErr, cleanupErr)
 	}
 	targetState, targetErr := inspectSourceName(path.directoryFD, backupKeyringName, fd, ops)
 	if targetErr != nil {
-		_, cleanupErr := cleanupBackupStaging(path, fd, ops)
-		return BackupResult{CleanupRequired: true}, errors.Join(ErrSourceCleanupRequired, targetErr, cleanupErr)
+		stillDirty, cleanupErr := cleanupBackupStaging(path, fd, ops)
+		return BackupResult{CleanupRequired: stillDirty}, errors.Join(ErrSourceCleanupRequired, targetErr, cleanupErr)
 	}
 	if targetState != sourceNameAbsent {
-		_, cleanupErr := cleanupBackupStaging(path, fd, ops)
-		return BackupResult{}, errors.Join(ErrBackupExists, cleanupErr)
+		stillDirty, cleanupErr := cleanupBackupStaging(path, fd, ops)
+		return BackupResult{CleanupRequired: stillDirty}, errors.Join(ErrBackupExists, cleanupErr)
 	}
 	if err := ops.fsync(path.directoryFD); err != nil {
-		_, cleanupErr := cleanupBackupStaging(path, fd, ops)
-		return BackupResult{CleanupRequired: true}, errors.Join(
+		stillDirty, cleanupErr := cleanupBackupStaging(path, fd, ops)
+		return BackupResult{CleanupRequired: stillDirty}, errors.Join(
 			sourceProvisionFailure("sync keyring backup directory", err),
 			cleanupErr,
 		)
@@ -140,17 +140,21 @@ func backupKeyringAt(
 		backupKeyringName,
 		uint(unix.RENAME_NOREPLACE),
 	); renameErr != nil {
-		_, cleanupErr := cleanupBackupStaging(path, fd, ops)
+		stillDirty, cleanupErr := cleanupBackupStaging(path, fd, ops)
 		if errors.Is(renameErr, unix.EEXIST) {
-			return BackupResult{CleanupRequired: true}, errors.Join(ErrBackupExists, cleanupErr)
+			return BackupResult{CleanupRequired: stillDirty}, errors.Join(ErrBackupExists, cleanupErr)
 		}
-		return BackupResult{CleanupRequired: true}, errors.Join(
+		return BackupResult{CleanupRequired: stillDirty}, errors.Join(
 			sourceProvisionFailure("publish keyring backup", renameErr),
 			cleanupErr,
 		)
 	}
 	if err := validateBackupPublished(path, fd, data, ops); err != nil {
-		return BackupResult{Created: true, DurabilityUnknown: true}, err
+		// The rename won but post-publish verification failed. A staging
+		// object reappearing here means residue: hold for the operator.
+		stagingState, stagingErr := inspectSourceName(path.directoryFD, backupStagingName, fd, ops)
+		dirty := stagingErr != nil || stagingState != sourceNameAbsent
+		return BackupResult{Created: true, DurabilityUnknown: true, CleanupRequired: dirty}, errors.Join(err, stagingErr)
 	}
 	if err := ops.fsync(path.directoryFD); err != nil {
 		return BackupResult{Created: true, DurabilityUnknown: true}, sourceProvisionFailure(
@@ -292,6 +296,9 @@ func restoreKeyringAt(
 	state, inspectErr := inspectSourceName(path.directoryFD, backupKeyringName, fd, ops)
 	if inspectErr != nil || state != sourceNameCandidate {
 		return nil, errors.Join(ErrUnsafeSourceKeyring, inspectErr)
+	}
+	if err := path.revalidate(ops.sourcePathOps); err != nil {
+		return nil, err
 	}
 	restored, parseErr := ParseKeyring(data)
 	if parseErr != nil {
