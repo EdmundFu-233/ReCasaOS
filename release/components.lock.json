@@ -26,8 +26,8 @@
       "name": "user-service",
       "state": "locked",
       "source_repository": "https://github.com/EdmundFu-233/ReCasaOS-UserService",
-      "source_revision": "6781a48cc1dcf34a676f4a1a43d936b01a55f93c",
-      "artifact_sha256": "573139f2f2e4480483cdc7dce851ea42f85443fadea04ac3ed7ea26f5b8cebe3",
+      "source_revision": "1ce4d9d4617500a48e3e31d22d965525f2555a5a",
+      "artifact_sha256": "cbce06acde0983cafe5b140b0f4f280cd472082aa67643260e81ecb16bbfe8da",
       "license": "Apache-2.0",
       "api_schema": "user-service-openapi-v2",
       "compatibility_status": "passed"
