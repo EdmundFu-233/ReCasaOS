@@ -1,13 +1,13 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/IceWhaleTech/CasaOS/pkg/filesecurity"
 	"github.com/go-ini/ini"
 )
 
@@ -88,6 +88,13 @@ func PersistHTTPPort(value string) error {
 	return nil
 }
 
+// writeConfigAtomically serializes cfg and publishes it with the
+// descriptor-pinned atomic replacement in pkg/filesecurity. The destination
+// must be an absolute, clean path whose parent is a real directory: a
+// relative path or a symlinked parent fails closed without writing. The
+// commit report stays meaningful: serialization and every staging step
+// return committed == false with the destination untouched, while a failure
+// of the final directory durability sync returns committed == true.
 func writeConfigAtomically(cfg *ini.File, path string) (bool, error) {
 	if cfg == nil {
 		return false, errors.New("configuration is nil")
@@ -96,49 +103,13 @@ func writeConfigAtomically(cfg *ini.File, path string) (bool, error) {
 		return false, errors.New("configuration path is empty")
 	}
 
-	directory := filepath.Dir(path)
-	temporary, err := os.CreateTemp(directory, "."+filepath.Base(path)+".tmp-*")
+	var serialized bytes.Buffer
+	if _, err := cfg.WriteTo(&serialized); err != nil {
+		return false, fmt.Errorf("serialize configuration: %w", err)
+	}
+	published, err := filesecurity.ReplaceRegularFileWithCommit(path, serialized.Bytes(), 0o600)
 	if err != nil {
-		return false, fmt.Errorf("create temporary configuration: %w", err)
+		return published, fmt.Errorf("replace configuration: %w", err)
 	}
-	temporaryPath := temporary.Name()
-	temporaryClosed := false
-	committed := false
-	defer func() {
-		if !temporaryClosed {
-			_ = temporary.Close()
-		}
-		if !committed {
-			_ = os.Remove(temporaryPath)
-		}
-	}()
-
-	if err := temporary.Chmod(0o600); err != nil {
-		return false, fmt.Errorf("set temporary configuration permissions: %w", err)
-	}
-	if _, err := cfg.WriteTo(temporary); err != nil {
-		return false, fmt.Errorf("write temporary configuration: %w", err)
-	}
-	if err := temporary.Sync(); err != nil {
-		return false, fmt.Errorf("sync temporary configuration: %w", err)
-	}
-	if err := temporary.Close(); err != nil {
-		return false, fmt.Errorf("close temporary configuration: %w", err)
-	}
-	temporaryClosed = true
-	if err := os.Rename(temporaryPath, path); err != nil {
-		return false, fmt.Errorf("replace configuration: %w", err)
-	}
-	committed = true
-
-	directoryHandle, err := os.Open(directory)
-	if err != nil {
-		return true, fmt.Errorf("open configuration directory: %w", err)
-	}
-	defer directoryHandle.Close()
-	if err := directoryHandle.Sync(); err != nil {
-		return true, fmt.Errorf("sync configuration directory: %w", err)
-	}
-
 	return true, nil
 }
