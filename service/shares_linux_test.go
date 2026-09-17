@@ -160,13 +160,13 @@ func TestCompleteBackupDoesNotHideDirectorySyncFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	previousSync := syncSambaConfigDirectory
-	t.Cleanup(func() { syncSambaConfigDirectory = previousSync })
-	syncSambaConfigDirectory = func(string) error { return errors.New("injected directory sync failure") }
+	previousSync := sambaConfigDirectorySync
+	t.Cleanup(func() { sambaConfigDirectorySync = previousSync })
+	sambaConfigDirectorySync = func(int) error { return errors.New("injected directory sync failure") }
 	if _, _, err := ensureSambaConfigBackup(source, backupPath); err == nil {
 		t.Fatal("backup publication hid a directory sync failure")
 	}
-	syncSambaConfigDirectory = previousSync
+	sambaConfigDirectorySync = previousSync
 	backup, created, err := ensureSambaConfigBackup(source, backupPath)
 	if err != nil || created || string(backup.data) != "legacy" {
 		t.Fatalf("complete backup did not converge on retry: created=%v data=%q err=%v", created, backup.data, err)

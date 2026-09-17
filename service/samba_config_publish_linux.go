@@ -22,6 +22,10 @@ var sha256EmptyDigest = sha256.Sum256(nil)
 
 const sambaConfigQuarantineMarker = ".recasaos-quarantine-"
 
+// sambaConfigDirectorySync is the pinned-directory durability barrier. It is a
+// variable so tests can inject sync failures without a pathname-based seam.
+var sambaConfigDirectorySync = unix.Fsync
+
 // sambaConfigDirectory is a pinned Samba configuration directory. Every
 // staging, read, rename, quarantine, and cleanup operation resolves relative
 // to this descriptor, so replacing the directory path or one of its
@@ -49,7 +53,7 @@ func (directory sambaConfigDirectory) displayPath(base string) string {
 }
 
 func (directory sambaConfigDirectory) sync() error {
-	if err := unix.Fsync(directory.fd); err != nil {
+	if err := sambaConfigDirectorySync(directory.fd); err != nil {
 		return fmt.Errorf("sync Samba config directory %s: %w", directory.path, err)
 	}
 	return nil
