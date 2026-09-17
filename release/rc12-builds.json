@@ -1,0 +1,18 @@
+{
+  "rc": "v0.5.3+userservice-advisory-record",
+  "date": "2026-09-17",
+  "build_flags": "CGO_ENABLED=0, -trimpath, -tags netgo osusergo, -ldflags \"-X main.commit=<sha> -X main.date=2026-09-17 -s -w\"; darwin cross-compile to linux. Built from a checkout at the exact source_revision so the embedded VCS revision matches; byte-identical on rebuild. Docs-only change over rc11 (no Go source difference); the digest differs from rc11 only in embedded VCS metadata.",
+  "binaries": [
+    {
+      "component": "user-service",
+      "source_revision": "f25e495df180238e7937104f79a6e55b97bcd208",
+      "file": "userservice7-linux-arm64",
+      "sha256": "c4dd470a9544d95ac3341090c1fd2b360628eabc35431e5e2c5585e54bef541b",
+      "note": "adds the authentication advisory review record (security/ADVISORY_REVIEW.md) and its SECURITY.md link on top of the session-revocation revision; no Go changes"
+    }
+  ],
+  "compatibility": {
+    "check": "no API/OpenAPI or behavior change versus rc11; UserService docs-only diff; exact-head CI green",
+    "result": "passed"
+  }
+}
