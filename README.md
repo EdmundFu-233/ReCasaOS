@@ -66,6 +66,12 @@ the final target commit instead of re-resolving the staging path per call.
 The `v0.5.1` version was tagged during preparation, but its draft release
 was withdrawn before publication: no v0.5.1 release exists.
 
+Post-release hardening on `main` extends the same boundary: the v1 upload
+registry also pins its staging directory and parent per session, and both
+registries now prove that the staging name still identifies the pinned
+directory inode, quarantine it under an unpredictable name, and refuse to
+recursively delete a name that no longer matches.
+
 The full administrative dashboard is still **not ready for unrestricted
 Internet exposure**. Keep it on a private management network or mesh VPN,
 even at v0.5.2: post-release hardening continues on `main` (tracked in
