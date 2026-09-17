@@ -1,0 +1,18 @@
+{
+  "rc": "v0.5.3+userservice-sessions",
+  "date": "2026-09-17",
+  "build_flags": "CGO_ENABLED=0, -trimpath, -tags netgo osusergo, -ldflags \"-X main.commit=<sha> -X main.date=2026-09-17 -s -w\"; darwin cross-compile to linux. Built from a checkout at the exact source_revision so the embedded VCS revision matches; byte-identical on rebuild.",
+  "binaries": [
+    {
+      "component": "user-service",
+      "source_revision": "1ce4d9d4617500a48e3e31d22d965525f2555a5a",
+      "file": "userservice6-linux-arm64",
+      "sha256": "cbce06acde0983cafe5b140b0f4f280cd472082aa67643260e81ecb16bbfe8da",
+      "note": "refresh rotation with reuse detection, per-user token versions, single/all logout, per-username lockout, credential audit; independent agent review closed P1/P2/P3 findings; exact-head CI green including the Debian 247 systemd lifecycle lane"
+    }
+  ],
+  "compatibility": {
+    "check": "no API/OpenAPI change: new logout/logout-all/credential-events endpoints are additive; token wire format keeps the existing identity fields with additive jti/token_version that downstream parsers ignore; UserService exact-head CI green",
+    "result": "passed"
+  }
+}
