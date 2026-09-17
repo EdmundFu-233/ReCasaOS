@@ -1055,39 +1055,7 @@ func validateSambaCandidateWithTestparm(candidate []byte) error {
 }
 
 func writeFileAtomic(destination string, data []byte, permission fs.FileMode) error {
-	directoryPath := filepath.Dir(destination)
-	temporary, err := os.CreateTemp(directoryPath, "."+filepath.Base(destination)+".tmp-*")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-
-	if err := temporary.Chmod(permission); err != nil {
-		return errors.Join(err, temporary.Close())
-	}
-	written, writeErr := temporary.Write(data)
-	if writeErr == nil && written != len(data) {
-		writeErr = io.ErrShortWrite
-	}
-	if writeErr != nil {
-		return errors.Join(writeErr, temporary.Close())
-	}
-	if err := temporary.Sync(); err != nil {
-		return errors.Join(err, temporary.Close())
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(temporaryPath, destination); err != nil {
-		return err
-	}
-
-	directory, err := os.Open(directoryPath)
-	if err != nil {
-		return err
-	}
-	return errors.Join(directory.Sync(), directory.Close())
+	return filesecurity.ReplaceRegularFile(destination, data, permission)
 }
 
 func restartSambaService() error {
