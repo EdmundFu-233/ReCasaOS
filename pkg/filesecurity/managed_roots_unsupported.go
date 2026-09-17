@@ -36,6 +36,10 @@ func (m *ManagedRoots) OpenRegular(string) (*os.File, error) {
 	return nil, ErrManagedRootsUnsupported
 }
 
+func (m *ManagedRoots) OpenRegularIn(*os.File, string) (*os.File, error) {
+	return nil, ErrManagedRootsUnsupported
+}
+
 func (m *ManagedRoots) OpenPath(string) (*os.File, error) {
 	return nil, ErrManagedRootsUnsupported
 }
@@ -65,6 +69,10 @@ func (m *ManagedRoots) MkdirAll(string, fs.FileMode) error {
 }
 
 func (m *ManagedRoots) Remove(string) error {
+	return ErrManagedRootsUnsupported
+}
+
+func (m *ManagedRoots) RemoveIn(*os.File, string) error {
 	return ErrManagedRootsUnsupported
 }
 
@@ -101,6 +109,10 @@ func (m *ManagedRoots) CommitNoReplaceWithExpectedIdentity(string, string, Manag
 }
 
 func (m *ManagedRoots) CommitNoReplaceWithExpectedIdentityAndDigest(string, string, ManagedFileIdentity, [32]byte) (ManagedFileIdentity, error) {
+	return ManagedFileIdentity{}, ErrManagedRootsUnsupported
+}
+
+func (m *ManagedRoots) CommitNoReplaceWithExpectedIdentityAndDigestIn(*os.File, string, string, ManagedFileIdentity, [32]byte) (ManagedFileIdentity, error) {
 	return ManagedFileIdentity{}, ErrManagedRootsUnsupported
 }
 

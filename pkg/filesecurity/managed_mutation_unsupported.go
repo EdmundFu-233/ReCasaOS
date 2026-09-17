@@ -4,6 +4,7 @@ package filesecurity
 
 import (
 	"io/fs"
+	"os"
 )
 
 type ManagedWritableFile struct{}
@@ -21,5 +22,9 @@ func (m *ManagedRoots) AcquireMutation() (func(), error) {
 }
 
 func (m *ManagedRoots) CreateExclusive(string, fs.FileMode) (*ManagedWritableFile, error) {
+	return nil, ErrManagedRootsUnsupported
+}
+
+func (m *ManagedRoots) CreateExclusiveIn(*os.File, string, fs.FileMode) (*ManagedWritableFile, error) {
 	return nil, ErrManagedRootsUnsupported
 }

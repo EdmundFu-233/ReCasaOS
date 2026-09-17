@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"mime/multipart"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -37,6 +38,7 @@ type FileInfo struct {
 	chunkSize            int64
 	lastActivity         time.Time
 	roots                *filesecurity.ManagedRoots
+	stagingDirectory     *os.File
 	cleanupErr           error
 	completed            bool
 	completedAt          time.Time
@@ -337,12 +339,20 @@ func (s *FileUploadService) UploadFile(
 		cleanupErr := s.deleteUploadSession(key, fileInfo, true)
 		return errors.Join(changedServiceUploadErrorIf(namespaceMayHaveChanged, "target parent created before upload staging creation failed", err), cleanupErr)
 	}
+	stagingDirectory, err := fileInfo.ensureStagingDirectory()
+	if err != nil {
+		fileInfo.init = false
+		fileInfo.lock.Unlock()
+		cleanupErr := s.deleteUploadSession(key, fileInfo, true)
+		return errors.Join(changedServiceUploadErrorIf(namespaceMayHaveChanged, "upload staging directory could not be pinned", err), cleanupErr)
+	}
 	fileInfo.stagingClean = false
 	fileInfo.lastActivity = time.Now()
 	chunkIndex := int(chunkNumber - 1)
+	chunkName := strconv.FormatInt(chunkNumber, 10)
 	reconciled := false
 	if fileInfo.uploaded[chunkIndex] {
-		reconciled, err = reconcileRecordedServiceChunk(fileInfo, chunkIndex, roots, chunkPath, currentChunkSize)
+		reconciled, err = reconcileRecordedServiceChunk(fileInfo, chunkIndex, stagingDirectory, chunkName, currentChunkSize)
 		if err != nil {
 			fileInfo.lock.Unlock()
 			return changedServiceUploadErrorIf(namespaceMayHaveChanged || hadPublishedChunks, "upload namespace changed before recorded chunk reconciliation failed", err)
@@ -368,7 +378,7 @@ func (s *FileUploadService) UploadFile(
 		var writeResult serviceChunkWriteResult
 		writeResult, writeErr = func() (serviceChunkWriteResult, error) {
 			defer chunkSpaceRelease()
-			return writeValidatedServiceChunk(roots, chunkPath, source, currentChunkSize)
+			return writeValidatedServiceChunkIn(roots, stagingDirectory, chunkName, source, currentChunkSize)
 		}()
 		if writeErr != nil && !writeResult.Published {
 			fileInfo.lock.Unlock()
@@ -457,6 +467,37 @@ func (s *FileUploadService) makeUploadDirectory(roots *filesecurity.ManagedRoots
 	return s.mkdirAll(roots, path, mode)
 }
 
+// ensureStagingDirectory pins the session staging directory once and reuses
+// that descriptor for every later chunk, reconciliation, and assembly name
+// lookup. The caller must hold fileInfo.lock.
+func (fileInfo *FileInfo) ensureStagingDirectory() (*os.File, error) {
+	if fileInfo == nil || fileInfo.roots == nil {
+		return nil, errors.New("management file roots are unavailable")
+	}
+	if fileInfo.stagingDirectory != nil {
+		return fileInfo.stagingDirectory, nil
+	}
+	if fileInfo.tempDir == "" {
+		return nil, errors.New("upload staging directory is unavailable")
+	}
+	directory, err := fileInfo.roots.OpenDirectory(fileInfo.tempDir)
+	if err != nil {
+		return nil, fmt.Errorf("pin upload staging directory: %w", err)
+	}
+	fileInfo.stagingDirectory = directory
+	return directory, nil
+}
+
+// closeStagingDirectory releases the held staging descriptor once the session
+// is terminal. Cleanup remains pathname-based and retryable.
+func closeStagingDirectory(fileInfo *FileInfo) {
+	if fileInfo == nil || fileInfo.stagingDirectory == nil {
+		return
+	}
+	_ = fileInfo.stagingDirectory.Close()
+	fileInfo.stagingDirectory = nil
+}
+
 func sameServiceUploadNamespace(fileInfo *FileInfo, principalID int, roots *filesecurity.ManagedRoots, basePath, targetPath, targetRelative string) bool {
 	return fileInfo != nil && fileInfo.principalID == principalID && fileInfo.roots == roots &&
 		fileInfo.base == basePath && fileInfo.targetPath == targetPath &&
@@ -521,6 +562,7 @@ func (s *FileUploadService) cleanupExpiredUploads(now time.Time) {
 		completed := fileInfo.completed
 		fileInfo.lock.Unlock()
 		if terminal && s.uploadStatus[key] == fileInfo {
+			closeStagingDirectory(fileInfo)
 			cleanupErr := s.removeUploadTree(fileInfo.tempDir)
 			if cleanupErr != nil {
 				if requestChanged {
@@ -593,6 +635,7 @@ func (s *FileUploadService) deleteUploadSession(key string, fileInfo *FileInfo, 
 		// Remove the generation's staging directory before making the key
 		// available to a new session. Otherwise late cleanup could delete the
 		// replacement session's chunks.
+		closeStagingDirectory(fileInfo)
 		cleanupErr := s.removeUploadTree(fileInfo.tempDir)
 		if cleanupErr != nil {
 			if requestChanged {
@@ -758,6 +801,16 @@ func writeValidatedServiceChunk(roots *filesecurity.ManagedRoots, destination st
 	return writeValidatedServiceChunkTo(out, source, expectedSize, filesecurity.MaxUploadChunkSize)
 }
 
+// writeValidatedServiceChunkIn is writeValidatedServiceChunk for a chunk name
+// resolved beneath the session's held staging descriptor.
+func writeValidatedServiceChunkIn(roots *filesecurity.ManagedRoots, directory *os.File, name string, source io.ReadCloser, expectedSize int64) (serviceChunkWriteResult, error) {
+	out, err := roots.CreateExclusiveIn(directory, name, 0o600)
+	if err != nil {
+		return serviceChunkWriteResult{}, errors.Join(err, source.Close())
+	}
+	return writeValidatedServiceChunkTo(out, source, expectedSize, filesecurity.MaxUploadChunkSize)
+}
+
 func writeValidatedServiceChunkTo(out serviceChunkWriter, source io.ReadCloser, expectedSize, limit int64) (result serviceChunkWriteResult, resultErr error) {
 	writerFinished := false
 	defer func() {
@@ -793,19 +846,22 @@ func writeValidatedServiceChunkTo(out serviceChunkWriter, source io.ReadCloser, 
 	return result, nil
 }
 
-func reconcileRecordedServiceChunk(fileInfo *FileInfo, chunkIndex int, roots *filesecurity.ManagedRoots, chunkPath string, expectedSize int64) (bool, error) {
+func reconcileRecordedServiceChunk(fileInfo *FileInfo, chunkIndex int, directory *os.File, chunkName string, expectedSize int64) (bool, error) {
 	if fileInfo == nil || chunkIndex < 0 || chunkIndex >= len(fileInfo.uploaded) || !fileInfo.uploaded[chunkIndex] {
 		return false, nil
+	}
+	if fileInfo.roots == nil {
+		return false, errors.New("management file roots are unavailable")
 	}
 	if len(fileInfo.chunkDigests) != len(fileInfo.uploaded) {
 		return false, fmt.Errorf("invalid upload digest state")
 	}
-	release, err := roots.AcquireMutation()
+	release, err := fileInfo.roots.AcquireMutation()
 	if err != nil {
 		return false, err
 	}
 	defer release()
-	chunk, err := roots.OpenRegular(chunkPath)
+	chunk, err := fileInfo.roots.OpenRegularIn(directory, chunkName)
 	if errors.Is(err, fs.ErrNotExist) {
 		fileInfo.uploaded[chunkIndex] = false
 		fileInfo.chunkDigests[chunkIndex] = [sha256.Size]byte{}
@@ -878,15 +934,19 @@ func assembleServiceUpload(fileInfo *FileInfo) (result serviceAssemblyResult, re
 	if len(fileInfo.chunkDigests) != len(fileInfo.uploaded) {
 		return result, errors.New("invalid upload digest state")
 	}
+	directory, err := fileInfo.ensureStagingDirectory()
+	if err != nil {
+		return result, err
+	}
 	namespaceChanged := false
-	if err := fileInfo.roots.Remove(fileInfo.assemblyPath); err != nil {
+	if err := fileInfo.roots.RemoveIn(directory, ".complete"); err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
 			return result, err
 		}
 	} else {
 		namespaceChanged = true
 	}
-	out, err := fileInfo.roots.CreateExclusive(fileInfo.assemblyPath, 0o600)
+	out, err := fileInfo.roots.CreateExclusiveIn(directory, ".complete", 0o600)
 	if err != nil {
 		return result, changedServiceUploadErrorIf(namespaceChanged, "old upload assembly removed before recreation failed", err)
 	}
@@ -901,11 +961,8 @@ func assembleServiceUpload(fileInfo *FileInfo) (result serviceAssemblyResult, re
 	var totalWritten int64
 	completionDigest := sha256.New()
 	for chunkNumber := int64(1); chunkNumber <= fileInfo.totalChunks; chunkNumber++ {
-		chunkLocation, err := fileInfo.roots.MatchChild(fileInfo.base, filepath.Join(fileInfo.tempRelative, strconv.FormatInt(chunkNumber, 10)))
-		if err != nil {
-			return result, err
-		}
-		info, err := fileInfo.roots.Stat(chunkLocation.Canonical)
+		chunkName := strconv.FormatInt(chunkNumber, 10)
+		info, err := fileInfo.roots.StatDirectoryEntry(directory, chunkName)
 		if err != nil {
 			return result, err
 		}
@@ -913,7 +970,7 @@ func assembleServiceUpload(fileInfo *FileInfo) (result serviceAssemblyResult, re
 			return result, fmt.Errorf("invalid upload chunk %d", chunkNumber)
 		}
 
-		chunk, err := fileInfo.roots.OpenRegular(chunkLocation.Canonical)
+		chunk, err := fileInfo.roots.OpenRegularIn(directory, chunkName)
 		if err != nil {
 			return result, err
 		}
@@ -967,7 +1024,7 @@ func assembleServiceUpload(fileInfo *FileInfo) (result serviceAssemblyResult, re
 			return result, err
 		}
 	}
-	identity, err := fileInfo.roots.CommitNoReplaceWithExpectedIdentityAndDigest(fileInfo.assemblyPath, fileInfo.targetPath, assemblyIdentity, result.Digest)
+	identity, err := fileInfo.roots.CommitNoReplaceWithExpectedIdentityAndDigestIn(directory, ".complete", fileInfo.targetPath, assemblyIdentity, result.Digest)
 	result.Identity = identity
 	if err != nil {
 		result.TargetPublished = filesecurity.ManagedMutationChanged(err)

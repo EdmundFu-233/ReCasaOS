@@ -25,6 +25,7 @@ const (
 	managedResolvePolicy                        = unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_SYMLINKS
 	managedRootDescriptorName                   = "<managed-root>"
 	managedOpenedPathDescriptorName             = "<managed-opened-path>"
+	managedHeldChildDescriptorName              = "<managed-held-child>"
 	managedDirectoryEntryDescriptorName         = "<managed-directory-entry>"
 	managedTemporaryDescriptorName              = "<managed-temporary>"
 	managedRemovalDirectoryDescriptorName       = "<managed-removal-directory>"
@@ -239,6 +240,39 @@ func (m *ManagedRoots) OpenRegular(absolutePath string) (*os.File, error) {
 	opened, err := m.open(absolutePath, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOCTTY, 0)
 	if err != nil {
 		return nil, err
+	}
+	if err := validateManagedOpenedFile(opened, false); err != nil {
+		_ = opened.Close()
+		return nil, err
+	}
+	return opened, nil
+}
+
+// OpenRegularIn opens an existing regular child of an already-opened managed
+// directory. The name is resolved relative to the held descriptor, so it stays
+// bound to the directory inode that was validated when the descriptor was
+// obtained.
+func (m *ManagedRoots) OpenRegularIn(directory *os.File, name string) (*os.File, error) {
+	if m == nil {
+		return nil, ErrManagedPathOutsideRoots
+	}
+	if err := validateManagedHeldDirectory(directory); err != nil {
+		return nil, err
+	}
+	if err := ValidatePathComponent(name); err != nil {
+		return nil, err
+	}
+	fd, err := unix.Openat2(int(directory.Fd()), name, &unix.OpenHow{
+		Flags:   unix.O_RDONLY | unix.O_NONBLOCK | unix.O_NOCTTY | unix.O_CLOEXEC | unix.O_NOFOLLOW,
+		Resolve: managedResolvePolicy,
+	})
+	if err != nil {
+		return nil, classifyManagedResolutionError(err)
+	}
+	opened := os.NewFile(uintptr(fd), managedHeldChildDescriptorName)
+	if opened == nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("open managed path")
 	}
 	if err := validateManagedOpenedFile(opened, false); err != nil {
 		_ = opened.Close()
@@ -571,6 +605,45 @@ func (m *ManagedRoots) Remove(absolutePath string) error {
 		return fmt.Errorf("%w: refusing to remove a mount boundary", ErrUnsafePath)
 	}
 	return m.unlinkManagedNameAndSync(parentFD, base, 0, "sync removed managed entry parent", true)
+}
+
+// RemoveIn removes one non-directory entry relative to an already-opened
+// managed directory, refusing to cross a mount boundary.
+func (m *ManagedRoots) RemoveIn(directory *os.File, name string) error {
+	if m == nil {
+		return ErrManagedPathOutsideRoots
+	}
+	if err := validateManagedHeldDirectory(directory); err != nil {
+		return err
+	}
+	if err := ValidatePathComponent(name); err != nil {
+		return err
+	}
+	release, err := m.AcquireMutation()
+	if err != nil {
+		return err
+	}
+	defer release()
+	directoryFD := int(directory.Fd())
+	parentMountID, err := managedMountIDAt(directoryFD, "", unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
+	if err != nil {
+		return err
+	}
+	targetMountID, err := managedMountIDAt(directoryFD, name, unix.AT_SYMLINK_NOFOLLOW)
+	if err != nil {
+		return err
+	}
+	if targetMountID != parentMountID {
+		return fmt.Errorf("%w: refusing to remove a mount boundary", ErrUnsafePath)
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstatat(directoryFD, name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return classifyManagedResolutionError(err)
+	}
+	if stat.Mode&unix.S_IFMT == unix.S_IFDIR {
+		return fmt.Errorf("%w: refusing to remove a directory by name", ErrUnsafePath)
+	}
+	return m.unlinkManagedNameAndSync(directoryFD, name, 0, "sync removed managed directory entry", true)
 }
 
 // RemoveAll recursively removes an entry without following links. The
@@ -959,16 +1032,59 @@ func (m *ManagedRoots) commitNoReplaceWithExpectedIdentity(stagingPath, destinat
 	if err != nil {
 		return identity, err
 	}
-	destinationRoot, destinationLocation, err := m.resolveLocked(destinationPath)
-	if err != nil {
-		return identity, err
-	}
-
 	source, err := openManagedAt(stagingRoot, stagingLocation, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOCTTY, 0)
 	if err != nil {
 		return identity, err
 	}
 	defer source.Close()
+	stagingParentFD, stagingBase, err := openManagedParent(stagingRoot, stagingLocation)
+	if err != nil {
+		return identity, err
+	}
+	defer unix.Close(stagingParentFD)
+	stagingParentLocation, err := m.matchLocked(filepath.Dir(stagingLocation.Canonical))
+	if err != nil {
+		return identity, err
+	}
+	if err := m.validateManagedDestinationFD(stagingRoot, stagingParentFD, stagingParentLocation); err != nil {
+		return identity, err
+	}
+	return m.commitNoReplaceFromPinnedStaging(stagingParentFD, stagingBase, source, destinationPath, expected, expectedDigest)
+}
+
+// CommitNoReplaceWithExpectedIdentityAndDigestIn is the held-directory form of
+// CommitNoReplaceWithExpectedIdentityAndDigest. The staged file is resolved
+// relative to an already-opened managed directory, so replacing the staging
+// directory pathname cannot redirect the publication.
+func (m *ManagedRoots) CommitNoReplaceWithExpectedIdentityAndDigestIn(stagingDirectory *os.File, stagingName, destinationPath string, expected ManagedFileIdentity, expectedDigest [sha256.Size]byte) (ManagedFileIdentity, error) {
+	if m == nil {
+		return ManagedFileIdentity{}, ErrManagedPathOutsideRoots
+	}
+	if err := validateManagedHeldDirectory(stagingDirectory); err != nil {
+		return ManagedFileIdentity{}, err
+	}
+	if err := ValidatePathComponent(stagingName); err != nil {
+		return ManagedFileIdentity{}, err
+	}
+	release, err := m.AcquireMutation()
+	if err != nil {
+		return ManagedFileIdentity{}, err
+	}
+	defer release()
+	stagingParentFD, err := unix.Dup(int(stagingDirectory.Fd()))
+	if err != nil {
+		return ManagedFileIdentity{}, err
+	}
+	defer unix.Close(stagingParentFD)
+	source, err := m.OpenRegularIn(stagingDirectory, stagingName)
+	if err != nil {
+		return ManagedFileIdentity{}, err
+	}
+	defer source.Close()
+	return m.commitNoReplaceFromPinnedStaging(stagingParentFD, stagingName, source, destinationPath, &expected, &expectedDigest)
+}
+
+func (m *ManagedRoots) commitNoReplaceFromPinnedStaging(stagingParentFD int, stagingBase string, source *os.File, destinationPath string, expected *ManagedFileIdentity, expectedDigest *[sha256.Size]byte) (identity ManagedFileIdentity, resultErr error) {
 	if err := validateManagedOpenedFile(source, false); err != nil {
 		return identity, err
 	}
@@ -985,22 +1101,14 @@ func (m *ManagedRoots) commitNoReplaceWithExpectedIdentity(stagingPath, destinat
 	if stagingBefore.Size < 0 || stagingBefore.Size > MaxUploadTotalSize {
 		return identity, fmt.Errorf("upload staging file exceeds %d bytes", MaxUploadTotalSize)
 	}
-	stagingParentFD, stagingBase, err := openManagedParent(stagingRoot, stagingLocation)
-	if err != nil {
-		return identity, err
-	}
-	defer unix.Close(stagingParentFD)
-	stagingParentLocation, err := m.matchLocked(filepath.Dir(stagingLocation.Canonical))
-	if err != nil {
-		return identity, err
-	}
-	if err := m.validateManagedDestinationFD(stagingRoot, stagingParentFD, stagingParentLocation); err != nil {
-		return identity, err
-	}
 	if err := verifyManagedNameIdentity(stagingParentFD, stagingBase, &stagingBefore); err != nil {
 		return identity, err
 	}
 
+	destinationRoot, destinationLocation, err := m.resolveLocked(destinationPath)
+	if err != nil {
+		return identity, err
+	}
 	parentFD, destinationBase, err := openManagedParent(destinationRoot, destinationLocation)
 	if err != nil {
 		return identity, err
