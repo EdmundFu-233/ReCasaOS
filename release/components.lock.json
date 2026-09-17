@@ -6,8 +6,8 @@
       "name": "app-management",
       "state": "locked",
       "source_repository": "https://github.com/EdmundFu-233/ReCasaOS-AppManagement",
-      "source_revision": "7220742a404508fd6bc497f279d915c4e1b45dd9",
-      "artifact_sha256": "f5bef01300612ba15304f32db25e948f3cd7ff0e2c49a48de9bcaa539685fbfc",
+      "source_revision": "6fe9af7111653d041d65460b19b61f1cdf7f0673",
+      "artifact_sha256": "130888db8def7543f7e18aa9f953e145044a58cd820a6a135000fe61850b0cb6",
       "license": "Apache-2.0",
       "api_schema": "appmanagement-openapi-v2",
       "compatibility_status": "passed"
@@ -16,8 +16,8 @@
       "name": "gateway",
       "state": "locked",
       "source_repository": "https://github.com/EdmundFu-233/ReCasaOS-Gateway",
-      "source_revision": "d4ac7e7d60f59dc70e0d6e2761e6193eb2109be6",
-      "artifact_sha256": "cfb9619676a422006ca41c0c4d49283e03e3dc469188cdfcdcfcb198a7f2d103",
+      "source_revision": "ba42b100337ee42c00c3dad1d49caf1450596064",
+      "artifact_sha256": "43ad618d153c704c3358ed587d3c4a620fd915638a35511a9bf46a2b22d97d09",
       "license": "Apache-2.0",
       "api_schema": "gateway-openapi-v1",
       "compatibility_status": "passed"
@@ -26,8 +26,8 @@
       "name": "user-service",
       "state": "locked",
       "source_repository": "https://github.com/EdmundFu-233/ReCasaOS-UserService",
-      "source_revision": "a65f40b1331f5986ab8b35d78802c40981d81a93",
-      "artifact_sha256": "1434a76438ee4d2c4eb436e739537be139b2cc3d7642d89aa3a6040dd81f6c94",
+      "source_revision": "6781a48cc1dcf34a676f4a1a43d936b01a55f93c",
+      "artifact_sha256": "573139f2f2e4480483cdc7dce851ea42f85443fadea04ac3ed7ea26f5b8cebe3",
       "license": "Apache-2.0",
       "api_schema": "user-service-openapi-v2",
       "compatibility_status": "passed"
@@ -36,8 +36,8 @@
       "name": "message-bus",
       "state": "locked",
       "source_repository": "https://github.com/EdmundFu-233/ReCasaOS-MessageBus",
-      "source_revision": "ba87168fcfa4ac5ff7a114f66a139eb5fe427646",
-      "artifact_sha256": "28c1c8349cfa85129e95f083213acb1297ef96ad5ddded5b51acae6d51541e55",
+      "source_revision": "f6666910c8c634c7529c2c47bcb1edc6df4ca92d",
+      "artifact_sha256": "01204e8f4482d6afa56925a4f4fdad727e6d43f5c103b482d1fdb3b61924802d",
       "license": "Apache-2.0",
       "api_schema": "messagebus-openapi-v2",
       "compatibility_status": "passed"
