@@ -13,8 +13,8 @@ preserving compatibility where that does not weaken the security boundary.
 
 ## Current status
 
-**v0.5.0 is released** at
-[EdmundFu-233/ReCasaOS v0.5.0](https://github.com/EdmundFu-233/ReCasaOS/releases/tag/v0.5.0).
+**v0.5.2 is released** at
+[EdmundFu-233/ReCasaOS v0.5.2](https://github.com/EdmundFu-233/ReCasaOS/releases/tag/v0.5.2).
 All six required components are locked in
 [`release/components.lock.json`](release/components.lock.json) with immutable
 source revisions, artifact digests, licenses, API/schema versions, and passed
@@ -56,9 +56,19 @@ Do not use `get.casaos.io` install or update scripts. Those scripts are
 controlled by the upstream CasaOS project and do not install the fixes in
 this fork.
 
+v0.5.2 extends the v0.5.0 hardening: root `casaos.conf` persistence and
+Samba configuration publishes now use the descriptor-pinned atomic
+replacement, the Samba compare-and-swap publisher resolves every staging,
+read, exchange, rollback, quarantine, and cleanup operation against one
+pinned config-directory descriptor, and each v2 resumable upload session
+holds its staging directory descriptor across chunk writes, assembly, and
+the final target commit instead of re-resolving the staging path per call.
+The `v0.5.1` version was tagged during preparation, but its draft release
+was withdrawn before publication: no v0.5.1 release exists.
+
 The full administrative dashboard is still **not ready for unrestricted
 Internet exposure**. Keep it on a private management network or mesh VPN,
-even at v0.5.0: post-release hardening continues on `main` (tracked in
+even at v0.5.2: post-release hardening continues on `main` (tracked in
 [Issues](https://github.com/EdmundFu-233/ReCasaOS/issues)), and an
 independent penetration test has not been performed.
 
