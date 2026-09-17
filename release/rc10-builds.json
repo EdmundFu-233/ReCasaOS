@@ -1,0 +1,39 @@
+{
+  "rc": "v0.5.3+gateway-service-credential",
+  "date": "2026-09-17",
+  "build_flags": "CGO_ENABLED=0, -trimpath, -tags netgo osusergo, -ldflags \"-X main.commit=<sha> -X main.date=2026-09-17 -s -w\"; darwin cross-compile to linux. Each build ran from a checkout at the exact source_revision so the embedded VCS revision matches the ldflags commit; gateway rebuilt twice byte-identical, app-management and message-bus confirmed byte-identical on rebuild from their merge commits.",
+  "binaries": [
+    {
+      "component": "gateway",
+      "source_revision": "ba42b100337ee42c00c3dad1d49caf1450596064",
+      "file": "gateway4-linux-arm64",
+      "sha256": "43ad618d153c704c3358ed587d3c4a620fd915638a35511a9bf46a2b22d97d09",
+      "note": "gateway service credential (gateway.token), service/self route non-persistence and lease exemption, refresh-issuer rejection, atomic owner-only runtime files; local race suites green; no component CI lane in this repo"
+    },
+    {
+      "component": "user-service",
+      "source_revision": "6781a48cc1dcf34a676f4a1a43d936b01a55f93c",
+      "file": "userservice5-linux-arm64",
+      "sha256": "573139f2f2e4480483cdc7dce851ea42f85443fadea04ac3ed7ea26f5b8cebe3",
+      "note": "gateway service-credential client plus VM lifecycle stub that publishes gateway.token and requires the bearer; full CI green including the Debian 247 systemd lifecycle lane"
+    },
+    {
+      "component": "app-management",
+      "source_revision": "6fe9af7111653d041d65460b19b61f1cdf7f0673",
+      "file": "appmgmt3-linux-arm64",
+      "sha256": "130888db8def7543f7e18aa9f953e145044a58cd820a6a135000fe61850b0cb6",
+      "note": "gateway service-credential client; local full race suite green except the pre-existing Docker-daemon-dependent pkg/docker lane (no daemon on this host)"
+    },
+    {
+      "component": "message-bus",
+      "source_revision": "f6666910c8c634c7529c2c47bcb1edc6df4ca92d",
+      "file": "msgbus2-linux-arm64",
+      "sha256": "01204e8f4482d6afa56925a4f4fdad727e6d43f5c103b482d1fdb3b61924802d",
+      "note": "gateway service-credential client; local full race suite green"
+    }
+  ],
+  "compatibility": {
+    "check": "no API/OpenAPI change: the four components adopt the same bearer-authenticated management client against the new gateway; gateway accepts its per-start token as an alternative credential with a dedicated service owner, wrong tokens answer 401, and the legacy-route adoption is limited to service identities. Root repo adds pkg/gatewayclient with redirect/refusal, symlink, rotation, and bounds tests. Full local race suites green in all five repos; UserService exact-head CI (incl. Debian VM lifecycle lane) green.",
+    "result": "passed"
+  }
+}
