@@ -183,8 +183,13 @@ func TestPublishedChunkSyncFailureIsRecordedAndRetryReconciles(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer roots.Close()
-	fileInfo := &FileInfo{uploaded: []bool{true}, chunkDigests: [][sha256.Size]byte{result.Digest}, uploadedChunkNum: 1}
-	reconciled, err := reconcileRecordedServiceChunk(fileInfo, 0, roots, target, result.Written)
+	directory, err := roots.OpenDirectory(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directory.Close()
+	fileInfo := &FileInfo{uploaded: []bool{true}, chunkDigests: [][sha256.Size]byte{result.Digest}, uploadedChunkNum: 1, roots: roots}
+	reconciled, err := reconcileRecordedServiceChunk(fileInfo, 0, directory, "chunk", result.Written)
 	if err != nil || !reconciled {
 		t.Fatalf("recorded retry reconciliation = %t, %v", reconciled, err)
 	}
@@ -217,6 +222,7 @@ func TestAssembleServiceUploadPreservesOldAssemblyRemovalOnLaterFailure(t *testi
 		uploaded:       []bool{true},
 		chunkDigests:   make([][sha256.Size]byte, 1),
 		base:           root,
+		tempDir:        tempDir,
 		targetPath:     filepath.Join(root, "target"),
 		targetRelative: "target",
 		tempRelative:   tempRelative,
@@ -255,6 +261,7 @@ func TestAssembleServiceUploadRejectsAssemblyReplacementBeforeCommit(t *testing.
 		uploaded:       []bool{true},
 		chunkDigests:   [][sha256.Size]byte{sha256.Sum256([]byte("safe"))},
 		base:           root,
+		tempDir:        tempDir,
 		targetPath:     target,
 		targetRelative: "target",
 		tempRelative:   tempRelative,
@@ -686,6 +693,86 @@ func TestV2UploadSessionRejectsSameTargetThroughDifferentBaseBeforeMutation(t *t
 	}
 	if !session.lastActivity.Equal(activityBeforeProbe) {
 		t.Fatal("alias chunk probe refreshed the existing upload session TTL")
+	}
+}
+
+func TestV2UploadHeldStagingDirectorySurvivesPathSwap(t *testing.T) {
+	root := t.TempDir()
+	roots, err := filesecurity.OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	upload := NewFileUploadService()
+	upload.managementRoots = func() (*filesecurity.ManagedRoots, error) { return roots, nil }
+	upload.removeTree = os.RemoveAll
+
+	const principalID = 7
+	const identifier = "held-staging-swap"
+	const relativePath = "held-target.bin"
+	const fileName = "held-target.bin"
+	targetPath := filepath.Join(root, relativePath)
+
+	if err := upload.UploadFile(
+		nil,
+		principalID,
+		root,
+		1,
+		1,
+		1,
+		2,
+		2,
+		identifier,
+		relativePath,
+		fileName,
+		multipartFileHeader(t, fileName, "a"),
+	); err != nil {
+		t.Fatalf("first chunk: %v", err)
+	}
+	key := boundUploadIdentifier(principalID, identifier, targetPath)
+	session := upload.uploadStatus[key]
+	if session == nil {
+		t.Fatal("session missing after first chunk")
+	}
+	session.lock.Lock()
+	tempDir := session.tempDir
+	held := session.stagingDirectory
+	session.lock.Unlock()
+	if held == nil {
+		t.Fatal("session did not pin its staging directory")
+	}
+
+	// Swap the staging pathname after the session pinned its descriptor and
+	// plant a decoy chunk where pathname-based assembly would read it.
+	if err := os.Rename(tempDir, tempDir+".held"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(tempDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, "2"), []byte("Z"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := upload.UploadFile(
+		nil,
+		principalID,
+		root,
+		2,
+		1,
+		1,
+		2,
+		2,
+		identifier,
+		relativePath,
+		fileName,
+		multipartFileHeader(t, fileName, "b"),
+	); err != nil {
+		t.Fatalf("completing chunk after staging path swap: %v", err)
+	}
+	data, err := os.ReadFile(targetPath)
+	if err != nil || string(data) != "ab" {
+		t.Fatalf("published target = %q, %v", data, err)
 	}
 }
 

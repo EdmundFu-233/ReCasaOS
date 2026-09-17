@@ -247,6 +247,55 @@ func (m *ManagedRoots) CreateExclusive(absolutePath string, permission fs.FileMo
 		unix.Close(parentFD)
 		return nil, err
 	}
+	success, err := m.createExclusiveAt(parentFD, destinationName, permission, release)
+	if err != nil {
+		return nil, err
+	}
+	succeeded = true
+	return success, nil
+}
+
+// CreateExclusiveIn creates an unpublished destination-local staging inode
+// beneath an already-opened managed directory and holds the mutation lease for
+// the complete write lifetime. Every name lookup stays relative to the held
+// descriptor, so replacing the directory's pathname cannot redirect the write;
+// Close publishes the requested name with a same-descriptor rename.
+func (m *ManagedRoots) CreateExclusiveIn(directory *os.File, name string, permission fs.FileMode) (*ManagedWritableFile, error) {
+	if m == nil {
+		return nil, ErrManagedPathOutsideRoots
+	}
+	if permission.Perm() == 0 || permission&^fs.ModePerm != 0 {
+		return nil, fmt.Errorf("invalid managed file permissions")
+	}
+	if err := validateManagedHeldDirectory(directory); err != nil {
+		return nil, err
+	}
+	if err := ValidatePathComponent(name); err != nil {
+		return nil, err
+	}
+	release, err := m.AcquireMutation()
+	if err != nil {
+		return nil, err
+	}
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			release()
+		}
+	}()
+	parentFD, err := unix.Dup(int(directory.Fd()))
+	if err != nil {
+		return nil, err
+	}
+	success, err := m.createExclusiveAt(parentFD, name, permission, release)
+	if err != nil {
+		return nil, err
+	}
+	succeeded = true
+	return success, nil
+}
+
+func (m *ManagedRoots) createExclusiveAt(parentFD int, destinationName string, permission fs.FileMode, release func()) (*ManagedWritableFile, error) {
 	var existing unix.Stat_t
 	if err := unix.Fstatat(parentFD, destinationName, &existing, unix.AT_SYMLINK_NOFOLLOW); err == nil {
 		unix.Close(parentFD)
@@ -266,8 +315,6 @@ func (m *ManagedRoots) CreateExclusive(absolutePath string, permission fs.FileMo
 		parentCloseErr := unix.Close(parentFD)
 		return nil, errors.Join(err, closeErr, cleanupErr, parentCloseErr)
 	}
-
-	succeeded = true
 	return &ManagedWritableFile{
 		roots:           m,
 		file:            temporary,
@@ -276,4 +323,18 @@ func (m *ManagedRoots) CreateExclusive(absolutePath string, permission fs.FileMo
 		destinationName: destinationName,
 		release:         release,
 	}, nil
+}
+
+func validateManagedHeldDirectory(directory *os.File) error {
+	if directory == nil {
+		return ErrUnsafePath
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(directory.Fd()), &stat); err != nil {
+		return err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return fmt.Errorf("%w: held managed descriptor is not a directory", ErrUnsafePath)
+	}
+	return nil
 }
