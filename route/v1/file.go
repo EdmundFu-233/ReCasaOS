@@ -983,7 +983,10 @@ type v1UploadSession struct {
 	completionIdentity filesecurity.ManagedFileIdentity
 	completionErr      error
 	stagingClean       bool
+	roots              *filesecurity.ManagedRoots
 	stagingDirectory   *os.File
+	stagingParent      *os.File
+	stagingName        string
 }
 
 type v1UploadAssemblyResult struct {
@@ -1112,8 +1115,7 @@ func (r *v1UploadSessionRegistry) finishSession(key string, session *v1UploadSes
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.sessions[key] == session {
-		closeV1StagingDirectory(session)
-		cleanupErr := r.removeUploadTree(session.tempDir)
+		cleanupErr := r.cleanupStaging(session)
 		if cleanupErr != nil {
 			if requestChanged {
 				cleanupErr = changedV1UploadError("upload staging cleanup remains incomplete", cleanupErr)
@@ -1161,8 +1163,7 @@ func (r *v1UploadSessionRegistry) cleanup(now time.Time) {
 		requestChanged := completed || filesecurity.ManagedMutationChanged(session.cleanupErr)
 		session.lock.Unlock()
 		if terminal && r.sessions[key] == session {
-			closeV1StagingDirectory(session)
-			cleanupErr := r.removeUploadTree(session.tempDir)
+			cleanupErr := r.cleanupStaging(session)
 			if cleanupErr != nil {
 				if requestChanged {
 					cleanupErr = changedV1UploadError("upload staging cleanup remains incomplete", cleanupErr)
@@ -1206,9 +1207,9 @@ func sameV1UploadMetadata(session *v1UploadSession, paths v1UploadPaths, totalCh
 		session.totalChunks == totalChunks
 }
 
-// ensureV1StagingDirectory pins the session staging directory once and reuses
-// that descriptor for every later chunk publication, chunk-set probe, and
-// assembly name lookup. The caller must hold session.lock.
+// ensureV1StagingDirectory pins the session staging directory and its parent
+// once and reuses those descriptors for every later chunk publication,
+// chunk-set probe, and assembly name lookup. The caller must hold session.lock.
 func (session *v1UploadSession) ensureV1StagingDirectory(roots *filesecurity.ManagedRoots) (*os.File, error) {
 	if session == nil || roots == nil {
 		return nil, errors.New("management file roots are unavailable")
@@ -1219,22 +1220,55 @@ func (session *v1UploadSession) ensureV1StagingDirectory(roots *filesecurity.Man
 	if session.tempDir == "" {
 		return nil, errors.New("upload staging directory is unavailable")
 	}
+	parent, err := roots.OpenDirectory(filepath.Dir(session.tempDir))
+	if err != nil {
+		return nil, fmt.Errorf("pin upload staging parent: %w", err)
+	}
 	directory, err := roots.OpenDirectory(session.tempDir)
 	if err != nil {
+		_ = parent.Close()
 		return nil, fmt.Errorf("pin upload staging directory: %w", err)
 	}
+	session.roots = roots
+	session.stagingParent = parent
+	session.stagingName = filepath.Base(session.tempDir)
 	session.stagingDirectory = directory
 	return directory, nil
 }
 
-// closeV1StagingDirectory releases the held staging descriptor once the
-// session is terminal. Cleanup remains pathname-based and retryable.
+// closeV1StagingDirectory releases the held staging descriptors once the
+// session is terminal or its staging has been removed.
 func closeV1StagingDirectory(session *v1UploadSession) {
-	if session == nil || session.stagingDirectory == nil {
+	if session == nil {
 		return
 	}
-	_ = session.stagingDirectory.Close()
-	session.stagingDirectory = nil
+	if session.stagingDirectory != nil {
+		_ = session.stagingDirectory.Close()
+		session.stagingDirectory = nil
+	}
+	if session.stagingParent != nil {
+		_ = session.stagingParent.Close()
+		session.stagingParent = nil
+	}
+	session.stagingName = ""
+}
+
+// cleanupStaging removes the session staging tree. When the session holds its
+// staging descriptors, removal is bound to the directory inode the session
+// created; a replaced name fails closed and keeps the descriptors for a later
+// retry instead of recursively deleting the replacement.
+func (r *v1UploadSessionRegistry) cleanupStaging(session *v1UploadSession) error {
+	if session == nil {
+		return nil
+	}
+	if session.stagingParent != nil && session.stagingDirectory != nil && session.roots != nil {
+		if err := session.roots.RemoveHeldTree(session.stagingParent, session.stagingDirectory, session.stagingName); err != nil {
+			return err
+		}
+		closeV1StagingDirectory(session)
+		return nil
+	}
+	return r.removeUploadTree(session.tempDir)
 }
 
 func (r *v1UploadSessionRegistry) pruneCompletedLocked(now time.Time) {

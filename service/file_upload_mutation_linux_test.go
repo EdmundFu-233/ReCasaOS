@@ -774,6 +774,16 @@ func TestV2UploadHeldStagingDirectorySurvivesPathSwap(t *testing.T) {
 	if err != nil || string(data) != "ab" {
 		t.Fatalf("published target = %q, %v", data, err)
 	}
+	// Cleanup is bound to the pinned inode: the swapped replacement must be
+	// preserved rather than recursively deleted, and the original held tree
+	// remains for operator review.
+	decoy, err := os.ReadFile(filepath.Join(tempDir, "2"))
+	if err != nil || string(decoy) != "Z" {
+		t.Fatalf("cleanup deleted the swapped staging replacement: %q, %v", decoy, err)
+	}
+	if _, err := os.Stat(filepath.Join(tempDir+".held", ".complete")); err != nil {
+		t.Fatalf("held staging tree was not preserved: %v", err)
+	}
 }
 
 func multipartFileHeader(t *testing.T, name, contents string) *multipart.FileHeader {

@@ -88,6 +88,148 @@ func TestHeldDirectoryOperationsSurvivePathSwap(t *testing.T) {
 	}
 }
 
+func TestRemoveHeldTreeRemovesOnlyTheHeldInode(t *testing.T) {
+	roots, root := openHeldDirectoryTestRoots(t)
+	parentPath := filepath.Join(root, "parent")
+	if err := os.Mkdir(parentPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sessionPath := filepath.Join(parentPath, "session")
+	if err := os.MkdirAll(filepath.Join(sessionPath, "nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessionPath, "1"), []byte("chunk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessionPath, "nested", "2"), []byte("chunk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := roots.OpenDirectory(parentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	held, err := roots.OpenDirectory(sessionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+
+	if err := roots.RemoveHeldTree(parent, held, "session"); err != nil {
+		t.Fatalf("remove held tree: %v", err)
+	}
+	entries, err := os.ReadDir(parentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("held tree removal left residue: %#v", entries)
+	}
+}
+
+func TestRemoveHeldTreeFailsClosedOnNameReplacement(t *testing.T) {
+	roots, root := openHeldDirectoryTestRoots(t)
+	parentPath := filepath.Join(root, "parent")
+	if err := os.Mkdir(parentPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sessionPath := filepath.Join(parentPath, "session")
+	if err := os.Mkdir(sessionPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessionPath, "1"), []byte("chunk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := roots.OpenDirectory(parentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	held, err := roots.OpenDirectory(sessionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+
+	if err := os.Rename(sessionPath, sessionPath+".original"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(sessionPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessionPath, "decoy"), []byte("decoy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := roots.RemoveHeldTree(parent, held, "session"); !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("replaced name removal error = %v, want ErrUnsafePath", err)
+	}
+	decoy, err := os.ReadFile(filepath.Join(sessionPath, "decoy"))
+	if err != nil || string(decoy) != "decoy" {
+		t.Fatalf("replacement was deleted: %q, %v", decoy, err)
+	}
+	original, err := os.ReadFile(filepath.Join(sessionPath+".original", "1"))
+	if err != nil || string(original) != "chunk" {
+		t.Fatalf("held tree was deleted: %q, %v", original, err)
+	}
+}
+
+func TestRemoveHeldTreeTreatsMissingNameAsRemoved(t *testing.T) {
+	roots, root := openHeldDirectoryTestRoots(t)
+	parentPath := filepath.Join(root, "parent")
+	if err := os.Mkdir(parentPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sessionPath := filepath.Join(parentPath, "session")
+	if err := os.Mkdir(sessionPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := roots.OpenDirectory(parentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	held, err := roots.OpenDirectory(sessionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	if err := os.Remove(sessionPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := roots.RemoveHeldTree(parent, held, "session"); err != nil {
+		t.Fatalf("missing name removal error = %v", err)
+	}
+}
+
+func TestRemoveHeldTreeRejectsNonDirectoryDescriptors(t *testing.T) {
+	roots, root := openHeldDirectoryTestRoots(t)
+	parentPath := filepath.Join(root, "parent")
+	if err := os.Mkdir(parentPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(parentPath, "file")
+	if err := os.WriteFile(filePath, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := roots.OpenDirectory(parentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	opened, err := roots.OpenRegular(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	if err := roots.RemoveHeldTree(parent, opened, "file"); !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("non-directory held descriptor error = %v, want ErrUnsafePath", err)
+	}
+	if err := roots.RemoveHeldTree(opened, parent, "file"); !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("non-directory parent descriptor error = %v, want ErrUnsafePath", err)
+	}
+}
+
 func TestHeldDirectoryCommitSurvivesStagingPathSwap(t *testing.T) {
 	roots, root := openHeldDirectoryTestRoots(t)
 	stagingPath := filepath.Join(root, "staging")

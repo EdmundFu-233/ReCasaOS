@@ -39,6 +39,8 @@ type FileInfo struct {
 	lastActivity         time.Time
 	roots                *filesecurity.ManagedRoots
 	stagingDirectory     *os.File
+	stagingParent        *os.File
+	stagingName          string
 	cleanupErr           error
 	completed            bool
 	completedAt          time.Time
@@ -467,9 +469,9 @@ func (s *FileUploadService) makeUploadDirectory(roots *filesecurity.ManagedRoots
 	return s.mkdirAll(roots, path, mode)
 }
 
-// ensureStagingDirectory pins the session staging directory once and reuses
-// that descriptor for every later chunk, reconciliation, and assembly name
-// lookup. The caller must hold fileInfo.lock.
+// ensureStagingDirectory pins the session staging directory and its parent
+// once and reuses those descriptors for every later chunk, reconciliation,
+// and assembly name lookup. The caller must hold fileInfo.lock.
 func (fileInfo *FileInfo) ensureStagingDirectory() (*os.File, error) {
 	if fileInfo == nil || fileInfo.roots == nil {
 		return nil, errors.New("management file roots are unavailable")
@@ -480,22 +482,54 @@ func (fileInfo *FileInfo) ensureStagingDirectory() (*os.File, error) {
 	if fileInfo.tempDir == "" {
 		return nil, errors.New("upload staging directory is unavailable")
 	}
+	parent, err := fileInfo.roots.OpenDirectory(filepath.Dir(fileInfo.tempDir))
+	if err != nil {
+		return nil, fmt.Errorf("pin upload staging parent: %w", err)
+	}
 	directory, err := fileInfo.roots.OpenDirectory(fileInfo.tempDir)
 	if err != nil {
+		_ = parent.Close()
 		return nil, fmt.Errorf("pin upload staging directory: %w", err)
 	}
+	fileInfo.stagingParent = parent
+	fileInfo.stagingName = filepath.Base(fileInfo.tempDir)
 	fileInfo.stagingDirectory = directory
 	return directory, nil
 }
 
-// closeStagingDirectory releases the held staging descriptor once the session
-// is terminal. Cleanup remains pathname-based and retryable.
+// closeStagingDirectory releases the held staging descriptors once the
+// session is terminal or its staging has been removed.
 func closeStagingDirectory(fileInfo *FileInfo) {
-	if fileInfo == nil || fileInfo.stagingDirectory == nil {
+	if fileInfo == nil {
 		return
 	}
-	_ = fileInfo.stagingDirectory.Close()
-	fileInfo.stagingDirectory = nil
+	if fileInfo.stagingDirectory != nil {
+		_ = fileInfo.stagingDirectory.Close()
+		fileInfo.stagingDirectory = nil
+	}
+	if fileInfo.stagingParent != nil {
+		_ = fileInfo.stagingParent.Close()
+		fileInfo.stagingParent = nil
+	}
+	fileInfo.stagingName = ""
+}
+
+// cleanupUploadStaging removes the session staging tree. When the session
+// holds its staging descriptors, removal is bound to the directory inode the
+// session created: a replaced name fails closed and keeps the descriptors for
+// a later retry instead of recursively deleting the replacement.
+func (s *FileUploadService) cleanupUploadStaging(fileInfo *FileInfo) error {
+	if fileInfo == nil {
+		return nil
+	}
+	if fileInfo.stagingParent != nil && fileInfo.stagingDirectory != nil && fileInfo.roots != nil {
+		if err := fileInfo.roots.RemoveHeldTree(fileInfo.stagingParent, fileInfo.stagingDirectory, fileInfo.stagingName); err != nil {
+			return err
+		}
+		closeStagingDirectory(fileInfo)
+		return nil
+	}
+	return s.removeUploadTree(fileInfo.tempDir)
 }
 
 func sameServiceUploadNamespace(fileInfo *FileInfo, principalID int, roots *filesecurity.ManagedRoots, basePath, targetPath, targetRelative string) bool {
@@ -562,8 +596,7 @@ func (s *FileUploadService) cleanupExpiredUploads(now time.Time) {
 		completed := fileInfo.completed
 		fileInfo.lock.Unlock()
 		if terminal && s.uploadStatus[key] == fileInfo {
-			closeStagingDirectory(fileInfo)
-			cleanupErr := s.removeUploadTree(fileInfo.tempDir)
+			cleanupErr := s.cleanupUploadStaging(fileInfo)
 			if cleanupErr != nil {
 				if requestChanged {
 					cleanupErr = changedServiceUploadError("upload staging cleanup remains incomplete", cleanupErr)
@@ -635,8 +668,7 @@ func (s *FileUploadService) deleteUploadSession(key string, fileInfo *FileInfo, 
 		// Remove the generation's staging directory before making the key
 		// available to a new session. Otherwise late cleanup could delete the
 		// replacement session's chunks.
-		closeStagingDirectory(fileInfo)
-		cleanupErr := s.removeUploadTree(fileInfo.tempDir)
+		cleanupErr := s.cleanupUploadStaging(fileInfo)
 		if cleanupErr != nil {
 			if requestChanged {
 				cleanupErr = changedServiceUploadError("upload completed but staging cleanup remains incomplete", cleanupErr)
