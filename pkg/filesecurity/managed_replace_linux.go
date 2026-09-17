@@ -39,32 +39,43 @@ var (
 // Callers needing create-only semantics must use ManagedRoots.CreateExclusive
 // instead: this helper intentionally replaces.
 func ReplaceRegularFile(absolutePath string, data []byte, permission fs.FileMode) error {
+	_, err := ReplaceRegularFileWithCommit(absolutePath, data, permission)
+	return err
+}
+
+// ReplaceRegularFileWithCommit is ReplaceRegularFile with an explicit commit
+// report. published becomes true once the destination name has been atomically
+// replaced; a failure of the final parent-directory durability sync is then
+// returned together with published == true so callers can keep committed
+// in-memory state aligned with the new file. Every path that returns
+// published == false leaves the destination untouched.
+func ReplaceRegularFileWithCommit(absolutePath string, data []byte, permission fs.FileMode) (bool, error) {
 	directoryPath, base, err := splitReplaceDestination(absolutePath)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if len(data) > maxReplaceDataBytes {
-		return ErrReplaceDataUnsafe
+		return false, ErrReplaceDataUnsafe
 	}
 	if permission.Perm() == 0 || permission&^fs.ModePerm != 0 {
-		return ErrReplaceDataUnsafe
+		return false, ErrReplaceDataUnsafe
 	}
 	parentFD, err := unix.Open(directoryPath, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return fmt.Errorf("%w: pin replace parent: %v", ErrReplacePathUnsafe, err)
+		return false, fmt.Errorf("%w: pin replace parent: %v", ErrReplacePathUnsafe, err)
 	}
 	defer unix.Close(parentFD)
 	var parentStat unix.Stat_t
 	if err := unix.Fstat(parentFD, &parentStat); err != nil {
-		return fmt.Errorf("%w: inspect replace parent: %v", ErrReplacePathUnsafe, err)
+		return false, fmt.Errorf("%w: inspect replace parent: %v", ErrReplacePathUnsafe, err)
 	}
 	if parentStat.Mode&unix.S_IFMT != unix.S_IFDIR {
-		return fmt.Errorf("%w: replace parent is not a directory", ErrReplacePathUnsafe)
+		return false, fmt.Errorf("%w: replace parent is not a directory", ErrReplacePathUnsafe)
 	}
 
 	staged, cleanup, err := stageReplaceTemporary(parentFD, permission)
 	if err != nil {
-		return err
+		return false, err
 	}
 	published := false
 	defer func() {
@@ -73,25 +84,25 @@ func ReplaceRegularFile(absolutePath string, data []byte, permission fs.FileMode
 		}
 	}()
 	if err := writeReplaceFull(staged.fd, data); err != nil {
-		return err
+		return false, err
 	}
 	if err := unix.Fchmod(staged.fd, uint32(permission.Perm())); err != nil {
-		return fmt.Errorf("chmod replace staging: %w", err)
+		return false, fmt.Errorf("chmod replace staging: %w", err)
 	}
 	if err := unix.Fsync(staged.fd); err != nil {
-		return fmt.Errorf("sync replace staging: %w", err)
+		return false, fmt.Errorf("sync replace staging: %w", err)
 	}
 	if err := verifyReplaceStaging(staged.fd); err != nil {
-		return err
+		return false, err
 	}
 	if err := staged.publish(parentFD, base); err != nil {
-		return err
+		return false, err
 	}
 	published = true
 	if err := unix.Fsync(parentFD); err != nil {
-		return fmt.Errorf("sync replace parent: %w", err)
+		return true, fmt.Errorf("sync replace parent: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 func splitReplaceDestination(absolutePath string) (string, string, error) {
@@ -115,28 +126,39 @@ type replaceStaging struct {
 	fd        int
 	name      string
 	anonymous bool
+	closed    bool
 }
 
-func stageReplaceTemporary(parentFD int, permission fs.FileMode) (replaceStaging, func(), error) {
+func (staged *replaceStaging) closeStaging() {
+	if staged == nil || staged.closed {
+		return
+	}
+	unix.Close(staged.fd)
+	staged.closed = true
+}
+
+func stageReplaceTemporary(parentFD int, permission fs.FileMode) (*replaceStaging, func(), error) {
 	noop := func() {}
 	fd, err := unix.Openat(parentFD, ".", unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, uint32(permission.Perm()))
 	if err == nil {
-		return replaceStaging{fd: fd, anonymous: true}, func() { unix.Close(fd) }, nil
+		staged := &replaceStaging{fd: fd, anonymous: true}
+		return staged, func() { staged.closeStaging() }, nil
 	}
 	if !errors.Is(err, unix.EOPNOTSUPP) && !errors.Is(err, unix.EINVAL) {
-		return replaceStaging{}, noop, fmt.Errorf("stage replace temporary: %w", err)
+		return nil, noop, fmt.Errorf("stage replace temporary: %w", err)
 	}
 	name, err := replaceTemporaryName()
 	if err != nil {
-		return replaceStaging{}, noop, err
+		return nil, noop, err
 	}
 	fd, err = unix.Openat(parentFD, name, unix.O_CREAT|unix.O_EXCL|unix.O_RDWR|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(permission.Perm()))
 	if err != nil {
-		return replaceStaging{}, noop, fmt.Errorf("stage replace named temporary: %w", err)
+		return nil, noop, fmt.Errorf("stage replace named temporary: %w", err)
 	}
-	return replaceStaging{fd: fd, name: name}, func() {
+	staged := &replaceStaging{fd: fd, name: name}
+	return staged, func() {
 		_ = unix.Unlinkat(parentFD, name, 0)
-		unix.Close(fd)
+		staged.closeStaging()
 	}, nil
 }
 
@@ -185,7 +207,7 @@ func verifyReplaceStaging(fd int) error {
 	return nil
 }
 
-func (staged replaceStaging) publish(parentFD int, base string) error {
+func (staged *replaceStaging) publish(parentFD int, base string) error {
 	name := staged.name
 	if staged.anonymous {
 		// linkat cannot overwrite, so even anonymous staging lands on a
@@ -193,27 +215,25 @@ func (staged replaceStaging) publish(parentFD int, base string) error {
 		// atomic rename.
 		linked, err := replaceTemporaryName()
 		if err != nil {
-			unix.Close(staged.fd)
+			staged.closeStaging()
 			return err
 		}
 		procPath := fmt.Sprintf("/proc/self/fd/%d", staged.fd)
 		if err := unix.Linkat(unix.AT_FDCWD, procPath, parentFD, linked, unix.AT_SYMLINK_FOLLOW); err != nil {
-			unix.Close(staged.fd)
+			staged.closeStaging()
 			return fmt.Errorf("publish replace staging: %w", err)
 		}
-		unix.Close(staged.fd)
+		staged.closeStaging()
 		name = linked
 	}
 	if err := unix.Renameat2(parentFD, name, parentFD, base, 0); err != nil {
 		if staged.anonymous {
 			_ = unix.Unlinkat(parentFD, name, 0)
 		} else {
-			unix.Close(staged.fd)
+			staged.closeStaging()
 		}
 		return fmt.Errorf("publish replace staging: %w", err)
 	}
-	if !staged.anonymous {
-		unix.Close(staged.fd)
-	}
+	staged.closeStaging()
 	return nil
 }

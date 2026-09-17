@@ -33,6 +33,24 @@ func preserveConfigGlobals(t *testing.T) {
 	})
 }
 
+func assertOnlyExpectedDirectoryEntries(t *testing.T, directory string, expected ...string) {
+	t.Helper()
+
+	allowed := make(map[string]struct{}, len(expected))
+	for _, name := range expected {
+		allowed[name] = struct{}{}
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatalf("read test directory: %v", err)
+	}
+	for _, entry := range entries {
+		if _, ok := allowed[entry.Name()]; !ok {
+			t.Fatalf("unexpected residue in %s: %q", directory, entry.Name())
+		}
+	}
+}
+
 func TestMigrateLegacyHTTPPortRetriesBeforeClearing(t *testing.T) {
 	preserveConfigGlobals(t)
 
@@ -168,12 +186,35 @@ func TestPersistHTTPPortUsesActualPathAndAtomicPrivateReplacement(t *testing.T) 
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Fatalf("persisted configuration mode = %#o, want 0600", got)
 	}
-	matches, err := filepath.Glob(filepath.Join(directory, ".custom.conf.tmp-*"))
-	if err != nil {
-		t.Fatalf("glob temporary configurations: %v", err)
+	assertOnlyExpectedDirectoryEntries(t, directory, "custom.conf")
+}
+
+func TestPersistHTTPPortRejectsRelativeConfigPathWithoutMutatingState(t *testing.T) {
+	preserveConfigGlobals(t)
+
+	directory := t.TempDir()
+	path := filepath.Join(directory, "custom.conf")
+	InitSetup(path, "[server]\nHttpPort = 80\n")
+	ConfigFilePath = "relative-casaos.conf"
+
+	if err := PersistHTTPPort("49152"); err == nil {
+		t.Fatal("PersistHTTPPort unexpectedly persisted through a relative path")
 	}
-	if len(matches) != 0 {
-		t.Fatalf("temporary configuration files remain after success: %v", matches)
+	if ServerInfo.HttpPort != "80" {
+		t.Fatalf("ServerInfo.HttpPort = %q after failure, want 80", ServerInfo.HttpPort)
+	}
+	if got := Cfg.Section("server").Key("HttpPort").String(); got != "80" {
+		t.Fatalf("in-memory HttpPort = %q after failure, want 80", got)
+	}
+	persisted, err := ini.Load(path)
+	if err != nil {
+		t.Fatalf("load original configuration after failure: %v", err)
+	}
+	if got := persisted.Section("server").Key("HttpPort").String(); got != "80" {
+		t.Fatalf("on-disk HttpPort = %q after failure, want 80", got)
+	}
+	if _, err := os.Stat(ConfigFilePath); !os.IsNotExist(err) {
+		t.Fatalf("relative configuration path was written: err=%v", err)
 	}
 }
 
@@ -228,13 +269,7 @@ func TestPersistHTTPPortRollsBackBeforeReplacementFailure(t *testing.T) {
 					t.Fatalf("on-disk HttpPort = %q after failure, want %q", got, test.keyValue)
 				}
 			}
-			matches, err := filepath.Glob(filepath.Join(directory, ".blocked.conf.tmp-*"))
-			if err != nil {
-				t.Fatalf("glob temporary configurations: %v", err)
-			}
-			if len(matches) != 0 {
-				t.Fatalf("temporary configuration files remain after failure: %v", matches)
-			}
+			assertOnlyExpectedDirectoryEntries(t, directory, "custom.conf", "blocked.conf")
 		})
 	}
 }
