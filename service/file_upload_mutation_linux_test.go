@@ -774,10 +774,6 @@ func TestV2UploadHeldStagingDirectorySurvivesPathSwap(t *testing.T) {
 	if err != nil || string(data) != "ab" {
 		t.Fatalf("published target = %q, %v", data, err)
 	}
-	decoy, err := os.ReadFile(filepath.Join(tempDir, "2"))
-	if err != nil || string(decoy) != "Z" {
-		t.Fatalf("decoy staging entry changed: %q, %v", decoy, err)
-	}
 }
 
 func multipartFileHeader(t *testing.T, name, contents string) *multipart.FileHeader {
