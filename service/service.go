@@ -19,6 +19,7 @@ import (
 	"github.com/IceWhaleTech/CasaOS-Common/external"
 	"github.com/IceWhaleTech/CasaOS/codegen/message_bus"
 	"github.com/IceWhaleTech/CasaOS/pkg/config"
+	"github.com/IceWhaleTech/CasaOS/pkg/gatewayclient"
 	"github.com/patrickmn/go-cache"
 	"gorm.io/gorm"
 )
@@ -67,7 +68,7 @@ type Repository interface {
 }
 
 func NewService(db *gorm.DB, RuntimePath string) Repository {
-	gatewayManagement, err := external.NewManagementService(RuntimePath)
+	gatewayManagement, err := gatewayclient.New(RuntimePath)
 	if err != nil && len(RuntimePath) > 0 {
 		panic(err)
 	}
