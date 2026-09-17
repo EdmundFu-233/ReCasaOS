@@ -53,6 +53,70 @@ func TestWriteV1ChunkAbortsBeforePublishOnReaderAndSizeErrors(t *testing.T) {
 	}
 }
 
+func TestV1UploadHeldStagingDirectorySurvivesPathSwap(t *testing.T) {
+	root := t.TempDir()
+	roots, err := filesecurity.OpenManagementFileRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+
+	paths, err := buildV1UploadPaths(roots, 41, root, filepath.Join("held", "target.bin"), "target.bin", 2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := v1UploadSessionRegistry{
+		sessions:   make(map[string]*v1UploadSession),
+		removeTree: os.RemoveAll,
+	}
+	session, err := registry.acquire(paths, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := roots.MkdirAll(filepath.Dir(paths.target), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := roots.MkdirAll(paths.tempDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	directory, err := session.ensureV1StagingDirectory(roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeUploadChunkWithLimitIn(roots, directory, "1", strings.NewReader("A1"), filesecurity.MaxUploadChunkSize); err != nil {
+		t.Fatal(err)
+	}
+
+	// Swap the staging pathname after the session pinned its descriptor and
+	// plant a decoy chunk where pathname-based assembly would read it.
+	if err := os.Rename(paths.tempDir, paths.tempDir+".held"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(paths.tempDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(paths.tempDir, "2"), []byte("Z"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := writeUploadChunkWithLimitIn(roots, directory, "2", strings.NewReader("A2"), filesecurity.MaxUploadChunkSize); err != nil {
+		t.Fatal(err)
+	}
+	complete, totalSize, err := allV1ChunksPresentIn(roots, directory, 2)
+	if err != nil || !complete || totalSize != 4 {
+		t.Fatalf("chunk probe after swap = complete %v, size %d, err %v", complete, totalSize, err)
+	}
+	result, err := assembleV1UploadIn(roots, paths.base, paths.targetRelative, directory, paths.target, 2)
+	if err != nil || !result.TargetPublished {
+		t.Fatalf("assembly after swap = %+v, %v", result, err)
+	}
+	contents, err := os.ReadFile(paths.target)
+	if err != nil || string(contents) != "A1A2" {
+		t.Fatalf("published target = %q, %v", contents, err)
+	}
+	registry.finish(paths.tempDir, session)
+}
+
 func TestBuildV1UploadPathsSeparatesDifferentTargets(t *testing.T) {
 	root := t.TempDir()
 	roots, err := filesecurity.OpenManagementFileRoots([]string{root})

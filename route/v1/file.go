@@ -886,6 +886,10 @@ func PostFileUpload(ctx echo.Context) error {
 	if err := roots.MkdirAll(paths.tempDir, 0o700); err != nil {
 		return respondV1UploadFailure(ctx, changedV1UploadErrorIf(namespaceMayHaveChanged, "target parent created before upload staging creation failed", err))
 	}
+	stagingDirectory, err := uploadSession.ensureV1StagingDirectory(roots)
+	if err != nil {
+		return respondV1UploadFailure(ctx, changedV1UploadErrorIf(namespaceMayHaveChanged, "upload staging directory could not be pinned", err))
+	}
 	uploadSession.stagingClean = false
 	// Recheck after creating parents so a pre-existing symlink cannot turn a
 	// previously missing prefix into an escape.
@@ -896,11 +900,11 @@ func PostFileUpload(ctx echo.Context) error {
 		return respondV1UploadFailure(ctx, changedV1UploadErrorIf(namespaceMayHaveChanged, "upload path changed after directory creation", err))
 	}
 
-	if err := writeUploadChunkWithSpace(roots, paths.chunk, f, fileHeader.Size); err != nil {
+	if err := writeUploadChunkWithSpaceIn(roots, stagingDirectory, strconv.FormatInt(chunkNumber, 10), paths.chunk, f, fileHeader.Size); err != nil {
 		return respondV1UploadFailure(ctx, changedV1UploadErrorIf(namespaceMayHaveChanged, "upload directories may have changed before chunk publication failed", err))
 	}
 
-	complete, assemblyBytes, err := allV1ChunksPresent(roots, paths.base, paths.tempRelative, totalChunks)
+	complete, assemblyBytes, err := allV1ChunksPresentIn(roots, stagingDirectory, totalChunks)
 	if err != nil {
 		return respondV1UploadFailure(ctx, changedV1UploadError("upload chunk published before chunk-set validation failed", err))
 	}
@@ -909,7 +913,7 @@ func PostFileUpload(ctx echo.Context) error {
 		if spaceErr != nil {
 			return respondV1UploadFailure(ctx, changedV1UploadError("upload chunks published before assembly space admission failed", spaceErr))
 		}
-		assemblyResult, assemblyErr := assembleV1Upload(roots, paths.base, paths.targetRelative, paths.tempRelative, paths.assembly, paths.target, totalChunks)
+		assemblyResult, assemblyErr := assembleV1UploadIn(roots, paths.base, paths.targetRelative, stagingDirectory, paths.target, totalChunks)
 		assemblySpaceRelease()
 		if assemblyResult.TargetPublished {
 			uploadSession.completed = true
@@ -979,6 +983,7 @@ type v1UploadSession struct {
 	completionIdentity filesecurity.ManagedFileIdentity
 	completionErr      error
 	stagingClean       bool
+	stagingDirectory   *os.File
 }
 
 type v1UploadAssemblyResult struct {
@@ -1107,6 +1112,7 @@ func (r *v1UploadSessionRegistry) finishSession(key string, session *v1UploadSes
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.sessions[key] == session {
+		closeV1StagingDirectory(session)
 		cleanupErr := r.removeUploadTree(session.tempDir)
 		if cleanupErr != nil {
 			if requestChanged {
@@ -1155,6 +1161,7 @@ func (r *v1UploadSessionRegistry) cleanup(now time.Time) {
 		requestChanged := completed || filesecurity.ManagedMutationChanged(session.cleanupErr)
 		session.lock.Unlock()
 		if terminal && r.sessions[key] == session {
+			closeV1StagingDirectory(session)
 			cleanupErr := r.removeUploadTree(session.tempDir)
 			if cleanupErr != nil {
 				if requestChanged {
@@ -1197,6 +1204,37 @@ func sameV1UploadMetadata(session *v1UploadSession, paths v1UploadPaths, totalCh
 		session.targetRelative == paths.targetRelative &&
 		session.tempDir == paths.tempDir && session.tempRelative == paths.tempRelative &&
 		session.totalChunks == totalChunks
+}
+
+// ensureV1StagingDirectory pins the session staging directory once and reuses
+// that descriptor for every later chunk publication, chunk-set probe, and
+// assembly name lookup. The caller must hold session.lock.
+func (session *v1UploadSession) ensureV1StagingDirectory(roots *filesecurity.ManagedRoots) (*os.File, error) {
+	if session == nil || roots == nil {
+		return nil, errors.New("management file roots are unavailable")
+	}
+	if session.stagingDirectory != nil {
+		return session.stagingDirectory, nil
+	}
+	if session.tempDir == "" {
+		return nil, errors.New("upload staging directory is unavailable")
+	}
+	directory, err := roots.OpenDirectory(session.tempDir)
+	if err != nil {
+		return nil, fmt.Errorf("pin upload staging directory: %w", err)
+	}
+	session.stagingDirectory = directory
+	return directory, nil
+}
+
+// closeV1StagingDirectory releases the held staging descriptor once the
+// session is terminal. Cleanup remains pathname-based and retryable.
+func closeV1StagingDirectory(session *v1UploadSession) {
+	if session == nil || session.stagingDirectory == nil {
+		return
+	}
+	_ = session.stagingDirectory.Close()
+	session.stagingDirectory = nil
 }
 
 func (r *v1UploadSessionRegistry) pruneCompletedLocked(now time.Time) {
@@ -1365,11 +1403,38 @@ func writeUploadChunkWithSpace(roots *filesecurity.ManagedRoots, destination str
 	return writeUploadChunkWithLimit(roots, destination, source, filesecurity.MaxUploadChunkSize)
 }
 
+// writeUploadChunkWithSpaceIn is writeUploadChunkWithSpace for a chunk name
+// resolved beneath the session's held staging descriptor. Capacity admission
+// still samples the actual staging write parent.
+func writeUploadChunkWithSpaceIn(roots *filesecurity.ManagedRoots, directory *os.File, name, reservationPath string, source io.Reader, expectedSize int64) error {
+	if expectedSize < 0 || expectedSize > filesecurity.MaxUploadChunkSize {
+		return errUploadTooLarge
+	}
+	release, err := filesecurity.ReserveUploadSpace(roots, filepath.Dir(reservationPath), uint64(expectedSize))
+	if err != nil {
+		return err
+	}
+	defer release()
+	return writeUploadChunkWithLimitIn(roots, directory, name, source, filesecurity.MaxUploadChunkSize)
+}
+
 func writeUploadChunkWithLimit(roots *filesecurity.ManagedRoots, destination string, source io.Reader, limit int64) error {
 	out, err := roots.CreateExclusive(destination, 0o600)
 	if err != nil {
 		return err
 	}
+	return writeUploadChunkTo(out, source, limit)
+}
+
+func writeUploadChunkWithLimitIn(roots *filesecurity.ManagedRoots, directory *os.File, name string, source io.Reader, limit int64) error {
+	out, err := roots.CreateExclusiveIn(directory, name, 0o600)
+	if err != nil {
+		return err
+	}
+	return writeUploadChunkTo(out, source, limit)
+}
+
+func writeUploadChunkTo(out *filesecurity.ManagedWritableFile, source io.Reader, limit int64) error {
 	defer out.Abort()
 	written, copyErr := io.Copy(out, io.LimitReader(source, limit+1))
 	if copyErr != nil {
@@ -1412,6 +1477,29 @@ func allV1ChunksPresent(roots *filesecurity.ManagedRoots, base, tempRelative str
 	return true, totalSize, nil
 }
 
+// allV1ChunksPresentIn probes chunk names relative to the session's held
+// staging descriptor.
+func allV1ChunksPresentIn(roots *filesecurity.ManagedRoots, directory *os.File, totalChunks int64) (bool, int64, error) {
+	var totalSize int64
+	for chunkNumber := int64(1); chunkNumber <= totalChunks; chunkNumber++ {
+		info, err := roots.StatDirectoryEntry(directory, strconv.FormatInt(chunkNumber, 10))
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, 0, nil
+		}
+		if err != nil {
+			return false, 0, err
+		}
+		if !info.Mode().IsRegular() || info.Size() > filesecurity.MaxUploadChunkSize {
+			return false, 0, fmt.Errorf("invalid upload chunk %d", chunkNumber)
+		}
+		if info.Size() < 0 || totalSize > filesecurity.MaxUploadTotalSize-info.Size() {
+			return false, 0, fmt.Errorf("assembled upload exceeds %d bytes", filesecurity.MaxUploadTotalSize)
+		}
+		totalSize += info.Size()
+	}
+	return true, totalSize, nil
+}
+
 func verifyCompletedV1Upload(session *v1UploadSession, roots v1CompletedUploadIdentityVerifier) error {
 	if session == nil || !session.completed || session.completionSize < 0 {
 		return errors.New("invalid completed upload state")
@@ -1423,15 +1511,30 @@ func verifyCompletedV1Upload(session *v1UploadSession, roots v1CompletedUploadId
 }
 
 func assembleV1Upload(roots *filesecurity.ManagedRoots, base, targetRelative, tempRelative, assemblyPath, targetPath string, totalChunks int64, beforeCommit ...func() error) (result v1UploadAssemblyResult, resultErr error) {
+	if roots == nil {
+		return result, errors.New("management file roots are unavailable")
+	}
+	directory, err := roots.OpenDirectory(filepath.Dir(assemblyPath))
+	if err != nil {
+		return result, err
+	}
+	defer directory.Close()
+	return assembleV1UploadIn(roots, base, targetRelative, directory, targetPath, totalChunks, beforeCommit...)
+}
+
+// assembleV1UploadIn assembles chunks and commits the completed file using
+// names resolved beneath the session's held staging descriptor, so replacing
+// the staging directory pathname cannot redirect chunk reads or publication.
+func assembleV1UploadIn(roots *filesecurity.ManagedRoots, base, targetRelative string, directory *os.File, targetPath string, totalChunks int64, beforeCommit ...func() error) (result v1UploadAssemblyResult, resultErr error) {
 	namespaceChanged := false
-	if err := roots.Remove(assemblyPath); err != nil {
+	if err := roots.RemoveIn(directory, ".complete"); err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
 			return result, err
 		}
 	} else {
 		namespaceChanged = true
 	}
-	out, err := roots.CreateExclusive(assemblyPath, 0o600)
+	out, err := roots.CreateExclusiveIn(directory, ".complete", 0o600)
 	if err != nil {
 		return result, changedV1UploadErrorIf(namespaceChanged, "old upload assembly removed before recreation failed", err)
 	}
@@ -1446,11 +1549,7 @@ func assembleV1Upload(roots *filesecurity.ManagedRoots, base, targetRelative, te
 	completionDigest := sha256.New()
 	var totalWritten int64
 	for chunkNumber := int64(1); chunkNumber <= totalChunks; chunkNumber++ {
-		chunkLocation, err := roots.MatchChild(base, filepath.Join(tempRelative, strconv.FormatInt(chunkNumber, 10)))
-		if err != nil {
-			return result, err
-		}
-		chunk, err := roots.OpenRegular(chunkLocation.Canonical)
+		chunk, err := roots.OpenRegularIn(directory, strconv.FormatInt(chunkNumber, 10))
 		if err != nil {
 			return result, err
 		}
@@ -1498,7 +1597,7 @@ func assembleV1Upload(roots *filesecurity.ManagedRoots, base, targetRelative, te
 			return result, err
 		}
 	}
-	identity, err := roots.CommitNoReplaceWithExpectedIdentityAndDigest(assemblyPath, targetPath, assemblyIdentity, result.Digest)
+	identity, err := roots.CommitNoReplaceWithExpectedIdentityAndDigestIn(directory, ".complete", targetPath, assemblyIdentity, result.Digest)
 	result.Identity = identity
 	if err != nil {
 		result.TargetPublished = filesecurity.ManagedMutationChanged(err)
