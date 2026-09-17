@@ -115,6 +115,12 @@ func TestV1UploadHeldStagingDirectorySurvivesPathSwap(t *testing.T) {
 		t.Fatalf("published target = %q, %v", contents, err)
 	}
 	registry.finish(paths.tempDir, session)
+	// Cleanup is bound to the pinned inode: the swapped replacement must be
+	// preserved rather than recursively deleted.
+	decoy, err := os.ReadFile(filepath.Join(paths.tempDir, "2"))
+	if err != nil || string(decoy) != "Z" {
+		t.Fatalf("cleanup deleted the swapped staging replacement: %q, %v", decoy, err)
+	}
 }
 
 func TestBuildV1UploadPathsSeparatesDifferentTargets(t *testing.T) {

@@ -76,6 +76,10 @@ func (m *ManagedRoots) RemoveIn(*os.File, string) error {
 	return ErrManagedRootsUnsupported
 }
 
+func (m *ManagedRoots) RemoveHeldTree(*os.File, *os.File, string) error {
+	return ErrManagedRootsUnsupported
+}
+
 func (m *ManagedRoots) RemoveAll(string) error {
 	return ErrManagedRootsUnsupported
 }

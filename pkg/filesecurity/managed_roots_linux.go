@@ -646,6 +646,88 @@ func (m *ManagedRoots) RemoveIn(directory *os.File, name string) error {
 	return m.unlinkManagedNameAndSync(directoryFD, name, 0, "sync removed managed directory entry", true)
 }
 
+// RemoveHeldTree removes the tree named name beneath an already-opened
+// managed parent after proving that name still identifies held, the directory
+// the session created. The proven entry is moved to an unpredictable
+// quarantine name before recursive removal, so a concurrent replacement is
+// never deleted; a name that no longer matches fails closed. An already
+// absent name is treated as removed.
+func (m *ManagedRoots) RemoveHeldTree(parent, held *os.File, name string) error {
+	if m == nil {
+		return ErrManagedPathOutsideRoots
+	}
+	if err := validateManagedHeldDirectory(parent); err != nil {
+		return err
+	}
+	if err := validateManagedHeldDirectory(held); err != nil {
+		return err
+	}
+	if err := ValidatePathComponent(name); err != nil {
+		return err
+	}
+	release, err := m.AcquireMutation()
+	if err != nil {
+		return err
+	}
+	defer release()
+	parentFD := int(parent.Fd())
+	var heldStat unix.Stat_t
+	if err := unix.Fstat(int(held.Fd()), &heldStat); err != nil {
+		return err
+	}
+	parentMountID, err := managedMountIDAt(parentFD, "", unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
+	if err != nil {
+		return err
+	}
+	nameMountID, err := managedMountIDAt(parentFD, name, unix.AT_SYMLINK_NOFOLLOW)
+	if errors.Is(err, unix.ENOENT) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if nameMountID != parentMountID {
+		return fmt.Errorf("%w: refusing to remove a mount boundary", ErrUnsafePath)
+	}
+	if err := managedNameMatchesInode(parentFD, name, &heldStat); err != nil {
+		return err
+	}
+	quarantineName, err := randomManagedTransferName(".recasaos-held-remove-")
+	if err != nil {
+		return err
+	}
+	if err := unix.Renameat2(parentFD, name, parentFD, quarantineName, unix.RENAME_NOREPLACE); err != nil {
+		return fmt.Errorf("%w: quarantine held staging directory: %v", ErrUnsafePath, err)
+	}
+	if err := managedNameMatchesInode(parentFD, quarantineName, &heldStat); err != nil {
+		// Restore the proven directory; never delete an unverified name.
+		if rollbackErr := unix.Renameat2(parentFD, quarantineName, parentFD, name, unix.RENAME_NOREPLACE); rollbackErr != nil {
+			return errors.Join(err, fmt.Errorf("%w: unknown staging directory preserved at %s", ErrUnsafePath, quarantineName), rollbackErr)
+		}
+		return err
+	}
+	entryBudget := int64(0)
+	if err := validateManagedRemovableEntryAt(parentFD, quarantineName, parentMountID, 0, &entryBudget, false); err != nil {
+		return err
+	}
+	state := &managedRemovalState{}
+	if err := m.removeManagedEntryAtPrevalidated(parentFD, quarantineName, parentMountID, 0, state); err != nil {
+		return err
+	}
+	return m.syncManagedDirectory(parentFD, "sync removed held staging directory parent", true)
+}
+
+func managedNameMatchesInode(parentFD int, name string, expected *unix.Stat_t) error {
+	var actual unix.Stat_t
+	if err := unix.Fstatat(parentFD, name, &actual, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return err
+	}
+	if actual.Dev != expected.Dev || actual.Ino != expected.Ino || actual.Mode&unix.S_IFMT != expected.Mode&unix.S_IFMT {
+		return fmt.Errorf("%w: upload staging directory name changed before cleanup", ErrUnsafePath)
+	}
+	return nil
+}
+
 // RemoveAll recursively removes an entry without following links. The
 // configured root itself can never be removed.
 func (m *ManagedRoots) RemoveAll(absolutePath string) error {
