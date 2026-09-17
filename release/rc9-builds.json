@@ -1,0 +1,18 @@
+{
+  "rc": "v0.5.0+post-release",
+  "date": "2026-09-16",
+  "binaries": [
+    {
+      "component": "user-service",
+      "source_revision": "a65f40b1331f5986ab8b35d78802c40981d81a93",
+      "file": "userservice4-linux-arm64",
+      "sha256": "1434a76438ee4d2c4eb436e739537be139b2cc3d7642d89aa3a6040dd81f6c94",
+      "vm_smoke": "executes on linux/arm64 (-v prints v0.4.8)",
+      "note": "post-release hardening: local non-admin password reset without role changes (UserService#14) plus Debian 247 systemd lifecycle evidence (UserService#15); byte-identical on rebuild"
+    }
+  ],
+  "compatibility": {
+    "check": "no API/OpenAPI change: new reset-user-password CLI subcommand and systemd unit only; full UserService Go suite green; Debian 247 systemd lifecycle lane green including the new non-admin reset phase",
+    "result": "passed"
+  }
+}
