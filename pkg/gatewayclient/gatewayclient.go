@@ -6,6 +6,8 @@ package gatewayclient
 
 import (
 	"bytes"
+	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -90,7 +92,11 @@ func (c *Client) waitForAddress() (string, error) {
 // and symlink refusal. The file is opened and re-checked against its lstat
 // identity so a replacement between the two steps fails closed.
 func (c *Client) readBoundedFile(name string, limit int64) (string, error) {
-	path := filepath.Join(c.runtimePath, name)
+	return readRuntimeFile(c.runtimePath, name, limit)
+}
+
+func readRuntimeFile(runtimePath, name string, limit int64) (string, error) {
+	path := filepath.Join(runtimePath, name)
 	info, err := os.Lstat(path)
 	if err != nil {
 		return "", err
@@ -272,4 +278,57 @@ func (c *Client) do(method, path string, body []byte) (*http.Response, error) {
 		return nil, fmt.Errorf("gateway management request failed: %w", err)
 	}
 	return response, nil
+}
+
+// ServiceAuthorization returns the Authorization header value carrying the
+// gateway's per-start service credential, for an in-stack call to another
+// component's loopback listener. It is read at every call, so a restarted
+// gateway's new credential is picked up without restarting the caller.
+func ServiceAuthorization(runtimePath string) (string, error) {
+	token, err := readRuntimeFile(runtimePath, ServiceTokenFilename, maxCredentialFileBytes)
+	if err != nil {
+		return "", fmt.Errorf("read gateway service token: %w", err)
+	}
+	if token == "" {
+		return "", errors.New("gateway service token is empty")
+	}
+	return "Bearer " + token, nil
+}
+
+// ServiceAuthorizationMatches reports, in constant time, whether an
+// Authorization header value carries the active service credential, in the
+// "Bearer <token>" form or bare. A missing or unreadable credential file never
+// matches.
+func ServiceAuthorizationMatches(runtimePath, authorization string) bool {
+	token, err := readRuntimeFile(runtimePath, ServiceTokenFilename, maxCredentialFileBytes)
+	if err != nil || token == "" {
+		return false
+	}
+	presented := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(authorization), "Bearer "))
+	if len(presented) != len(token) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(presented), []byte(token)) == 1
+}
+
+// ServiceRequestEditor is for the API clients oapi-codegen generates (pass it
+// to WithRequestEditorFn): a request to a loopback address that carries no
+// Authorization header of its own gets the service credential. Any other
+// destination never sees it. A credential that cannot be read is not an
+// error here: the request goes out without it and the callee decides.
+func ServiceRequestEditor(runtimePath string) func(context.Context, *http.Request) error {
+	return func(_ context.Context, request *http.Request) error {
+		if request.Header.Get("Authorization") != "" || !isLoopbackHost(request.URL.Hostname()) {
+			return nil
+		}
+		if authorization, err := ServiceAuthorization(runtimePath); err == nil {
+			request.Header.Set("Authorization", authorization)
+		}
+		return nil
+	}
+}
+
+func isLoopbackHost(host string) bool {
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

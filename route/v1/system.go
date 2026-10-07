@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/IceWhaleTech/CasaOS-Common/utils/logger"
+	"go.uber.org/zap"
 	"net/http"
 	"os"
 	"runtime"
@@ -334,10 +336,16 @@ func GetSystemProxy(ctx echo.Context) error {
 
 func PutSystemState(ctx echo.Context) error {
 	state := ctx.Param("state")
+	var err error
 	if strings.ToLower(state) == "off" {
-		service.MyService.System().SystemShutdown()
+		err = service.MyService.System().SystemShutdown()
 	} else if strings.ToLower(state) == "restart" {
-		service.MyService.System().SystemReboot()
+		err = service.MyService.System().SystemReboot()
+	}
+	if err != nil {
+		// the command output stays in the journal, not in the response
+		logger.Error("power operation failed", zap.String("state", state), zap.Error(err))
+		return ctx.JSON(http.StatusInternalServerError, model.Result{Success: common_err.SERVICE_ERROR, Message: "power operation failed"})
 	}
 	return ctx.JSON(http.StatusOK, model.Result{Success: common_err.SUCCESS, Message: common_err.GetMsg(common_err.SUCCESS), Data: "The operation will be completed shortly."})
 }
