@@ -186,7 +186,7 @@ func unaryMessageBusFor(repository Repository) UnaryMessageBusClient {
 }
 
 func (c *store) MessageBus() *message_bus.ClientWithResponses {
-	client, _ := message_bus.NewClientWithResponses("", message_bus.WithHTTPClient(messageBusHTTPClient), func(c *message_bus.Client) error {
+	client, _ := message_bus.NewClientWithResponses("", message_bus.WithHTTPClient(messageBusHTTPClient), message_bus.WithRequestEditorFn(gatewayclient.ServiceRequestEditor(config.CommonInfo.RuntimePath)), func(c *message_bus.Client) error {
 		// error will never be returned, as we always want to return a client, even with wrong address,
 		// in order to avoid panic.
 		//
