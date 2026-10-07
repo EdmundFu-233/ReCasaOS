@@ -42,6 +42,7 @@ type SharesService interface {
 	CreateShare(share model2.SharesDBModel) error
 	CreateShares(shares []model2.SharesDBModel) error
 	DeleteShare(id string) error
+	SetShareUsername(id string, username string) error
 	UpdateConfigFile() error
 	InitSambaConfig() error
 	ReconcileSambaConfig() error
@@ -56,6 +57,9 @@ type sharesStruct struct {
 	managementRoots       func() (*filesecurity.ManagedRoots, error)
 	validateCandidate     func([]byte) error
 	restartSMBD           func() error
+	// setShareOwner hands a share directory to its account (or to root);
+	// tests replace it, the default is setShareDirectoryOwner.
+	setShareOwner         func(roots *filesecurity.ManagedRoots, path, username string) (func() error, error)
 	beforeConfigPublish   func(string)
 	beforeConfigCleanup   func(string)
 	commitLegacyMigration func(*gorm.DB) error
@@ -94,7 +98,7 @@ func (s *sharesStruct) GetSharesByPath(path string) (shares []model2.SharesDBMod
 }
 
 func (s *sharesStruct) GetSharesList() (shares []model2.SharesDBModel) {
-	s.db.Select("anonymous,path,id").Find(&shares)
+	s.db.Select("anonymous,path,name,username,id").Find(&shares)
 	return
 }
 
@@ -188,18 +192,110 @@ func (s *sharesStruct) CreateShares(shares []model2.SharesDBModel) error {
 	if err := transaction.Create(&shares).Error; err != nil {
 		return errors.Join(fmt.Errorf("create shares: %w", err), transaction.Rollback().Error)
 	}
-	candidate, err := s.renderConfigFromDB(transaction, managementRoots)
+	restoreOwners, err := s.applyShareOwners(managementRoots, shares, false)
 	if err != nil {
 		return errors.Join(err, transaction.Rollback().Error)
 	}
+	candidate, err := s.renderConfigFromDB(transaction, managementRoots)
+	if err != nil {
+		return errors.Join(err, transaction.Rollback().Error, restoreOwners())
+	}
 	mutation, err := s.publishCandidateLocked(candidate, state)
 	if err != nil {
-		return errors.Join(err, transaction.Rollback().Error, s.restoreConfigStateLocked(state, mutation))
+		return errors.Join(err, transaction.Rollback().Error, s.restoreConfigStateLocked(state, mutation), restoreOwners())
 	}
 	if err := transaction.Commit().Error; err != nil {
-		return errors.Join(fmt.Errorf("commit share transaction: %w", err), transaction.Rollback().Error, s.restoreConfigStateLocked(state, mutation))
+		return errors.Join(fmt.Errorf("commit share transaction: %w", err), transaction.Rollback().Error, s.restoreConfigStateLocked(state, mutation), restoreOwners())
 	}
 	return nil
+}
+
+// SetShareUsername restricts a share to one share account, or lifts the
+// restriction with an empty username, and republishes the config in the same
+// transaction as the row: either both change or neither.
+func (s *sharesStruct) SetShareUsername(id string, username string) error {
+	if username != "" {
+		if err := ValidateSambaUsername(username); err != nil {
+			return err
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	releaseConfigLock, err := s.acquireConfigProcessLock()
+	if err != nil {
+		return err
+	}
+	defer releaseConfigLock()
+	state, err := s.captureConfigStateLocked()
+	if err != nil {
+		return err
+	}
+	managementRoots, err := s.managementFileRoots()
+	if err != nil {
+		return err
+	}
+	transaction := s.db.Begin()
+	if transaction.Error != nil {
+		return fmt.Errorf("begin share transaction: %w", transaction.Error)
+	}
+	share := model2.SharesDBModel{}
+	if err := transaction.Where("id = ?", id).First(&share).Error; err != nil {
+		return errors.Join(fmt.Errorf("load share: %w", err), transaction.Rollback().Error)
+	}
+	if err := transaction.Model(&share).Update("username", username).Error; err != nil {
+		return errors.Join(fmt.Errorf("update share account: %w", err), transaction.Rollback().Error)
+	}
+	restoreOwner, err := s.shareOwner()(managementRoots, share.Path, username)
+	if err != nil {
+		return errors.Join(err, transaction.Rollback().Error)
+	}
+	candidate, err := s.renderConfigFromDB(transaction, managementRoots)
+	if err != nil {
+		return errors.Join(err, transaction.Rollback().Error, restoreOwner())
+	}
+	mutation, err := s.publishCandidateLocked(candidate, state)
+	if err != nil {
+		return errors.Join(err, transaction.Rollback().Error, s.restoreConfigStateLocked(state, mutation), restoreOwner())
+	}
+	if err := transaction.Commit().Error; err != nil {
+		return errors.Join(fmt.Errorf("commit share transaction: %w", err), transaction.Rollback().Error, s.restoreConfigStateLocked(state, mutation), restoreOwner())
+	}
+	return nil
+}
+
+func (s *sharesStruct) shareOwner() func(*filesecurity.ManagedRoots, string, string) (func() error, error) {
+	if s.setShareOwner != nil {
+		return s.setShareOwner
+	}
+	return setShareDirectoryOwner
+}
+
+// applyShareOwners hands each share's directory to its account; the returned
+// function undoes all of it.
+func (s *sharesStruct) applyShareOwners(roots *filesecurity.ManagedRoots, shares []model2.SharesDBModel, release bool) (func() error, error) {
+	restores := []func() error{}
+	restoreAll := func() error {
+		var err error
+		for i := len(restores) - 1; i >= 0; i-- {
+			err = errors.Join(err, restores[i]())
+		}
+		return err
+	}
+	for _, share := range shares {
+		if share.Username == "" {
+			continue
+		}
+		username := share.Username
+		if release {
+			username = ""
+		}
+		restore, err := s.shareOwner()(roots, share.Path, username)
+		if err != nil {
+			return nil, errors.Join(err, restoreAll())
+		}
+		restores = append(restores, restore)
+	}
+	return restoreAll, nil
 }
 
 func (s *sharesStruct) DeleteShare(id string) error {
@@ -229,16 +325,21 @@ func (s *sharesStruct) DeleteShare(id string) error {
 	if err := transaction.Delete(&share).Error; err != nil {
 		return errors.Join(fmt.Errorf("delete share: %w", err), transaction.Rollback().Error)
 	}
-	candidate, err := s.renderConfigFromDB(transaction, managementRoots)
+	// a share account must not keep the folder after its share is gone
+	restoreOwners, err := s.applyShareOwners(managementRoots, []model.SharesDBModel{share}, true)
 	if err != nil {
 		return errors.Join(err, transaction.Rollback().Error)
 	}
+	candidate, err := s.renderConfigFromDB(transaction, managementRoots)
+	if err != nil {
+		return errors.Join(err, transaction.Rollback().Error, restoreOwners())
+	}
 	mutation, err := s.publishCandidateLocked(candidate, state)
 	if err != nil {
-		return errors.Join(err, transaction.Rollback().Error, s.restoreConfigStateLocked(state, mutation))
+		return errors.Join(err, transaction.Rollback().Error, s.restoreConfigStateLocked(state, mutation), restoreOwners())
 	}
 	if err := transaction.Commit().Error; err != nil {
-		return errors.Join(fmt.Errorf("commit share transaction: %w", err), transaction.Rollback().Error, s.restoreConfigStateLocked(state, mutation))
+		return errors.Join(fmt.Errorf("commit share transaction: %w", err), transaction.Rollback().Error, s.restoreConfigStateLocked(state, mutation), restoreOwners())
 	}
 	return nil
 }
@@ -426,7 +527,7 @@ func (s *sharesStruct) renderConfigFromDB(database *gorm.DB, managementRoots *fi
 
 func loadSambaShares(database *gorm.DB) ([]model2.SharesDBModel, error) {
 	shares := []model2.SharesDBModel{}
-	if err := database.Select("id,anonymous,path,name").Order("id ASC").Find(&shares).Error; err != nil {
+	if err := database.Select("id,anonymous,path,name,username").Order("id ASC").Find(&shares).Error; err != nil {
 		return nil, fmt.Errorf("load Samba shares: %w", err)
 	}
 	if len(shares) > maxManagedSambaShares {
@@ -902,6 +1003,18 @@ func renderSambaSharesConfig(managementRoots *filesecurity.ManagedRoots, shares 
 		}
 		seenPaths[canonicalPath] = struct{}{}
 		seenNames[nameKey] = struct{}{}
+		// Re-validated here, not only at the API: the name is written into the
+		// config. A share without an account renders exactly as before.
+		account := ""
+		if share.Username != "" {
+			if err := ValidateSambaUsername(share.Username); err != nil {
+				return nil, fmt.Errorf("validate Samba share %d: %w", share.ID, err)
+			}
+			// valid users and force user together: one without the other
+			// either leaves the share open to every Samba account or hands
+			// the files to whoever connected
+			account = fmt.Sprintf("valid users = %s\nforce user = %s\n", share.Username, share.Username)
+		}
 
 		_, _ = fmt.Fprintf(&configBuilder, `
 [%s]
@@ -915,8 +1028,8 @@ create mask = 0660
 directory mask = 0770
 follow symlinks = no
 wide links = no
-
-`, canonicalName, canonicalPath)
+%s
+`, canonicalName, canonicalPath, account)
 	}
 	candidate := []byte(configBuilder.String())
 	if err := validateSambaCandidateSize(candidate); err != nil {

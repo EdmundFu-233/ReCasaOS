@@ -15,8 +15,12 @@ type SharesDBModel struct {
 	Anonymous bool   `json:"anonymous"`
 	Path      string `json:"path"`
 	Name      string `json:"name"`
-	Updated   int64  `gorm:"autoUpdateTime"`
-	Created   int64  `gorm:"autoCreateTime"`
+	// Username is the share account allowed to mount the share. Empty: any
+	// account Samba knows, as for every row created before share accounts
+	// existed (AutoMigrate adds the column; old rows read back empty).
+	Username string `json:"username"`
+	Updated  int64  `gorm:"autoUpdateTime"`
+	Created  int64  `gorm:"autoCreateTime"`
 }
 
 func (p *SharesDBModel) TableName() string {
