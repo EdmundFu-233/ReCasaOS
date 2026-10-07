@@ -59,6 +59,10 @@ type sharesStruct struct {
 	beforeConfigPublish   func(string)
 	beforeConfigCleanup   func(string)
 	commitLegacyMigration func(*gorm.DB) error
+	// externalMainConfig: the host owns smb.conf and includes the shares
+	// fragment. The main config is then never read, written, verified or
+	// backed up here; only the fragment is managed.
+	externalMainConfig bool
 }
 
 const (
@@ -66,9 +70,12 @@ const (
 	defaultSambaSharesConfigPath = "/etc/samba/smb.casa.conf"
 	defaultSambaLockPath         = "/run/lock/recasaos-samba.lock"
 	sambaMainConfigMarker        = "# ReCasaOS managed Samba main config v1\n"
-	sambaSharesConfigMarker      = "# ReCasaOS managed Samba shares v1\n"
-	maxSambaConfigBytes          = 4 << 20
-	maxManagedSambaShares        = 256
+	// SambaMainConfigExternal is the [server] SambaMainConfig value for a
+	// main config owned by the host (see model.ServerModel).
+	SambaMainConfigExternal = "external"
+	sambaSharesConfigMarker = "# ReCasaOS managed Samba shares v1\n"
+	maxSambaConfigBytes     = 4 << 20
+	maxManagedSambaShares   = 256
 )
 
 func IsManagedSambaMainConfigLine(line string) bool {
@@ -119,6 +126,8 @@ type sambaConfigSnapshot struct {
 type sambaConfigState struct {
 	main   sambaConfigSnapshot
 	shares sambaConfigSnapshot
+	// mainExternal: main is not tracked (externalMainConfig).
+	mainExternal bool
 }
 
 type sambaConfigMutation struct {
@@ -264,6 +273,10 @@ func (s *sharesStruct) UpdateConfigFile() error {
 func (s *sharesStruct) InitSambaConfig() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.externalMainConfig {
+		mainPath, sharesPath := s.configPaths()
+		return checkExternalSambaMainIncludes(mainPath, sharesPath)
+	}
 	releaseConfigLock, err := s.acquireConfigProcessLock()
 	if err != nil {
 		return err
@@ -314,38 +327,49 @@ func (s *sharesStruct) ReconcileSambaConfig() error {
 	if err != nil {
 		return err
 	}
-	expectedMain, err := renderSambaMainConfig(state.shares.path)
-	if err != nil {
-		return err
-	}
-	managedMain := bytes.HasPrefix(state.main.data, []byte(sambaMainConfigMarker)) && bytes.Equal(state.main.data, expectedMain)
-	managedShares := !state.shares.exists || bytes.HasPrefix(state.shares.data, []byte(sambaSharesConfigMarker))
-	if !managedMain || !managedShares {
-		legacyMain, legacyErr := isExactLegacySambaMainConfig(state.main.data, state.shares.path)
-		if legacyErr != nil {
-			return legacyErr
+	if s.externalMainConfig {
+		// No legacy migration: that converts a main config this service
+		// owned. Only the fragment is reconciled, and only into an existing
+		// managed one or a new file.
+		if err := checkExternalSambaMainIncludes(state.main.path, state.shares.path); err != nil {
+			return err
 		}
-		if !legacyMain && !(managedMain && state.shares.exists && !managedShares) {
-			return errors.New("refusing to reconcile an unmanaged or unexpected Samba main config")
+		if state.shares.exists && !bytes.HasPrefix(state.shares.data, []byte(sambaSharesConfigMarker)) {
+			return fmt.Errorf("refusing to overwrite unmanaged Samba config %s", state.shares.path)
 		}
-		return s.migrateLegacySambaConfigLocked(state, managedMain)
-	}
-	if !managedMain {
-		return errors.New("refusing to reconcile an unmanaged or unexpected Samba main config")
+	} else {
+		expectedMain, err := renderSambaMainConfig(state.shares.path)
+		if err != nil {
+			return err
+		}
+		managedMain := bytes.HasPrefix(state.main.data, []byte(sambaMainConfigMarker)) && bytes.Equal(state.main.data, expectedMain)
+		managedShares := !state.shares.exists || bytes.HasPrefix(state.shares.data, []byte(sambaSharesConfigMarker))
+		if !managedMain || !managedShares {
+			legacyMain, legacyErr := isExactLegacySambaMainConfig(state.main.data, state.shares.path)
+			if legacyErr != nil {
+				return legacyErr
+			}
+			if !legacyMain && !(managedMain && state.shares.exists && !managedShares) {
+				return errors.New("refusing to reconcile an unmanaged or unexpected Samba main config")
+			}
+			return s.migrateLegacySambaConfigLocked(state, managedMain)
+		}
 	}
 	managementRoots, err := s.managementFileRoots()
 	if err != nil {
 		return err
 	}
-	legacyState, err := s.inspectLegacySambaReconcileState(state, managementRoots)
-	if err != nil {
-		return fmt.Errorf("inspect resumable legacy Samba migration: %w", err)
-	}
-	if legacyState == legacySambaResume {
-		return s.migrateLegacySambaConfigLocked(state, true)
-	}
-	if legacyState == legacySambaCompleted {
-		return nil
+	if !s.externalMainConfig {
+		legacyState, err := s.inspectLegacySambaReconcileState(state, managementRoots)
+		if err != nil {
+			return fmt.Errorf("inspect resumable legacy Samba migration: %w", err)
+		}
+		if legacyState == legacySambaResume {
+			return s.migrateLegacySambaConfigLocked(state, true)
+		}
+		if legacyState == legacySambaCompleted {
+			return nil
+		}
 	}
 	transaction := s.db.Begin()
 	if transaction.Error != nil {
@@ -534,11 +558,17 @@ func (s *sharesStruct) captureConfigStateLocked() (sambaConfigState, error) {
 
 func (s *sharesStruct) captureRawConfigStateLocked() (sambaConfigState, error) {
 	mainPath, sharesPath := s.configPaths()
-	mainSnapshot, err := readSambaConfigSnapshot(mainPath, true, "")
+	sharesSnapshot, err := readSambaConfigSnapshot(sharesPath, false, "")
 	if err != nil {
 		return sambaConfigState{}, err
 	}
-	sharesSnapshot, err := readSambaConfigSnapshot(sharesPath, false, "")
+	if s.externalMainConfig {
+		// Not read: an externally owned main config may legitimately be a
+		// symlink (e.g. into a read-only store), which the tracked reader
+		// refuses.
+		return sambaConfigState{main: sambaConfigSnapshot{path: mainPath}, shares: sharesSnapshot, mainExternal: true}, nil
+	}
+	mainSnapshot, err := readSambaConfigSnapshot(mainPath, true, "")
 	if err != nil {
 		return sambaConfigState{}, err
 	}
@@ -611,6 +641,9 @@ func verifySambaConfigSnapshot(snapshot sambaConfigSnapshot) error {
 }
 
 func verifySambaConfigState(state sambaConfigState) error {
+	if state.mainExternal {
+		return verifySambaConfigSnapshot(state.shares)
+	}
 	return errors.Join(verifySambaConfigSnapshot(state.main), verifySambaConfigSnapshot(state.shares))
 }
 
@@ -643,6 +676,9 @@ func (s *sharesStruct) writeTrackedSambaConfig(expected sambaConfigSnapshot, dat
 }
 
 func (s *sharesStruct) initSambaConfigLocked(snapshot sambaConfigSnapshot) (sambaConfigMutation, error) {
+	if s.externalMainConfig {
+		return sambaConfigMutation{}, nil
+	}
 	_, sharesPath := s.configPaths()
 	mainConfig, err := renderSambaMainConfig(sharesPath)
 	if err != nil {
@@ -1077,7 +1113,9 @@ func restartSambaService() error {
 }
 
 func NewSharesService(db *gorm.DB) SharesService {
+	external := config.ServerInfo != nil && strings.EqualFold(strings.TrimSpace(config.ServerInfo.SambaMainConfig), SambaMainConfigExternal)
 	return &sharesStruct{
+		externalMainConfig:    external,
 		db:                    db,
 		sambaConfigPath:       defaultSambaConfigPath,
 		sambaSharesConfigPath: defaultSambaSharesConfigPath,
@@ -1085,4 +1123,33 @@ func NewSharesService(db *gorm.DB) SharesService {
 		validateCandidate:     validateSambaCandidateWithTestparm,
 		restartSMBD:           restartSambaService,
 	}
+}
+
+// checkExternalSambaMainIncludes verifies, read-only, that an externally owned
+// main config includes the shares fragment: otherwise every share published
+// here would silently never be served. The main config is resolved like smbd
+// does, symlinks included; this file is never written.
+func checkExternalSambaMainIncludes(mainPath, sharesPath string) error {
+	file, err := os.Open(mainPath)
+	if err != nil {
+		return fmt.Errorf("read external Samba main config: %w", err)
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxSambaConfigBytes+1))
+	if err != nil {
+		return fmt.Errorf("read external Samba main config: %w", err)
+	}
+	if len(data) > maxSambaConfigBytes {
+		return fmt.Errorf("external Samba main config %s exceeds %d bytes", mainPath, maxSambaConfigBytes)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		key, value, found := strings.Cut(strings.TrimSpace(line), "=")
+		if !found || strings.HasPrefix(key, "#") || strings.HasPrefix(key, ";") {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(key), "include") && strings.TrimSpace(value) == sharesPath {
+			return nil
+		}
+	}
+	return fmt.Errorf("external Samba main config %s does not include %s", mainPath, sharesPath)
 }

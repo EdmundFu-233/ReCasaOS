@@ -26,6 +26,11 @@ type ServerModel struct {
 	Token        string
 	USBAutoMount string
 	UpdateUrl    string
+	// SambaMainConfig says who owns the Samba main config (smb.conf):
+	// "managed" (the default) lets CasaOS write it; "external" means the
+	// host's configuration management owns it and includes the shares
+	// fragment (smb.casa.conf), so CasaOS manages only that fragment.
+	SambaMainConfig string
 }
 
 // 服务配置
