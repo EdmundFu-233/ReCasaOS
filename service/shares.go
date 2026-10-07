@@ -1063,7 +1063,7 @@ func restartSambaService() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	output := &boundedCommandOutput{limit: 8 << 10}
-	restart := exec.CommandContext(ctx, "/bin/bash", "-c", `source "$1"; RestartSMBD`, "recasaos-samba", helperPath)
+	restart := exec.CommandContext(ctx, "bash", "-c", `source "$1"; RestartSMBD`, "recasaos-samba", helperPath)
 	restart.Stdout = output
 	restart.Stderr = output
 	err := restart.Run()

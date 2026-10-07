@@ -16,7 +16,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/IceWhaleTech/CasaOS-Common/utils/command"
 	exec2 "github.com/IceWhaleTech/CasaOS-Common/utils/exec"
 
 	"github.com/IceWhaleTech/CasaOS-Common/utils/logger"
@@ -331,7 +330,7 @@ func (c *systemService) CreateFile(path string) (int, error) {
 }
 
 func (c *systemService) GetDeviceTree() string {
-	if output, err := command.OnlyExec("source " + config.AppInfo.ShellPath + "/helper.sh ;GetDeviceTree"); err != nil {
+	if output, err := onlyExec("source " + config.AppInfo.ShellPath + "/helper.sh ;GetDeviceTree"); err != nil {
 		return ""
 	} else {
 		return output
@@ -355,7 +354,7 @@ func (c *systemService) GetDiskInfo() *disk.UsageStat {
 }
 
 func (c *systemService) GetNetState(name string) string {
-	if output, err := command.OnlyExec("source " + config.AppInfo.ShellPath + "/helper.sh ;CatNetCardState " + name); err != nil {
+	if output, err := onlyExec("source " + config.AppInfo.ShellPath + "/helper.sh ;CatNetCardState " + name); err != nil {
 		return ""
 	} else {
 		return output
@@ -608,7 +607,7 @@ func (c *systemService) GetNet(physics bool) []string {
 		t = "2"
 	}
 
-	if output, err := command.OnlyExec("source " + config.AppInfo.ShellPath + "/helper.sh ;GetNetCard " + t); err != nil {
+	if output, err := onlyExec("source " + config.AppInfo.ShellPath + "/helper.sh ;GetNetCard " + t); err != nil {
 		return []string{}
 	} else {
 		return strings.Split(output, "\n")
@@ -622,11 +621,11 @@ func (s *systemService) UpdateSystemVersion(_ string) error {
 }
 
 func (s *systemService) UpdateAssist() {
-	command.ExecResultStrArray("source " + config.AppInfo.ShellPath + "/assist.sh")
+	_, _ = onlyExec("source " + config.AppInfo.ShellPath + "/assist.sh")
 }
 
 func (s *systemService) GetTimeZone() string {
-	if output, err := command.OnlyExec("source " + config.AppInfo.ShellPath + "/helper.sh ;GetTimeZone"); err != nil {
+	if output, err := onlyExec("source " + config.AppInfo.ShellPath + "/helper.sh ;GetTimeZone"); err != nil {
 		return ""
 	} else {
 		return output
@@ -634,7 +633,7 @@ func (s *systemService) GetTimeZone() string {
 }
 
 func (s *systemService) GetSystemConfigDebug() []string {
-	if output, err := command.OnlyExec("source " + config.AppInfo.ShellPath + "/helper.sh ;GetSysInfo"); err != nil {
+	if output, err := onlyExec("source " + config.AppInfo.ShellPath + "/helper.sh ;GetSysInfo"); err != nil {
 		return []string{}
 	} else {
 		return strings.Split(output, "\n")
