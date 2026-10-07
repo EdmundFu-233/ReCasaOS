@@ -149,8 +149,17 @@ func InitV1Router() http.Handler {
 			{
 				v1SharesGroup.GET("", v1.GetSambaSharesList)
 				v1SharesGroup.POST("", v1.PostSambaSharesCreate)
+				v1SharesGroup.PUT("/:id", v1.PutSambaShare)
 				v1SharesGroup.DELETE("/:id", v1.DeleteSambaShares)
 				v1SharesGroup.GET("/status", v1.GetSambaStatus)
+			}
+			v1SambaUsersGroup := v1SambaGroup.Group("/users")
+			v1SambaUsersGroup.Use()
+			{
+				v1SambaUsersGroup.GET("", v1.GetSambaUsersList)
+				v1SambaUsersGroup.POST("", v1.PostSambaUserCreate)
+				v1SambaUsersGroup.PUT("/:username/password", v1.PutSambaUserPassword)
+				v1SambaUsersGroup.DELETE("/:username", v1.DeleteSambaUser)
 			}
 		}
 		v1NotifyGroup := v1Group.Group("/notify")
