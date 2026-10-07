@@ -18,5 +18,9 @@ ServerApi =
 Handshake =
 Token = 
 USBAutoMount =
+; Who owns /etc/samba/smb.conf: "managed" (default, CasaOS writes it) or
+; "external" (the host's configuration management owns it and includes
+; /etc/samba/smb.casa.conf; CasaOS then manages only that fragment).
+SambaMainConfig = managed
 
 [system]
