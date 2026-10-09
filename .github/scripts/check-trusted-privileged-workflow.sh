@@ -22,7 +22,7 @@ primary_workflow="${2:-$repo_root/.github/workflows/recasaos-ci-security.yml}"
 # digest update in this independently frozen checker.
 command -v python3 >/dev/null 2>&1 ||
   die "Python is unavailable for trusted workflow hashing"
-expected_workflow_sha256=54846e6270b8b922c7a3107fb8403d25da1fb4045e42806c896d41600553e169
+expected_workflow_sha256=3a77e805acf1649dfa2e8c2203f9ce353cddf00c0f7934d13069dbc12342e90a
 actual_workflow_sha256="$(
   python3 - "$workflow" <<'PYTHON'
 import hashlib

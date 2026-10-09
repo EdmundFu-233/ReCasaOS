@@ -147,7 +147,7 @@ grep -Fq -- 'inline GOTOOLCHAIN override is forbidden' \
   fail 'inline Go workflow was rejected for the wrong reason'
 
 expect_rejection stale-go-mod go.mod \
-  'toolchain go1.26.6' \
+  'toolchain go1.26.9' \
   'toolchain go1.26.5' \
   'go.mod must pin exactly one toolchain'
 expect_rejection stale-language-version go.mod \
@@ -156,17 +156,17 @@ expect_rejection stale-language-version go.mod \
   'go.mod must pin exactly one language version'
 expect_rejection stale-workflow-version \
   .github/workflows/recasaos-ci-security.yml \
-  '          go-version: "1.26.6"' \
+  '          go-version: "1.26.9"' \
   '          go-version: "1.26.5"' \
   'setup-go step must pin exactly go-version'
 expect_rejection unpinned-workflow-version \
   .github/workflows/codeql.yml \
-  '          go-version: "1.26.6"' \
+  '          go-version: "1.26.9"' \
   '          go-version-file: go.mod' \
   'setup-go must not use go-version-file'
 expect_rejection stale-workflow-label \
   .github/workflows/trusted-privileged-ci.yml \
-  'name: Set up Go 1.26.6' \
+  'name: Set up Go 1.26.9' \
   'name: Set up Go 1.26.5' \
   'setup-go step name must start with'
 expect_rejection unpinned-setup-action \
@@ -181,8 +181,8 @@ expect_rejection wrong-setup-action-sha \
   'setup-go action does not use the reviewed SHA'
 expect_rejection version-outside-with \
   .github/workflows/codeql.yml \
-  $'        with:\n          go-version: "1.26.6"\n          cache: true' \
-  $'        env:\n          go-version: "1.26.6"\n        with:\n          cache: true' \
+  $'        with:\n          go-version: "1.26.9"\n          cache: true' \
+  $'        env:\n          go-version: "1.26.9"\n        with:\n          cache: true' \
   'setup-go step must pin exactly go-version'
 expect_rejection workflow-toolchain-override \
   .github/workflows/recasaos-ci-security.yml \
@@ -197,30 +197,30 @@ expect_rejection shell-toolchain-override \
 expect_rejection orphan-workflow-version \
   .github/workflows/codeql.yml \
   '          persist-credentials: false' \
-  $'          persist-credentials: false\n          go-version: "1.26.6"' \
+  $'          persist-credentials: false\n          go-version: "1.26.9"' \
   'orphan go-version key is forbidden'
 expect_pairing_rejection workflow-version-filler \
   .github/workflows/codeql.yml \
-  '          go-version: "1.26.6"' \
+  '          go-version: "1.26.9"' \
   '          go-version: "1.26.5"' \
   '          persist-credentials: false' \
-  $'          persist-credentials: false\n          go-version: "1.26.6"' \
+  $'          persist-credentials: false\n          go-version: "1.26.9"' \
   'setup-go step must pin exactly go-version'
 expect_pairing_rejection workflow-name-filler \
   .github/workflows/codeql.yml \
-  '      - name: Set up Go 1.26.6' \
+  '      - name: Set up Go 1.26.9' \
   '      - name: Set up Go 1.26.5' \
   '      - name: Check out source' \
-  '      - name: Set up Go 1.26.6 filler' \
+  '      - name: Set up Go 1.26.9 filler' \
   'setup-go step name must start with'
 expect_rejection stale-hosted-toolcache \
   .github/scripts/test-public-files-debian11-vm.sh \
-  '/opt/hostedtoolcache/go/1.26.6/*' \
+  '/opt/hostedtoolcache/go/1.26.9/*' \
   '/opt/hostedtoolcache/go/1.26.5/*' \
   'stale hosted-toolcache Go version found'
 expect_rejection stale-systemd-runtime \
   .github/scripts/test-public-files-systemd.sh \
-  'go version go1.26.6 linux/amd64' \
+  'go version go1.26.9 linux/amd64' \
   'go version go1.26.5 linux/amd64' \
   'stale or unreviewed Go toolchain pin found'
 
