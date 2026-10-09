@@ -163,10 +163,13 @@ jobs:
           IFS=$'\n\t'
 
           # This is the official Debian 11.11 image published on 2026-07-13,
-          # pinned to its linux/amd64 OCI manifest. The repository is mounted
-          # read-only and the container receives no host environment, devices,
-          # elevated privileges, or Docker socket.
-          image='debian:bullseye-20260713@sha256:e40377b87a60470bf4aa59f0598d173bfb7d705e83bb310f9b6ef4a0ed00ec21'
+          # pinned to its linux/amd64 OCI manifest and pulled from the AWS
+          # Public ECR mirror of the Docker official images, which serves the
+          # identical digest-addressed manifest without anonymous Docker Hub
+          # rate limits. The repository is mounted read-only and the container
+          # receives no host environment, devices, elevated privileges, or
+          # Docker socket.
+          image='public.ecr.aws/docker/library/debian@sha256:e40377b87a60470bf4aa59f0598d173bfb7d705e83bb310f9b6ef4a0ed00ec21'
           docker run --rm \
             --security-opt no-new-privileges \
             --pids-limit 512 \
