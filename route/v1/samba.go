@@ -63,6 +63,7 @@ func GetSambaSharesList(ctx echo.Context) error {
 			Anonymous: v.Anonymous,
 			Path:      v.Path,
 			ID:        v.ID,
+			Username:  v.Username,
 		})
 	}
 	return ctx.JSON(common_err.SUCCESS, model.Result{Success: common_err.SUCCESS, Message: common_err.GetMsg(common_err.SUCCESS), Data: shareList})
@@ -85,6 +86,11 @@ func PostSambaSharesCreate(ctx echo.Context) error {
 		}
 		if share.Path == "" {
 			return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INSUFFICIENT_PERMISSIONS, Message: common_err.GetMsg(common_err.INSUFFICIENT_PERMISSIONS)})
+		}
+		if share.Username != "" {
+			if message := checkShareAccount(share.Username); message != "" {
+				return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: message})
+			}
 		}
 	}
 	managementRoots, err := filesecurity.ManagementFileRoots()
@@ -115,7 +121,7 @@ func PostSambaSharesCreate(ctx echo.Context) error {
 		}
 		seenPaths[canonicalPath] = struct{}{}
 		seenNames[caseFoldedName] = struct{}{}
-		canonicalShares = append(canonicalShares, model.Shares{Anonymous: v.Anonymous, Path: canonicalPath})
+		canonicalShares = append(canonicalShares, model.Shares{Anonymous: v.Anonymous, Path: canonicalPath, Username: v.Username})
 		shareNames = append(shareNames, shareName)
 	}
 	shareDBModels := make([]model2.SharesDBModel, 0, len(canonicalShares))
@@ -124,6 +130,7 @@ func PostSambaSharesCreate(ctx echo.Context) error {
 			Anonymous: v.Anonymous,
 			Path:      v.Path,
 			Name:      shareNames[index],
+			Username:  v.Username,
 		})
 	}
 	if err := service.MyService.Shares().CreateShares(shareDBModels); err != nil {
@@ -142,6 +149,39 @@ func DeleteSambaShares(ctx echo.Context) error {
 		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
 	}
 	return ctx.JSON(common_err.SUCCESS, model.Result{Success: common_err.SUCCESS, Message: common_err.GetMsg(common_err.SUCCESS), Data: id})
+}
+
+// PutSambaShare restricts a share to one share account ({"username": "..."}),
+// or lifts the restriction with an empty username.
+func PutSambaShare(ctx echo.Context) error {
+	id := ctx.Param("id")
+	request := model.Shares{}
+	if id == "" || ctx.Bind(&request) != nil {
+		return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
+	}
+	if request.Username != "" {
+		if message := checkShareAccount(request.Username); message != "" {
+			return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: message})
+		}
+	}
+	if err := service.MyService.Shares().SetShareUsername(id, request.Username); err != nil {
+		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
+	}
+	return ctx.JSON(common_err.SUCCESS, model.Result{Success: common_err.SUCCESS, Message: common_err.GetMsg(common_err.SUCCESS), Data: id})
+}
+
+// checkShareAccount returns why username cannot restrict a share, or "".
+// Only share accounts qualify: naming root or any other system account would
+// render it into "force user".
+var checkShareAccount = func(username string) string {
+	managed, err := service.IsSambaShareAccount(username)
+	if err != nil {
+		return err.Error()
+	}
+	if !managed {
+		return service.ErrSambaUserNotManaged.Error()
+	}
+	return ""
 }
 
 // client

@@ -760,21 +760,24 @@ func (s *systemService) GetCPUPower() map[string]string {
 }
 
 func (s *systemService) SystemReboot() error {
-	arg := []string{"6"}
-	cmd := exec2.Command("init", arg...)
-	_, err := cmd.CombinedOutput()
-	if err != nil {
-		return err
-	}
-	return nil
+	return runSystemctlPowerAction("reboot")
 }
 
 func (s *systemService) SystemShutdown() error {
-	arg := []string{"0"}
-	cmd := exec2.Command("init", arg...)
-	_, err := cmd.CombinedOutput()
+	return runSystemctlPowerAction("poweroff")
+}
+
+// runSystemctlPowerAction asks systemd for a power transition. SysV `init 0/6`
+// is a compatibility shim that not every systemd host ships (NixOS has no
+// /sbin/init runlevel interface). --no-block queues the job and returns, so the
+// API can still answer before the service is stopped.
+func runSystemctlPowerAction(action string) error {
+	output, err := exec2.Command("systemctl", "--no-block", action).CombinedOutput()
 	if err != nil {
-		return err
+		if message := strings.TrimSpace(string(output)); message != "" {
+			return fmt.Errorf("systemctl %s: %w: %s", action, err, message)
+		}
+		return fmt.Errorf("systemctl %s: %w", action, err)
 	}
 	return nil
 }

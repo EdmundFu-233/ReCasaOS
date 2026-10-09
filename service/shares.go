@@ -42,6 +42,7 @@ type SharesService interface {
 	CreateShare(share model2.SharesDBModel) error
 	CreateShares(shares []model2.SharesDBModel) error
 	DeleteShare(id string) error
+	SetShareUsername(id string, username string) error
 	UpdateConfigFile() error
 	InitSambaConfig() error
 	ReconcileSambaConfig() error
@@ -56,9 +57,16 @@ type sharesStruct struct {
 	managementRoots       func() (*filesecurity.ManagedRoots, error)
 	validateCandidate     func([]byte) error
 	restartSMBD           func() error
+	// setShareOwner hands a share directory to its account (or to root);
+	// tests replace it, the default is setShareDirectoryOwner.
+	setShareOwner         func(roots *filesecurity.ManagedRoots, path, username string) (func() error, error)
 	beforeConfigPublish   func(string)
 	beforeConfigCleanup   func(string)
 	commitLegacyMigration func(*gorm.DB) error
+	// externalMainConfig: the host owns smb.conf and includes the shares
+	// fragment. The main config is then never read, written, verified or
+	// backed up here; only the fragment is managed.
+	externalMainConfig bool
 }
 
 const (
@@ -66,9 +74,12 @@ const (
 	defaultSambaSharesConfigPath = "/etc/samba/smb.casa.conf"
 	defaultSambaLockPath         = "/run/lock/recasaos-samba.lock"
 	sambaMainConfigMarker        = "# ReCasaOS managed Samba main config v1\n"
-	sambaSharesConfigMarker      = "# ReCasaOS managed Samba shares v1\n"
-	maxSambaConfigBytes          = 4 << 20
-	maxManagedSambaShares        = 256
+	// SambaMainConfigExternal is the [server] SambaMainConfig value for a
+	// main config owned by the host (see model.ServerModel).
+	SambaMainConfigExternal = "external"
+	sambaSharesConfigMarker = "# ReCasaOS managed Samba shares v1\n"
+	maxSambaConfigBytes     = 4 << 20
+	maxManagedSambaShares   = 256
 )
 
 func IsManagedSambaMainConfigLine(line string) bool {
@@ -87,7 +98,7 @@ func (s *sharesStruct) GetSharesByPath(path string) (shares []model2.SharesDBMod
 }
 
 func (s *sharesStruct) GetSharesList() (shares []model2.SharesDBModel) {
-	s.db.Select("anonymous,path,id").Find(&shares)
+	s.db.Select("anonymous,path,name,username,id").Find(&shares)
 	return
 }
 
@@ -119,6 +130,8 @@ type sambaConfigSnapshot struct {
 type sambaConfigState struct {
 	main   sambaConfigSnapshot
 	shares sambaConfigSnapshot
+	// mainExternal: main is not tracked (externalMainConfig).
+	mainExternal bool
 }
 
 type sambaConfigMutation struct {
@@ -179,18 +192,110 @@ func (s *sharesStruct) CreateShares(shares []model2.SharesDBModel) error {
 	if err := transaction.Create(&shares).Error; err != nil {
 		return errors.Join(fmt.Errorf("create shares: %w", err), transaction.Rollback().Error)
 	}
-	candidate, err := s.renderConfigFromDB(transaction, managementRoots)
+	restoreOwners, err := s.applyShareOwners(managementRoots, shares, false)
 	if err != nil {
 		return errors.Join(err, transaction.Rollback().Error)
 	}
+	candidate, err := s.renderConfigFromDB(transaction, managementRoots)
+	if err != nil {
+		return errors.Join(err, transaction.Rollback().Error, restoreOwners())
+	}
 	mutation, err := s.publishCandidateLocked(candidate, state)
 	if err != nil {
-		return errors.Join(err, transaction.Rollback().Error, s.restoreConfigStateLocked(state, mutation))
+		return errors.Join(err, transaction.Rollback().Error, s.restoreConfigStateLocked(state, mutation), restoreOwners())
 	}
 	if err := transaction.Commit().Error; err != nil {
-		return errors.Join(fmt.Errorf("commit share transaction: %w", err), transaction.Rollback().Error, s.restoreConfigStateLocked(state, mutation))
+		return errors.Join(fmt.Errorf("commit share transaction: %w", err), transaction.Rollback().Error, s.restoreConfigStateLocked(state, mutation), restoreOwners())
 	}
 	return nil
+}
+
+// SetShareUsername restricts a share to one share account, or lifts the
+// restriction with an empty username, and republishes the config in the same
+// transaction as the row: either both change or neither.
+func (s *sharesStruct) SetShareUsername(id string, username string) error {
+	if username != "" {
+		if err := ValidateSambaUsername(username); err != nil {
+			return err
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	releaseConfigLock, err := s.acquireConfigProcessLock()
+	if err != nil {
+		return err
+	}
+	defer releaseConfigLock()
+	state, err := s.captureConfigStateLocked()
+	if err != nil {
+		return err
+	}
+	managementRoots, err := s.managementFileRoots()
+	if err != nil {
+		return err
+	}
+	transaction := s.db.Begin()
+	if transaction.Error != nil {
+		return fmt.Errorf("begin share transaction: %w", transaction.Error)
+	}
+	share := model2.SharesDBModel{}
+	if err := transaction.Where("id = ?", id).First(&share).Error; err != nil {
+		return errors.Join(fmt.Errorf("load share: %w", err), transaction.Rollback().Error)
+	}
+	if err := transaction.Model(&share).Update("username", username).Error; err != nil {
+		return errors.Join(fmt.Errorf("update share account: %w", err), transaction.Rollback().Error)
+	}
+	restoreOwner, err := s.shareOwner()(managementRoots, share.Path, username)
+	if err != nil {
+		return errors.Join(err, transaction.Rollback().Error)
+	}
+	candidate, err := s.renderConfigFromDB(transaction, managementRoots)
+	if err != nil {
+		return errors.Join(err, transaction.Rollback().Error, restoreOwner())
+	}
+	mutation, err := s.publishCandidateLocked(candidate, state)
+	if err != nil {
+		return errors.Join(err, transaction.Rollback().Error, s.restoreConfigStateLocked(state, mutation), restoreOwner())
+	}
+	if err := transaction.Commit().Error; err != nil {
+		return errors.Join(fmt.Errorf("commit share transaction: %w", err), transaction.Rollback().Error, s.restoreConfigStateLocked(state, mutation), restoreOwner())
+	}
+	return nil
+}
+
+func (s *sharesStruct) shareOwner() func(*filesecurity.ManagedRoots, string, string) (func() error, error) {
+	if s.setShareOwner != nil {
+		return s.setShareOwner
+	}
+	return setShareDirectoryOwner
+}
+
+// applyShareOwners hands each share's directory to its account; the returned
+// function undoes all of it.
+func (s *sharesStruct) applyShareOwners(roots *filesecurity.ManagedRoots, shares []model2.SharesDBModel, release bool) (func() error, error) {
+	restores := []func() error{}
+	restoreAll := func() error {
+		var err error
+		for i := len(restores) - 1; i >= 0; i-- {
+			err = errors.Join(err, restores[i]())
+		}
+		return err
+	}
+	for _, share := range shares {
+		if share.Username == "" {
+			continue
+		}
+		username := share.Username
+		if release {
+			username = ""
+		}
+		restore, err := s.shareOwner()(roots, share.Path, username)
+		if err != nil {
+			return nil, errors.Join(err, restoreAll())
+		}
+		restores = append(restores, restore)
+	}
+	return restoreAll, nil
 }
 
 func (s *sharesStruct) DeleteShare(id string) error {
@@ -220,16 +325,21 @@ func (s *sharesStruct) DeleteShare(id string) error {
 	if err := transaction.Delete(&share).Error; err != nil {
 		return errors.Join(fmt.Errorf("delete share: %w", err), transaction.Rollback().Error)
 	}
-	candidate, err := s.renderConfigFromDB(transaction, managementRoots)
+	// a share account must not keep the folder after its share is gone
+	restoreOwners, err := s.applyShareOwners(managementRoots, []model.SharesDBModel{share}, true)
 	if err != nil {
 		return errors.Join(err, transaction.Rollback().Error)
 	}
+	candidate, err := s.renderConfigFromDB(transaction, managementRoots)
+	if err != nil {
+		return errors.Join(err, transaction.Rollback().Error, restoreOwners())
+	}
 	mutation, err := s.publishCandidateLocked(candidate, state)
 	if err != nil {
-		return errors.Join(err, transaction.Rollback().Error, s.restoreConfigStateLocked(state, mutation))
+		return errors.Join(err, transaction.Rollback().Error, s.restoreConfigStateLocked(state, mutation), restoreOwners())
 	}
 	if err := transaction.Commit().Error; err != nil {
-		return errors.Join(fmt.Errorf("commit share transaction: %w", err), transaction.Rollback().Error, s.restoreConfigStateLocked(state, mutation))
+		return errors.Join(fmt.Errorf("commit share transaction: %w", err), transaction.Rollback().Error, s.restoreConfigStateLocked(state, mutation), restoreOwners())
 	}
 	return nil
 }
@@ -264,6 +374,10 @@ func (s *sharesStruct) UpdateConfigFile() error {
 func (s *sharesStruct) InitSambaConfig() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.externalMainConfig {
+		mainPath, sharesPath := s.configPaths()
+		return checkExternalSambaMainIncludes(mainPath, sharesPath)
+	}
 	releaseConfigLock, err := s.acquireConfigProcessLock()
 	if err != nil {
 		return err
@@ -314,38 +428,49 @@ func (s *sharesStruct) ReconcileSambaConfig() error {
 	if err != nil {
 		return err
 	}
-	expectedMain, err := renderSambaMainConfig(state.shares.path)
-	if err != nil {
-		return err
-	}
-	managedMain := bytes.HasPrefix(state.main.data, []byte(sambaMainConfigMarker)) && bytes.Equal(state.main.data, expectedMain)
-	managedShares := !state.shares.exists || bytes.HasPrefix(state.shares.data, []byte(sambaSharesConfigMarker))
-	if !managedMain || !managedShares {
-		legacyMain, legacyErr := isExactLegacySambaMainConfig(state.main.data, state.shares.path)
-		if legacyErr != nil {
-			return legacyErr
+	if s.externalMainConfig {
+		// No legacy migration: that converts a main config this service
+		// owned. Only the fragment is reconciled, and only into an existing
+		// managed one or a new file.
+		if err := checkExternalSambaMainIncludes(state.main.path, state.shares.path); err != nil {
+			return err
 		}
-		if !legacyMain && !(managedMain && state.shares.exists && !managedShares) {
-			return errors.New("refusing to reconcile an unmanaged or unexpected Samba main config")
+		if state.shares.exists && !bytes.HasPrefix(state.shares.data, []byte(sambaSharesConfigMarker)) {
+			return fmt.Errorf("refusing to overwrite unmanaged Samba config %s", state.shares.path)
 		}
-		return s.migrateLegacySambaConfigLocked(state, managedMain)
-	}
-	if !managedMain {
-		return errors.New("refusing to reconcile an unmanaged or unexpected Samba main config")
+	} else {
+		expectedMain, err := renderSambaMainConfig(state.shares.path)
+		if err != nil {
+			return err
+		}
+		managedMain := bytes.HasPrefix(state.main.data, []byte(sambaMainConfigMarker)) && bytes.Equal(state.main.data, expectedMain)
+		managedShares := !state.shares.exists || bytes.HasPrefix(state.shares.data, []byte(sambaSharesConfigMarker))
+		if !managedMain || !managedShares {
+			legacyMain, legacyErr := isExactLegacySambaMainConfig(state.main.data, state.shares.path)
+			if legacyErr != nil {
+				return legacyErr
+			}
+			if !legacyMain && !(managedMain && state.shares.exists && !managedShares) {
+				return errors.New("refusing to reconcile an unmanaged or unexpected Samba main config")
+			}
+			return s.migrateLegacySambaConfigLocked(state, managedMain)
+		}
 	}
 	managementRoots, err := s.managementFileRoots()
 	if err != nil {
 		return err
 	}
-	legacyState, err := s.inspectLegacySambaReconcileState(state, managementRoots)
-	if err != nil {
-		return fmt.Errorf("inspect resumable legacy Samba migration: %w", err)
-	}
-	if legacyState == legacySambaResume {
-		return s.migrateLegacySambaConfigLocked(state, true)
-	}
-	if legacyState == legacySambaCompleted {
-		return nil
+	if !s.externalMainConfig {
+		legacyState, err := s.inspectLegacySambaReconcileState(state, managementRoots)
+		if err != nil {
+			return fmt.Errorf("inspect resumable legacy Samba migration: %w", err)
+		}
+		if legacyState == legacySambaResume {
+			return s.migrateLegacySambaConfigLocked(state, true)
+		}
+		if legacyState == legacySambaCompleted {
+			return nil
+		}
 	}
 	transaction := s.db.Begin()
 	if transaction.Error != nil {
@@ -402,7 +527,7 @@ func (s *sharesStruct) renderConfigFromDB(database *gorm.DB, managementRoots *fi
 
 func loadSambaShares(database *gorm.DB) ([]model2.SharesDBModel, error) {
 	shares := []model2.SharesDBModel{}
-	if err := database.Select("id,anonymous,path,name").Order("id ASC").Find(&shares).Error; err != nil {
+	if err := database.Select("id,anonymous,path,name,username").Order("id ASC").Find(&shares).Error; err != nil {
 		return nil, fmt.Errorf("load Samba shares: %w", err)
 	}
 	if len(shares) > maxManagedSambaShares {
@@ -534,11 +659,17 @@ func (s *sharesStruct) captureConfigStateLocked() (sambaConfigState, error) {
 
 func (s *sharesStruct) captureRawConfigStateLocked() (sambaConfigState, error) {
 	mainPath, sharesPath := s.configPaths()
-	mainSnapshot, err := readSambaConfigSnapshot(mainPath, true, "")
+	sharesSnapshot, err := readSambaConfigSnapshot(sharesPath, false, "")
 	if err != nil {
 		return sambaConfigState{}, err
 	}
-	sharesSnapshot, err := readSambaConfigSnapshot(sharesPath, false, "")
+	if s.externalMainConfig {
+		// Not read: an externally owned main config may legitimately be a
+		// symlink (e.g. into a read-only store), which the tracked reader
+		// refuses.
+		return sambaConfigState{main: sambaConfigSnapshot{path: mainPath}, shares: sharesSnapshot, mainExternal: true}, nil
+	}
+	mainSnapshot, err := readSambaConfigSnapshot(mainPath, true, "")
 	if err != nil {
 		return sambaConfigState{}, err
 	}
@@ -611,6 +742,9 @@ func verifySambaConfigSnapshot(snapshot sambaConfigSnapshot) error {
 }
 
 func verifySambaConfigState(state sambaConfigState) error {
+	if state.mainExternal {
+		return verifySambaConfigSnapshot(state.shares)
+	}
 	return errors.Join(verifySambaConfigSnapshot(state.main), verifySambaConfigSnapshot(state.shares))
 }
 
@@ -643,6 +777,9 @@ func (s *sharesStruct) writeTrackedSambaConfig(expected sambaConfigSnapshot, dat
 }
 
 func (s *sharesStruct) initSambaConfigLocked(snapshot sambaConfigSnapshot) (sambaConfigMutation, error) {
+	if s.externalMainConfig {
+		return sambaConfigMutation{}, nil
+	}
 	_, sharesPath := s.configPaths()
 	mainConfig, err := renderSambaMainConfig(sharesPath)
 	if err != nil {
@@ -866,6 +1003,18 @@ func renderSambaSharesConfig(managementRoots *filesecurity.ManagedRoots, shares 
 		}
 		seenPaths[canonicalPath] = struct{}{}
 		seenNames[nameKey] = struct{}{}
+		// Re-validated here, not only at the API: the name is written into the
+		// config. A share without an account renders exactly as before.
+		account := ""
+		if share.Username != "" {
+			if err := ValidateSambaUsername(share.Username); err != nil {
+				return nil, fmt.Errorf("validate Samba share %d: %w", share.ID, err)
+			}
+			// valid users and force user together: one without the other
+			// either leaves the share open to every Samba account or hands
+			// the files to whoever connected
+			account = fmt.Sprintf("valid users = %s\nforce user = %s\n", share.Username, share.Username)
+		}
 
 		_, _ = fmt.Fprintf(&configBuilder, `
 [%s]
@@ -879,8 +1028,8 @@ create mask = 0660
 directory mask = 0770
 follow symlinks = no
 wide links = no
-
-`, canonicalName, canonicalPath)
+%s
+`, canonicalName, canonicalPath, account)
 	}
 	candidate := []byte(configBuilder.String())
 	if err := validateSambaCandidateSize(candidate); err != nil {
@@ -1077,7 +1226,9 @@ func restartSambaService() error {
 }
 
 func NewSharesService(db *gorm.DB) SharesService {
+	external := config.ServerInfo != nil && strings.EqualFold(strings.TrimSpace(config.ServerInfo.SambaMainConfig), SambaMainConfigExternal)
 	return &sharesStruct{
+		externalMainConfig:    external,
 		db:                    db,
 		sambaConfigPath:       defaultSambaConfigPath,
 		sambaSharesConfigPath: defaultSambaSharesConfigPath,
@@ -1085,4 +1236,33 @@ func NewSharesService(db *gorm.DB) SharesService {
 		validateCandidate:     validateSambaCandidateWithTestparm,
 		restartSMBD:           restartSambaService,
 	}
+}
+
+// checkExternalSambaMainIncludes verifies, read-only, that an externally owned
+// main config includes the shares fragment: otherwise every share published
+// here would silently never be served. The main config is resolved like smbd
+// does, symlinks included; this file is never written.
+func checkExternalSambaMainIncludes(mainPath, sharesPath string) error {
+	file, err := os.Open(mainPath)
+	if err != nil {
+		return fmt.Errorf("read external Samba main config: %w", err)
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxSambaConfigBytes+1))
+	if err != nil {
+		return fmt.Errorf("read external Samba main config: %w", err)
+	}
+	if len(data) > maxSambaConfigBytes {
+		return fmt.Errorf("external Samba main config %s exceeds %d bytes", mainPath, maxSambaConfigBytes)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		key, value, found := strings.Cut(strings.TrimSpace(line), "=")
+		if !found || strings.HasPrefix(key, "#") || strings.HasPrefix(key, ";") {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(key), "include") && strings.TrimSpace(value) == sharesPath {
+			return nil
+		}
+	}
+	return fmt.Errorf("external Samba main config %s does not include %s", mainPath, sharesPath)
 }
