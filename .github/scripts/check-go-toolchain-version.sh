@@ -7,7 +7,7 @@ fail() {
   exit 1
 }
 
-expected=1.26.6
+expected=1.26.9
 expected_language=1.26.0
 script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 repository="${1:-$(cd -- "$script_directory/../.." && pwd -P)}"

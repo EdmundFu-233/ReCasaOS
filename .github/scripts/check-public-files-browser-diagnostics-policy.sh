@@ -115,7 +115,7 @@ canonicalize = lambda do |value|
   end
 end
 job_digest = Digest::SHA256.hexdigest(JSON.generate(canonicalize.call(job)))
-expected_job_digest = "cff2a06f51ec029ff0b72057f610083189ae5ffb31f763bb90c296fb59bb69e2"
+expected_job_digest = "bae539884b37378fd91692d9faca9df5e8cfb904a8613101ec4570a411016d81"
 reject("browser job semantic digest changed") unless
   job_digest == expected_job_digest
 reject("browser job has unexpected keys") unless
@@ -130,7 +130,7 @@ steps = job["steps"]
 reject("browser steps are missing") unless steps.is_a?(Array)
 expected_step_names = [
   "Check out source",
-  "Set up Go 1.26.6",
+  "Set up Go 1.26.9",
   "Set up Node.js 24.18.0",
   "Install exact browser-test dependencies",
   "Install ephemeral browser dependencies",
