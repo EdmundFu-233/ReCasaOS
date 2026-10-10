@@ -43,6 +43,7 @@ type SharesService interface {
 	CreateShares(shares []model2.SharesDBModel) error
 	DeleteShare(id string) error
 	SetShareUsername(id string, username string) error
+	SetShare(id string, username string, timeMachine *bool) error
 	UpdateConfigFile() error
 	InitSambaConfig() error
 	ReconcileSambaConfig() error
@@ -101,7 +102,7 @@ func (s *sharesStruct) GetSharesByPath(path string) (shares []model2.SharesDBMod
 }
 
 func (s *sharesStruct) GetSharesList() (shares []model2.SharesDBModel) {
-	s.db.Select("anonymous,path,name,username,id").Find(&shares)
+	s.db.Select("anonymous,path,name,username,time_machine,id").Find(&shares)
 	return
 }
 
@@ -217,6 +218,12 @@ func (s *sharesStruct) CreateShares(shares []model2.SharesDBModel) error {
 // restriction with an empty username, and republishes the config in the same
 // transaction as the row: either both change or neither.
 func (s *sharesStruct) SetShareUsername(id string, username string) error {
+	return s.SetShare(id, username, nil)
+}
+
+// SetShare sets a share's account and, when timeMachine is not nil, its Time
+// Machine flag: one transaction, one publish.
+func (s *sharesStruct) SetShare(id string, username string, timeMachine *bool) error {
 	if username != "" {
 		if err := ValidateSambaUsername(username); err != nil {
 			return err
@@ -247,6 +254,11 @@ func (s *sharesStruct) SetShareUsername(id string, username string) error {
 	}
 	if err := transaction.Model(&share).Update("username", username).Error; err != nil {
 		return errors.Join(fmt.Errorf("update share account: %w", err), transaction.Rollback().Error)
+	}
+	if timeMachine != nil {
+		if err := transaction.Model(&share).Update("time_machine", *timeMachine).Error; err != nil {
+			return errors.Join(fmt.Errorf("update share Time Machine flag: %w", err), transaction.Rollback().Error)
+		}
 	}
 	restoreOwner, err := s.shareOwner()(managementRoots, share.Path, username)
 	if err != nil {
@@ -541,7 +553,7 @@ func (s *sharesStruct) renderConfigFromDB(database *gorm.DB, managementRoots *fi
 
 func loadSambaShares(database *gorm.DB) ([]model2.SharesDBModel, error) {
 	shares := []model2.SharesDBModel{}
-	if err := database.Select("id,anonymous,path,name,username").Order("id ASC").Find(&shares).Error; err != nil {
+	if err := database.Select("id,anonymous,path,name,username,time_machine").Order("id ASC").Find(&shares).Error; err != nil {
 		return nil, fmt.Errorf("load Samba shares: %w", err)
 	}
 	if len(shares) > maxManagedSambaShares {
@@ -1061,6 +1073,13 @@ func renderSambaSharesConfig(managementRoots *filesecurity.ManagedRoots, shares 
 			// either leaves the share open to every Samba account or hands
 			// the files to whoever connected
 			account = fmt.Sprintf("valid users = %s\nforce user = %s\n", share.Username, share.Username)
+		}
+		// per share: a module line in [global] takes every share down on a host
+		// without vfs_fruit. "fruit:time machine" implies durable handles and
+		// the locking settings Time Machine needs; smbd (built with mDNS)
+		// advertises the share as _adisk._tcp itself.
+		if share.TimeMachine {
+			account += "vfs objects = catia fruit streams_xattr\nfruit:time machine = yes\n"
 		}
 
 		_, _ = fmt.Fprintf(&configBuilder, `
