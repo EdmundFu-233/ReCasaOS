@@ -43,6 +43,7 @@ type SharesService interface {
 	CreateShares(shares []model2.SharesDBModel) error
 	DeleteShare(id string) error
 	SetShareUsername(id string, username string) error
+	SetShare(id string, username string, timeMachine *bool) error
 	UpdateConfigFile() error
 	InitSambaConfig() error
 	ReconcileSambaConfig() error
@@ -73,7 +74,9 @@ const (
 	defaultSambaConfigPath       = "/etc/samba/smb.conf"
 	defaultSambaSharesConfigPath = "/etc/samba/smb.casa.conf"
 	defaultSambaLockPath         = "/run/lock/recasaos-samba.lock"
-	sambaMainConfigMarker        = "# ReCasaOS managed Samba main config v1\n"
+	sambaMainConfigMarker        = "# ReCasaOS managed Samba main config v2\n"
+	// v1: same template with `map to guest = bad user`; upgraded in place.
+	previousSambaMainConfigMarker = "# ReCasaOS managed Samba main config v1\n"
 	// SambaMainConfigExternal is the [server] SambaMainConfig value for a
 	// main config owned by the host (see model.ServerModel).
 	SambaMainConfigExternal = "external"
@@ -83,7 +86,8 @@ const (
 )
 
 func IsManagedSambaMainConfigLine(line string) bool {
-	return line == strings.TrimSuffix(sambaMainConfigMarker, "\n")
+	return line == strings.TrimSuffix(sambaMainConfigMarker, "\n") ||
+		line == strings.TrimSuffix(previousSambaMainConfigMarker, "\n")
 }
 
 func (s *sharesStruct) GetSharesByName(name string) (shares []model2.SharesDBModel) {
@@ -98,7 +102,7 @@ func (s *sharesStruct) GetSharesByPath(path string) (shares []model2.SharesDBMod
 }
 
 func (s *sharesStruct) GetSharesList() (shares []model2.SharesDBModel) {
-	s.db.Select("anonymous,path,name,username,id").Find(&shares)
+	s.db.Select("anonymous,path,name,username,time_machine,id").Find(&shares)
 	return
 }
 
@@ -214,6 +218,12 @@ func (s *sharesStruct) CreateShares(shares []model2.SharesDBModel) error {
 // restriction with an empty username, and republishes the config in the same
 // transaction as the row: either both change or neither.
 func (s *sharesStruct) SetShareUsername(id string, username string) error {
+	return s.SetShare(id, username, nil)
+}
+
+// SetShare sets a share's account and, when timeMachine is not nil, its Time
+// Machine flag: one transaction, one publish.
+func (s *sharesStruct) SetShare(id string, username string, timeMachine *bool) error {
 	if username != "" {
 		if err := ValidateSambaUsername(username); err != nil {
 			return err
@@ -244,6 +254,11 @@ func (s *sharesStruct) SetShareUsername(id string, username string) error {
 	}
 	if err := transaction.Model(&share).Update("username", username).Error; err != nil {
 		return errors.Join(fmt.Errorf("update share account: %w", err), transaction.Rollback().Error)
+	}
+	if timeMachine != nil {
+		if err := transaction.Model(&share).Update("time_machine", *timeMachine).Error; err != nil {
+			return errors.Join(fmt.Errorf("update share Time Machine flag: %w", err), transaction.Rollback().Error)
+		}
 	}
 	restoreOwner, err := s.shareOwner()(managementRoots, share.Path, username)
 	if err != nil {
@@ -439,6 +454,17 @@ func (s *sharesStruct) ReconcileSambaConfig() error {
 			return fmt.Errorf("refusing to overwrite unmanaged Samba config %s", state.shares.path)
 		}
 	} else {
+		before := state
+		upgraded, err := s.upgradePreviousSambaMainConfigLocked(state.main)
+		if err != nil {
+			return errors.Join(err, s.restoreConfigStateLocked(before, sambaConfigMutation{mainWritten: upgraded}))
+		}
+		if upgraded != nil {
+			state.main = *upgraded
+			if err := s.restartSamba(); err != nil {
+				return errors.Join(err, s.restoreConfigStateLocked(before, sambaConfigMutation{mainWritten: upgraded}))
+			}
+		}
 		expectedMain, err := renderSambaMainConfig(state.shares.path)
 		if err != nil {
 			return err
@@ -527,7 +553,7 @@ func (s *sharesStruct) renderConfigFromDB(database *gorm.DB, managementRoots *fi
 
 func loadSambaShares(database *gorm.DB) ([]model2.SharesDBModel, error) {
 	shares := []model2.SharesDBModel{}
-	if err := database.Select("id,anonymous,path,name,username").Order("id ASC").Find(&shares).Error; err != nil {
+	if err := database.Select("id,anonymous,path,name,username,time_machine").Order("id ASC").Find(&shares).Error; err != nil {
 		return nil, fmt.Errorf("load Samba shares: %w", err)
 	}
 	if len(shares) > maxManagedSambaShares {
@@ -785,6 +811,9 @@ func (s *sharesStruct) initSambaConfigLocked(snapshot sambaConfigSnapshot) (samb
 	if err != nil {
 		return sambaConfigMutation{}, err
 	}
+	if upgraded, err := s.upgradePreviousSambaMainConfigLocked(snapshot); upgraded != nil || err != nil {
+		return sambaConfigMutation{mainWritten: upgraded}, err
+	}
 	if bytes.HasPrefix(snapshot.data, []byte(sambaMainConfigMarker)) {
 		if !bytes.Equal(snapshot.data, mainConfig) {
 			return sambaConfigMutation{}, errors.New("managed Samba main config does not match the expected template")
@@ -835,18 +864,48 @@ func ensureSambaConfigBackup(snapshot sambaConfigSnapshot, backupPath string) (s
 	return existing, false, nil
 }
 
+// Anonymous shares are refused, so no login may fall back to guest: a wrong
+// password is answered with "access denied" and the client asks again, instead
+// of a guest session that then sees no share.
 func renderSambaMainConfig(sharesPath string) ([]byte, error) {
+	return renderSambaMainConfigVersion(sharesPath, sambaMainConfigMarker, "never")
+}
+
+func renderPreviousSambaMainConfig(sharesPath string) ([]byte, error) {
+	return renderSambaMainConfigVersion(sharesPath, previousSambaMainConfigMarker, "bad user")
+}
+
+func renderSambaMainConfigVersion(sharesPath, marker, mapToGuest string) ([]byte, error) {
 	if !filepath.IsAbs(sharesPath) || strings.ContainsAny(sharesPath, "\r\n\\\"%") {
 		return nil, errors.New("unsafe Samba shares config path")
 	}
-	return []byte(sambaMainConfigMarker + `[global]
+	return []byte(marker + `[global]
    min protocol = SMB2
    server signing = mandatory
    ea support = yes
-   map to guest = bad user
+   map to guest = ` + mapToGuest + `
    follow symlinks = no
    wide links = no
    include = ` + sharesPath + "\n"), nil
+}
+
+// upgradePreviousSambaMainConfigLocked replaces a byte-exact v1 managed main
+// config with the current template. Anything else is left alone (nil, nil).
+func (s *sharesStruct) upgradePreviousSambaMainConfigLocked(main sambaConfigSnapshot) (*sambaConfigSnapshot, error) {
+	_, sharesPath := s.configPaths()
+	previous, err := renderPreviousSambaMainConfig(sharesPath)
+	if err != nil || !bytes.Equal(main.data, previous) {
+		return nil, err
+	}
+	current, err := renderSambaMainConfig(sharesPath)
+	if err != nil {
+		return nil, err
+	}
+	written, err := s.writeTrackedSambaConfig(main, current, 0o600)
+	if err != nil {
+		return written, fmt.Errorf("upgrade Samba main config: %w", err)
+	}
+	return written, nil
 }
 
 func (s *sharesStruct) publishCandidateLocked(candidate []byte, state sambaConfigState) (sambaConfigMutation, error) {
@@ -1014,6 +1073,13 @@ func renderSambaSharesConfig(managementRoots *filesecurity.ManagedRoots, shares 
 			// either leaves the share open to every Samba account or hands
 			// the files to whoever connected
 			account = fmt.Sprintf("valid users = %s\nforce user = %s\n", share.Username, share.Username)
+		}
+		// per share: a module line in [global] takes every share down on a host
+		// without vfs_fruit. "fruit:time machine" implies durable handles and
+		// the locking settings Time Machine needs; smbd (built with mDNS)
+		// advertises the share as _adisk._tcp itself.
+		if share.TimeMachine {
+			account += "vfs objects = catia fruit streams_xattr\nfruit:time machine = yes\n"
 		}
 
 		_, _ = fmt.Fprintf(&configBuilder, `
