@@ -58,6 +58,9 @@ type sharesStruct struct {
 	managementRoots       func() (*filesecurity.ManagedRoots, error)
 	validateCandidate     func([]byte) error
 	restartSMBD           func() error
+	// reloadSMBD: reload, then close the named shares (shares_refresh.go);
+	// nil → share edits restart smbd
+	reloadSMBD func(closeShares []string) error
 	// setShareOwner hands a share directory to its account (or to root);
 	// tests replace it, the default is setShareDirectoryOwner.
 	setShareOwner         func(roots *filesecurity.ManagedRoots, path, username string) (func() error, error)
@@ -931,8 +934,15 @@ func (s *sharesStruct) publishCandidateLocked(candidate []byte, state sambaConfi
 	if err != nil {
 		return mutation, fmt.Errorf("publish Samba shares config: %w", err)
 	}
-	if err := s.restartSamba(); err != nil {
-		return mutation, fmt.Errorf("restart Samba: %w", err)
+	// main config written (first publish, upgrade): globals changed → restart
+	if mutation.mainWritten != nil {
+		if err := s.restartSamba(); err != nil {
+			return mutation, fmt.Errorf("restart Samba: %w", err)
+		}
+		return mutation, nil
+	}
+	if err := s.refreshSambaShares(snapshotData(state.shares), candidate); err != nil {
+		return mutation, fmt.Errorf("refresh Samba: %w", err)
 	}
 	return mutation, nil
 }
@@ -965,8 +975,10 @@ func (s *sharesStruct) restoreConfigStateLocked(state sambaConfigState, mutation
 			restoreErr = errors.Join(restoreErr, fmt.Errorf("%w: preserving Samba backup because main config ownership was lost", errSambaConfigConflict))
 		}
 	}
-	if mainRestored || sharesRestored {
+	if mainRestored {
 		restoreErr = errors.Join(restoreErr, s.restartSamba())
+	} else if sharesRestored {
+		restoreErr = errors.Join(restoreErr, s.refreshSambaShares(mutation.sharesWritten.data, snapshotData(state.shares)))
 	}
 	return restoreErr
 }
@@ -985,6 +997,14 @@ func (s *sharesStruct) restoreSambaConfigSnapshotIfOwned(original sambaConfigSna
 		return false, err
 	}
 	return true, nil
+}
+
+// snapshotData: the content smbd saw; nil for a missing file.
+func snapshotData(snapshot sambaConfigSnapshot) []byte {
+	if !snapshot.exists {
+		return nil
+	}
+	return snapshot.data
 }
 
 func (s *sharesStruct) restartSamba() error {
@@ -1301,6 +1321,7 @@ func NewSharesService(db *gorm.DB) SharesService {
 		managementRoots:       filesecurity.ManagementFileRoots,
 		validateCandidate:     validateSambaCandidateWithTestparm,
 		restartSMBD:           restartSambaService,
+		reloadSMBD:            reloadSambaService,
 	}
 }
 
