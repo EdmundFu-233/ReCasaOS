@@ -16,6 +16,8 @@ type Shares struct {
 	Path      string `json:"path"`
 	// Username restricts the share to one share account (see SambaUser).
 	Username string `json:"username"`
+	// TimeMachine: Time Machine destination for macOS.
+	TimeMachine bool `json:"time_machine"`
 }
 
 // SambaUser is the payload for creating a share account or changing its

@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/IceWhaleTech/CasaOS-Common/model"
-	"github.com/IceWhaleTech/CasaOS-Common/utils/command"
 	"github.com/IceWhaleTech/CasaOS-Common/utils/constants"
 	"github.com/IceWhaleTech/CasaOS-Common/utils/logger"
 
@@ -27,6 +26,7 @@ import (
 	"github.com/IceWhaleTech/CasaOS/pkg/samba"
 	"github.com/IceWhaleTech/CasaOS/pkg/smbcredentials"
 	"github.com/IceWhaleTech/CasaOS/pkg/sqlite"
+	"github.com/IceWhaleTech/CasaOS/pkg/startscripts"
 	"github.com/IceWhaleTech/CasaOS/pkg/utils/file"
 	"github.com/IceWhaleTech/CasaOS/route"
 	"github.com/IceWhaleTech/CasaOS/service"
@@ -223,10 +223,6 @@ func main() {
 		)
 	}
 
-	// run any script that needs to be executed
-	scriptDirectory := filepath.Join(constants.DefaultConfigPath, "start.d")
-	command.ExecuteScripts(scriptDirectory)
-
 	if supported, err := daemon.SdNotify(false, daemon.SdNotifyReady); err != nil {
 		logger.Error("Failed to notify systemd that casaos main service is ready", zap.Any("error", err))
 	} else if supported {
@@ -234,6 +230,10 @@ func main() {
 	} else {
 		logger.Info("This process is not running as a systemd service.")
 	}
+
+	// start.d scripts (e.g. the UI's event registration) after readiness: one
+	// that waits for another service must not hold this one back
+	go runStartScripts(filepath.Join(constants.DefaultConfigPath, "start.d"))
 	// http.HandleFunc("/v1/file/test", func(w http.ResponseWriter, r *http.Request) {
 
 	// 	//http.ServeFile(w, r, r.URL.Path[1:])
@@ -252,5 +252,20 @@ func main() {
 	err = s.Serve(listener) // not using http.serve() to fix G114: Use of net/http serve function that has no support for setting timeouts (see https://github.com/securego/gosec)
 	if err != nil && err != http.ErrServerClosed {
 		panic(err)
+	}
+}
+
+func runStartScripts(dir string) {
+	results, err := startscripts.Run(context.Background(), dir, 2*time.Minute)
+	if err != nil {
+		logger.Error("Failed to read the start script directory", zap.String("directory", dir), zap.Error(err))
+		return
+	}
+	for _, result := range results {
+		if result.Err != nil {
+			logger.Error("Start script failed", zap.String("script", result.Path), zap.Error(result.Err), zap.String("output", result.Output))
+		} else {
+			logger.Info("Start script finished", zap.String("script", result.Path), zap.String("output", result.Output))
+		}
 	}
 }

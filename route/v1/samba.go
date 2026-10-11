@@ -60,10 +60,11 @@ func GetSambaSharesList(ctx echo.Context) error {
 	shareList := []model.Shares{}
 	for _, v := range shares {
 		shareList = append(shareList, model.Shares{
-			Anonymous: v.Anonymous,
-			Path:      v.Path,
-			ID:        v.ID,
-			Username:  v.Username,
+			Anonymous:   v.Anonymous,
+			Path:        v.Path,
+			ID:          v.ID,
+			Username:    v.Username,
+			TimeMachine: v.TimeMachine,
 		})
 	}
 	return ctx.JSON(common_err.SUCCESS, model.Result{Success: common_err.SUCCESS, Message: common_err.GetMsg(common_err.SUCCESS), Data: shareList})
@@ -90,6 +91,11 @@ func PostSambaSharesCreate(ctx echo.Context) error {
 		if share.Username != "" {
 			if message := checkShareAccount(share.Username); message != "" {
 				return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: message})
+			}
+		}
+		if share.TimeMachine {
+			if err := checkTimeMachineSupport(); err != nil {
+				return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: err.Error()})
 			}
 		}
 	}
@@ -121,16 +127,17 @@ func PostSambaSharesCreate(ctx echo.Context) error {
 		}
 		seenPaths[canonicalPath] = struct{}{}
 		seenNames[caseFoldedName] = struct{}{}
-		canonicalShares = append(canonicalShares, model.Shares{Anonymous: v.Anonymous, Path: canonicalPath, Username: v.Username})
+		canonicalShares = append(canonicalShares, model.Shares{Anonymous: v.Anonymous, Path: canonicalPath, Username: v.Username, TimeMachine: v.TimeMachine})
 		shareNames = append(shareNames, shareName)
 	}
 	shareDBModels := make([]model2.SharesDBModel, 0, len(canonicalShares))
 	for index, v := range canonicalShares {
 		shareDBModels = append(shareDBModels, model2.SharesDBModel{
-			Anonymous: v.Anonymous,
-			Path:      v.Path,
-			Name:      shareNames[index],
-			Username:  v.Username,
+			Anonymous:   v.Anonymous,
+			Path:        v.Path,
+			Name:        shareNames[index],
+			Username:    v.Username,
+			TimeMachine: v.TimeMachine,
 		})
 	}
 	if err := service.MyService.Shares().CreateShares(shareDBModels); err != nil {
@@ -155,7 +162,11 @@ func DeleteSambaShares(ctx echo.Context) error {
 // or lifts the restriction with an empty username.
 func PutSambaShare(ctx echo.Context) error {
 	id := ctx.Param("id")
-	request := model.Shares{}
+	// time_machine absent: unchanged (clients that only set the account)
+	request := struct {
+		Username    string `json:"username"`
+		TimeMachine *bool  `json:"time_machine"`
+	}{}
 	if id == "" || ctx.Bind(&request) != nil {
 		return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: common_err.GetMsg(common_err.INVALID_PARAMS)})
 	}
@@ -164,11 +175,20 @@ func PutSambaShare(ctx echo.Context) error {
 			return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: message})
 		}
 	}
-	if err := service.MyService.Shares().SetShareUsername(id, request.Username); err != nil {
+	if request.TimeMachine != nil && *request.TimeMachine {
+		if err := checkTimeMachineSupport(); err != nil {
+			return ctx.JSON(common_err.CLIENT_ERROR, model.Result{Success: common_err.INVALID_PARAMS, Message: err.Error()})
+		}
+	}
+	if err := service.MyService.Shares().SetShare(id, request.Username, request.TimeMachine); err != nil {
 		return ctx.JSON(common_err.SERVICE_ERROR, model.Result{Success: common_err.SERVICE_ERROR, Message: common_err.GetMsg(common_err.SERVICE_ERROR), Data: err.Error()})
 	}
 	return ctx.JSON(common_err.SUCCESS, model.Result{Success: common_err.SUCCESS, Message: common_err.GetMsg(common_err.SUCCESS), Data: id})
 }
+
+// checkTimeMachineSupport refuses up front a share that would mount and then
+// refuse every connection; replaced in tests.
+var checkTimeMachineSupport = service.ValidateTimeMachineSupport
 
 // checkShareAccount returns why username cannot restrict a share, or "".
 // Only share accounts qualify: naming root or any other system account would

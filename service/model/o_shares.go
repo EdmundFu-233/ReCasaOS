@@ -19,8 +19,11 @@ type SharesDBModel struct {
 	// account Samba knows, as for every row created before share accounts
 	// existed (AutoMigrate adds the column; old rows read back empty).
 	Username string `json:"username"`
-	Updated  int64  `gorm:"autoUpdateTime"`
-	Created  int64  `gorm:"autoCreateTime"`
+	// TimeMachine offers the share to macOS as a Time Machine destination
+	// (vfs_fruit; smbd advertises it as _adisk._tcp over mDNS).
+	TimeMachine bool  `json:"time_machine"`
+	Updated     int64 `gorm:"autoUpdateTime"`
+	Created     int64 `gorm:"autoCreateTime"`
 }
 
 func (p *SharesDBModel) TableName() string {
